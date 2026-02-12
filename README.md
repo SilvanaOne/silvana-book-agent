@@ -250,6 +250,99 @@ cloud-agent seller --market <ID> --amount 10 --price-limit 95000
 | `cloud-agent sign multihash --input <B64>` | Sign a Canton multihash |
 | `cloud-agent sign message --input <TEXT>` | Sign a text message |
 
+## gRPC API
+
+The agent communicates with the Silvana orderbook server via 4 gRPC services defined in `proto/silvana/*/v1/*.proto`.
+
+### Services Overview
+
+| Service | Proto | Role | Streaming |
+|---------|-------|------|-----------|
+| DAppProviderService | `ledger/v1/ledger.proto` | Two-phase transaction signing, balance and contract queries | Server-streaming (`GetActiveContracts`, `GetUpdates`) |
+| SettlementService | `settlement/v1/settlement.proto` | DVP settlement orchestration, RFQ handling | Bidirectional (`SettlementStream`) |
+| OrderbookService | `orderbook/v1/orderbook.proto` | Order submission, market data, RFQ initiation | Server-streaming (`SubscribeOrderbook`, `SubscribeOrders`, `SubscribeSettlements`) |
+| PricingService | `pricing/v1/pricing.proto` | External price feeds (Binance, ByBit, CoinGecko) | Server-streaming (`StreamPrices`) |
+
+### Two-Phase Transaction Flow
+
+All ledger-mutating operations use a two-phase signing protocol:
+
+1. Agent calls `PrepareTransaction` with an operation type and parameters
+2. Server returns the full `prepared_transaction` bytes and a hash
+3. Agent uses `tx-verifier` to independently verify the transaction matches the requested operation (correct template, parties, amounts)
+4. Agent signs the hash locally with its Ed25519 private key
+5. Agent calls `ExecuteTransaction` with the signature
+6. Server submits the signed transaction to the Canton ledger
+
+Operation types:
+
+| Operation | Description |
+|-----------|-------------|
+| `TRANSFER_CC` | Send Canton Coin |
+| `TRANSFER_CIP56` | Send CIP-56 token |
+| `ACCEPT_CIP56` | Accept incoming CIP-56 transfer |
+| `PAY_DVP_FEE` | Pay DVP processing fee |
+| `PROPOSE_DVP` | Create DVP proposal |
+| `ACCEPT_DVP` | Accept DVP proposal |
+| `PAY_ALLOC_FEE` | Pay allocation processing fee |
+| `ALLOCATE` | Allocate tokens to DVP |
+| `REQUEST_PREAPPROVAL` | Request TransferPreapproval |
+| `REQUEST_RECURRING_PREPAID` | Request prepaid subscription |
+| `REQUEST_RECURRING_PAYASYOUGO` | Request pay-as-you-go subscription |
+| `REQUEST_USER_SERVICE` | Request UserService (onboarding) |
+
+### Settlement Stream (Bidirectional)
+
+The `SettlementStream` RPC is a long-lived bidirectional gRPC stream used for RFQ handling and settlement lifecycle coordination.
+
+**Agent sends:**
+- Handshake (party ID, operator party, LP name)
+- Heartbeats
+- Preconfirmation decisions (accept/reject)
+- DVP lifecycle events (creation, acceptance, allocation, settlement)
+- RFQ quotes or rejections
+
+**Server sends:**
+- Handshake acknowledgement
+- Heartbeats
+- Settlement proposals
+- Preconfirmation requests
+- RFQ requests (routed from users requesting quotes)
+
+The agent opens this stream when `[liquidity_provider]` is configured in `agent.toml`. RFQ requests arrive on this stream and the agent responds with a quote (price computed from mid-price and configured spread) or a rejection.
+
+### Key Query RPCs
+
+| RPC | Service | Returns |
+|-----|---------|---------|
+| `GetBalances` | Ledger | Token balances (total, locked, unlocked) |
+| `GetActiveContracts` | Ledger | Stream of active contracts by template filter |
+| `GetUpdates` | Ledger | Stream of ledger transactions from a given offset |
+| `GetPrice` | Pricing | Bid, ask, last price for a market |
+| `GetKlines` | Pricing | OHLCV candlestick data (1m to 1w intervals) |
+| `GetOrders` | Orderbook | Orders with status and type filters |
+| `GetOrderbookDepth` | Orderbook | Aggregated bid/offer price levels |
+| `GetSettlementProposals` | Orderbook | Settlement proposals with status filter |
+| `GetSettlementStatus` | Settlement | Step-by-step DVP status with buyer/seller next actions |
+| `GetMarkets` | Orderbook | Available markets and their configuration |
+| `GetMarketData` | Orderbook | Best bid/ask, last price, 24h volume |
+
+### Server-Streaming Subscriptions
+
+| RPC | Service | Payload |
+|-----|---------|---------|
+| `GetActiveContracts` | Ledger | Active contracts matching template filter |
+| `GetUpdates` | Ledger | Ledger transaction stream from a given offset |
+| `SubscribeSettlements` | Orderbook | Settlement status change events |
+| `StreamPrices` | Pricing | Real-time price ticks with optional orderbook and trade data |
+
+The agent currently uses polling (`poll_interval_secs`, default 10s) for mid-price updates rather than `StreamPrices`. Developers can modify this to use streaming for lower latency. `SubscribeOrderbook` and `SubscribeOrders` are also available but not used by the agent.
+
+### Authentication
+
+- **JWT** — Self-describing Ed25519 JWT (RFC 8037) with automatic refresh. Used for Orderbook, Pricing, and Settlement RPCs. The token embeds the Ed25519 public key; the server verifies it matches the registered party.
+- **Message signing** — Per-request Ed25519 signature on the canonical request payload, used for Ledger two-phase transactions. Server responses are also signed; the agent verifies them using `LEDGER_SERVICE_PUBLIC_KEY`.
+
 ## Security Model
 
 - **Two-phase signing**: The server prepares a transaction and returns the full prepared transaction bytes along with a hash. The agent independently recomputes the hash from the prepared transaction, verifies the transaction matches the expected operation using `tx-verifier`, and only then signs and submits.
