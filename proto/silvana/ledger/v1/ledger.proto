@@ -8,14 +8,12 @@ import "google/protobuf/struct.proto";
 option go_package = "github.com/SilvanaOne/canton-agent/proto;ledger";
 
 // ============================================================================
-// DAppProviderService — CIP-0103 dApp Standard compliant provider
+// DAppProviderService
 //
 // Proxied ledger operations for cloud agents with two-phase transaction flow.
 // Authentication: JWT in gRPC metadata header "authorization: Bearer <token>"
 // JWT must be self-describing EdDSA with embedded JWK (RFC 8037).
 // Server verifies public key fingerprint matches party_id.
-//
-// See CIP-0103: https://github.com/digital-asset/canton/cips/cip-0103
 // ============================================================================
 
 service DAppProviderService {
@@ -44,7 +42,7 @@ service DAppProviderService {
   // Discover on-chain DvpProposal/Dvp contracts for active settlements
   rpc GetSettlementContracts(GetSettlementContractsRequest) returns (GetSettlementContractsResponse);
 
-  // Get provider service info (CIP-0103 status)
+  // Get provider service info
   rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
 
   // === Onboarding RPCs (Ed25519 message signing, no JWT required) ===
@@ -61,7 +59,7 @@ service DAppProviderService {
   // Submit multihash signature (signed by agent's Ed25519 key)
   rpc SubmitOnboardingSignature(SubmitOnboardingSignatureRequest) returns (SubmitOnboardingSignatureResponse);
 
-  // === Two-Phase Transaction RPCs (CIP-0103 prepareExecute split) ===
+  // === Two-Phase Transaction RPCs ===
 
   // Phase 1: Prepare transaction (server builds tx, returns hash to sign)
   rpc PrepareTransaction(PrepareTransactionRequest) returns (PrepareTransactionResponse);
@@ -243,14 +241,14 @@ message GetSettlementContractsResponse {
   repeated DiscoveredContract contracts = 1;
 }
 
-// --- GetServiceInfo (CIP-0103 status) ---
+// --- GetServiceInfo ---
 
 message GetServiceInfoRequest {}
 
 message GetServiceInfoResponse {
   string provider_id = 1;                              // Service identifier
   string version = 2;                                  // API version (e.g. "1.0.0")
-  string provider_type = 3;                            // "remote" per CIP-0103
+  string provider_type = 3;                            // "remote"
   repeated TransactionOperation supported_operations = 4;
   string network_id = 5;                               // CAIP-2 (e.g. "canton:global-domain")
   string synchronizer_id = 6;
@@ -261,7 +259,7 @@ message GetServiceInfoResponse {
 // Onboarding Messages
 //
 // Cloud agent self-service onboarding flow. RPCs use Ed25519 message-level
-// signing (same MessageSignature scheme as CIP-0103 transactions) to prove
+// signing (same MessageSignature scheme as two-phase transactions) to prove
 // the caller owns the private key matching the public_key in the request.
 // No JWT required — identity is the Ed25519 public key.
 // ============================================================================
@@ -360,24 +358,23 @@ message MessageSignature {
 }
 
 // ============================================================================
-// CIP-0103 Error Model (ProviderRpcError)
+// Error Model (ProviderRpcError)
 //
 // Standardized error codes based on EIP-1193 and EIP-1474.
-// Mapped to CIP-0103 numeric codes for interoperability.
 // ============================================================================
 
 enum ProviderErrorCode {
   PROVIDER_ERROR_UNSPECIFIED = 0;
-  PROVIDER_ERROR_USER_REJECTED = 1;        // CIP-0103: 4001 — User rejected the request
-  PROVIDER_ERROR_UNAUTHORIZED = 2;          // CIP-0103: 4100 — Method/account not authorized
-  PROVIDER_ERROR_UNSUPPORTED_METHOD = 3;    // CIP-0103: 4200 — Provider doesn't support method
-  PROVIDER_ERROR_DISCONNECTED = 4;          // CIP-0103: 4900 — Provider disconnected
-  PROVIDER_ERROR_INVALID_PARAMS = 5;        // CIP-0103: -32602 — Invalid method parameters
-  PROVIDER_ERROR_INTERNAL = 6;              // CIP-0103: -32603 — Internal error
-  PROVIDER_ERROR_TRANSACTION_REJECTED = 7;  // CIP-0103: -32003 — Transaction creation failed
-  PROVIDER_ERROR_RESOURCE_NOT_FOUND = 8;    // CIP-0103: -32001 — Requested resource not found
-  PROVIDER_ERROR_RESOURCE_UNAVAILABLE = 9;  // CIP-0103: -32002 — Requested resource unavailable
-  PROVIDER_ERROR_LIMIT_EXCEEDED = 10;       // CIP-0103: -32005 — Request exceeds limit
+  PROVIDER_ERROR_USER_REJECTED = 1;        // 4001 — User rejected the request
+  PROVIDER_ERROR_UNAUTHORIZED = 2;          // 4100 — Method/account not authorized
+  PROVIDER_ERROR_UNSUPPORTED_METHOD = 3;    // 4200 — Provider doesn't support method
+  PROVIDER_ERROR_DISCONNECTED = 4;          // 4900 — Provider disconnected
+  PROVIDER_ERROR_INVALID_PARAMS = 5;        // -32602 — Invalid method parameters
+  PROVIDER_ERROR_INTERNAL = 6;              // -32603 — Internal error
+  PROVIDER_ERROR_TRANSACTION_REJECTED = 7;  // -32003 — Transaction creation failed
+  PROVIDER_ERROR_RESOURCE_NOT_FOUND = 8;    // -32001 — Requested resource not found
+  PROVIDER_ERROR_RESOURCE_UNAVAILABLE = 9;  // -32002 — Requested resource unavailable
+  PROVIDER_ERROR_LIMIT_EXCEEDED = 10;       // -32005 — Request exceeds limit
 }
 
 message ProviderError {
@@ -387,7 +384,7 @@ message ProviderError {
 }
 
 // ============================================================================
-// CIP-0103 Transaction Lifecycle (txChanged)
+// Transaction Lifecycle
 //
 // Status progression: pending → signed → executed → completed | failed
 // ============================================================================
@@ -538,7 +535,7 @@ message PrepareTransactionResponse {
   // Message-level signature from dApp provider service (Ed25519 over canonical response payload)
   MessageSignature response_signature = 30;
 
-  // CIP-0103 transaction lifecycle status (always PENDING after prepare)
+  // Transaction lifecycle status (always PENDING after prepare)
   TransactionStatus transaction_status = 40;
 }
 
@@ -570,9 +567,9 @@ message ExecuteTransactionResponse {
   // Message-level signature from dApp provider service (Ed25519 over canonical response payload)
   MessageSignature response_signature = 30;
 
-  // CIP-0103 transaction lifecycle status (EXECUTED on success, FAILED on error)
+  // Transaction lifecycle status (EXECUTED on success, FAILED on error)
   TransactionStatus transaction_status = 40;
-  // CIP-0103 structured error (ProviderRpcError) — populated when success=false
+  // Structured error (ProviderRpcError) — populated when success=false
   optional ProviderError provider_error = 41;
 }
 
