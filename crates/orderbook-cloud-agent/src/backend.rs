@@ -1,0 +1,208 @@
+//! Cloud settlement backend using DAppProviderService (CIP-0103)
+//!
+//! Implements `SettlementBackend` by calling the DAppProviderService gRPC proxy
+//! instead of accessing Canton ledger directly.
+//!
+//! All amulet-touching operations (pay_fee, allocate, transfer_traffic_fee) are
+//! serialized through a PaymentQueue to avoid LOCKED_CONTRACTS race conditions.
+//! Operations that don't use amulets (propose_dvp, accept_dvp) run concurrently.
+
+use anyhow::Result;
+use async_trait::async_trait;
+use tracing::{debug, info};
+
+use orderbook_agent_logic::config::BaseConfig;
+use orderbook_agent_logic::confirm::ConfirmLock;
+use orderbook_agent_logic::settlement::{DiscoveredContract, SettlementBackend, StepResult};
+use orderbook_proto::ledger::{
+    prepare_transaction_request::Params, AcceptDvpParams,
+    PrepareTransactionRequest, ProposeDvpParams, TransactionOperation,
+};
+
+use tx_verifier::OperationExpectation;
+
+use crate::ledger_client::DAppProviderClient;
+use crate::payment_queue::PaymentQueue;
+
+/// Settlement backend that uses DAppProviderService gRPC (no direct ledger access)
+pub struct CloudSettlementBackend {
+    config: BaseConfig,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+    confirm_lock: ConfirmLock,
+    /// Serializes all amulet-touching operations with priority
+    /// (Allocate > PayFee > TransferTrafficFee)
+    payment_queue: PaymentQueue,
+}
+
+impl CloudSettlementBackend {
+    pub fn new(config: BaseConfig, verbose: bool, dry_run: bool, force: bool, confirm: bool, confirm_lock: ConfirmLock) -> Self {
+        let payment_queue = PaymentQueue::new(
+            config.clone(),
+            verbose,
+            dry_run,
+            force,
+            confirm,
+            confirm_lock.clone(),
+        );
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue }
+    }
+
+    /// Create a new DAppProviderClient for this request
+    async fn create_client(&self) -> Result<DAppProviderClient> {
+        DAppProviderClient::new(
+            &self.config.orderbook_grpc_url,
+            &self.config.party_id,
+            &self.config.role,
+            &self.config.private_key_bytes,
+            self.config.token_ttl_secs,
+            Some(self.config.node_name.as_str()),
+            &self.config.ledger_service_public_key,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl SettlementBackend for CloudSettlementBackend {
+    async fn pay_fee(&self, proposal_id: &str, fee_type: &str) -> Result<StepResult> {
+        self.payment_queue.submit_pay_fee(proposal_id, fee_type).await
+    }
+
+    async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
+        if self.confirm && !self.dry_run {
+            orderbook_agent_logic::confirm::confirm_transaction(
+                &self.confirm_lock,
+                "Propose DVP",
+                &format!("proposal: {}", proposal_id),
+            ).await?;
+        }
+
+        let mut client = self.create_client().await?;
+
+        let expectation = OperationExpectation::ProposeDvp {
+            buyer_party: self.config.party_id.clone(),
+            seller_party: String::new(), // not known at this level
+            proposal_id: proposal_id.to_string(),
+            synchronizer_id: self.config.synchronizer_id.clone(),
+        };
+
+        let result = client
+            .submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::ProposeDvp as i32,
+                    params: Some(Params::ProposeDvp(ProposeDvpParams {
+                        proposal_id: proposal_id.to_string(),
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                self.verbose,
+                self.dry_run,
+                self.force,
+            )
+            .await?;
+
+        let traffic = result.traffic.as_ref().map(|t| t.total_bytes).unwrap_or(0);
+        let cid = result.contract_id.clone().unwrap_or_default();
+        info!("Created DvpProposal for {}: CID={}", proposal_id, cid);
+
+        Ok(StepResult {
+            contract_id: cid,
+            update_id: result.update_id,
+            traffic_total: traffic,
+        })
+    }
+
+    async fn accept_dvp(&self, proposal_id: &str, dvp_proposal_cid: &str) -> Result<StepResult> {
+        if self.confirm && !self.dry_run {
+            orderbook_agent_logic::confirm::confirm_transaction(
+                &self.confirm_lock,
+                "Accept DVP",
+                &format!("proposal: {}, dvp_proposal: {}", proposal_id, dvp_proposal_cid),
+            ).await?;
+        }
+
+        let mut client = self.create_client().await?;
+
+        let expectation = OperationExpectation::AcceptDvp {
+            seller_party: self.config.party_id.clone(),
+            proposal_id: proposal_id.to_string(),
+            dvp_proposal_cid: dvp_proposal_cid.to_string(),
+        };
+
+        let result = client
+            .submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::AcceptDvp as i32,
+                    params: Some(Params::AcceptDvp(AcceptDvpParams {
+                        proposal_id: proposal_id.to_string(),
+                        dvp_proposal_cid: dvp_proposal_cid.to_string(),
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                self.verbose,
+                self.dry_run,
+                self.force,
+            )
+            .await?;
+
+        let traffic = result.traffic.as_ref().map(|t| t.total_bytes).unwrap_or(0);
+        let cid = result.contract_id.clone().unwrap_or_default();
+        info!("Accepted DVP for {}: CID={}", proposal_id, cid);
+
+        Ok(StepResult {
+            contract_id: cid,
+            update_id: result.update_id,
+            traffic_total: traffic,
+        })
+    }
+
+    async fn allocate(&self, proposal_id: &str, dvp_cid: &str) -> Result<StepResult> {
+        self.payment_queue.submit_allocate(proposal_id, dvp_cid).await
+    }
+
+    async fn transfer_traffic_fee(
+        &self,
+        traffic_bytes: u64,
+        step_name: &str,
+        proposal_id: &str,
+    ) -> Result<()> {
+        if traffic_bytes == 0 {
+            return Ok(());
+        }
+        self.payment_queue
+            .submit_transfer_traffic_fee(traffic_bytes, step_name, proposal_id)
+            .await
+    }
+
+    async fn sync_contracts(
+        &self,
+        settlement_ids: &[String],
+    ) -> Result<Vec<DiscoveredContract>> {
+        if settlement_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut client = self.create_client().await?;
+        let contracts = client.get_settlement_contracts(settlement_ids).await?;
+
+        debug!(
+            "sync_contracts: found {} contracts for {} settlements",
+            contracts.len(),
+            settlement_ids.len()
+        );
+
+        Ok(contracts
+            .into_iter()
+            .map(|c| DiscoveredContract {
+                settlement_id: c.settlement_id,
+                contract_id: c.contract_id,
+                contract_type: c.contract_type,
+            })
+            .collect())
+    }
+}

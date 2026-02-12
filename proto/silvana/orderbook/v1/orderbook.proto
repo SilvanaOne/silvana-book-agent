@@ -1,0 +1,1016 @@
+syntax = "proto3";
+
+package silvana.orderbook.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/SilvanaOne/canton-agent/proto;orderbook";
+
+// ============================================================================
+// Enumerations
+// ============================================================================
+
+// Order type enumeration
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_BID = 1;  // Buy order
+  ORDER_TYPE_OFFER = 2; // Sell order
+}
+
+// Order status enumeration
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_ACTIVE = 1;
+  ORDER_STATUS_PARTIAL = 2;
+  ORDER_STATUS_FILLED = 3;
+  ORDER_STATUS_CANCELLED = 4;
+  ORDER_STATUS_EXPIRED = 5;
+}
+
+// Time in force enumeration
+enum TimeInForce {
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  TIME_IN_FORCE_GTC = 1; // Good Till Cancel
+  TIME_IN_FORCE_IOC = 2; // Immediate Or Cancel
+  TIME_IN_FORCE_FOK = 3; // Fill Or Kill
+  TIME_IN_FORCE_GTD = 4; // Good Till Date
+}
+
+// Settlement status enumeration (simplified - 4 states only)
+enum SettlementStatus {
+  SETTLEMENT_STATUS_UNSPECIFIED = 0;
+  SETTLEMENT_STATUS_PENDING = 1;
+  SETTLEMENT_STATUS_SETTLED = 2;
+  SETTLEMENT_STATUS_CANCELLED = 3;
+  SETTLEMENT_STATUS_FAILED = 4;
+}
+
+// Market type enumeration
+enum MarketType {
+  MARKET_TYPE_UNSPECIFIED = 0;
+  MARKET_TYPE_GENERAL = 1;
+  MARKET_TYPE_INSTITUTIONAL = 2;
+  MARKET_TYPE_OTC = 3;
+}
+
+// ============================================================================
+// Core Data Messages (matching SQL tables)
+// ============================================================================
+
+// NOTE: Authentication is via gRPC metadata header: authorization: Bearer <token>
+// JWT is self-describing:
+// - Server-signed tokens: no 'jwk' header, verified with JWT_PUBLIC_KEY env var
+// - External account tokens: 'jwk' header with Ed25519 public key (RFC 8037),
+//   verified against 'sub' claim (party_id) fingerprint
+
+// Instrument message
+message Instrument {
+  string instrument_id = 1;
+  string instrument_type = 2;
+  string name = 3;
+  string symbol = 4;
+  optional string description = 5;
+  optional string issuer = 6;
+  optional string registry = 7;
+  optional google.protobuf.Struct metadata = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  string news_symbol = 11;  // Symbol for news API search (e.g., 'BTC' for WBTC)
+}
+
+// Market message
+message Market {
+  string market_id = 1;
+  MarketType market_type = 2;
+  string base_instrument = 3;
+  string quote_instrument = 4;
+  string pair_symbol = 5; // Generated: base/quote
+  bool is_active = 6;
+  string min_order_size = 7; // DECIMAL(38,10) as string
+  optional string max_order_size = 8; // DECIMAL(38,10) as string
+  string tick_size = 9; // DECIMAL(38,10) as string
+  string maker_fee = 10; // DECIMAL(10,6) as string
+  string taker_fee = 11; // DECIMAL(10,6) as string
+  optional google.protobuf.Struct metadata = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  optional google.protobuf.Struct price_feeds = 15; // Price feed configurations
+
+  // Optional price information (populated if available)
+  optional double current_price = 16;
+  optional double change_24h = 17;
+  optional double volume_24h = 18;
+  optional google.protobuf.Timestamp price_updated_at = 19;
+}
+
+// Order message
+message Order {
+  uint64 order_id = 1; // BIGINT UNSIGNED AUTO_INCREMENT
+  string market_id = 2;
+  OrderType order_type = 3;
+  string trader = 4; // Canton party ID
+  optional string trader_order_ref = 5;
+  string base_instrument = 6;
+  string quote_instrument = 7;
+  string price = 8; // DECIMAL(38,10) as string
+  string quantity = 9; // DECIMAL(38,10) as string
+  string filled_quantity = 10; // DECIMAL(38,10) as string
+  string pending_quantity = 11; // DECIMAL(38,10) as string
+  string remaining_quantity = 12; // DECIMAL(38,10) as string (calculated)
+  OrderStatus status = 13;
+  TimeInForce time_in_force = 14;
+  optional google.protobuf.Timestamp expires_at = 15;
+  uint64 version = 16; // Optimistic locking
+  optional google.protobuf.Struct credentials = 17;
+  optional google.protobuf.Struct requirements = 18;
+  optional google.protobuf.Struct metadata = 19;
+  google.protobuf.Timestamp created_at = 20;
+  google.protobuf.Timestamp updated_at = 21;
+  optional google.protobuf.Timestamp cancelled_at = 22;
+  optional string signature = 23;  // Base64-encoded Ed25519 signature for order authentication
+  bytes signed_data = 24;  // Original signed order data (binary)
+  uint64 nonce = 25;  // Unique nonce per trader for replay protection
+}
+
+// Orderbook depth level (aggregated view without user details)
+message OrderbookLevel {
+  string price = 1; // DECIMAL(38,10) as string
+  string total_quantity = 2; // DECIMAL(38,10) as string
+  uint32 order_count = 3;
+  google.protobuf.Timestamp first_order_time = 4;
+}
+
+// Orderbook depth for a market
+message OrderbookDepth {
+  string market_id = 1;
+  string pair_symbol = 2;
+  repeated OrderbookLevel bids = 3; // Sorted by price DESC
+  repeated OrderbookLevel offers = 4; // Sorted by price ASC
+  google.protobuf.Timestamp snapshot_time = 5;
+}
+
+// Settlement proposal message (simplified - immutable values + status only)
+message SettlementProposal {
+  string proposal_id = 1; // UUID v7 - single ID used everywhere
+  string market_id = 2;
+  string buyer = 3;
+  string seller = 4;
+  string base_instrument = 5;
+  string quote_instrument = 6;
+  string base_quantity = 7; // DECIMAL(38,10) as string
+  string quote_quantity = 8; // DECIMAL(38,10) as string
+  string settlement_price = 9; // DECIMAL(38,10) as string
+
+  // Fee schedule (set by matching engine, to be paid by parties)
+  string dvp_processing_fee_buyer = 10; // DECIMAL(38,10) as string
+  string dvp_processing_fee_seller = 11; // DECIMAL(38,10) as string
+  string allocation_processing_fee_buyer = 12; // DECIMAL(38,10) as string
+  string allocation_processing_fee_seller = 13; // DECIMAL(38,10) as string
+
+  SettlementStatus status = 14;
+  optional string error_message = 15;
+  google.protobuf.Timestamp created_at = 16;
+  optional google.protobuf.Timestamp settled_at = 17;
+  optional google.protobuf.Timestamp cancelled_at = 18;
+  optional google.protobuf.Timestamp failed_at = 19;
+
+  // Matched order IDs (always populated - links proposal to bid/offer orders)
+  OrderMatch order_match = 20;
+}
+
+// Order match message
+message OrderMatch {
+  string settlement_proposal_id = 1; // UUID v7 - primary key (same as proposal_id)
+  uint64 bid_order_id = 2;
+  uint64 offer_order_id = 3;
+  string matched_quantity = 4; // DECIMAL(38,10) as string
+  string matched_price = 5; // DECIMAL(38,10) as string
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// Settlement (completed) message - audit trail for completed settlements
+message Settlement {
+  uint64 settlement_id = 1; // BIGINT UNSIGNED AUTO_INCREMENT (internal DB key)
+  string proposal_id = 2; // UUID v7 - reference to settlement proposal
+  string market_id = 3;
+  string buyer = 4;
+  string seller = 5;
+  string base_instrument = 6;
+  string quote_instrument = 7;
+  string base_quantity = 8; // DECIMAL(38,10) as string
+  string quote_quantity = 9; // DECIMAL(38,10) as string
+  string settlement_price = 10; // DECIMAL(38,10) as string
+
+  // Fees paid (copied from proposal for audit trail)
+  string dvp_processing_fee_buyer = 11; // DECIMAL(38,10) as string
+  string dvp_processing_fee_seller = 12; // DECIMAL(38,10) as string
+  string allocation_processing_fee_buyer = 13; // DECIMAL(38,10) as string
+  string allocation_processing_fee_seller = 14; // DECIMAL(38,10) as string
+
+  optional string settled_dvp_cid = 15; // Final SettledDvp contract ID
+  optional string settlement_update_id = 16; // Canton update ID
+  google.protobuf.Timestamp settled_at = 17;
+}
+
+// Market data message
+message MarketData {
+  string market_id = 1;
+  string pair_symbol = 2;
+  optional string best_bid = 3; // DECIMAL(38,10) as string
+  optional string best_offer = 4; // DECIMAL(38,10) as string
+  optional string last_price = 5; // DECIMAL(38,10) as string
+  string volume_24h = 6; // DECIMAL(38,10) as string
+  uint32 trades_24h = 7;
+  uint32 open_orders = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// ============================================================================
+// Service Request/Response Messages
+// ============================================================================
+
+// Get user's orders
+message GetOrdersRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;
+  optional OrderStatus status = 3;
+  optional OrderType order_type = 4;
+  optional uint32 limit = 5;
+  optional uint32 offset = 6;
+  // Liquidity provider filtering (returns orders from LP parties)
+  optional uint32 liquidity_provider_active_seconds = 11;  // Only LPs active within N seconds (default 60)
+  repeated string liquidity_provider_names = 12;           // Filter by specific LP names
+}
+
+message GetOrdersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Order orders = 3;
+  uint32 total = 4;
+}
+
+// Get orderbook depth (aggregated, no user details)
+message GetOrderbookDepthRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string market_id = 2;
+  optional uint32 depth = 3; // Number of price levels (default 20)
+}
+
+message GetOrderbookDepthResponse {
+  bool success = 1;
+  string message = 2;
+  OrderbookDepth orderbook = 3;
+}
+
+// Get user's settlement proposals
+message GetSettlementProposalsRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;
+  optional SettlementStatus status = 3;
+  optional uint32 limit = 4;
+  optional uint32 offset = 5;
+}
+
+message GetSettlementProposalsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated SettlementProposal proposals = 3;
+  uint32 total = 4;
+}
+
+// Get a single settlement proposal by ID
+message GetSettlementProposalRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string proposal_id = 2;  // UUID v7
+}
+
+message GetSettlementProposalResponse {
+  bool success = 1;
+  string message = 2;
+  optional SettlementProposal proposal = 3;
+}
+
+// Get available instruments (filtered by JWT permissions)
+message GetInstrumentsRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string instrument_type = 2;
+  optional uint32 limit = 3;
+  optional uint32 offset = 4;
+}
+
+message GetInstrumentsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Instrument instruments = 3;
+  uint32 total = 4;
+}
+
+// Get available markets (filtered by JWT permissions)
+message GetMarketsRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional MarketType market_type = 2;
+  optional string base_instrument = 3;
+  optional string quote_instrument = 4;
+  optional bool active_only = 5;
+  optional uint32 limit = 6;
+  optional uint32 offset = 7;
+}
+
+message GetMarketsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Market markets = 3;
+  uint32 total = 4;
+}
+
+// Get user's order history
+message GetOrderHistoryRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;
+  optional google.protobuf.Timestamp from_time = 3;
+  optional google.protobuf.Timestamp to_time = 4;
+  optional uint32 limit = 5;
+  optional uint32 offset = 6;
+}
+
+message GetOrderHistoryResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Order orders = 3;
+  uint32 total = 4;
+}
+
+// Get market data (filtered by JWT permissions)
+message GetMarketDataRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  repeated string market_ids = 2; // Empty = all accessible markets
+}
+
+message GetMarketDataResponse {
+  bool success = 1;
+  string message = 2;
+  repeated MarketData market_data = 3;
+}
+
+// Get user's settlements (completed)
+message GetSettlementsRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;
+  optional google.protobuf.Timestamp from_time = 3;
+  optional google.protobuf.Timestamp to_time = 4;
+  optional uint32 limit = 5;
+  optional uint32 offset = 6;
+}
+
+message GetSettlementsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Settlement settlements = 3;
+  uint32 total = 4;
+}
+
+// Subscribe to orderbook updates (streaming)
+message SubscribeOrderbookRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string market_id = 2;
+  optional uint32 depth = 3; // Number of price levels
+}
+
+// Orderbook update event
+message OrderbookUpdate {
+  string market_id = 1;
+  enum UpdateType {
+    UPDATE_TYPE_UNSPECIFIED = 0;
+    UPDATE_TYPE_SNAPSHOT = 1;
+    UPDATE_TYPE_DELTA = 2;
+  }
+  UpdateType update_type = 2;
+  repeated OrderbookLevel bid_updates = 3;
+  repeated OrderbookLevel offer_updates = 4;
+  google.protobuf.Timestamp timestamp = 5;
+  uint64 sequence_number = 6; // For ordering updates
+}
+
+// Subscribe to user's order updates (streaming)
+message SubscribeOrdersRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;
+}
+
+// Order update event
+message OrderUpdate {
+  enum EventType {
+    EVENT_TYPE_UNSPECIFIED = 0;
+    EVENT_TYPE_CREATED = 1;
+    EVENT_TYPE_UPDATED = 2;
+    EVENT_TYPE_FILLED = 3;
+    EVENT_TYPE_PARTIALLY_FILLED = 4;
+    EVENT_TYPE_CANCELLED = 5;
+    EVENT_TYPE_EXPIRED = 6;
+  }
+  EventType event_type = 1;
+  Order order = 2;
+  optional OrderMatch match = 3; // For fill events
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+// Subscribe to user's settlement updates (streaming)
+message SubscribeSettlementsRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;
+}
+
+// Settlement update event (for streaming - simplified to status changes)
+message SettlementUpdate {
+  enum EventType {
+    EVENT_TYPE_UNSPECIFIED = 0;
+    EVENT_TYPE_PROPOSAL_CREATED = 1;  // New proposal created
+    EVENT_TYPE_STATUS_CHANGED = 2;    // Status changed (pending → settled/cancelled/failed)
+    EVENT_TYPE_SETTLED = 3;           // Settlement completed
+    EVENT_TYPE_FAILED = 4;            // Settlement failed
+    EVENT_TYPE_CANCELLED = 5;         // Settlement cancelled
+  }
+  EventType event_type = 1;
+  SettlementProposal proposal = 2;
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// Submit a new order
+message SubmitOrderRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string market_id = 2;
+  OrderType order_type = 3;
+  string price = 4;  // DECIMAL(38,10) as string
+  string quantity = 5;  // DECIMAL(38,10) as string
+  TimeInForce time_in_force = 6;
+  optional google.protobuf.Timestamp expires_at = 7;
+  optional string trader_order_ref = 8;
+  optional google.protobuf.Struct credentials = 9;
+  optional google.protobuf.Struct requirements = 10;
+  optional google.protobuf.Struct metadata = 11;
+  optional string signature = 12;  // Base64-encoded Ed25519 signature for order authentication
+  bytes signed_data = 13;  // Original signed order data (binary)
+  uint64 nonce = 14;  // Unique nonce per trader for replay protection
+}
+
+message SubmitOrderResponse {
+  bool success = 1;
+  string message = 2;
+  optional Order order = 3;
+}
+
+// Cancel an existing order
+message CancelOrderRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  uint64 order_id = 2;
+}
+
+message CancelOrderResponse {
+  bool success = 1;
+  string message = 2;
+  optional Order order = 3;
+}
+
+// ============================================================================
+// Admin Operations (require operator authentication)
+// ============================================================================
+
+// Create a new party (operator, registry, or trader)
+message CreatePartyRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string party_id = 2;
+  string party_name = 3;
+  string party_type = 4; // trader, operator, registry, issuer, validator
+  optional string user_service_cid = 5; // UserService contract ID for traders
+  optional string operator_config_cid = 6; // OperatorConfiguration contract ID for operators
+  optional google.protobuf.Struct metadata = 7;
+  optional string user_service_request_cid = 8; // UserService request contract ID
+  google.protobuf.Struct user_data = 9; // User-specific data (KYC, credentials, etc.)
+  optional string email = 10;                            // Party email address
+  optional string public_key = 11;                       // Base58 public key
+  optional string invite_code = 12;                      // Invite code used during registration
+  optional string source = 13;                           // Source: loop_wallet, form, supa_wallet, admin, onboard, zoro_wallet
+  optional string encrypted_private_key = 14;            // AES-256-GCM encrypted private key
+  // Liquidity provider fields (creates/links LP entry when party is created)
+  optional string liquidity_provider_name = 16;        // LP name to create/link
+  optional string liquidity_provider_description = 17; // LP description (for new LPs)
+}
+
+message CreatePartyResponse {
+  bool success = 1;
+  string message = 2;
+  Party party = 3;
+}
+
+// Update an existing party (admin operation)
+message UpdatePartyRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string party_id = 2;                            // Required - which party to update
+  uint64 expected_version = 3;                    // Required - optimistic locking
+  optional string party_name = 4;
+  optional string user_service_cid = 5;
+  optional string operator_config_cid = 6;
+  optional string user_service_request_cid = 7;
+  optional google.protobuf.Struct user_data = 8;
+  optional google.protobuf.Struct metadata = 9;
+  optional string change_reason = 10;             // Audit: why this change
+  optional string email = 11;                     // Party email address
+  optional string public_key = 12;                // Base58 public key
+  optional string invite_code = 13;               // Invite code used during registration
+  optional string source = 14;                    // Source: loop_wallet, form, supa_wallet, admin
+  optional string encrypted_private_key = 15;     // AES-256-GCM encrypted private key
+}
+
+message UpdatePartyResponse {
+  bool success = 1;
+  string message = 2;
+  Party party = 3;
+}
+
+// Deactivate a party (soft delete - admin operation)
+message DeactivatePartyRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string party_id = 2;
+  uint64 expected_version = 3;
+  string change_reason = 4;                       // Required for deactivation
+}
+
+message DeactivatePartyResponse {
+  bool success = 1;
+  string message = 2;
+  Party party = 3;
+}
+
+// Get party change history (audit trail)
+message GetPartyHistoryRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string party_id = 2;
+  optional uint32 limit = 3;
+  optional uint32 offset = 4;
+}
+
+// Single entry in party history
+message PartyHistoryEntry {
+  uint64 history_id = 1;
+  string party_id = 2;
+  string action = 3;                              // created, updated, deactivated, reactivated
+  string changed_by = 4;
+  optional string change_reason = 5;
+  uint64 version = 6;
+  Party party_snapshot = 7;                       // Full party state at this version
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message GetPartyHistoryResponse {
+  bool success = 1;
+  string message = 2;
+  repeated PartyHistoryEntry history = 3;
+  uint32 total = 4;
+}
+
+// Get a single party by ID
+message GetPartyRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string party_id = 2;
+}
+
+message GetPartyResponse {
+  bool success = 1;
+  string message = 2;
+  Party party = 3;
+}
+
+// List parties with filters and pagination
+message GetPartiesRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string party_type = 2;           // Filter by type: trader, operator, registry, issuer, validator
+  optional bool active_only = 3;            // If true, only return active parties (default: all)
+  optional uint32 limit = 4;                // Max results (default: 50, max: 1000)
+  optional uint32 offset = 5;               // Pagination offset
+}
+
+message GetPartiesResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Party parties = 3;
+  uint32 total = 4;
+}
+
+// Party information
+message Party {
+  string party_id = 1;
+  string party_name = 2;
+  string party_type = 3;
+  optional string user_service_cid = 4;
+  optional string operator_config_cid = 5;
+  bool is_active = 6;
+  optional google.protobuf.Struct metadata = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  optional string user_service_request_cid = 10;  // UserService request contract ID
+  google.protobuf.Struct user_data = 11;           // User-specific data (KYC, credentials, etc.)
+  uint64 version = 12;                             // Optimistic locking version
+  optional string email = 13;                      // Party email address
+  optional string public_key = 14;                 // Base58 public key
+  optional string invite_code = 15;                // Invite code used during registration
+  string source = 16;                              // Source: loop_wallet, form, supa_wallet, admin
+}
+
+// Liquidity provider information
+message LiquidityProvider {
+  string name = 1;                                  // Primary key name
+  string party_id = 2;                              // Canton party ID
+  optional string description = 3;                  // Description
+  optional google.protobuf.Timestamp last_active_time = 4;  // Last ping time
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// Get liquidity providers list
+message GetLiquidityProvidersRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional uint32 active_seconds = 2;  // Only return LPs active within N seconds (default: all)
+  optional uint32 limit = 3;           // Pagination
+  optional uint32 offset = 4;
+}
+
+message GetLiquidityProvidersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated LiquidityProvider liquidity_providers = 3;
+  uint32 total = 4;
+}
+
+// ============================================================================
+// Waiting List
+// ============================================================================
+
+// Waiting list entry for users pending onboarding
+message WaitingListEntry {
+  uint64 id = 1;
+  optional string party_id = 2;
+  google.protobuf.Struct user_data = 3;
+  string source = 4;                    // loop_wallet, form, supa_wallet, agent
+  optional string email = 5;
+  optional string public_key = 6;
+  string onboarding_status = 7;         // requested, signature_required, topology_created, onboarded
+  uint64 version = 8;
+  optional google.protobuf.Struct metadata = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  optional string multihash = 12;
+  optional string multihash_signature = 13;
+  optional string invite_code = 14;
+}
+
+// Add entry to waiting list (JWT auth with user 'onboard')
+message AddWaitingListEntryRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  google.protobuf.Struct user_data = 2;
+  string source = 3;
+  optional string email = 4;
+  optional string public_key = 5;
+  optional google.protobuf.Struct metadata = 6;
+}
+
+message AddWaitingListEntryResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 id = 3;
+}
+
+// ============================================================================
+// Rounds
+// ============================================================================
+
+// Canton round with conversion coefficients for reward calculations
+message Round {
+  uint64 round_number = 1;
+  optional string issuance_per_featured_app_reward_coupon = 2;    // DECIMAL(38,10) as string
+  optional string issuance_per_unfeatured_app_reward_coupon = 3;  // DECIMAL(38,10) as string
+  optional string cc_usd_rate = 4;                                 // DECIMAL(38,10) as string
+  optional string traffic_cost_usd_per_mb = 5;                     // DECIMAL(38,10) as string
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+// Latest coefficient values (may come from different rounds)
+message LatestCoefficients {
+  // Issuance coefficient for featured apps (from most recent round with value)
+  optional string issuance_per_featured_app_reward_coupon = 1;
+  optional uint64 issuance_per_featured_app_reward_coupon_round = 2;
+
+  // Issuance coefficient for unfeatured apps (from most recent round with value)
+  optional string issuance_per_unfeatured_app_reward_coupon = 3;
+  optional uint64 issuance_per_unfeatured_app_reward_coupon_round = 4;
+
+  // CC/USD exchange rate (from most recent round with value)
+  optional string cc_usd_rate = 5;
+  optional uint64 cc_usd_rate_round = 6;
+
+  // Traffic cost in USD per MB (from most recent round with value)
+  optional string traffic_cost_usd_per_mb = 7;
+  optional uint64 traffic_cost_usd_per_mb_round = 8;
+}
+
+// Get rounds data with latest coefficients
+message GetRoundsDataRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional uint32 limit = 2;  // Default: 10, max: 100
+}
+
+message GetRoundsDataResponse {
+  bool success = 1;
+  string message = 2;
+  repeated Round rounds = 3;           // Last N rounds ordered by round_number DESC
+  LatestCoefficients latest = 4;       // Latest non-NULL values for each coefficient
+  uint32 total_rounds = 5;             // Total rounds in database
+}
+
+// ============================================================================
+// Invites
+// ============================================================================
+
+// Invite status enum
+enum InviteStatus {
+  INVITE_STATUS_UNSPECIFIED = 0;
+  INVITE_STATUS_VALID = 1;
+  INVITE_STATUS_EXPIRED = 2;
+  INVITE_STATUS_USED = 3;
+  INVITE_STATUS_CANCELLED = 4;
+}
+
+// Invite code for user onboarding
+message Invite {
+  string invite_code = 1;
+  string channel = 2;
+  optional string rewards = 3;           // DECIMAL(38,10) as string
+  optional google.protobuf.Struct metadata = 4;
+  InviteStatus status = 5;
+  uint32 count_used = 6;
+  optional uint32 max_count = 7;
+  string created_by = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+// Get invite by code
+message GetInviteRequest {
+  string invite_code = 1;
+}
+
+message GetInviteResponse {
+  bool found = 1;
+  optional Invite invite = 2;
+}
+
+// Use invite code (increments count, marks used if at max)
+message UseInviteRequest {
+  string invite_code = 1;
+  optional string party_id = 2;  // Who is using the invite
+}
+
+message UseInviteResponse {
+  bool success = 1;
+  string message = 2;
+  optional Invite invite = 3;    // Updated invite after use
+}
+
+// Create a new instrument
+message CreateInstrumentRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string instrument_id = 2;
+  string instrument_type = 3; // token, asset, commodity, native
+  string name = 4;
+  string symbol = 5;
+  optional string description = 6;
+  optional string issuer = 7; // Canton party ID
+  optional string registry = 8; // Canton registry party ID
+  optional google.protobuf.Struct metadata = 9;
+  string news_symbol = 10;  // Symbol for news API search (e.g., 'BTC' for WBTC)
+}
+
+message CreateInstrumentResponse {
+  bool success = 1;
+  string message = 2;
+  Instrument instrument = 3;
+}
+
+// Create a new market
+message CreateMarketRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string market_id = 2;
+  MarketType market_type = 3;
+  optional string base_instrument = 4; // Optional for general markets
+  optional string quote_instrument = 5; // Optional for general markets
+  string min_order_size = 6; // DECIMAL as string
+  optional string max_order_size = 7; // DECIMAL as string
+  string tick_size = 8; // Minimum price increment
+  string maker_fee = 9; // DECIMAL as string (e.g., "0.001" for 0.1%)
+  string taker_fee = 10; // DECIMAL as string (e.g., "0.002" for 0.2%)
+  optional google.protobuf.Struct metadata = 11;
+  optional google.protobuf.Struct price_feeds = 12; // Price feed configurations
+}
+
+message CreateMarketResponse {
+  bool success = 1;
+  string message = 2;
+  Market market = 3;
+}
+
+// Update price feeds for an existing market
+message UpdateMarketPriceFeedsRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string market_id = 2;
+  google.protobuf.Struct price_feeds = 3; // New price feed configuration
+}
+
+message UpdateMarketPriceFeedsResponse {
+  bool success = 1;
+  string message = 2;
+  Market market = 3; // Updated market info
+}
+
+// ============================================================================
+// RFQ (Request-for-Quote) Messages
+// ============================================================================
+
+// Request quotes from connected liquidity providers
+message RequestQuotesRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string market_id = 2;
+  string direction = 3;           // "buy" or "sell"
+  string quantity = 4;            // DECIMAL(38,10) as string — base instrument quantity
+  repeated string lp_names = 5;   // Optional: specific LPs to request from (empty = all connected)
+  optional uint32 timeout_secs = 6;  // How long to wait for LP responses (default: 10, max: 30)
+}
+
+message RequestQuotesResponse {
+  bool success = 1;
+  string message = 2;
+  string rfq_id = 3;              // UUIDv7 for this RFQ session
+  repeated RfqQuoteInfo quotes = 4;
+  repeated RfqRejectInfo rejections = 5;
+  uint32 lps_requested = 6;       // How many LP parties were contacted
+  uint32 lps_responded = 7;       // How many responded (quotes + rejections)
+}
+
+// Quote info returned to user
+message RfqQuoteInfo {
+  string quote_id = 1;
+  string lp_name = 2;
+  string price = 3;               // DECIMAL(38,10) as string — price per unit
+  string quantity = 4;            // DECIMAL(38,10) as string — base quantity
+  string quote_quantity = 5;      // DECIMAL(38,10) as string — total cost/proceeds in quote instrument
+  google.protobuf.Timestamp valid_until = 6;
+  optional uint32 allocate_before_secs = 7;   // LP's allocation deadline requirement (seconds from DVP creation)
+  optional uint32 settle_before_secs = 8;     // LP's settlement deadline requirement (seconds from DVP creation)
+}
+
+// Rejection info returned to user
+message RfqRejectInfo {
+  string lp_name = 1;
+  string reason = 2;              // Human-readable reason
+  optional string min_quantity = 3; // LP's min acceptable quantity (if rejected for amount)
+  optional string max_quantity = 4; // LP's max acceptable quantity (if rejected for amount)
+}
+
+// Accept a specific quote
+message AcceptQuoteRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  string rfq_id = 2;              // Original RFQ session ID
+  string quote_id = 3;            // Specific quote to accept
+}
+
+message AcceptQuoteResponse {
+  bool success = 1;
+  string message = 2;
+  optional string proposal_id = 3;  // Settlement proposal ID (if accepted)
+}
+
+// Get connected liquidity providers (replaces activity-based filter)
+message GetConnectedLiquidityProvidersRequest {
+  // Auth via gRPC metadata: authorization: Bearer <token>
+  optional string market_id = 2;  // Future: filter by market support
+}
+
+message GetConnectedLiquidityProvidersResponse {
+  bool success = 1;
+  string message = 2;
+  repeated ConnectedLpInfo liquidity_providers = 3;
+}
+
+message ConnectedLpInfo {
+  string name = 1;
+  string description = 2;
+  uint32 connected_agents = 3;    // Number of connected party_ids for this LP
+}
+
+// ============================================================================
+// RFQ Audit Log Messages
+// ============================================================================
+
+enum RfqAuditEventType {
+  RFQ_AUDIT_EVENT_TYPE_UNSPECIFIED = 0;
+  RFQ_AUDIT_EVENT_TYPE_REQUEST = 1;
+  RFQ_AUDIT_EVENT_TYPE_QUOTE = 2;
+  RFQ_AUDIT_EVENT_TYPE_REJECT = 3;
+  RFQ_AUDIT_EVENT_TYPE_ACCEPT = 4;
+  RFQ_AUDIT_EVENT_TYPE_EXPIRE = 5;
+}
+
+message RfqAuditLogEntry {
+  uint64 id = 1;
+  string rfq_id = 2;
+  RfqAuditEventType event_type = 3;
+  string market_id = 4;
+  string direction = 5;
+  string requesting_party = 6;
+  optional string lp_name = 7;
+  optional string lp_party_id = 8;
+  optional string quantity = 9;
+  optional string price = 10;
+  optional string quote_quantity = 11;
+  optional string quote_id = 12;
+  optional string proposal_id = 13;
+  optional string error_message = 14;
+  google.protobuf.Timestamp created_at = 15;
+}
+
+message GetRfqAuditLogRequest {
+  // Auth via gRPC metadata — private access: only entries where
+  // requesting_party = caller OR lp_party_id = caller
+  optional string rfq_id = 1;
+  optional string market_id = 2;
+  optional RfqAuditEventType event_type = 3;
+  optional string lp_name = 4;
+  optional google.protobuf.Timestamp from_time = 5;
+  optional google.protobuf.Timestamp to_time = 6;
+  optional uint32 limit = 7;
+  optional uint32 offset = 8;
+}
+
+message GetRfqAuditLogResponse {
+  repeated RfqAuditLogEntry entries = 1;
+  uint32 total = 2;
+}
+
+// ============================================================================
+// Service Definition
+// ============================================================================
+
+service OrderbookService {
+  // Query operations
+  rpc GetOrders(GetOrdersRequest) returns (GetOrdersResponse);
+  rpc GetOrderbookDepth(GetOrderbookDepthRequest) returns (GetOrderbookDepthResponse);
+  rpc GetSettlementProposals(GetSettlementProposalsRequest) returns (GetSettlementProposalsResponse);
+  rpc GetSettlementProposal(GetSettlementProposalRequest) returns (GetSettlementProposalResponse);
+  rpc GetInstruments(GetInstrumentsRequest) returns (GetInstrumentsResponse);
+  rpc GetMarkets(GetMarketsRequest) returns (GetMarketsResponse);
+  rpc GetOrderHistory(GetOrderHistoryRequest) returns (GetOrderHistoryResponse);
+  rpc GetMarketData(GetMarketDataRequest) returns (GetMarketDataResponse);
+  rpc GetSettlements(GetSettlementsRequest) returns (GetSettlementsResponse);
+
+  // Order management operations
+  rpc SubmitOrder(SubmitOrderRequest) returns (SubmitOrderResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+
+  // Party operations
+  rpc GetParty(GetPartyRequest) returns (GetPartyResponse);
+  rpc GetParties(GetPartiesRequest) returns (GetPartiesResponse);
+
+  // Liquidity provider operations
+  rpc GetLiquidityProviders(GetLiquidityProvidersRequest) returns (GetLiquidityProvidersResponse);
+  rpc GetConnectedLiquidityProviders(GetConnectedLiquidityProvidersRequest) returns (GetConnectedLiquidityProvidersResponse);
+
+  // RFQ operations
+  rpc RequestQuotes(RequestQuotesRequest) returns (RequestQuotesResponse);
+  rpc AcceptQuote(AcceptQuoteRequest) returns (AcceptQuoteResponse);
+  rpc GetRfqAuditLog(GetRfqAuditLogRequest) returns (GetRfqAuditLogResponse);
+
+  // Waiting list operations (JWT auth with user 'onboard')
+  rpc AddWaitingListEntry(AddWaitingListEntryRequest) returns (AddWaitingListEntryResponse);
+
+  // Invite operations
+  rpc GetInvite(GetInviteRequest) returns (GetInviteResponse);
+  rpc UseInvite(UseInviteRequest) returns (UseInviteResponse);
+
+  // Rounds operations
+  rpc GetRoundsData(GetRoundsDataRequest) returns (GetRoundsDataResponse);
+
+  // Admin operations (require operator authentication)
+  rpc CreateParty(CreatePartyRequest) returns (CreatePartyResponse);
+  rpc UpdateParty(UpdatePartyRequest) returns (UpdatePartyResponse);
+  rpc DeactivateParty(DeactivatePartyRequest) returns (DeactivatePartyResponse);
+  rpc GetPartyHistory(GetPartyHistoryRequest) returns (GetPartyHistoryResponse);
+  rpc CreateInstrument(CreateInstrumentRequest) returns (CreateInstrumentResponse);
+  rpc CreateMarket(CreateMarketRequest) returns (CreateMarketResponse);
+  rpc UpdateMarketPriceFeeds(UpdateMarketPriceFeedsRequest) returns (UpdateMarketPriceFeedsResponse);
+
+  // Streaming subscriptions
+  rpc SubscribeOrderbook(SubscribeOrderbookRequest) returns (stream OrderbookUpdate);
+  rpc SubscribeOrders(SubscribeOrdersRequest) returns (stream OrderUpdate);
+  rpc SubscribeSettlements(SubscribeSettlementsRequest) returns (stream SettlementUpdate);
+}
