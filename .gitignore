@@ -17,3 +17,6 @@ target/
 Thumbs.db
 
 logs
+
+# Docker build artifacts
+docker/release/
