@@ -1,4 +1,9 @@
-.PHONY: build-arm build-x86 build-mac build-all release-archives github-release
+.PHONY: help build-arm build-x86 build-mac build-all release-archives github-release
+
+.DEFAULT_GOAL := help
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
 build-arm: ## Build cloud-agent for Ubuntu Linux ARM64 (aarch64) using Docker
 	@echo "Building cloud-agent for Ubuntu Linux ARM64..."
@@ -60,7 +65,7 @@ release-archives: build-all ## Build and create release archives for all platfor
 	@ls -lh docker/release/github/
 
 # Usage: make github-release VERSION=v1.0.0
-github-release: release-archives ## Create a GitHub release using gh CLI (all platforms)
+github-release: release-archives ## Create a GitHub release (usage: make github-release VERSION=v1.0.0)
 	@if [ -z "$(VERSION)" ]; then \
 		echo "Error: VERSION is required"; \
 		echo "Usage: make github-release VERSION=v1.0.0"; \
