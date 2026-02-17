@@ -616,6 +616,7 @@ message Party {
   optional string public_key = 14;                 // Base58 public key
   optional string invite_code = 15;                // Invite code used during registration
   string source = 16;                              // Source: loop_wallet, form, supa_wallet, admin
+  optional string participant = 17;               // Participant ID hosting this party (PAR::name::fingerprint)
 }
 
 // Liquidity provider information
