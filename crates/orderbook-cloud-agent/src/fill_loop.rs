@@ -5,15 +5,16 @@
 //! Runs the settlement agent in the background to process settlements.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn, error};
 
 use orderbook_agent_logic::client::OrderbookClient;
 use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use orderbook_agent_logic::runner::{run_agent, AcceptedRfqTrade, AgentOptions, BalanceProvider};
 use orderbook_agent_logic::settlement::SettlementBackend;
 
 /// Direction of the fill operation
@@ -66,6 +67,8 @@ where
     let actionable_count = Arc::new(AtomicUsize::new(0));
     let max_active = config.max_active_settlements;
     let agent_shutdown = Arc::new(Notify::new());
+    let accepted_rfq_trades: Arc<Mutex<HashMap<String, AcceptedRfqTrade>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Shutdown signal for the fill loop (Ctrl-C handler notifies this)
     let fill_shutdown = Arc::new(Notify::new());
@@ -81,6 +84,7 @@ where
     let agent_config = config.clone();
     let agent_actionable = actionable_count.clone();
     let agent_shutdown_clone = agent_shutdown.clone();
+    let agent_accepted_trades = accepted_rfq_trades.clone();
     let agent_handle = tokio::spawn(async move {
         if let Err(e) = run_agent(
             agent_config,
@@ -91,6 +95,8 @@ where
                 orders_only: false,
                 actionable_count: Some(agent_actionable),
                 shutdown_notify: Some(agent_shutdown_clone),
+                accepted_rfq_trades: Some(agent_accepted_trades),
+                quoted_rfq_trades: None,
             },
         )
         .await
@@ -251,6 +257,15 @@ where
             match client.accept_quote(&rfq_response.rfq_id, &best.quote_id).await {
                 Ok(resp) => {
                     if resp.success {
+                        if let Some(ref pid) = resp.proposal_id {
+                            accepted_rfq_trades.lock().await.insert(pid.clone(), AcceptedRfqTrade {
+                                proposal_id: pid.clone(),
+                                market_id: params.market_id.clone(),
+                                price: best.price.clone(),
+                                base_quantity: best.quantity.clone(),
+                                quote_quantity: best.quote_quantity.clone(),
+                            });
+                        }
                         let qty: f64 = best.quantity.parse().unwrap_or(0.0);
                         filled_total += qty;
                         remaining -= qty;
@@ -334,6 +349,15 @@ where
                         );
                         match client.accept_quote(&retry_resp.rfq_id, &best.quote_id).await {
                             Ok(resp) if resp.success => {
+                                if let Some(ref pid) = resp.proposal_id {
+                                    accepted_rfq_trades.lock().await.insert(pid.clone(), AcceptedRfqTrade {
+                                        proposal_id: pid.clone(),
+                                        market_id: params.market_id.clone(),
+                                        price: best.price.clone(),
+                                        base_quantity: best.quantity.clone(),
+                                        quote_quantity: best.quote_quantity.clone(),
+                                    });
+                                }
                                 let qty: f64 = best.quantity.parse().unwrap_or(0.0);
                                 filled_total += qty;
                                 remaining -= qty;
@@ -365,15 +389,39 @@ where
         }
     }
 
+    // Wait for all settlements to complete before signalling shutdown.
+    // The background agent is still running and advancing settlements.
+    let settle_timeout = Duration::from_secs(300);
+    let settle_poll = Duration::from_secs(5);
+    info!("Fill loop done. Waiting for {} active settlement(s) to complete...",
+        actionable_count.load(Ordering::Relaxed));
+
+    let settle_start = tokio::time::Instant::now();
+    loop {
+        let active = actionable_count.load(Ordering::Relaxed);
+        if active == 0 {
+            info!("All settlements completed.");
+            break;
+        }
+        if settle_start.elapsed() > settle_timeout {
+            warn!("Timed out waiting for {} settlement(s) after {}s, proceeding with shutdown",
+                active, settle_timeout.as_secs());
+            break;
+        }
+        if interruptible_sleep(settle_poll, &fill_shutdown).await {
+            warn!("Ctrl-C received while waiting for settlements. {} still active.", active);
+            break;
+        }
+    }
+
     // Signal the background agent to shut down gracefully
-    info!("Fill loop done. Signalling background agent to shut down...");
+    info!("Signalling background agent to shut down...");
     agent_shutdown.notify_one();
 
-    // Wait for the agent to complete its graceful shutdown (drain settlements)
-    info!("Waiting for settlements to complete (timeout 120s)...");
-    match tokio::time::timeout(Duration::from_secs(120), agent_handle).await {
+    // Wait for the agent to complete its graceful shutdown
+    match tokio::time::timeout(Duration::from_secs(30), agent_handle).await {
         Ok(result) => { let _ = result; }
-        Err(_) => { warn!("Background agent did not shut down within 120s, exiting anyway"); }
+        Err(_) => { warn!("Background agent did not shut down within 30s, exiting anyway"); }
     }
 
     Ok(())

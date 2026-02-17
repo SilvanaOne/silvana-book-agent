@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,25 @@ use crate::config::BaseConfig;
 use crate::order_manager::OrderManager;
 use crate::order_tracker::OrderTracker;
 use crate::settlement::{SettlementBackend, SettlementExecutor};
+
+/// Trade parameters recorded when buyer accepts an RFQ quote
+#[derive(Debug, Clone)]
+pub struct AcceptedRfqTrade {
+    pub proposal_id: String,
+    pub market_id: String,
+    pub price: String,
+    pub base_quantity: String,
+    pub quote_quantity: String,
+}
+
+/// Trade parameters recorded when LP sends an RFQ quote
+#[derive(Debug, Clone)]
+pub struct QuotedTrade {
+    pub market_id: String,
+    pub price: String,
+    pub base_quantity: String,
+    pub quote_quantity: String,
+}
 
 /// Trait for fetching token balances
 ///
@@ -40,6 +60,10 @@ pub struct AgentOptions {
     pub actionable_count: Option<Arc<AtomicUsize>>,
     /// Optional external shutdown signal (used by fill loop to stop the background agent)
     pub shutdown_notify: Option<Arc<Notify>>,
+    /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
+    pub accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
+    /// LP: trades we quoted on (for settlement verification by attribute matching)
+    pub quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
 }
 
 /// Run the agent event loop
@@ -103,6 +127,14 @@ where
     // If caller provided an actionable_count Arc, inject it into the executor
     if let Some(ext_count) = &options.actionable_count {
         settlement_executor.set_actionable_count(ext_count.clone());
+    }
+
+    // Inject RFQ verification state if provided
+    if let Some(ref accepted) = options.accepted_rfq_trades {
+        settlement_executor.set_accepted_rfq_trades(accepted.clone());
+    }
+    if let Some(ref quoted) = options.quoted_rfq_trades {
+        settlement_executor.set_quoted_rfq_trades(quoted.clone());
     }
 
     // Create order manager with shared tracker

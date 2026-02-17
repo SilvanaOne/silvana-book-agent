@@ -290,7 +290,7 @@ impl OrderManager {
         let base_unlocked = if base == "CC" { cc_unlocked } else { self.find_unlocked_token(base) };
         let quote_unlocked = if quote == "CC" { cc_unlocked } else { self.find_unlocked_token(quote) };
 
-        info!(
+        debug!(
             "Balance check for {}: CC={:.4}, {}={:.4}, {}={:.4}, fee_reserve={:.2}",
             market_config.market_id, cc_unlocked, base, base_unlocked, quote, quote_unlocked, fee_reserve
         );
@@ -411,7 +411,7 @@ impl OrderManager {
 
         let tick = self.get_tick_size(market_id).await;
         let mid_price = current_price;
-        info!("Refreshing grid for {} (cancel→place): mid={}, tick={}", market_id, mid_price, tick);
+        debug!("Refreshing grid for {} (cancel→place): mid={}, tick={}", market_id, mid_price, tick);
 
         // Build list of new orders: (abs_delta, side, price_str, quantity)
         // Sorted by abs(delta_percent) ascending so tightest-spread orders are replaced first
@@ -475,7 +475,7 @@ impl OrderManager {
             }
         }
 
-        info!(
+        debug!(
             "Grid refreshed for {}: cancelled [{}], placed [{}]",
             market_id,
             cancelled_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
@@ -529,7 +529,7 @@ impl OrderManager {
                 // 4. Check if price moved beyond threshold
                 let change_pct = ((current_price - last_price).abs() / last_price) * 100.0;
                 if change_pct >= market.price_change_threshold_percent {
-                    info!(
+                    debug!(
                         "Price moved {:.2}% (threshold {:.2}%), refreshing grid for {}",
                         change_pct, market.price_change_threshold_percent, market_id
                     );

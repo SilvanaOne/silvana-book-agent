@@ -44,6 +44,7 @@ use crate::client::OrderbookClient;
 use crate::config::BaseConfig;
 use crate::order_tracker::{OrderTracker, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
+use crate::runner::{AcceptedRfqTrade, QuotedTrade};
 use crate::types::{AdvanceResult, FailedSettlement, SettlementStage, SettlementState};
 
 /// Result from a settlement step operation
@@ -112,6 +113,10 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     needs_readvance: HashSet<String>,
     /// Shared counter of settlements where this agent must act (not waiting/terminal)
     actionable_count: Arc<AtomicUsize>,
+    /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
+    accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
+    /// LP: trades we quoted on (for settlement verification by attribute matching)
+    quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
 }
 
 impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
@@ -134,6 +139,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             task_handles: Vec::new(),
             needs_readvance: HashSet::new(),
             actionable_count: Arc::new(AtomicUsize::new(0)),
+            accepted_rfq_trades: None,
+            quoted_rfq_trades: None,
         }
     }
 
@@ -145,6 +152,16 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Replace the actionable count Arc with an externally-provided one
     pub fn set_actionable_count(&mut self, count: Arc<AtomicUsize>) {
         self.actionable_count = count;
+    }
+
+    /// Set buyer RFQ trade tracking (for proposal verification)
+    pub fn set_accepted_rfq_trades(&mut self, trades: Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>) {
+        self.accepted_rfq_trades = Some(trades);
+    }
+
+    /// Set LP quoted trade tracking (for proposal verification)
+    pub fn set_quoted_rfq_trades(&mut self, trades: Arc<Mutex<Vec<QuotedTrade>>>) {
+        self.quoted_rfq_trades = Some(trades);
     }
 
     /// Count settlements where this agent must act (not waiting or terminal)
@@ -282,7 +299,38 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             return Ok(());
         }
 
-        // Verify order before accepting settlement
+        // RFQ proposals (no order_match) — verify against agent's in-memory state
+        if proposal.order_match.is_none() {
+            let rfq_verified = self.verify_rfq_proposal(&proposal).await;
+            if !rfq_verified {
+                warn!("[{}] RFQ proposal rejected: not in agent's tracked RFQ state", proposal_id);
+                let state = SettlementState::new(proposal, is_buyer);
+                self.active_settlements.insert(proposal_id.clone(), state);
+                if let Err(e) = self.reject_proposal(&proposal_id).await {
+                    warn!("[{}] Failed to reject: {}", proposal_id, e);
+                    self.active_settlements.shift_remove(&proposal_id);
+                }
+                return Ok(());
+            }
+            // RFQ verified — order_id=0 (no orderbook order to track)
+            let order_id = 0u64;
+            {
+                let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
+                let mut tracker = self.tracker.lock().await;
+                tracker.mark_pending(&proposal_id, order_id, base_quantity);
+            }
+            let state = SettlementState::new(proposal, is_buyer);
+            self.active_settlements.insert(proposal_id.clone(), state);
+            if self.config.auto_settle {
+                if let Err(e) = self.advance_settlement(&proposal_id).await {
+                    warn!("[{}] Initial advance failed: {:#}", proposal_id, e);
+                }
+            }
+            self.update_actionable_count();
+            return Ok(());
+        }
+
+        // Orderbook proposals — verify order via tracker
         let verify_result = {
             let tracker = self.tracker.lock().await;
             tracker.verify_settlement(&proposal, &self.config.party_id)
@@ -779,6 +827,62 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             VerifyResult::Rejected { reason } => Err(reason),
             VerifyResult::NeedServerLookup { .. } => Err("Unexpected NeedServerLookup".to_string()),
         }
+    }
+
+    /// Verify an RFQ proposal against agent's own in-memory state.
+    ///
+    /// Buyer path: match by proposal_id, then verify all trade parameters.
+    /// LP path: match by (market_id, price, base_quantity, quote_quantity).
+    /// Returns true if verified, false if rejected.
+    async fn verify_rfq_proposal(&self, proposal: &SettlementProposal) -> bool {
+        // Path 1: Buyer — match by proposal_id, verify all amounts
+        if let Some(ref accepted) = self.accepted_rfq_trades {
+            let mut map = accepted.lock().await;
+            if let Some(trade) = map.remove(&proposal.proposal_id) {
+                if trade.market_id != proposal.market_id {
+                    warn!("[{}] RFQ verification failed: market_id mismatch (expected={}, got={})",
+                        proposal.proposal_id, trade.market_id, proposal.market_id);
+                    return false;
+                }
+                if trade.price != proposal.settlement_price {
+                    warn!("[{}] RFQ verification failed: price mismatch (expected={}, got={})",
+                        proposal.proposal_id, trade.price, proposal.settlement_price);
+                    return false;
+                }
+                if trade.base_quantity != proposal.base_quantity {
+                    warn!("[{}] RFQ verification failed: base_quantity mismatch (expected={}, got={})",
+                        proposal.proposal_id, trade.base_quantity, proposal.base_quantity);
+                    return false;
+                }
+                if trade.quote_quantity != proposal.quote_quantity {
+                    warn!("[{}] RFQ verification failed: quote_quantity mismatch (expected={}, got={})",
+                        proposal.proposal_id, trade.quote_quantity, proposal.quote_quantity);
+                    return false;
+                }
+                info!("[{}] RFQ verified: buyer trade params match (market={}, price={}, qty={}, quote_qty={})",
+                    proposal.proposal_id, trade.market_id, trade.price, trade.base_quantity, trade.quote_quantity);
+                return true;
+            }
+        }
+
+        // Path 2: LP — match by ALL trade parameters (exact string comparison)
+        if let Some(ref trades) = self.quoted_rfq_trades {
+            let mut trades = trades.lock().await;
+            if let Some(idx) = trades.iter().position(|t| {
+                t.market_id == proposal.market_id
+                    && t.price == proposal.settlement_price
+                    && t.base_quantity == proposal.base_quantity
+                    && t.quote_quantity == proposal.quote_quantity
+            }) {
+                let matched = trades.swap_remove(idx);
+                info!("[{}] RFQ verified: LP quoted matching trade (market={}, price={}, qty={}, quote_qty={})",
+                    proposal.proposal_id, matched.market_id, matched.price,
+                    matched.base_quantity, matched.quote_quantity);
+                return true;
+            }
+        }
+
+        false
     }
 
     // ========================================================================

@@ -4,9 +4,10 @@
 //! with quotes or rejections based on market configuration and mid-prices.
 
 use orderbook_agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
+use orderbook_agent_logic::runner::QuotedTrade;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -21,6 +22,8 @@ pub struct RfqHandler {
     /// Market mid-prices: market_id -> mid_price
     mid_prices: Arc<RwLock<HashMap<String, f64>>>,
     party_id: String,
+    /// Trades we quoted (for settlement verification)
+    quoted_trades: Arc<Mutex<Vec<QuotedTrade>>>,
 }
 
 /// Result of handling an RFQ request
@@ -38,12 +41,18 @@ impl RfqHandler {
             markets: config.markets.clone(),
             mid_prices: Arc::new(RwLock::new(HashMap::new())),
             party_id: config.party_id.clone(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
     /// Get a reference to mid_prices for external updates
     pub fn mid_prices(&self) -> Arc<RwLock<HashMap<String, f64>>> {
         self.mid_prices.clone()
+    }
+
+    /// Get a reference to quoted trades for settlement verification
+    pub fn quoted_trades(&self) -> Arc<Mutex<Vec<QuotedTrade>>> {
+        self.quoted_trades.clone()
     }
 
     /// Handle an incoming RFQ request
@@ -220,6 +229,14 @@ impl RfqHandler {
             mid_price,
             if request.direction == 1 { rfq_config.offer_spread_percent } else { rfq_config.bid_spread_percent }
         );
+
+        // Record trade for settlement verification
+        self.quoted_trades.lock().await.push(QuotedTrade {
+            market_id: request.market_id.clone(),
+            price: format!("{:.10}", price),
+            base_quantity: format!("{:.10}", quantity),
+            quote_quantity: format!("{:.10}", quote_quantity),
+        });
 
         RfqResponse::Quote(RfqQuote {
             rfq_id,

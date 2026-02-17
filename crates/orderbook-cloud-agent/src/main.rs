@@ -345,7 +345,7 @@ async fn main() -> Result<()> {
     // Initialize logging (LOG_DESTINATION=console|file)
     orderbook_agent_logic::logging::init_logging(
         cli.verbose,
-        &["orderbook_cloud_agent", "orderbook_agent_logic", "tx_verifier"],
+        &["cloud_agent", "orderbook_agent_logic", "tx_verifier"],
         "cloud-agent",
     );
 
@@ -423,19 +423,27 @@ async fn run_cloud_agent(
     );
     info!("Fee reserve: {:.2} CC", config.fee_reserve_cc);
 
-    // Start LP settlement stream if liquidity_provider is configured
-    if let Some(ref lp_config) = config.liquidity_provider {
+    // Create RfqHandler early so we can share its quoted_trades Arc with AgentOptions
+    let quoted_rfq_trades = if config.liquidity_provider.is_some() {
+        let rfq_handler = rfq_handler::RfqHandler::new(&config)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
+        let quoted_trades = rfq_handler.quoted_trades();
+
         info!(
             "LP mode enabled: name={}, starting settlement stream",
-            lp_config.name
+            config.liquidity_provider.as_ref().unwrap().name
         );
         let config_clone = config.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_lp_settlement_stream(config_clone).await {
+            if let Err(e) = run_lp_settlement_stream(config_clone, rfq_handler).await {
                 tracing::error!("LP settlement stream failed: {}", e);
             }
         });
-    }
+
+        Some(quoted_trades)
+    } else {
+        None
+    };
 
     let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
     let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock);
@@ -465,6 +473,8 @@ async fn run_cloud_agent(
             orders_only,
             actionable_count: None,
             shutdown_notify: None,
+            accepted_rfq_trades: None,
+            quoted_rfq_trades,
         },
     )
     .await
@@ -524,7 +534,7 @@ async fn run_fill(
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
+async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
         CantonToServerMessage, SettlementHandshake, CantonNodeAuth,
@@ -532,14 +542,11 @@ async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
         server_to_canton_message::Message as ServerMessage,
     };
     use tokio_stream::StreamExt;
-    use rfq_handler::{RfqHandler, RfqResponse};
+    use rfq_handler::RfqResponse;
     use orderbook_agent_logic::client::OrderbookClient;
 
     let lp_config = config.liquidity_provider.as_ref()
         .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
-
-    let rfq_handler = RfqHandler::new(&config)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
 
     // Collect RFQ-enabled market_ids for mid-price polling
     let rfq_market_ids: Vec<String> = config
@@ -590,12 +597,7 @@ async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
     loop {
         info!("Connecting LP settlement stream to {}", config.orderbook_grpc_url);
 
-        let channel = tonic::transport::Channel::from_shared(config.orderbook_grpc_url.clone())
-            .context("Invalid gRPC URL")?
-            .connect()
-            .await;
-
-        let channel = match channel {
+        let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to connect: {}, retrying in 5s", e);
