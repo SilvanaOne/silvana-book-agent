@@ -113,7 +113,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
                 self.node_name.as_deref(),
             ) {
                 Ok(new_jwt) => {
-                    info!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
+                    debug!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
                     *self.token.write().unwrap() = new_jwt;
                     *self.expires_at.write().unwrap() = now + self.ttl_secs;
                 }

@@ -23,7 +23,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::Request;
 use tokio_stream::Stream;
 use std::pin::Pin;
-use tracing::info;
+use tracing::debug;
 
 use crate::auth::generate_jwt;
 use crate::config::BaseConfig;
@@ -416,7 +416,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
                 Some(self.auth_data.node_name.as_str()),
             ) {
                 Ok(new_jwt) => {
-                    info!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
+                    debug!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
                     *self.token.write().unwrap() = new_jwt;
                     *self.expires_at.write().unwrap() = now + self.auth_data.ttl_secs;
                 }
