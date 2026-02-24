@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
@@ -424,6 +426,7 @@ async fn run_cloud_agent(
     info!("Fee reserve: {:.2} CC", config.fee_reserve_cc);
 
     // Create RfqHandler early so we can share its quoted_trades Arc with AgentOptions
+    let lp_shutdown = Arc::new(AtomicBool::new(false));
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
         let rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
@@ -434,8 +437,9 @@ async fn run_cloud_agent(
             config.liquidity_provider.as_ref().unwrap().name
         );
         let config_clone = config.clone();
+        let lp_shutdown_clone = lp_shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_lp_settlement_stream(config_clone, rfq_handler).await {
+            if let Err(e) = run_lp_settlement_stream(config_clone, rfq_handler, lp_shutdown_clone).await {
                 tracing::error!("LP settlement stream failed: {}", e);
             }
         });
@@ -475,6 +479,7 @@ async fn run_cloud_agent(
             shutdown_notify: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades,
+            lp_shutdown: Some(lp_shutdown),
         },
     )
     .await
@@ -534,7 +539,7 @@ async fn run_fill(
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler) -> Result<()> {
+async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Arc<AtomicBool>) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
         CantonToServerMessage, SettlementHandshake, CantonNodeAuth,
@@ -595,6 +600,11 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
     });
 
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            info!("LP stream shutting down, not reconnecting");
+            return Ok(());
+        }
+
         info!("Connecting LP settlement stream to {}", config.orderbook_grpc_url);
 
         let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
@@ -673,6 +683,10 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
                     info!("LP handshake acknowledged: accepted={}", ack.accepted);
                 }
                 Some(ServerMessage::RfqRequest(request)) => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        info!("Ignoring RFQ {} - shutting down", request.rfq_id);
+                        break;
+                    }
                     info!(
                         "Received RFQ request: rfq_id={}, market={}, direction={}, qty={}",
                         request.rfq_id, request.market_id, request.direction, request.quantity

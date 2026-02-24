@@ -267,9 +267,17 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Handle a new settlement proposal
     async fn handle_proposal_created(&mut self, proposal: SettlementProposal) -> Result<()> {
-        // Deduplicate: ignore if already processing this proposal (stream replay)
+        // Deduplicate: ignore if already processing, completed, or rejected (stream replay)
         if self.active_settlements.contains_key(&proposal.proposal_id) {
             debug!("[{}] Duplicate ProposalCreated, ignoring", proposal.proposal_id);
+            return Ok(());
+        }
+        if self.completed_proposals.contains(&proposal.proposal_id) {
+            debug!("[{}] Already completed, ignoring stream replay", proposal.proposal_id);
+            return Ok(());
+        }
+        if self.rejected_proposals.contains(&proposal.proposal_id) {
+            debug!("[{}] Already rejected, ignoring stream replay", proposal.proposal_id);
             return Ok(());
         }
 
@@ -1217,6 +1225,19 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::Allocate => {
+            // LP allocates last — wait for operator to witness counterparty's allocation
+            let counterparty_alloc = if state.is_buyer {
+                status.allocation_seller.as_ref()
+            } else {
+                status.allocation_buyer.as_ref()
+            };
+            let counterparty_witnessed = counterparty_alloc
+                .map(|s| s.status == 4) // DVP_STEP_STATUS_CONFIRMED (operator witnessed)
+                .unwrap_or(false);
+            if !counterparty_witnessed {
+                return AdvanceResult::Wait { proposal_id };
+            }
+
             info!("[{}] NextAction: Allocate", proposal_id);
             let dvp_cid = match state.dvp_cid {
                 Some(ref cid) => cid.clone(),
@@ -1237,20 +1258,21 @@ async fn advance_single<B: SettlementBackend>(
                         state.is_buyer, event_type, &result.update_id, &result.contract_id,
                     ).await;
 
-                    let pending_traffic = if config.join_traffic {
-                        result.traffic_total
+                    // Allocate is the LP's last on-chain action — always pay traffic now
+                    let combined = if config.join_traffic {
+                        state.pending_traffic + result.traffic_total
                     } else {
-                        backend.transfer_traffic_fee(result.traffic_total, "allocate", &proposal_id).await
-                            .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
-                        0
+                        result.traffic_total
                     };
+                    backend.transfer_traffic_fee(combined, "allocate", &proposal_id).await
+                        .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::Allocated,
                         dvp_proposal_cid: None,
                         dvp_cid: None,
                         allocation_cid: Some(result.contract_id),
-                        pending_traffic,
+                        pending_traffic: 0,
                     }
                 }
                 Err(e) => AdvanceResult::Error {

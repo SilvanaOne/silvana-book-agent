@@ -97,6 +97,7 @@ where
                 shutdown_notify: Some(agent_shutdown_clone),
                 accepted_rfq_trades: Some(agent_accepted_trades),
                 quoted_rfq_trades: None,
+                lp_shutdown: None,
             },
         )
         .await

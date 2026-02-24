@@ -64,6 +64,8 @@ pub struct AgentOptions {
     pub accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
     /// LP: trades we quoted on (for settlement verification by attribute matching)
     pub quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
+    /// Signal to LP settlement stream to stop accepting new RFQs on shutdown
+    pub lp_shutdown: Option<Arc<AtomicBool>>,
 }
 
 /// Run the agent event loop
@@ -159,7 +161,7 @@ where
     };
 
     // Setup timers — use Skip so accumulated ticks don't starve ctrl_c
-    let mut heartbeat_timer = interval(Duration::from_secs(30));
+    let mut heartbeat_timer = interval(Duration::from_secs(300));
     heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut order_update_timer = interval(Duration::from_secs(5));
     order_update_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -190,13 +192,18 @@ where
     // in the same spawned task to guarantee the force-exit always works.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
+    let lp_shutdown = options.lp_shutdown.clone();
     {
         let flag = shutdown_flag.clone();
         let notify = shutdown_notify.clone();
+        let lp_shutdown = lp_shutdown.clone();
         tokio::spawn(async move {
             signal::ctrl_c().await.ok();
             warn!("Ctrl-C received, shutting down gracefully...");
             flag.store(true, Ordering::SeqCst);
+            if let Some(ref lp) = lp_shutdown {
+                lp.store(true, Ordering::SeqCst);
+            }
             notify.notify_one();
 
             // Wait for second Ctrl-C → force exit immediately
