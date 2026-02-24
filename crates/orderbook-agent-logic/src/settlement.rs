@@ -643,12 +643,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.failed_settlements.remove(&proposal_id);
             }
             AdvanceResult::Error { proposal_id, error } => {
+                let is_inactive = error.contains("INACTIVE_CONTRACTS");
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
                         next_retry: Instant::now(),
                     });
-                entry.retry_count += 1;
+                if !is_inactive {
+                    entry.retry_count += 1;
+                }
 
                 if entry.is_exhausted() {
                     error!(
@@ -666,7 +669,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     return;
                 }
 
-                let delay = FailedSettlement::retry_delay(entry.retry_count);
+                let delay = if is_inactive {
+                    Duration::from_secs(5)
+                } else {
+                    FailedSettlement::retry_delay(entry.retry_count)
+                };
                 entry.next_retry = Instant::now() + delay;
                 warn!(
                     "[{}] Settlement error (retry {}/{} in {:?}): {:#}",

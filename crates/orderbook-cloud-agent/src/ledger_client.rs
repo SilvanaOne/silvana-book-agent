@@ -606,12 +606,18 @@ impl DAppProviderClient {
                     anyhow::bail!("Command already submitted (DUPLICATE_COMMAND): {}", error_msg);
                 }
 
-                // INACTIVE_CONTRACTS: contract was consumed/archived — retrying the
-                // same command will always fail. Bail immediately so the settlement
-                // layer can re-discover contracts via sync_on_chain_contracts().
+                // INACTIVE_CONTRACTS: contract was consumed/archived between
+                // prepare and execute. Re-prepare to get fresh CIDs from ACS.
                 if error_msg.contains("INACTIVE_CONTRACTS") {
-                    warn!("Contract consumed, not retrying [{}]: {}", prepared.command_id, error_msg);
-                    anyhow::bail!("Contract consumed (INACTIVE_CONTRACTS): {}", error_msg);
+                    if attempt < max_retries - 1 {
+                        warn!(
+                            "INACTIVE_CONTRACTS (attempt {}/{}), re-preparing with fresh CIDs in 2s [{}]",
+                            attempt + 1, max_retries, prepared.command_id
+                        );
+                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                        continue;
+                    }
+                    anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
                 }
 
                 if attempt < max_retries - 1 {
