@@ -28,7 +28,7 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -99,7 +99,7 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     rejected_proposals: HashSet<String>,
     /// Proposals that completed successfully — skip in polling to avoid re-processing
     completed_proposals: HashSet<String>,
-    shutting_down: bool,
+    shutting_down: Arc<AtomicBool>,
     tracker: Arc<Mutex<OrderTracker>>,
     /// Client for querying orders from server (user order lookup)
     query_client: Option<OrderbookClient>,
@@ -131,7 +131,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             active_settlements: IndexMap::new(),
             rejected_proposals: HashSet::new(),
             completed_proposals: HashSet::new(),
-            shutting_down: false,
+            shutting_down: Arc::new(AtomicBool::new(false)),
             tracker,
             query_client: None,
             semaphore: Arc::new(Semaphore::new(thread_count)),
@@ -204,7 +204,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Signal that we are shutting down — reject new proposals, drain confirmed ones
     pub fn set_shutting_down(&mut self) {
-        self.shutting_down = true;
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Replace the shutdown flag with an externally-provided one (shares runner's Ctrl-C flag)
+    pub fn set_shutdown_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.shutting_down = flag;
     }
 
     /// Reject all unconfirmed settlements (still at ProposalReceived stage)
@@ -365,7 +370,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         );
 
         // Reject new proposals during shutdown
-        if self.shutting_down {
+        if self.shutting_down.load(Ordering::Relaxed) {
             info!("[{}] Rejecting proposal (shutting down)", proposal_id);
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
@@ -530,7 +535,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let config = self.config.clone();
             let backend = Arc::clone(&self.backend);
             let tracker = Arc::clone(&self.tracker);
-            let shutting_down = self.shutting_down;
+            let shutting_down = self.shutting_down.clone();
             let pid = proposal_id.clone();
             let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
 
@@ -542,6 +547,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let mut local_state = state;
 
                 loop {
+                    // Check shutdown flag before each step
+                    let is_shutting_down = shutting_down.load(Ordering::Relaxed);
+
                     let result = tokio::time::timeout(Duration::from_secs(120), async {
                         advance_single(
                             pid.clone(),
@@ -549,7 +557,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                             config.clone(),
                             backend.clone(),
                             tracker.clone(),
-                            shutting_down,
+                            is_shutting_down,
                         )
                         .await
                     })
@@ -563,7 +571,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         }
                     };
 
-                    if advance_result.should_readvance() {
+                    if advance_result.should_readvance() && !shutting_down.load(Ordering::Relaxed) {
                         advance_result.apply_to_state(&mut local_state);
                         // Brief pause between steps to avoid saturating the ledger
                         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -603,7 +611,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             self.config.clone(),
             Arc::clone(&self.backend),
             Arc::clone(&self.tracker),
-            self.shutting_down,
+            self.shutting_down.load(Ordering::Relaxed),
         ).await;
 
         let should_continue = result.should_readvance();

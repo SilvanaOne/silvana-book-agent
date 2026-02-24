@@ -336,6 +336,10 @@ where
         });
     }
 
+    // Share the runner's Ctrl-C flag with the settlement executor so spawned
+    // tasks observe shutdown immediately (not a stale bool copy).
+    settlement_executor.set_shutdown_flag(shutdown_flag.clone());
+
     // Track consecutive poll failures for connectivity detection
     let mut poll_failures: u32 = 0;
 
@@ -349,6 +353,11 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    // Skip processing new settlement events during shutdown
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
                     match result {
                         Some(Ok(update)) => {
                             let update_desc = format!(
@@ -395,6 +404,11 @@ where
                 }
 
                 _ = settlement_poll_timer.tick() => {
+                    // Skip poll cycle during shutdown — let the notify branch fire
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
                     // Reconnect settlement stream if broken
                     if settlement_stream.is_none() {
                         match orderbook_client.subscribe_settlements(None).await {
@@ -509,6 +523,12 @@ where
     // Graceful shutdown — save state and exit immediately
     info!("Shutting down...");
     settlement_executor.set_shutting_down();
+
+    // Wait for in-flight settlement tasks to finish (they stop looping on shutdown flag)
+    let drained = settlement_executor.drain_tasks().await;
+    if drained > 0 {
+        info!("Drained {} settlement task(s)", drained);
+    }
 
     // Cancel market orders (quick)
     if has_markets {
