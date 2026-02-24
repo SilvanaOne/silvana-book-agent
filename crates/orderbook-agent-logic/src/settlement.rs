@@ -117,6 +117,8 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
     /// LP: trades we quoted on (for settlement verification by attribute matching)
     quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
+    /// Skip all verification and accept every proposal (migration from old worker without saved state)
+    no_reject: bool,
 }
 
 impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
@@ -141,6 +143,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             actionable_count: Arc::new(AtomicUsize::new(0)),
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
+            no_reject: false,
         }
     }
 
@@ -162,6 +165,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Set LP quoted trade tracking (for proposal verification)
     pub fn set_quoted_rfq_trades(&mut self, trades: Arc<Mutex<Vec<QuotedTrade>>>) {
         self.quoted_rfq_trades = Some(trades);
+    }
+
+    /// Enable no-reject mode: accept all proposals without verification
+    pub fn set_no_reject(&mut self, no_reject: bool) {
+        self.no_reject = no_reject;
     }
 
     /// Count settlements where this agent must act (not waiting or terminal)
@@ -289,6 +297,62 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         let proposal_id = proposal.proposal_id.clone();
+
+        // Check if this proposal was already verified and tracked before shutdown.
+        // settlement_orders is restored from saved state — if present, the proposal
+        // was previously accepted and pending_quantity is already accounted for.
+        // Skip verification (RFQ trade may have been consumed) and mark_pending
+        // (would double-count pending_quantity).
+        {
+            let tracker = self.tracker.lock().await;
+            if tracker.has_settlement_order(&proposal_id) {
+                info!(
+                    "[{}] Restored proposal from saved state, skipping re-verification (role: {})",
+                    proposal_id,
+                    if is_buyer { "buyer" } else { "seller" }
+                );
+                drop(tracker);
+                let state = SettlementState::new(proposal, is_buyer);
+                self.active_settlements.insert(proposal_id.clone(), state);
+                if self.config.auto_settle {
+                    if let Err(e) = self.advance_settlement(&proposal_id).await {
+                        warn!("[{}] Initial advance of restored proposal failed: {:#}", proposal_id, e);
+                    }
+                }
+                self.update_actionable_count();
+                return Ok(());
+            }
+        }
+
+        // --no-reject mode: skip all verification, accept every proposal.
+        // Used when migrating from an old worker that didn't save state —
+        // start_time_ms = now would cause all pre-existing orders to fail
+        // the nonce check, and RFQ trade maps are empty.
+        if self.no_reject {
+            info!(
+                "[{}] Accepting proposal without verification (--no-reject mode, role: {})",
+                proposal_id,
+                if is_buyer { "buyer" } else { "seller" }
+            );
+            let order_id = proposal.order_match.as_ref().map_or(0u64, |om| {
+                if is_buyer { om.bid_order_id } else { om.offer_order_id }
+            });
+            {
+                let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
+                let mut tracker = self.tracker.lock().await;
+                tracker.mark_pending(&proposal_id, order_id, base_quantity);
+            }
+            let state = SettlementState::new(proposal, is_buyer);
+            self.active_settlements.insert(proposal_id.clone(), state);
+            if self.config.auto_settle {
+                if let Err(e) = self.advance_settlement(&proposal_id).await {
+                    warn!("[{}] Initial advance failed: {:#}", proposal_id, e);
+                }
+            }
+            self.update_actionable_count();
+            return Ok(());
+        }
+
         info!(
             "New settlement proposal: {} (role: {})",
             proposal_id,
@@ -937,6 +1001,26 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Get list of active settlements
     pub fn active_settlements(&self) -> &IndexMap<String, SettlementState> {
         &self.active_settlements
+    }
+
+    /// Get completed proposals set (for state persistence)
+    pub fn completed_proposals(&self) -> &HashSet<String> {
+        &self.completed_proposals
+    }
+
+    /// Get rejected proposals set (for state persistence)
+    pub fn rejected_proposals(&self) -> &HashSet<String> {
+        &self.rejected_proposals
+    }
+
+    /// Inject previously saved completed proposals (for state restoration)
+    pub fn inject_completed_proposals(&mut self, proposals: HashSet<String>) {
+        self.completed_proposals = proposals;
+    }
+
+    /// Inject previously saved rejected proposals (for state restoration)
+    pub fn inject_rejected_proposals(&mut self, proposals: HashSet<String>) {
+        self.rejected_proposals = proposals;
     }
 }
 

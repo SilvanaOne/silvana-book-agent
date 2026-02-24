@@ -4,6 +4,7 @@
 //! settlement proposals against them. User orders (placed via frontend) are
 //! imported from the server on demand.
 
+use base64::Engine;
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
@@ -12,6 +13,7 @@ use tracing::{debug, info, warn};
 use orderbook_proto::orderbook::{Order, SettlementProposal};
 
 use crate::auth::{sign_order_data, verify_order_signature};
+use crate::state::{SavedSettlementOrder, SavedTrackedOrder};
 
 /// Tracked order with quantity accounting
 pub struct TrackedOrder {
@@ -326,6 +328,90 @@ impl OrderTracker {
                 );
             }
         }
+    }
+
+    /// Export tracker state for persistence
+    ///
+    /// Returns (start_time_ms, orders, settlement_orders) as serializable types.
+    pub fn export_state(&self) -> (u64, Vec<SavedTrackedOrder>, Vec<SavedSettlementOrder>) {
+        let orders: Vec<SavedTrackedOrder> = self
+            .orders
+            .values()
+            .map(|o| SavedTrackedOrder {
+                order_id: o.order_id,
+                market_id: o.market_id.clone(),
+                order_type: o.order_type,
+                price: o.price.to_string(),
+                quantity: o.quantity.to_string(),
+                settled_quantity: o.settled_quantity.to_string(),
+                pending_quantity: o.pending_quantity.to_string(),
+                nonce: o.nonce,
+                signature: o.signature.clone(),
+                signed_data: base64::engine::general_purpose::STANDARD.encode(&o.signed_data),
+                placed_by: o.placed_by.clone(),
+                is_active: o.is_active,
+            })
+            .collect();
+
+        let settlement_orders: Vec<SavedSettlementOrder> = self
+            .settlement_orders
+            .iter()
+            .map(|(proposal_id, (order_id, quantity))| SavedSettlementOrder {
+                proposal_id: proposal_id.clone(),
+                order_id: *order_id,
+                quantity: quantity.to_string(),
+            })
+            .collect();
+
+        (self.start_time_ms, orders, settlement_orders)
+    }
+
+    /// Import previously saved state into this tracker
+    ///
+    /// Used on restart to restore order verification and quantity accounting.
+    pub fn import_state(
+        &mut self,
+        orders: Vec<SavedTrackedOrder>,
+        settlement_orders: Vec<SavedSettlementOrder>,
+    ) {
+        for saved in orders {
+            let signed_data = base64::engine::general_purpose::STANDARD
+                .decode(&saved.signed_data)
+                .unwrap_or_default();
+            let order = TrackedOrder {
+                order_id: saved.order_id,
+                market_id: saved.market_id,
+                order_type: saved.order_type,
+                price: Decimal::from_str(&saved.price).unwrap_or_default(),
+                quantity: Decimal::from_str(&saved.quantity).unwrap_or_default(),
+                settled_quantity: Decimal::from_str(&saved.settled_quantity).unwrap_or_default(),
+                pending_quantity: Decimal::from_str(&saved.pending_quantity).unwrap_or_default(),
+                nonce: saved.nonce,
+                signature: saved.signature,
+                signed_data,
+                placed_by: saved.placed_by,
+                is_active: saved.is_active,
+            };
+            self.orders.insert(order.order_id, order);
+        }
+
+        for saved in settlement_orders {
+            let quantity = Decimal::from_str(&saved.quantity).unwrap_or_default();
+            self.settlement_orders
+                .insert(saved.proposal_id, (saved.order_id, quantity));
+        }
+
+        info!(
+            "Restored {} order(s) and {} settlement mapping(s) from saved state",
+            self.orders.len(),
+            self.settlement_orders.len()
+        );
+    }
+
+    /// Check if a proposal is already tracked in settlement_orders.
+    /// Used on restart to skip re-verification of restored proposals.
+    pub fn has_settlement_order(&self, proposal_id: &str) -> bool {
+        self.settlement_orders.contains_key(proposal_id)
     }
 
     /// Cancel a specific order

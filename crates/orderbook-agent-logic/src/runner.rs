@@ -5,7 +5,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,10 @@ use crate::config::BaseConfig;
 use crate::order_manager::OrderManager;
 use crate::order_tracker::OrderTracker;
 use crate::settlement::{SettlementBackend, SettlementExecutor};
+use crate::state::{
+    SavedAcceptedRfqTrade, SavedFillState, SavedQuotedTrade, SavedState, delete_state, load_state,
+    save_state,
+};
 
 /// Trade parameters recorded when buyer accepts an RFQ quote
 #[derive(Debug, Clone)]
@@ -66,6 +71,14 @@ pub struct AgentOptions {
     pub quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
     /// Signal to LP settlement stream to stop accepting new RFQs on shutdown
     pub lp_shutdown: Option<Arc<AtomicBool>>,
+    /// Path to state file for save/restore on shutdown/restart
+    pub state_file: Option<PathBuf>,
+    /// Skip state restoration even if state file exists
+    pub no_restore: bool,
+    /// Fill loop state for save on shutdown (set by fill loop before signaling shutdown)
+    pub fill_state: Option<Arc<Mutex<Option<SavedFillState>>>>,
+    /// Accept all proposals without verification (for migration from old worker without saved state)
+    pub no_reject: bool,
 }
 
 /// Run the agent event loop
@@ -93,6 +106,35 @@ where
 
     info!("Connected to orderbook service");
 
+    // Try to restore state from previous session
+    let restored_state = if let Some(ref state_file) = options.state_file {
+        if options.no_restore {
+            info!("State restoration disabled (--no-restore)");
+            delete_state(state_file);
+            None
+        } else {
+            match load_state(state_file) {
+                Some(saved) if saved.party_id == config.party_id => {
+                    info!(
+                        "Restoring state from previous session (saved at {}, start_time={})",
+                        saved.saved_at, saved.start_time_ms
+                    );
+                    Some(saved)
+                }
+                Some(saved) => {
+                    warn!(
+                        "State file party_id '{}' != config '{}', ignoring",
+                        saved.party_id, config.party_id
+                    );
+                    None
+                }
+                None => None,
+            }
+        }
+    } else {
+        None
+    };
+
     // Cancel ALL existing orders (all markets) before setting start_time
     info!("Clearing all existing orders...");
     {
@@ -113,9 +155,13 @@ where
         }
     }
 
-    // Set immutable start_time — orders with nonce < start_time are rejected
-    let start_time_ms = chrono::Utc::now().timestamp_millis() as u64;
-    info!("Start time: {} ms", start_time_ms);
+    // Set start_time: use saved value if restoring, else current time
+    let start_time_ms = if let Some(ref saved) = restored_state {
+        saved.start_time_ms
+    } else {
+        chrono::Utc::now().timestamp_millis() as u64
+    };
+    info!("Start time: {} ms{}", start_time_ms, if restored_state.is_some() { " (restored)" } else { "" });
 
     // Create shared order tracker
     let tracker = Arc::new(Mutex::new(OrderTracker::new(
@@ -123,8 +169,32 @@ where
         config.private_key_bytes,
     )));
 
+    // Restore order tracker state if available
+    if let Some(ref saved) = restored_state {
+        let mut t = tracker.lock().await;
+        t.import_state(saved.orders.clone(), saved.settlement_orders.clone());
+    }
+
     // Create settlement executor with shared tracker
     let mut settlement_executor = SettlementExecutor::new(&config, tracker.clone(), backend);
+
+    // Enable no-reject mode if requested (skip verification for all proposals)
+    if options.no_reject {
+        settlement_executor.set_no_reject(true);
+    }
+
+    // Restore dedup sets if available
+    if let Some(ref saved) = restored_state {
+        settlement_executor
+            .inject_completed_proposals(saved.completed_proposals.iter().cloned().collect::<HashSet<_>>());
+        settlement_executor
+            .inject_rejected_proposals(saved.rejected_proposals.iter().cloned().collect::<HashSet<_>>());
+        info!(
+            "Restored {} completed and {} rejected proposal(s)",
+            saved.completed_proposals.len(),
+            saved.rejected_proposals.len()
+        );
+    }
 
     // If caller provided an actionable_count Arc, inject it into the executor
     if let Some(ext_count) = &options.actionable_count {
@@ -133,10 +203,51 @@ where
 
     // Inject RFQ verification state if provided
     if let Some(ref accepted) = options.accepted_rfq_trades {
+        // Restore saved RFQ trades into the shared map
+        if let Some(ref saved) = restored_state {
+            if !saved.accepted_rfq_trades.is_empty() {
+                let mut map = accepted.lock().await;
+                for trade in &saved.accepted_rfq_trades {
+                    map.insert(
+                        trade.proposal_id.clone(),
+                        AcceptedRfqTrade {
+                            proposal_id: trade.proposal_id.clone(),
+                            market_id: trade.market_id.clone(),
+                            price: trade.price.clone(),
+                            base_quantity: trade.base_quantity.clone(),
+                            quote_quantity: trade.quote_quantity.clone(),
+                        },
+                    );
+                }
+                info!("Restored {} accepted RFQ trade(s)", saved.accepted_rfq_trades.len());
+            }
+        }
         settlement_executor.set_accepted_rfq_trades(accepted.clone());
     }
     if let Some(ref quoted) = options.quoted_rfq_trades {
+        // Restore saved quoted trades into the shared vec
+        if let Some(ref saved) = restored_state {
+            if !saved.quoted_rfq_trades.is_empty() {
+                let mut trades = quoted.lock().await;
+                for trade in &saved.quoted_rfq_trades {
+                    trades.push(QuotedTrade {
+                        market_id: trade.market_id.clone(),
+                        price: trade.price.clone(),
+                        base_quantity: trade.base_quantity.clone(),
+                        quote_quantity: trade.quote_quantity.clone(),
+                    });
+                }
+                info!("Restored {} quoted RFQ trade(s)", saved.quoted_rfq_trades.len());
+            }
+        }
         settlement_executor.set_quoted_rfq_trades(quoted.clone());
+    }
+
+    // Delete state file after successful restore
+    if restored_state.is_some() {
+        if let Some(ref state_file) = options.state_file {
+            delete_state(state_file);
+        }
     }
 
     // Create order manager with shared tracker
@@ -392,51 +503,91 @@ where
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown — save state and exit immediately
     info!("Shutting down...");
     settlement_executor.set_shutting_down();
 
-    let cleanup = async {
-        if has_markets {
-            info!("Cancelling all orders...");
-            if let Err(e) = order_manager.cancel_all_market_orders().await {
-                warn!("Failed to cancel some orders: {}", e);
-            }
+    // Cancel market orders (quick)
+    if has_markets {
+        info!("Cancelling all orders...");
+        if let Err(e) = order_manager.cancel_all_market_orders().await {
+            warn!("Failed to cancel some orders: {}", e);
+        }
+    }
+
+    // Save state to disk for restoration on next restart
+    if let Some(ref state_file) = options.state_file {
+        let active_count = settlement_executor.active_settlements().len();
+
+        // Export order tracker state
+        let (saved_start_time, saved_orders, saved_settlement_orders) = {
+            let t = tracker.lock().await;
+            t.export_state()
+        };
+
+        // Build saved state
+        let mut saved = SavedState::new(config.party_id.clone(), saved_start_time);
+        saved.completed_proposals = settlement_executor
+            .completed_proposals()
+            .iter()
+            .cloned()
+            .collect();
+        saved.rejected_proposals = settlement_executor
+            .rejected_proposals()
+            .iter()
+            .cloned()
+            .collect();
+        saved.orders = saved_orders;
+        saved.settlement_orders = saved_settlement_orders;
+
+        // Save accepted RFQ trades
+        if let Some(ref accepted) = options.accepted_rfq_trades {
+            let map = accepted.lock().await;
+            saved.accepted_rfq_trades = map
+                .values()
+                .map(|t| SavedAcceptedRfqTrade {
+                    proposal_id: t.proposal_id.clone(),
+                    market_id: t.market_id.clone(),
+                    price: t.price.clone(),
+                    base_quantity: t.base_quantity.clone(),
+                    quote_quantity: t.quote_quantity.clone(),
+                })
+                .collect();
         }
 
-        settlement_executor.reject_unconfirmed().await;
-        settlement_executor.drain_tasks().await;
+        // Save quoted RFQ trades
+        if let Some(ref quoted) = options.quoted_rfq_trades {
+            let trades = quoted.lock().await;
+            saved.quoted_rfq_trades = trades
+                .iter()
+                .map(|t| SavedQuotedTrade {
+                    market_id: t.market_id.clone(),
+                    price: t.price.clone(),
+                    base_quantity: t.base_quantity.clone(),
+                    quote_quantity: t.quote_quantity.clone(),
+                })
+                .collect();
+        }
 
-        let active = settlement_executor.active_settlements().len();
-        if active > 0 {
-            info!(
-                "Waiting for {} confirmed settlement(s) to complete...",
-                active
-            );
-            info!("Press Ctrl+C again to force exit");
+        // Save fill loop state if present
+        if let Some(ref fill_state) = options.fill_state {
+            saved.fill_state = fill_state.lock().await.clone();
+        }
 
-            loop {
-                match tokio::time::timeout(Duration::from_secs(120), async {
-                    settlement_executor.sync_on_chain_contracts().await;
-                    settlement_executor.advance_all_settlements().await;
-                }).await {
-                    Ok(()) => {}
-                    Err(_) => warn!("Shutdown settlement cycle timed out after 120s"),
-                }
-
-                if settlement_executor.active_settlements().is_empty() {
-                    info!("All settlements completed");
-                    break;
-                }
-
-                tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
+        match save_state(state_file, &saved) {
+            Ok(()) => {
+                info!(
+                    "State saved ({} active settlements, {} completed, {} rejected). Restart to resume.",
+                    active_count,
+                    saved.completed_proposals.len(),
+                    saved.rejected_proposals.len(),
+                );
+            }
+            Err(e) => {
+                error!("Failed to save state: {:#}", e);
             }
         }
-    };
-
-    // The spawned Ctrl-C handler above handles force-exit on second signal,
-    // so we just await cleanup directly.
-    cleanup.await;
+    }
 
     info!("Agent stopped");
     Ok(())

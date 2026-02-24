@@ -80,6 +80,12 @@ enum Commands {
         /// Disable settlement
         #[arg(long)]
         orders_only: bool,
+        /// Skip restoring state from previous session
+        #[arg(long)]
+        no_restore: bool,
+        /// Accept all proposals without verification (for migration from old worker without saved state)
+        #[arg(long)]
+        no_reject: bool,
     },
     /// Query information
     Info {
@@ -371,7 +377,9 @@ async fn main() -> Result<()> {
         Commands::Agent {
             settlement_only,
             orders_only,
-        } => run_cloud_agent(base_config, settlement_only, orders_only, verbose, dry_run, force, confirm).await,
+            no_restore,
+            no_reject,
+        } => run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm).await,
         Commands::Info { command } => run_info(base_config, command).await,
         Commands::Preapproval { command } => run_preapproval(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Subscription { command } => run_subscription(base_config, command, verbose, dry_run, force, confirm).await,
@@ -409,6 +417,8 @@ async fn run_cloud_agent(
     config: BaseConfig,
     settlement_only: bool,
     orders_only: bool,
+    no_restore: bool,
+    no_reject: bool,
     verbose: bool,
     dry_run: bool,
     force: bool,
@@ -480,6 +490,10 @@ async fn run_cloud_agent(
             accepted_rfq_trades: None,
             quoted_rfq_trades,
             lp_shutdown: Some(lp_shutdown),
+            state_file: Some(PathBuf::from("agent-state.json")),
+            no_restore,
+            fill_state: None,
+            no_reject,
         },
     )
     .await
@@ -535,7 +549,13 @@ async fn run_fill(
         interval_secs: interval,
     };
 
-    fill_loop::run_fill_loop(config, backend, balance_provider, params).await
+    // Check for saved fill state
+    let state_file = PathBuf::from("agent-state.json");
+    let saved_fill_state = orderbook_agent_logic::state::load_state(&state_file)
+        .filter(|s| s.party_id == config.party_id)
+        .and_then(|s| s.fill_state);
+
+    fill_loop::run_fill_loop(config, backend, balance_provider, params, saved_fill_state, Some(state_file)).await
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
