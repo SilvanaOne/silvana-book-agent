@@ -107,7 +107,7 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     semaphore: Arc<Semaphore>,
     in_progress: HashMap<String, Instant>,
     failed_settlements: HashMap<String, FailedSettlement>,
-    pending_results: Vec<(String, tokio::sync::oneshot::Receiver<AdvanceResult>)>,
+    pending_results: Vec<(String, tokio::sync::oneshot::Receiver<(AdvanceResult, SettlementState)>)>,
     task_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Settlements that completed a step inline and need re-advancing on the next tick
     needs_readvance: HashSet<String>,
@@ -170,6 +170,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Enable no-reject mode: accept all proposals without verification
     pub fn set_no_reject(&mut self, no_reject: bool) {
         self.no_reject = no_reject;
+    }
+
+    /// Return (in_progress, max_threads) for thread utilization logging
+    pub fn thread_utilization(&self) -> (usize, usize) {
+        (self.in_progress.len(), self.config.settlement_thread_count)
     }
 
     /// Count settlements where this agent must act (not waiting or terminal)
@@ -509,7 +514,14 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let permit = match self.semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    debug!("All {} settlement threads busy, will retry next cycle", self.config.settlement_thread_count);
+                    let total = self.active_settlements.len();
+                    let in_progress = self.in_progress.len();
+                    warn!(
+                        "All {} settlement threads busy ({} in-progress, {} waiting), will retry next cycle",
+                        self.config.settlement_thread_count,
+                        in_progress,
+                        total.saturating_sub(in_progress),
+                    );
                     break;
                 }
             };
@@ -520,37 +532,51 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let tracker = Arc::clone(&self.tracker);
             let shutting_down = self.shutting_down;
             let pid = proposal_id.clone();
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
 
             self.in_progress.insert(proposal_id.clone(), Instant::now());
             self.pending_results.push((proposal_id, rx));
 
             let handle = tokio::spawn(async move {
                 let _permit = permit; // held until task completes
-                let result = tokio::time::timeout(Duration::from_secs(120), async {
-                    advance_single(
-                        pid.clone(),
-                        state,
-                        config,
-                        backend,
-                        tracker,
-                        shutting_down,
-                    )
-                    .await
-                })
-                .await;
-                let _ = tx.send(match result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        error!("[{}] Settlement advancement timed out after 120s", pid);
-                        AdvanceResult::Timeout { proposal_id: pid }
+                let mut local_state = state;
+
+                loop {
+                    let result = tokio::time::timeout(Duration::from_secs(120), async {
+                        advance_single(
+                            pid.clone(),
+                            local_state.clone(),
+                            config.clone(),
+                            backend.clone(),
+                            tracker.clone(),
+                            shutting_down,
+                        )
+                        .await
+                    })
+                    .await;
+
+                    let advance_result = match result {
+                        Ok(r) => r,
+                        Err(_) => {
+                            error!("[{}] Settlement step timed out after 120s", pid);
+                            AdvanceResult::Timeout { proposal_id: pid.clone() }
+                        }
+                    };
+
+                    if advance_result.should_readvance() {
+                        advance_result.apply_to_state(&mut local_state);
+                        // Brief pause between steps to avoid saturating the ledger
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    } else {
+                        let _ = tx.send((advance_result, local_state));
+                        break;
                     }
-                });
+                }
             });
             self.task_handles.push(handle);
 
-            // Stagger spawns to avoid thundering-herd on Canton ledger (matches server pattern)
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Stagger spawns to avoid thundering-herd on Canton ledger
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -602,8 +628,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
         for (proposal_id, mut rx) in self.pending_results.drain(..) {
             match rx.try_recv() {
-                Ok(result) => {
+                Ok((result, final_state)) => {
                     self.in_progress.remove(&proposal_id);
+                    // Update active_settlements with accumulated state from the task
+                    if let Some(state) = self.active_settlements.get_mut(&proposal_id) {
+                        *state = final_state;
+                    }
                     completed.push(result);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {

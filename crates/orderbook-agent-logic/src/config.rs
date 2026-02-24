@@ -173,7 +173,7 @@ impl BaseConfig {
         let settlement_thread_count = std::env::var("SETTLEMENT_THREAD_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(25);
 
         let max_active_settlements = std::env::var("AGENT_MAX_SETTLEMENTS")
             .ok()

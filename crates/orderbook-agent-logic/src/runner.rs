@@ -467,6 +467,9 @@ where
                         let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
                         info!("Heartbeat: {} active settlement(s): {}", ids.len(), ids.join(", "));
                     }
+                    let (used, max) = settlement_executor.thread_utilization();
+                    let pct = if max > 0 { used * 100 / max } else { 0 };
+                    info!("Settlement threads: {}/{} ({}%)", used, max, pct);
                 }
 
                 _ = shutdown_notify.notified() => {
