@@ -24,6 +24,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
 use indexmap::IndexMap;
+use rand::Rng;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -64,6 +65,28 @@ pub struct DiscoveredContract {
     pub contract_type: String,
 }
 
+/// A fee payment queued for background processing (fire-and-forget).
+/// Persisted to state file on shutdown, restored on restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingFee {
+    pub proposal_id: String,
+    /// "dvp" or "allocate"
+    pub fee_type: String,
+    pub is_buyer: bool,
+    pub pending_traffic: u64,
+    #[serde(default)]
+    pub retry_count: u32,
+}
+
+/// A traffic fee queued for background processing (fire-and-forget).
+/// Persisted to state file on shutdown, restored on restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingTrafficFee {
+    pub traffic_bytes: u64,
+    pub step_name: String,
+    pub proposal_id: String,
+}
+
 /// Backend for executing settlement operations
 ///
 /// Implementations provide the actual transaction execution:
@@ -86,8 +109,31 @@ pub trait SettlementBackend: Send + Sync {
     /// Transfer traffic fee to PARTY_TRAFFIC_FEE
     async fn transfer_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str) -> Result<()>;
 
+    /// Queue a traffic fee at lowest priority (fire-and-forget).
+    /// The fee will be processed by the payment queue without blocking the caller.
+    fn queue_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str);
+
     /// Sync on-chain contracts for given settlement IDs
     async fn sync_contracts(&self, settlement_ids: &[String]) -> Result<Vec<DiscoveredContract>>;
+
+    /// Queue a fee payment for background processing (fire-and-forget).
+    /// The fee will be processed by the payment queue without blocking the caller.
+    async fn queue_fee_payment(&self, fee: PendingFee);
+
+    /// Get all pending background fee payments (for state persistence on shutdown).
+    fn get_pending_fees(&self) -> Vec<PendingFee>;
+
+    /// Restore pending fee payments from saved state (re-queue on restart).
+    async fn restore_pending_fees(&self, fees: Vec<PendingFee>);
+
+    /// Get all pending traffic fee payments (for state persistence on shutdown).
+    fn get_pending_traffic_fees(&self) -> Vec<PendingTrafficFee>;
+
+    /// Restore pending traffic fee payments from saved state (re-queue on restart).
+    fn restore_pending_traffic_fees(&self, fees: Vec<PendingTrafficFee>);
+
+    /// Get current payment queue depth: (allocations, fees, traffic).
+    fn queue_depth(&self) -> (u64, u64, u64);
 }
 
 /// Settlement executor handles the DVP workflow
@@ -172,9 +218,30 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.no_reject = no_reject;
     }
 
-    /// Return (in_progress, max_threads) for thread utilization logging
-    pub fn thread_utilization(&self) -> (usize, usize) {
-        (self.in_progress.len(), self.config.settlement_thread_count)
+    /// Get pending background fee payments from the backend (for state persistence).
+    pub fn get_pending_fees(&self) -> Vec<PendingFee> {
+        self.backend.get_pending_fees()
+    }
+
+    /// Get pending traffic fee payments from the backend (for state persistence).
+    pub fn get_pending_traffic_fees(&self) -> Vec<PendingTrafficFee> {
+        self.backend.get_pending_traffic_fees()
+    }
+
+    /// Get current payment queue depth: (allocations, fees, traffic).
+    pub fn queue_depth(&self) -> (u64, u64, u64) {
+        self.backend.queue_depth()
+    }
+
+    /// Return (in_progress, max_threads, in_backoff, waiting) for thread utilization logging
+    pub fn thread_utilization(&self) -> (usize, usize, usize, usize) {
+        let in_progress = self.in_progress.len();
+        let in_backoff = self.failed_settlements.values()
+            .filter(|f| Instant::now() < f.next_retry)
+            .count();
+        let total = self.active_settlements.len();
+        let waiting = total.saturating_sub(in_progress).saturating_sub(in_backoff);
+        (in_progress, self.config.settlement_thread_count, in_backoff, waiting)
     }
 
     /// Count settlements where this agent must act (not waiting or terminal)
@@ -325,9 +392,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if self.config.auto_settle {
-                    if let Err(e) = self.advance_settlement(&proposal_id).await {
-                        warn!("[{}] Initial advance of restored proposal failed: {:#}", proposal_id, e);
-                    }
+                    self.needs_readvance.insert(proposal_id.clone());
                 }
                 self.update_actionable_count();
                 return Ok(());
@@ -355,9 +420,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
             if self.config.auto_settle {
-                if let Err(e) = self.advance_settlement(&proposal_id).await {
-                    warn!("[{}] Initial advance failed: {:#}", proposal_id, e);
-                }
+                self.needs_readvance.insert(proposal_id.clone());
             }
             self.update_actionable_count();
             return Ok(());
@@ -404,9 +467,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
             if self.config.auto_settle {
-                if let Err(e) = self.advance_settlement(&proposal_id).await {
-                    warn!("[{}] Initial advance failed: {:#}", proposal_id, e);
-                }
+                self.needs_readvance.insert(proposal_id.clone());
             }
             self.update_actionable_count();
             return Ok(());
@@ -460,11 +521,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let state = SettlementState::new(proposal, is_buyer);
         self.active_settlements.insert(proposal_id.clone(), state);
 
-        // Immediately try to advance if auto-settle is enabled
+        // Mark for advancement by the parallel thread pool
         if self.config.auto_settle {
-            if let Err(e) = self.advance_settlement(&proposal_id).await {
-                warn!("[{}] Initial advance failed: {:#}", proposal_id, e);
-            }
+            self.needs_readvance.insert(proposal_id.clone());
         }
 
         Ok(())
@@ -486,9 +545,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 _ => "Unknown",
             };
             info!("[{}] Settlement status changed: {}", proposal.proposal_id, status_name);
-            if let Err(e) = self.advance_settlement(&proposal.proposal_id).await {
-                warn!("[{}] Advance after status change failed: {:#}", proposal.proposal_id, e);
-            }
+            self.needs_readvance.insert(proposal.proposal_id.clone());
         }
         Ok(())
     }
@@ -546,6 +603,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let _permit = permit; // held until task completes
                 let mut local_state = state;
 
+                // Initial jitter to stagger threads (0-2s) — avoids thundering herd
+                let jitter = rand::thread_rng().gen_range(0..2000u64);
+                tokio::time::sleep(Duration::from_millis(jitter)).await;
+
                 loop {
                     // Check shutdown flag before each step
                     let is_shutting_down = shutting_down.load(Ordering::Relaxed);
@@ -566,15 +627,21 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     let advance_result = match result {
                         Ok(r) => r,
                         Err(_) => {
-                            error!("[{}] Settlement step timed out after 120s", pid);
+                            error!(
+                                "[{}] Settlement step timed out after 120s (role={}, stage={})",
+                                pid,
+                                if local_state.is_buyer { "buyer" } else { "seller" },
+                                local_state.stage,
+                            );
                             AdvanceResult::Timeout { proposal_id: pid.clone() }
                         }
                     };
 
                     if advance_result.should_readvance() && !shutting_down.load(Ordering::Relaxed) {
                         advance_result.apply_to_state(&mut local_state);
-                        // Brief pause between steps to avoid saturating the ledger
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        // Jitter between steps (200-1000ms) to spread ledger load
+                        let step_jitter = 200 + rand::thread_rng().gen_range(0..800u64);
+                        tokio::time::sleep(Duration::from_millis(step_jitter)).await;
                     } else {
                         let _ = tx.send((advance_result, local_state));
                         break;
@@ -588,43 +655,6 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
     }
 
-    /// Advance a single settlement synchronously, looping until non-actionable.
-    ///
-    /// Used by handle_proposal_created and handle_status_changed for immediate
-    /// reaction to stream events. Loops calling advance_single until the result
-    /// is Wait/Terminal/Error/Timeout/Rejected — driving the entire settlement
-    /// flow from a single stream event.
-    pub async fn advance_settlement(&mut self, proposal_id: &str) -> Result<()> {
-        // Skip if already being processed by a parallel task
-        if self.in_progress.contains_key(proposal_id) {
-            return Ok(());
-        }
-
-        let state = match self.active_settlements.get(proposal_id) {
-            Some(s) => s.clone(),
-            None => return Ok(()),
-        };
-
-        let result = advance_single(
-            proposal_id.to_string(),
-            state,
-            self.config.clone(),
-            Arc::clone(&self.backend),
-            Arc::clone(&self.tracker),
-            self.shutting_down.load(Ordering::Relaxed),
-        ).await;
-
-        let should_continue = result.should_readvance();
-        self.apply_result(result).await;
-
-        if should_continue {
-            self.needs_readvance.insert(proposal_id.to_string());
-        } else {
-            self.needs_readvance.remove(proposal_id);
-        }
-
-        Ok(())
-    }
 
     /// Collect completed results from spawned tasks.
     ///
@@ -686,20 +716,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     pub async fn collect_and_readvance(&mut self) {
         let readvance_ids = self.collect_results().await;
 
-        // Merge spawned task results with inline needs_readvance
+        // Merge spawned task results with needs_readvance
         for pid in readvance_ids {
             self.needs_readvance.insert(pid);
         }
 
-        // Advance each settlement by one step (single-step, no loop)
-        let ids: Vec<String> = self.needs_readvance.drain().collect();
-        for pid in ids {
-            if self.active_settlements.contains_key(&pid) && !self.in_progress.contains_key(&pid) {
-                if let Err(e) = self.advance_settlement(&pid).await {
-                    warn!("[{}] Re-advance after collect failed: {:#}", pid, e);
-                }
-            }
-        }
+        // Spawn parallel tasks for all settlements needing advancement.
+        // advance_all_settlements iterates active_settlements and spawns
+        // tasks for any not already in_progress or in backoff.
+        self.advance_all_settlements().await;
     }
 
     /// Apply a single AdvanceResult to the executor state
@@ -746,12 +771,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             }
             AdvanceResult::Error { proposal_id, error } => {
                 let is_inactive = error.contains("INACTIVE_CONTRACTS");
+                let is_transient = is_inactive
+                    || error.contains("No Dvp contract ID found")
+                    || error.contains("No DvpProposal CID found");
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
                         next_retry: Instant::now(),
                     });
-                if !is_inactive {
+                if !is_transient {
                     entry.retry_count += 1;
                 }
 
@@ -771,16 +799,23 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     return;
                 }
 
-                let delay = if is_inactive {
-                    Duration::from_secs(5)
+                let delay = if is_transient {
+                    Duration::from_secs(10)
                 } else {
                     FailedSettlement::retry_delay(entry.retry_count)
                 };
                 entry.next_retry = Instant::now() + delay;
-                warn!(
-                    "[{}] Settlement error (retry {}/{} in {:?}): {:#}",
-                    proposal_id, entry.retry_count, FailedSettlement::max_retries(), delay, error
-                );
+                if is_transient {
+                    info!(
+                        "[{}] Waiting {:?}: {}",
+                        proposal_id, delay, error
+                    );
+                } else {
+                    warn!(
+                        "[{}] Settlement error (retry {}/{} in {:?}): {:#}",
+                        proposal_id, entry.retry_count, FailedSettlement::max_retries(), delay, error
+                    );
+                }
             }
             AdvanceResult::Timeout { proposal_id } => {
                 let entry = self.failed_settlements.entry(proposal_id.clone())
@@ -806,10 +841,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     return;
                 }
 
-                // Fixed 60s for timeouts (likely transient), not escalating backoff
-                entry.next_retry = Instant::now() + Duration::from_secs(60);
+                // Short backoff for timeouts (likely transient sequencer backpressure)
+                entry.next_retry = Instant::now() + Duration::from_secs(10);
                 warn!(
-                    "[{}] Settlement timed out (retry {}/{} in 60s)",
+                    "[{}] Settlement timed out (retry {}/{} in 10s)",
                     proposal_id, entry.retry_count, FailedSettlement::max_retries()
                 );
             }
@@ -904,15 +939,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let Some(state) = self.active_settlements.get_mut(&contract.settlement_id) else { continue };
 
             if contract.contract_type == "DvpProposal" && state.dvp_proposal_cid.is_none() {
-                info!("[{}] Discovered DvpProposal on-chain: {}", contract.settlement_id, contract.contract_id);
+                debug!("[{}] Discovered DvpProposal on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.dvp_proposal_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
             } else if contract.contract_type == "Dvp" && state.dvp_cid.is_none() {
-                info!("[{}] Discovered Dvp on-chain: {}", contract.settlement_id, contract.contract_id);
+                debug!("[{}] Discovered Dvp on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.dvp_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
             } else if contract.contract_type == "Allocation" && state.allocation_cid.is_none() {
-                info!("[{}] Discovered Allocation on-chain: {}", contract.settlement_id, contract.contract_id);
+                debug!("[{}] Discovered Allocation on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.allocation_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
             }
@@ -1120,6 +1155,54 @@ async fn record_step_completed(
     }
 }
 
+/// Record a "Submitted" settlement event via RPC (fee queued for background payment).
+///
+/// Unlike record_step_completed, this records a Submitted event with Pending result
+/// and no update_id/contract_id (payment hasn't happened yet).
+async fn record_step_submitted(
+    rpc_client: &mut OrderbookRpcClient,
+    proposal_id: &str,
+    party_id: &str,
+    is_buyer: bool,
+    event_type: SettlementEventType,
+) {
+    let recorded_by_role = if is_buyer {
+        RecordedByRole::Buyer as i32
+    } else {
+        RecordedByRole::Seller as i32
+    };
+
+    let request = RecordSettlementEventRequest {
+        auth: None,
+        proposal_id: proposal_id.to_string(),
+        recorded_by: party_id.to_string(),
+        recorded_by_role,
+        event_type: event_type as i32,
+        submission_id: None,
+        update_id: None,
+        contract_id: None,
+        template_id: None,
+        result: SettlementEventResult::Pending as i32,
+        error_message: None,
+        metadata: None,
+    };
+
+    match rpc_client.record_settlement_event(request).await {
+        Ok(event_id) => {
+            debug!(
+                "[{}] Recorded fee submitted event {:?} (event_id={})",
+                proposal_id, event_type, event_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "[{}] Failed to record fee submitted event {:?}: {}",
+                proposal_id, event_type, e
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Free function: advance a single settlement (runs in spawned task)
 // ============================================================================
@@ -1140,6 +1223,13 @@ async fn advance_single<B: SettlementBackend>(
     tracker: Arc<Mutex<OrderTracker>>,
     shutting_down: bool,
 ) -> AdvanceResult {
+    debug!(
+        "[{}] Advancing (role={}, stage={})",
+        proposal_id,
+        if state.is_buyer { "buyer" } else { "seller" },
+        state.stage,
+    );
+
     // Create RPC client (uses cached global channel — fast)
     let jwt = match generate_jwt(
         &config.party_id,
@@ -1210,39 +1300,32 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::PayDvpFee => {
-            info!("[{}] NextAction: PayDvpFee", proposal_id);
-            match backend.pay_fee(&proposal_id, "dvp").await {
-                Ok(result) => {
-                    let event_type = if state.is_buyer {
-                        SettlementEventType::DvpProcessingFeeBuyerCompleted
-                    } else {
-                        SettlementEventType::DvpProcessingFeeSellerCompleted
-                    };
-                    record_step_completed(
-                        &mut rpc_client, &proposal_id, &config.party_id,
-                        state.is_buyer, event_type, &result.update_id, &result.contract_id,
-                    ).await;
-
-                    let combined = if config.join_traffic {
-                        state.pending_traffic + result.traffic_total
-                    } else {
-                        result.traffic_total
-                    };
-                    backend.transfer_traffic_fee(combined, "dvp-fee", &proposal_id).await
-                        .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
-                    AdvanceResult::StepCompleted {
-                        proposal_id,
-                        stage: SettlementStage::DvpFeePaid,
-                        dvp_proposal_cid: None,
-                        dvp_cid: None,
-                        allocation_cid: None,
-                        pending_traffic: 0,
-                    }
-                }
-                Err(e) => AdvanceResult::Error {
-                    proposal_id,
-                    error: format!("PayDvpFee failed: {}", e),
-                },
+            info!("[{}] NextAction: PayDvpFee (queuing for background)", proposal_id);
+            let submitted_event = if state.is_buyer {
+                SettlementEventType::DvpProcessingFeeBuyerSubmitted
+            } else {
+                SettlementEventType::DvpProcessingFeeSellerSubmitted
+            };
+            // Record _Submitted immediately — server allows next step for agents (LPs)
+            record_step_submitted(
+                &mut rpc_client, &proposal_id, &config.party_id,
+                state.is_buyer, submitted_event,
+            ).await;
+            // Queue fee for background processing (fire-and-forget)
+            backend.queue_fee_payment(PendingFee {
+                proposal_id: proposal_id.clone(),
+                fee_type: "dvp".to_string(),
+                is_buyer: state.is_buyer,
+                pending_traffic: 0,
+                retry_count: 0,
+            }).await;
+            AdvanceResult::StepCompleted {
+                proposal_id,
+                stage: SettlementStage::DvpFeePaid,
+                dvp_proposal_cid: None,
+                dvp_cid: None,
+                allocation_cid: None,
+                pending_traffic: 0,
             }
         }
         NextAction::CreateDvp => {
@@ -1255,20 +1338,15 @@ async fn advance_single<B: SettlementBackend>(
                         &result.update_id, &result.contract_id,
                     ).await;
 
-                    let pending_traffic = if config.join_traffic {
-                        result.traffic_total
-                    } else {
-                        backend.transfer_traffic_fee(result.traffic_total, "propose", &proposal_id).await
-                            .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
-                        0
-                    };
+                    // Queue traffic fee at lowest priority (fire-and-forget)
+                    backend.queue_traffic_fee(result.traffic_total, "propose", &proposal_id);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpProposed,
                         dvp_proposal_cid: Some(result.contract_id),
                         dvp_cid: None,
                         allocation_cid: None,
-                        pending_traffic,
+                        pending_traffic: 0,
                     }
                 }
                 Err(e) => AdvanceResult::Error {
@@ -1295,20 +1373,15 @@ async fn advance_single<B: SettlementBackend>(
                         &result.update_id, &result.contract_id,
                     ).await;
 
-                    let pending_traffic = if config.join_traffic {
-                        result.traffic_total
-                    } else {
-                        backend.transfer_traffic_fee(result.traffic_total, "accept", &proposal_id).await
-                            .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
-                        0
-                    };
+                    // Queue traffic fee at lowest priority (fire-and-forget)
+                    backend.queue_traffic_fee(result.traffic_total, "accept", &proposal_id);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpAccepted,
                         dvp_proposal_cid: None,
                         dvp_cid: Some(result.contract_id),
                         allocation_cid: None,
-                        pending_traffic,
+                        pending_traffic: 0,
                     }
                 }
                 Err(e) => AdvanceResult::Error {
@@ -1318,39 +1391,32 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::PayAllocFee => {
-            info!("[{}] NextAction: PayAllocFee", proposal_id);
-            match backend.pay_fee(&proposal_id, "allocate").await {
-                Ok(result) => {
-                    let event_type = if state.is_buyer {
-                        SettlementEventType::AllocationProcessingFeeBuyerCompleted
-                    } else {
-                        SettlementEventType::AllocationProcessingFeeSellerCompleted
-                    };
-                    record_step_completed(
-                        &mut rpc_client, &proposal_id, &config.party_id,
-                        state.is_buyer, event_type, &result.update_id, &result.contract_id,
-                    ).await;
-
-                    let combined = if config.join_traffic {
-                        state.pending_traffic + result.traffic_total
-                    } else {
-                        result.traffic_total
-                    };
-                    backend.transfer_traffic_fee(combined, "alloc-fee", &proposal_id).await
-                        .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
-                    AdvanceResult::StepCompleted {
-                        proposal_id,
-                        stage: SettlementStage::AllocationFeePaid,
-                        dvp_proposal_cid: None,
-                        dvp_cid: None,
-                        allocation_cid: None,
-                        pending_traffic: 0,
-                    }
-                }
-                Err(e) => AdvanceResult::Error {
-                    proposal_id,
-                    error: format!("PayAllocFee failed: {}", e),
-                },
+            info!("[{}] NextAction: PayAllocFee (queuing for background)", proposal_id);
+            let submitted_event = if state.is_buyer {
+                SettlementEventType::AllocationProcessingFeeBuyerSubmitted
+            } else {
+                SettlementEventType::AllocationProcessingFeeSellerSubmitted
+            };
+            // Record _Submitted immediately — server allows next step for agents (LPs)
+            record_step_submitted(
+                &mut rpc_client, &proposal_id, &config.party_id,
+                state.is_buyer, submitted_event,
+            ).await;
+            // Queue fee for background processing (fire-and-forget)
+            backend.queue_fee_payment(PendingFee {
+                proposal_id: proposal_id.clone(),
+                fee_type: "allocate".to_string(),
+                is_buyer: state.is_buyer,
+                pending_traffic: 0,
+                retry_count: 0,
+            }).await;
+            AdvanceResult::StepCompleted {
+                proposal_id,
+                stage: SettlementStage::AllocationFeePaid,
+                dvp_proposal_cid: None,
+                dvp_cid: None,
+                allocation_cid: None,
+                pending_traffic: 0,
             }
         }
         NextAction::Allocate => {
@@ -1387,14 +1453,7 @@ async fn advance_single<B: SettlementBackend>(
                         state.is_buyer, event_type, &result.update_id, &result.contract_id,
                     ).await;
 
-                    // Allocate is the LP's last on-chain action — always pay traffic now
-                    let combined = if config.join_traffic {
-                        state.pending_traffic + result.traffic_total
-                    } else {
-                        result.traffic_total
-                    };
-                    backend.transfer_traffic_fee(combined, "allocate", &proposal_id).await
-                        .unwrap_or_else(|e| warn!("[{}] Traffic fee failed: {:#}", proposal_id, e));
+                    // Traffic fee queued by payment queue processor after allocate
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::Allocated,

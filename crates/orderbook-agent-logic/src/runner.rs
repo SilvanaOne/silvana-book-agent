@@ -175,6 +175,18 @@ where
         t.import_state(saved.orders.clone(), saved.settlement_orders.clone());
     }
 
+    // Restore pending background fee payments from saved state
+    if let Some(ref saved) = restored_state {
+        if !saved.pending_fees.is_empty() {
+            info!("Restoring {} pending fee payment(s) from saved state", saved.pending_fees.len());
+            backend.restore_pending_fees(saved.pending_fees.clone()).await;
+        }
+        if !saved.pending_traffic_fees.is_empty() {
+            info!("Restoring {} pending traffic fee(s) from saved state", saved.pending_traffic_fees.len());
+            backend.restore_pending_traffic_fees(saved.pending_traffic_fees.clone());
+        }
+    }
+
     // Create settlement executor with shared tracker
     let mut settlement_executor = SettlementExecutor::new(&config, tracker.clone(), backend);
 
@@ -272,8 +284,9 @@ where
     };
 
     // Setup timers — use Skip so accumulated ticks don't starve ctrl_c
-    let mut heartbeat_timer = interval(Duration::from_secs(300));
+    let mut heartbeat_timer = interval(Duration::from_secs(60));
     heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat_count: u64 = 0;
     let mut order_update_timer = interval(Duration::from_secs(5));
     order_update_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut settlement_poll_timer = interval(Duration::from_secs(config.poll_interval_secs));
@@ -476,14 +489,19 @@ where
                 }
 
                 _ = heartbeat_timer.tick() => {
+                    heartbeat_count += 1;
                     let active_settlements = settlement_executor.active_settlements();
-                    if !active_settlements.is_empty() {
-                        let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
-                        info!("Heartbeat: {} active settlement(s): {}", ids.len(), ids.join(", "));
-                    }
-                    let (used, max) = settlement_executor.thread_utilization();
+                    let n = active_settlements.len();
+                    let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
                     let pct = if max > 0 { used * 100 / max } else { 0 };
-                    info!("Settlement threads: {}/{} ({}%)", used, max, pct);
+                    let (alloc, fees, traffic) = settlement_executor.queue_depth();
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic);
+                    // Every 5 minutes, also list individual settlement IDs
+                    if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
+                        let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
+                        info!("Active settlements: {}", ids.join(", "));
+                    }
                 }
 
                 _ = shutdown_notify.notified() => {
@@ -595,6 +613,18 @@ where
         // Save fill loop state if present
         if let Some(ref fill_state) = options.fill_state {
             saved.fill_state = fill_state.lock().await.clone();
+        }
+
+        // Save pending background fee payments
+        saved.pending_fees = settlement_executor.get_pending_fees();
+        if !saved.pending_fees.is_empty() {
+            info!("Saving {} pending fee payment(s) for restart", saved.pending_fees.len());
+        }
+
+        // Save pending traffic fee payments
+        saved.pending_traffic_fees = settlement_executor.get_pending_traffic_fees();
+        if !saved.pending_traffic_fees.is_empty() {
+            info!("Saving {} pending traffic fee(s) for restart", saved.pending_traffic_fees.len());
         }
 
         match save_state(state_file, &saved) {

@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use orderbook_agent_logic::config::BaseConfig;
 use orderbook_agent_logic::confirm::ConfirmLock;
-use orderbook_agent_logic::settlement::{DiscoveredContract, SettlementBackend, StepResult};
+use orderbook_agent_logic::settlement::{DiscoveredContract, PendingFee, PendingTrafficFee, SettlementBackend, StepResult};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AcceptDvpParams,
     PrepareTransactionRequest, ProposeDvpParams, TransactionOperation,
@@ -177,6 +177,39 @@ impl SettlementBackend for CloudSettlementBackend {
         self.payment_queue
             .submit_transfer_traffic_fee(traffic_bytes, step_name, proposal_id)
             .await
+    }
+
+    fn queue_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str) {
+        self.payment_queue.queue_traffic_fee(traffic_bytes, step_name, proposal_id);
+    }
+
+    async fn queue_fee_payment(&self, fee: PendingFee) {
+        self.payment_queue.queue_fee_background(fee).await;
+    }
+
+    fn get_pending_fees(&self) -> Vec<PendingFee> {
+        // Block on the async lock — this is called during shutdown (sync context)
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.payment_queue.get_pending_fees())
+        })
+    }
+
+    async fn restore_pending_fees(&self, fees: Vec<PendingFee>) {
+        self.payment_queue.restore_pending_fees(fees).await;
+    }
+
+    fn get_pending_traffic_fees(&self) -> Vec<PendingTrafficFee> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.payment_queue.get_pending_traffic_fees())
+        })
+    }
+
+    fn restore_pending_traffic_fees(&self, fees: Vec<PendingTrafficFee>) {
+        self.payment_queue.restore_pending_traffic_fees(fees);
+    }
+
+    fn queue_depth(&self) -> (u64, u64, u64) {
+        self.payment_queue.queue_depth()
     }
 
     async fn sync_contracts(
