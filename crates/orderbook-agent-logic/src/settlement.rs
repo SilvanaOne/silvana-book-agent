@@ -26,7 +26,7 @@ use futures::future::join_all;
 use indexmap::IndexMap;
 use rand::Rng;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,7 +46,7 @@ use crate::config::BaseConfig;
 use crate::order_tracker::{OrderTracker, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
 use crate::runner::{AcceptedRfqTrade, QuotedTrade};
-use crate::types::{AdvanceResult, FailedSettlement, SettlementStage, SettlementState};
+use crate::types::{AdvanceResult, CidWaitingType, FailedSettlement, SettlementStage, SettlementState};
 
 /// Result from a settlement step operation
 #[derive(Debug, Clone)]
@@ -157,6 +157,8 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     task_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Settlements that completed a step inline and need re-advancing on the next tick
     needs_readvance: HashSet<String>,
+    /// Shared log for consolidating NextAction entries across parallel tasks
+    action_log: Arc<Mutex<Vec<(String, &'static str)>>>,
     /// Shared counter of settlements where this agent must act (not waiting/terminal)
     actionable_count: Arc<AtomicUsize>,
     /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
@@ -186,6 +188,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             pending_results: Vec::new(),
             task_handles: Vec::new(),
             needs_readvance: HashSet::new(),
+            action_log: Arc::new(Mutex::new(Vec::new())),
             actionable_count: Arc::new(AtomicUsize::new(0)),
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
@@ -242,6 +245,35 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let total = self.active_settlements.len();
         let waiting = total.saturating_sub(in_progress).saturating_sub(in_backoff);
         (in_progress, self.config.settlement_thread_count, in_backoff, waiting)
+    }
+
+    /// Log a one-line summary of proposals waiting for CIDs (called from heartbeat).
+    pub fn log_cid_waiting_summary(&self) {
+        let mut no_proposal = 0u32;
+        let mut no_dvp = 0u32;
+        let mut stuck_10m = 0u32;
+
+        for entry in self.failed_settlements.values() {
+            match entry.cid_waiting {
+                Some(CidWaitingType::DvpProposal) => no_proposal += 1,
+                Some(CidWaitingType::DvpContract) => no_dvp += 1,
+                None => continue,
+            }
+            if entry.first_transient_at
+                .map(|t| t.elapsed().as_secs() > 600)
+                .unwrap_or(false)
+            {
+                stuck_10m += 1;
+            }
+        }
+
+        let total = no_proposal + no_dvp;
+        if total > 0 {
+            warn!(
+                "CID waiting: {} proposals ({} no DvpProposal, {} no Dvp contract, {} stuck >10min)",
+                total, no_proposal, no_dvp, stuck_10m
+            );
+        }
     }
 
     /// Count settlements where this agent must act (not waiting or terminal)
@@ -593,6 +625,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let backend = Arc::clone(&self.backend);
             let tracker = Arc::clone(&self.tracker);
             let shutting_down = self.shutting_down.clone();
+            let action_log = Arc::clone(&self.action_log);
             let pid = proposal_id.clone();
             let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
 
@@ -619,6 +652,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                             backend.clone(),
                             tracker.clone(),
                             is_shutting_down,
+                            action_log.clone(),
                         )
                         .await
                     })
@@ -687,6 +721,20 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         self.pending_results = still_pending;
+
+        // Emit consolidated NextAction summary
+        let actions: Vec<(String, &'static str)> = self.action_log.lock().await.drain(..).collect();
+        if !actions.is_empty() {
+            let mut by_action: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            for (pid, action) in &actions {
+                let short_id = if pid.len() >= 8 { &pid[..8] } else { pid.as_str() };
+                by_action.entry(action).or_default().push(short_id);
+            }
+            let summary: Vec<String> = by_action.iter()
+                .map(|(action, ids)| format!("{}({})", action, ids.join(", ")))
+                .collect();
+            info!("Settlement actions: {}", summary.join(", "));
+        }
 
         // Apply all completed results
         for result in completed {
@@ -778,6 +826,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     .or_insert(FailedSettlement {
                         retry_count: 0,
                         next_retry: Instant::now(),
+                        first_transient_at: None,
+                        cid_waiting: None,
                     });
                 if !is_transient {
                     entry.retry_count += 1;
@@ -806,11 +856,42 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 };
                 entry.next_retry = Instant::now() + delay;
                 if is_transient {
-                    info!(
-                        "[{}] Waiting {:?}: {}",
-                        proposal_id, delay, error
-                    );
+                    let is_cid_waiting = error.contains("No Dvp contract ID found")
+                        || error.contains("No DvpProposal CID found");
+
+                    if is_cid_waiting {
+                        if entry.first_transient_at.is_none() {
+                            entry.first_transient_at = Some(Instant::now());
+                        }
+                        entry.cid_waiting = Some(if error.contains("No DvpProposal CID found") {
+                            CidWaitingType::DvpProposal
+                        } else {
+                            CidWaitingType::DvpContract
+                        });
+                        let waiting_secs = entry.first_transient_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        if waiting_secs > 600 {
+                            warn!(
+                                "[{}] Waiting {:?}: {} (stuck for {}s)",
+                                proposal_id, delay, error, waiting_secs
+                            );
+                        } else {
+                            debug!(
+                                "[{}] Waiting {:?}: {}",
+                                proposal_id, delay, error
+                            );
+                        }
+                    } else {
+                        // INACTIVE_CONTRACTS and other transient: keep as info
+                        entry.cid_waiting = None;
+                        info!(
+                            "[{}] Waiting {:?}: {}",
+                            proposal_id, delay, error
+                        );
+                    }
                 } else {
+                    entry.cid_waiting = None;
                     warn!(
                         "[{}] Settlement error (retry {}/{} in {:?}): {:#}",
                         proposal_id, entry.retry_count, FailedSettlement::max_retries(), delay, error
@@ -822,6 +903,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     .or_insert(FailedSettlement {
                         retry_count: 0,
                         next_retry: Instant::now(),
+                        first_transient_at: None,
+                        cid_waiting: None,
                     });
                 entry.retry_count += 1;
 
@@ -1222,6 +1305,7 @@ async fn advance_single<B: SettlementBackend>(
     backend: Arc<B>,
     tracker: Arc<Mutex<OrderTracker>>,
     shutting_down: bool,
+    action_log: Arc<Mutex<Vec<(String, &'static str)>>>,
 ) -> AdvanceResult {
     debug!(
         "[{}] Advancing (role={}, stage={})",
@@ -1284,7 +1368,7 @@ async fn advance_single<B: SettlementBackend>(
                 }
                 AdvanceResult::Rejected { proposal_id }
             } else {
-                info!("[{}] NextAction: Preconfirm", proposal_id);
+                action_log.lock().await.push((proposal_id.clone(), "Preconfirm"));
                 match rpc_client.submit_preconfirmation(
                     &proposal_id, &proposal_id, &config.party_id, true,
                 ).await {
@@ -1300,7 +1384,7 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::PayDvpFee => {
-            info!("[{}] NextAction: PayDvpFee (queuing for background)", proposal_id);
+            action_log.lock().await.push((proposal_id.clone(), "PayDvpFee"));
             let submitted_event = if state.is_buyer {
                 SettlementEventType::DvpProcessingFeeBuyerSubmitted
             } else {
@@ -1329,7 +1413,7 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::CreateDvp => {
-            info!("[{}] NextAction: CreateDvp", proposal_id);
+            action_log.lock().await.push((proposal_id.clone(), "CreateDvp"));
             match backend.propose_dvp(&proposal_id).await {
                 Ok(result) => {
                     record_step_completed(
@@ -1356,7 +1440,7 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::AcceptDvp => {
-            info!("[{}] NextAction: AcceptDvp", proposal_id);
+            action_log.lock().await.push((proposal_id.clone(), "AcceptDvp"));
             let dvp_proposal_cid = match state.dvp_proposal_cid {
                 Some(ref cid) => cid.clone(),
                 None => return AdvanceResult::Error {
@@ -1364,7 +1448,7 @@ async fn advance_single<B: SettlementBackend>(
                     error: "No DvpProposal CID found (not yet proposed?)".into(),
                 },
             };
-            info!("[{}] Using DvpProposal from on-chain sync: {}", proposal_id, dvp_proposal_cid);
+            debug!("[{}] Using DvpProposal from on-chain sync: {}", proposal_id, dvp_proposal_cid);
             match backend.accept_dvp(&proposal_id, &dvp_proposal_cid).await {
                 Ok(result) => {
                     record_step_completed(
@@ -1391,7 +1475,7 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::PayAllocFee => {
-            info!("[{}] NextAction: PayAllocFee (queuing for background)", proposal_id);
+            action_log.lock().await.push((proposal_id.clone(), "PayAllocFee"));
             let submitted_event = if state.is_buyer {
                 SettlementEventType::AllocationProcessingFeeBuyerSubmitted
             } else {
@@ -1433,7 +1517,7 @@ async fn advance_single<B: SettlementBackend>(
                 return AdvanceResult::Wait { proposal_id };
             }
 
-            info!("[{}] NextAction: Allocate", proposal_id);
+            action_log.lock().await.push((proposal_id.clone(), "Allocate"));
             let dvp_cid = match state.dvp_cid {
                 Some(ref cid) => cid.clone(),
                 None => return AdvanceResult::Error {

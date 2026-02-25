@@ -497,6 +497,7 @@ where
                     let (alloc, fees, traffic) = settlement_executor.queue_depth();
                     info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic",
                         n, used, max, pct, in_backoff, waiting, alloc, fees, traffic);
+                    settlement_executor.log_cid_waiting_summary();
                     // Every 5 minutes, also list individual settlement IDs
                     if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
                         let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
