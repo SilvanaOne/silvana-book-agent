@@ -644,7 +644,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         // (on-chain state change detected, step completed in-task, etc.).
         // Clear their cooldowns so they're immediately eligible, and spawn
         // them before the rest to prevent starvation by Wait polling.
-        let priority_ids: Vec<String> = self.needs_readvance.drain().collect();
+        let priority_ids: Vec<String> = self.needs_readvance.drain()
+            .filter(|pid| self.active_settlements.contains_key(pid))
+            .collect();
         for pid in &priority_ids {
             self.failed_settlements.remove(pid);
         }
