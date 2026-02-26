@@ -154,8 +154,9 @@ impl DAppProviderClient {
         ttl_secs: u64,
         node_name: Option<&str>,
         ledger_service_public_key: &[u8; 32],
+        connection_timeout_secs: Option<u64>,
     ) -> Result<Self> {
-        let channel = Self::create_channel(grpc_url).await?;
+        let channel = Self::create_channel(grpc_url, connection_timeout_secs).await?;
         let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interceptor = AuthInterceptor {
@@ -175,9 +176,45 @@ impl DAppProviderClient {
         })
     }
 
-    /// Create gRPC channel with optional TLS
-    async fn create_channel(grpc_url: &str) -> Result<Channel> {
+    /// Create a DAppProviderClient from a pre-existing shared channel.
+    ///
+    /// Skips channel creation (no TCP+TLS handshake). Each client gets its own
+    /// `AuthInterceptor` for JWT refresh, but shares the underlying HTTP/2 connection.
+    pub fn from_channel(
+        channel: Channel,
+        party_id: &str,
+        role: &str,
+        private_key_bytes: &[u8; 32],
+        ttl_secs: u64,
+        node_name: Option<&str>,
+        ledger_service_public_key: &[u8; 32],
+    ) -> Result<Self> {
+        let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let interceptor = AuthInterceptor {
+            token: Arc::new(RwLock::new(jwt)),
+            expires_at: Arc::new(RwLock::new(now + ttl_secs)),
+            party_id: party_id.to_string(),
+            role: role.to_string(),
+            private_key_bytes: *private_key_bytes,
+            ttl_secs,
+            node_name: node_name.map(|s| s.to_string()),
+        };
+        let client = DAppProviderServiceClient::with_interceptor(channel, interceptor);
+        Ok(Self {
+            client,
+            private_key_bytes: *private_key_bytes,
+            ledger_service_public_key: *ledger_service_public_key,
+        })
+    }
+
+    /// Create gRPC channel with optional TLS and timeouts
+    ///
+    /// The returned `Channel` is `Clone` and supports HTTP/2 multiplexing —
+    /// it can be shared across multiple workers to avoid per-request TCP+TLS overhead.
+    pub async fn create_channel(grpc_url: &str, timeout_secs: Option<u64>) -> Result<Channel> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
 
         if grpc_url.starts_with("https://") {
             let tls_config = ClientTlsConfig::new().with_webpki_roots().domain_name(
@@ -192,12 +229,16 @@ impl DAppProviderClient {
                 .context("Invalid gRPC URL")?
                 .tls_config(tls_config)
                 .context("Failed to configure TLS")?
+                .connect_timeout(timeout)
+                .timeout(timeout)
                 .connect()
                 .await
                 .context("Failed to connect to DAppProvider service")
         } else {
             Channel::from_shared(grpc_url.to_string())
                 .context("Invalid gRPC URL")?
+                .connect_timeout(timeout)
+                .timeout(timeout)
                 .connect()
                 .await
                 .context("Failed to connect to DAppProvider service")
@@ -219,7 +260,7 @@ impl DAppProviderClient {
                 template_filters: template_filters.to_vec(),
             })
             .await
-            .context("GetActiveContracts RPC failed")?;
+            .map_err(|s| anyhow!("GetActiveContracts RPC failed ({}): {}", s.code(), s.message()))?;
 
         let mut stream = resp.into_inner();
         let mut contracts = Vec::new();
@@ -245,7 +286,7 @@ impl DAppProviderClient {
             .client
             .get_ledger_end(GetLedgerEndRequest {})
             .await
-            .context("GetLedgerEnd RPC failed")?;
+            .map_err(|s| anyhow!("GetLedgerEnd RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().offset)
     }
 
@@ -264,7 +305,7 @@ impl DAppProviderClient {
                 template_filters: template_filters.to_vec(),
             })
             .await
-            .context("GetUpdates RPC failed")?;
+            .map_err(|s| anyhow!("GetUpdates RPC failed ({}): {}", s.code(), s.message()))?;
 
         let mut stream = resp.into_inner();
         let mut updates = Vec::new();
@@ -288,7 +329,7 @@ impl DAppProviderClient {
             .client
             .get_balances(GetBalancesRequest {})
             .await
-            .context("GetBalances RPC failed")?;
+            .map_err(|s| anyhow!("GetBalances RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().balances)
     }
 
@@ -298,7 +339,7 @@ impl DAppProviderClient {
             .client
             .get_preapprovals(GetPreapprovalsRequest {})
             .await
-            .context("GetPreapprovals RPC failed")?;
+            .map_err(|s| anyhow!("GetPreapprovals RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().preapprovals)
     }
 
@@ -308,7 +349,7 @@ impl DAppProviderClient {
             .client
             .get_dso_rates(GetDsoRatesRequest {})
             .await
-            .context("GetDsoRates RPC failed")?;
+            .map_err(|s| anyhow!("GetDsoRates RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner())
     }
 
@@ -323,8 +364,58 @@ impl DAppProviderClient {
                 settlement_ids: settlement_ids.to_vec(),
             })
             .await
-            .context("GetSettlementContracts RPC failed")?;
+            .map_err(|s| anyhow!("GetSettlementContracts RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().contracts)
+    }
+
+    /// Get unlocked amulets via the dedicated GetAmulets RPC
+    pub async fn get_amulets(&mut self) -> Result<Vec<crate::acs_worker::AmuletInfo>> {
+        use orderbook_proto::ledger::GetAmuletsRequest;
+
+        let resp = self
+            .client
+            .get_amulets(GetAmuletsRequest {})
+            .await
+            .map_err(|s| anyhow!("GetAmulets RPC failed ({}): {}", s.code(), s.message()))?;
+
+        Ok(resp
+            .into_inner()
+            .amulets
+            .into_iter()
+            .map(|a| crate::acs_worker::AmuletInfo {
+                contract_id: a.contract_id,
+                amount: a.amount.parse::<rust_decimal::Decimal>().unwrap_or(rust_decimal::Decimal::ZERO),
+            })
+            .collect())
+    }
+
+    /// Get amulets via GetActiveContracts with Amulet template filter (fallback)
+    pub async fn get_amulets_via_acs(&mut self) -> Result<Vec<crate::acs_worker::AmuletInfo>> {
+        let template = "#splice-amulet:Splice.Amulet:Amulet".to_string();
+        let contracts = self.get_active_contracts(&[template]).await?;
+
+        Ok(contracts
+            .into_iter()
+            .filter(|c| !c.template_id.contains("Locked"))
+            .filter_map(|c| {
+                let args = c.create_arguments?;
+                let amount_str = args.fields.get("amount")
+                    .and_then(|v| match &v.kind {
+                        Some(prost_types::value::Kind::StructValue(s)) =>
+                            s.fields.get("initialAmount"),
+                        _ => None,
+                    })
+                    .and_then(|v| match &v.kind {
+                        Some(prost_types::value::Kind::StringValue(s)) => Some(s.clone()),
+                        _ => None,
+                    })?;
+                let amount = amount_str.parse::<rust_decimal::Decimal>().ok()?;
+                Some(crate::acs_worker::AmuletInfo {
+                    contract_id: c.contract_id,
+                    amount,
+                })
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -352,7 +443,7 @@ impl DAppProviderClient {
             .client
             .prepare_transaction(req)
             .await
-            .context("PrepareTransaction RPC failed")?;
+            .map_err(|s| anyhow!("PrepareTransaction RPC failed ({}): {}", s.code(), s.message()))?;
         let response = resp.into_inner();
 
         // Verify response signature
@@ -399,7 +490,7 @@ impl DAppProviderClient {
                 }),
             })
             .await
-            .context("ExecuteTransaction RPC failed")?;
+            .map_err(|s| anyhow!("ExecuteTransaction RPC failed ({}): {}", s.code(), s.message()))?;
         let response = resp.into_inner();
 
         // Verify response signature
@@ -522,6 +613,7 @@ impl DAppProviderClient {
                     rewards_amount: None,
                     rewards_round: None,
                     response_signature: None,
+                    created_contracts: vec![],
                     transaction_status: 0,
                     provider_error: None,
                 });
@@ -564,7 +656,7 @@ impl DAppProviderClient {
                 Err(e) => {
                     // gRPC/network error — transaction may have succeeded
                     if start_offset > 0 {
-                        warn!("Execute error: {} — checking ledger updates", e);
+                        warn!("Execute error: {:#} — checking ledger updates", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         if let Some(recovered) = self.find_transaction_in_updates(
                             &prepared.command_id, start_offset
@@ -578,7 +670,7 @@ impl DAppProviderClient {
                         let delay = BASE_DELAY_MS * 2_u64.pow(attempt);
                         let jitter = rand::thread_rng().gen_range(0..delay / 10 + 1);
                         warn!(
-                            "Retrying after execute error (attempt {}/{}): {} — in {}ms [{}]",
+                            "Retrying after execute error (attempt {}/{}): {:#} — in {}ms [{}]",
                             attempt + 1, max_retries, e, delay + jitter, prepared.command_id
                         );
                         tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
@@ -682,6 +774,7 @@ impl DAppProviderClient {
                         rewards_amount: None,
                         rewards_round: None,
                         response_signature: None,
+                        created_contracts: vec![],
                         transaction_status: 0,
                         provider_error: None,
                     });

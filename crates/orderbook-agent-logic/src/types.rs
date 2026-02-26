@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use orderbook_proto::orderbook::SettlementProposal;
+use rust_decimal::Decimal;
 
 /// Settlement stage in the DVP workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +116,14 @@ pub enum AdvanceResult {
     Error { proposal_id: String, error: String },
     /// Timeout — likely transient, retry sooner (fixed 60s)
     Timeout { proposal_id: String },
+    /// Settlement needs allocation — caller should release settlement permit
+    /// before proceeding, since allocate blocks on the payment queue.
+    NeedsAllocate {
+        proposal_id: String,
+        dvp_cid: String,
+        allocation_cc: Option<Decimal>,
+        is_buyer: bool,
+    },
 }
 
 impl AdvanceResult {
@@ -127,7 +136,8 @@ impl AdvanceResult {
             | AdvanceResult::Terminal { proposal_id }
             | AdvanceResult::Wait { proposal_id }
             | AdvanceResult::Error { proposal_id, .. }
-            | AdvanceResult::Timeout { proposal_id } => proposal_id,
+            | AdvanceResult::Timeout { proposal_id }
+            | AdvanceResult::NeedsAllocate { proposal_id, .. } => proposal_id,
         }
     }
 

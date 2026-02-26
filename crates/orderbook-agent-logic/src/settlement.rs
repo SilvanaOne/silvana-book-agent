@@ -76,6 +76,12 @@ pub struct PendingFee {
     pub pending_traffic: u64,
     #[serde(default)]
     pub retry_count: u32,
+    /// USD fee amount from proposal (for CC conversion at queue time)
+    #[serde(default)]
+    pub fee_amount_usd: String,
+    /// Estimated CC needed (computed by backend using current CC/USD rate)
+    #[serde(default)]
+    pub fee_cc_estimate: f64,
 }
 
 /// A traffic fee queued for background processing (fire-and-forget).
@@ -103,8 +109,10 @@ pub trait SettlementBackend: Send + Sync {
     /// Accept DVP proposal (seller only)
     async fn accept_dvp(&self, proposal_id: &str, dvp_proposal_cid: &str) -> Result<StepResult>;
 
-    /// Allocate tokens for settlement
-    async fn allocate(&self, proposal_id: &str, dvp_cid: &str) -> Result<StepResult>;
+    /// Allocate tokens for settlement.
+    /// `allocation_cc`: Some(amount) if allocating CC amulets (needs amulet pre-selection),
+    /// None if allocating CIP-56 tokens.
+    async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult>;
 
     /// Transfer traffic fee to PARTY_TRAFFIC_FEE
     async fn transfer_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str) -> Result<()>;
@@ -134,6 +142,26 @@ pub trait SettlementBackend: Send + Sync {
 
     /// Get current payment queue depth: (allocations, fees, traffic).
     fn queue_depth(&self) -> (u64, u64, u64);
+
+    /// Get amulet cache stats: (available, consumed, reserved, selectable).
+    /// Returns None if the backend doesn't use an amulet cache.
+    fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
+        None
+    }
+
+    /// Get traffic fee backlog depth (fees waiting beyond the active queue).
+    fn traffic_backlog_depth(&self) -> usize {
+        0
+    }
+
+    /// Get per-pool worker utilization:
+    /// (alloc_active, alloc_max, fee_active, fee_max, traffic_active, traffic_max)
+    fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
+        None
+    }
+
+    /// Signal the payment queue to stop dispatching new work (for graceful shutdown).
+    fn shutdown(&self) {}
 }
 
 /// Settlement executor handles the DVP workflow
@@ -236,6 +264,21 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.backend.queue_depth()
     }
 
+    /// Get amulet cache stats: (available, consumed, reserved, selectable).
+    pub fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
+        self.backend.cache_stats()
+    }
+
+    /// Get traffic fee backlog depth (fees waiting beyond the active queue).
+    pub fn traffic_backlog_depth(&self) -> usize {
+        self.backend.traffic_backlog_depth()
+    }
+
+    /// Get per-pool worker utilization (delegated to backend).
+    pub fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
+        self.backend.worker_utilization()
+    }
+
     /// Return (in_progress, max_threads, in_backoff, waiting) for thread utilization logging
     pub fn thread_utilization(&self) -> (usize, usize, usize, usize) {
         let in_progress = self.in_progress.len();
@@ -249,14 +292,14 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Log a one-line summary of proposals waiting for CIDs (called from heartbeat).
     pub fn log_cid_waiting_summary(&self) {
-        let mut no_proposal = 0u32;
-        let mut no_dvp = 0u32;
+        let mut no_proposal_ids: Vec<&str> = Vec::new();
+        let mut no_dvp_ids: Vec<&str> = Vec::new();
         let mut stuck_10m = 0u32;
 
-        for entry in self.failed_settlements.values() {
+        for (id, entry) in &self.failed_settlements {
             match entry.cid_waiting {
-                Some(CidWaitingType::DvpProposal) => no_proposal += 1,
-                Some(CidWaitingType::DvpContract) => no_dvp += 1,
+                Some(CidWaitingType::DvpProposal) => no_proposal_ids.push(id),
+                Some(CidWaitingType::DvpContract) => no_dvp_ids.push(id),
                 None => continue,
             }
             if entry.first_transient_at
@@ -267,11 +310,13 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             }
         }
 
-        let total = no_proposal + no_dvp;
+        let total = no_proposal_ids.len() + no_dvp_ids.len();
         if total > 0 {
             warn!(
-                "CID waiting: {} proposals ({} no DvpProposal, {} no Dvp contract, {} stuck >10min)",
-                total, no_proposal, no_dvp, stuck_10m
+                "CID waiting: {} proposals ({} no DvpProposal, {} no Dvp contract, {} stuck >10min)\n  \
+                 no DvpProposal: {:?}\n  no Dvp contract: {:?}",
+                total, no_proposal_ids.len(), no_dvp_ids.len(), stuck_10m,
+                no_proposal_ids, no_dvp_ids,
             );
         }
     }
@@ -304,6 +349,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Signal that we are shutting down — reject new proposals, drain confirmed ones
     pub fn set_shutting_down(&mut self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Signal the backend's payment queue to stop dispatching new work.
+    pub fn shutdown_backend(&self) {
+        self.backend.shutdown();
     }
 
     /// Replace the shutdown flag with an externally-provided one (shares runner's Ctrl-C flag)
@@ -590,7 +640,23 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         // First, collect results from previously spawned tasks
         let _ = self.collect_results().await;
 
-        let proposal_ids: Vec<String> = self.active_settlements.keys().cloned().collect();
+        // Drain needs_readvance: these settlements have actual work to do
+        // (on-chain state change detected, step completed in-task, etc.).
+        // Clear their cooldowns so they're immediately eligible, and spawn
+        // them before the rest to prevent starvation by Wait polling.
+        let priority_ids: Vec<String> = self.needs_readvance.drain().collect();
+        for pid in &priority_ids {
+            self.failed_settlements.remove(pid);
+        }
+
+        // Build spawn list: priority IDs first, then remaining active settlements
+        let mut proposal_ids = priority_ids;
+        for key in self.active_settlements.keys() {
+            if !proposal_ids.contains(key) {
+                proposal_ids.push(key.clone());
+            }
+        }
+
         for proposal_id in proposal_ids {
             // Skip if already being processed by a spawned task
             if self.in_progress.contains_key(&proposal_id) {
@@ -633,7 +699,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             self.pending_results.push((proposal_id, rx));
 
             let handle = tokio::spawn(async move {
-                let _permit = permit; // held until task completes
+                let mut permit = Some(permit); // droppable before allocate
                 let mut local_state = state;
 
                 // Initial jitter to stagger threads (0-2s) — avoids thundering herd
@@ -644,7 +710,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     // Check shutdown flag before each step
                     let is_shutting_down = shutting_down.load(Ordering::Relaxed);
 
-                    let result = tokio::time::timeout(Duration::from_secs(120), async {
+                    let result = tokio::time::timeout(Duration::from_secs(300), async {
                         advance_single(
                             pid.clone(),
                             local_state.clone(),
@@ -662,7 +728,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         Ok(r) => r,
                         Err(_) => {
                             error!(
-                                "[{}] Settlement step timed out after 120s (role={}, stage={})",
+                                "[{}] Settlement step timed out after 300s (role={}, stage={})",
                                 pid,
                                 if local_state.is_buyer { "buyer" } else { "seller" },
                                 local_state.stage,
@@ -670,6 +736,72 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                             AdvanceResult::Timeout { proposal_id: pid.clone() }
                         }
                     };
+
+                    // NeedsAllocate: release settlement permit before blocking on payment queue
+                    if let AdvanceResult::NeedsAllocate {
+                        ref proposal_id, ref dvp_cid, allocation_cc, is_buyer,
+                    } = advance_result {
+                        // Release settlement permit — allows other settlements to start
+                        drop(permit.take());
+
+                        let alloc_result = tokio::time::timeout(
+                            Duration::from_secs(600),
+                            backend.allocate(proposal_id, dvp_cid, allocation_cc),
+                        ).await;
+                        let alloc_result = match alloc_result {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow::anyhow!("Allocate timed out after 600s")),
+                        };
+                        match alloc_result {
+                            Ok(step_result) => {
+                                // Record allocation completed event
+                                let event_type = if is_buyer {
+                                    SettlementEventType::AllocationBuyerCompleted
+                                } else {
+                                    SettlementEventType::AllocationSellerCompleted
+                                };
+                                let jwt = match generate_jwt(
+                                    &config.party_id, &config.role, &config.private_key_bytes,
+                                    config.token_ttl_secs, Some(config.node_name.as_str()),
+                                ) {
+                                    Ok(j) => j,
+                                    Err(e) => {
+                                        warn!("[{}] JWT gen for alloc event failed: {}", proposal_id, e);
+                                        String::new()
+                                    }
+                                };
+                                if !jwt.is_empty() {
+                                    if let Ok(mut rpc_client) = OrderbookRpcClient::connect(
+                                        &config.orderbook_grpc_url, Some(jwt),
+                                    ).await {
+                                        record_step_completed(
+                                            &mut rpc_client, proposal_id, &config.party_id,
+                                            is_buyer, event_type,
+                                            &step_result.update_id, &step_result.contract_id,
+                                        ).await;
+                                    }
+                                }
+
+                                let final_result = AdvanceResult::StepCompleted {
+                                    proposal_id: proposal_id.clone(),
+                                    stage: SettlementStage::Allocated,
+                                    dvp_proposal_cid: None,
+                                    dvp_cid: None,
+                                    allocation_cid: Some(step_result.contract_id),
+                                    pending_traffic: 0,
+                                };
+                                let _ = tx.send((final_result, local_state));
+                            }
+                            Err(e) => {
+                                let err_result = AdvanceResult::Error {
+                                    proposal_id: proposal_id.clone(),
+                                    error: format!("Allocate failed: {:#}", e),
+                                };
+                                let _ = tx.send((err_result, local_state));
+                            }
+                        }
+                        break;
+                    }
 
                     if advance_result.should_readvance() && !shutting_down.load(Ordering::Relaxed) {
                         advance_result.apply_to_state(&mut local_state);
@@ -727,8 +859,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         if !actions.is_empty() {
             let mut by_action: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
             for (pid, action) in &actions {
-                let short_id = if pid.len() >= 8 { &pid[..8] } else { pid.as_str() };
-                by_action.entry(action).or_default().push(short_id);
+                by_action.entry(action).or_default().push(pid.as_str());
             }
             let summary: Vec<String> = by_action.iter()
                 .map(|(action, ids)| format!("{}({})", action, ids.join(", ")))
@@ -815,13 +946,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.needs_readvance.remove(&proposal_id);
             }
             AdvanceResult::Wait { proposal_id } => {
-                self.failed_settlements.remove(&proposal_id);
-            }
-            AdvanceResult::Error { proposal_id, error } => {
-                let is_inactive = error.contains("INACTIVE_CONTRACTS");
-                let is_transient = is_inactive
-                    || error.contains("No Dvp contract ID found")
-                    || error.contains("No DvpProposal CID found");
+                // Cooldown: don't re-poll for 30s. Without this, Wait settlements
+                // are re-polled every 2s, consuming semaphore permits and starving
+                // actionable settlements (CreateDvp, AcceptDvp) that are later in
+                // the iteration order. When counterparty acts, sync_on_chain_contracts
+                // adds to needs_readvance which clears the cooldown immediately.
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
@@ -829,7 +958,26 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         first_transient_at: None,
                         cid_waiting: None,
                     });
-                if !is_transient {
+                entry.retry_count = 0; // Not a failure — don't accumulate
+                entry.next_retry = Instant::now() + Duration::from_secs(30);
+                entry.cid_waiting = None;
+            }
+            AdvanceResult::Error { proposal_id, error } => {
+                let is_permanent = error.contains("deadline-exceeded");
+                let is_inactive = error.contains("INACTIVE_CONTRACTS");
+                let is_transient = !is_permanent && (is_inactive
+                    || error.contains("No Dvp contract ID found")
+                    || error.contains("No DvpProposal CID found"));
+                let entry = self.failed_settlements.entry(proposal_id.clone())
+                    .or_insert(FailedSettlement {
+                        retry_count: 0,
+                        next_retry: Instant::now(),
+                        first_transient_at: None,
+                        cid_waiting: None,
+                    });
+                if is_permanent {
+                    entry.retry_count = FailedSettlement::max_retries();
+                } else if !is_transient {
                     entry.retry_count += 1;
                 }
 
@@ -931,6 +1079,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     proposal_id, entry.retry_count, FailedSettlement::max_retries()
                 );
             }
+            AdvanceResult::NeedsAllocate { .. } => {
+                // Should never reach apply_result — handled in the spawned task loop
+                warn!("Unexpected NeedsAllocate in apply_result");
+            }
         }
         self.update_actionable_count();
     }
@@ -1013,10 +1165,14 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let contracts = match self.backend.sync_contracts(&settlement_ids).await {
             Ok(c) => c,
             Err(e) => {
-                warn!("sync_on_chain_contracts: {}", e);
+                warn!("sync_on_chain_contracts: {} ({} active settlements)", e, settlement_ids.len());
                 return;
             }
         };
+
+        let mut found_proposals = 0u32;
+        let mut found_dvps = 0u32;
+        let mut found_allocations = 0u32;
 
         for contract in &contracts {
             let Some(state) = self.active_settlements.get_mut(&contract.settlement_id) else { continue };
@@ -1025,15 +1181,43 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 debug!("[{}] Discovered DvpProposal on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.dvp_proposal_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
+                found_proposals += 1;
             } else if contract.contract_type == "Dvp" && state.dvp_cid.is_none() {
                 debug!("[{}] Discovered Dvp on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.dvp_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
+                found_dvps += 1;
             } else if contract.contract_type == "Allocation" && state.allocation_cid.is_none() {
                 debug!("[{}] Discovered Allocation on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.allocation_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
+                found_allocations += 1;
             }
+        }
+
+        // Identify settlements still waiting for CIDs (only those already flagged as cid_waiting)
+        let missing_proposal_ids: Vec<&str> = self.failed_settlements.iter()
+            .filter(|(_, f)| matches!(f.cid_waiting, Some(CidWaitingType::DvpProposal)))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let missing_dvp_ids: Vec<&str> = self.failed_settlements.iter()
+            .filter(|(_, f)| matches!(f.cid_waiting, Some(CidWaitingType::DvpContract)))
+            .map(|(id, _)| id.as_str())
+            .collect();
+
+        if !missing_proposal_ids.is_empty() || !missing_dvp_ids.is_empty() {
+            warn!(
+                "sync_on_chain_contracts: gRPC returned {} contracts (new: {} DvpProposal, {} Dvp, {} Allocation). \
+                 Still missing: {} DvpProposal {:?}, {} Dvp {:?}",
+                contracts.len(), found_proposals, found_dvps, found_allocations,
+                missing_proposal_ids.len(), missing_proposal_ids,
+                missing_dvp_ids.len(), missing_dvp_ids,
+            );
+        } else if found_proposals > 0 || found_dvps > 0 || found_allocations > 0 {
+            info!(
+                "sync_on_chain_contracts: gRPC returned {} contracts (new: {} DvpProposal, {} Dvp, {} Allocation)",
+                contracts.len(), found_proposals, found_dvps, found_allocations,
+            );
         }
     }
 
@@ -1325,7 +1509,7 @@ async fn advance_single<B: SettlementBackend>(
         Ok(j) => j,
         Err(e) => return AdvanceResult::Error {
             proposal_id,
-            error: format!("JWT generation failed: {}", e),
+            error: format!("JWT generation failed: {:#}", e),
         },
     };
 
@@ -1333,7 +1517,7 @@ async fn advance_single<B: SettlementBackend>(
         Ok(c) => c,
         Err(e) => return AdvanceResult::Error {
             proposal_id,
-            error: format!("RPC connect failed: {}", e),
+            error: format!("RPC connect failed: {:#}", e),
         },
     };
 
@@ -1342,7 +1526,7 @@ async fn advance_single<B: SettlementBackend>(
         Ok(s) => s,
         Err(e) => return AdvanceResult::Error {
             proposal_id,
-            error: format!("GetSettlementStatus failed: {}", e),
+            error: format!("GetSettlementStatus failed: {:#}", e),
         },
     };
 
@@ -1378,7 +1562,7 @@ async fn advance_single<B: SettlementBackend>(
                     }
                     Err(e) => AdvanceResult::Error {
                         proposal_id,
-                        error: format!("Preconfirmation failed: {}", e),
+                        error: format!("Preconfirmation failed: {:#}", e),
                     },
                 }
             }
@@ -1396,12 +1580,19 @@ async fn advance_single<B: SettlementBackend>(
                 state.is_buyer, submitted_event,
             ).await;
             // Queue fee for background processing (fire-and-forget)
+            let fee_usd = if state.is_buyer {
+                state.proposal.dvp_processing_fee_buyer.clone()
+            } else {
+                state.proposal.dvp_processing_fee_seller.clone()
+            };
             backend.queue_fee_payment(PendingFee {
                 proposal_id: proposal_id.clone(),
                 fee_type: "dvp".to_string(),
                 is_buyer: state.is_buyer,
                 pending_traffic: 0,
                 retry_count: 0,
+                fee_amount_usd: fee_usd,
+                fee_cc_estimate: 0.0,
             }).await;
             AdvanceResult::StepCompleted {
                 proposal_id,
@@ -1435,11 +1626,28 @@ async fn advance_single<B: SettlementBackend>(
                 }
                 Err(e) => AdvanceResult::Error {
                     proposal_id,
-                    error: format!("CreateDvp failed: {}", e),
+                    error: format!("CreateDvp failed: {:#}", e),
                 },
             }
         }
         NextAction::AcceptDvp => {
+            // Check if proposal has expired before attempting on-chain transaction
+            if let Some(created_at) = &state.proposal.created_at {
+                let deadline = created_at.seconds + config.settle_before_secs as i64;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                if now > deadline {
+                    return AdvanceResult::Error {
+                        proposal_id,
+                        error: format!(
+                            "DvpProposal expired: deadline-exceeded (created {}s ago, max {}s)",
+                            now - created_at.seconds, config.settle_before_secs
+                        ),
+                    };
+                }
+            }
             action_log.lock().await.push((proposal_id.clone(), "AcceptDvp"));
             let dvp_proposal_cid = match state.dvp_proposal_cid {
                 Some(ref cid) => cid.clone(),
@@ -1470,7 +1678,7 @@ async fn advance_single<B: SettlementBackend>(
                 }
                 Err(e) => AdvanceResult::Error {
                     proposal_id,
-                    error: format!("AcceptDvp failed: {}", e),
+                    error: format!("AcceptDvp failed: {:#}", e),
                 },
             }
         }
@@ -1487,12 +1695,19 @@ async fn advance_single<B: SettlementBackend>(
                 state.is_buyer, submitted_event,
             ).await;
             // Queue fee for background processing (fire-and-forget)
+            let fee_usd = if state.is_buyer {
+                state.proposal.allocation_processing_fee_buyer.clone()
+            } else {
+                state.proposal.allocation_processing_fee_seller.clone()
+            };
             backend.queue_fee_payment(PendingFee {
                 proposal_id: proposal_id.clone(),
                 fee_type: "allocate".to_string(),
                 is_buyer: state.is_buyer,
                 pending_traffic: 0,
                 retry_count: 0,
+                fee_amount_usd: fee_usd,
+                fee_cc_estimate: 0.0,
             }).await;
             AdvanceResult::StepCompleted {
                 proposal_id,
@@ -1525,32 +1740,32 @@ async fn advance_single<B: SettlementBackend>(
                     error: "No Dvp contract ID found (not yet accepted?)".into(),
                 },
             };
-            match backend.allocate(&proposal_id, &dvp_cid).await {
-                Ok(result) => {
-                    let event_type = if state.is_buyer {
-                        SettlementEventType::AllocationBuyerCompleted
-                    } else {
-                        SettlementEventType::AllocationSellerCompleted
-                    };
-                    record_step_completed(
-                        &mut rpc_client, &proposal_id, &config.party_id,
-                        state.is_buyer, event_type, &result.update_id, &result.contract_id,
-                    ).await;
 
-                    // Traffic fee queued by payment queue processor after allocate
-                    AdvanceResult::StepCompleted {
-                        proposal_id,
-                        stage: SettlementStage::Allocated,
-                        dvp_proposal_cid: None,
-                        dvp_cid: None,
-                        allocation_cid: Some(result.contract_id),
-                        pending_traffic: 0,
-                    }
+            // Determine if this is a CC allocation (needs amulet pre-selection)
+            let my_instrument = if state.is_buyer {
+                &state.proposal.quote_instrument  // buyer allocates quote (payment leg)
+            } else {
+                &state.proposal.base_instrument   // seller allocates base (delivery leg)
+            };
+            let allocation_cc = match &config.cc_token_id {
+                Some(cc_id) if my_instrument == cc_id => {
+                    let amount_str = if state.is_buyer {
+                        &state.proposal.quote_quantity
+                    } else {
+                        &state.proposal.base_quantity
+                    };
+                    Some(Decimal::from_str(amount_str).unwrap_or(Decimal::ONE))
                 }
-                Err(e) => AdvanceResult::Error {
-                    proposal_id,
-                    error: format!("Allocate failed: {}", e),
-                },
+                _ => None,
+            };
+
+            // Return NeedsAllocate so the caller can release the settlement
+            // permit before blocking on the payment queue.
+            AdvanceResult::NeedsAllocate {
+                proposal_id,
+                dvp_cid,
+                allocation_cc,
+                is_buyer: state.is_buyer,
             }
         }
         NextAction::Wait => {

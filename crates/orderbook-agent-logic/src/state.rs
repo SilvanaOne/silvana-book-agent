@@ -10,7 +10,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::settlement::{PendingFee, PendingTrafficFee};
 
@@ -136,6 +136,44 @@ pub fn save_state(path: &Path, state: &SavedState) -> Result<()> {
     std::fs::rename(&tmp_path, path)?;
     info!("State saved to {}", path.display());
     Ok(())
+}
+
+/// Save a timestamped backup copy of the state file into a `backups/` subfolder.
+/// Never panics — logs errors and returns silently on failure.
+pub fn save_backup(path: &Path, state: &SavedState) {
+    let backup_dir = match path.parent() {
+        Some(parent) => parent.join("backups"),
+        None => {
+            error!("Cannot determine parent directory for backup: {}", path.display());
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&backup_dir) {
+        error!("Failed to create backup directory {}: {}", backup_dir.display(), e);
+        return;
+    }
+
+    // Use ISO8601 timestamp with colons replaced by dashes for filesystem safety
+    let timestamp = chrono::Utc::now()
+        .format("%Y-%m-%dT%H-%M-%SZ")
+        .to_string();
+    let backup_path = backup_dir.join(format!("agent-state-{}.json", timestamp));
+
+    let json = match serde_json::to_string_pretty(state) {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to serialize state for backup: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::write(&backup_path, &json) {
+        error!("Failed to write backup file {}: {}", backup_path.display(), e);
+        return;
+    }
+
+    info!("State backup saved to {}", backup_path.display());
 }
 
 /// Load state from a JSON file. Returns None if file doesn't exist or is corrupt.

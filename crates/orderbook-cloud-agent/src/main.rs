@@ -28,6 +28,8 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
+mod amulet_cache;
+mod acs_worker;
 mod backend;
 mod config;
 mod fill_loop;
@@ -470,6 +472,7 @@ async fn run_cloud_agent(
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await
     .context("Failed to create ledger client")?;
@@ -531,6 +534,7 @@ async fn run_fill(
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await
     .context("Failed to create ledger client")?;
@@ -893,6 +897,7 @@ async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await?;
 
@@ -994,6 +999,7 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await?;
 
@@ -1056,6 +1062,7 @@ async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, ver
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await?;
 
@@ -1167,6 +1174,7 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await?;
 
@@ -1201,6 +1209,7 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                             description,
                             command_id,
                             settlement_proposal_id: None,
+                            amulet_cids: vec![],
                         })),
                         request_signature: None,
                     },
@@ -1708,6 +1717,7 @@ instrument_admin = ""
         base_config.token_ttl_secs,
         Some(base_config.node_name.as_str()),
         &base_config.ledger_service_public_key,
+        Some(base_config.connection_timeout_secs),
     )
     .await
     .context("Failed to create authenticated DAppProvider client")?;
@@ -1859,6 +1869,7 @@ async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verb
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
     )
     .await?;
 

@@ -278,22 +278,37 @@ impl OrderbookClient {
         Ok(orders)
     }
 
-    /// Get pending settlement proposals for this party
+    /// Get pending settlement proposals for this party (paginated, fetches all)
     pub async fn get_pending_proposals(&mut self) -> Result<Vec<SettlementProposal>> {
-        let request = Request::new(GetSettlementProposalsRequest {
-            market_id: None,
-            status: Some(SettlementStatus::Pending as i32),
-            limit: Some(50),
-            offset: None,
-        });
+        let page_size = 50u32;
+        let mut all_proposals = Vec::new();
+        let mut offset = 0u32;
 
-        let response = self
-            .orderbook_client
-            .get_settlement_proposals(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_settlement_proposals failed: {}", e.message()))?;
+        loop {
+            let request = Request::new(GetSettlementProposalsRequest {
+                market_id: None,
+                status: Some(SettlementStatus::Pending as i32),
+                limit: Some(page_size),
+                offset: Some(offset),
+            });
 
-        Ok(response.into_inner().proposals)
+            let response = self
+                .orderbook_client
+                .get_settlement_proposals(request)
+                .await
+                .map_err(|e| anyhow::anyhow!("get_settlement_proposals failed: {}", e.message()))?;
+
+            let inner = response.into_inner();
+            let page_count = inner.proposals.len() as u32;
+            all_proposals.extend(inner.proposals);
+
+            if page_count < page_size || all_proposals.len() as u32 >= inner.total {
+                break;
+            }
+            offset += page_size;
+        }
+
+        Ok(all_proposals)
     }
 
     /// Subscribe to settlement updates

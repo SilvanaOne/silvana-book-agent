@@ -25,7 +25,7 @@ use crate::order_tracker::OrderTracker;
 use crate::settlement::{SettlementBackend, SettlementExecutor};
 use crate::state::{
     SavedAcceptedRfqTrade, SavedFillState, SavedQuotedTrade, SavedState, delete_state, load_state,
-    save_state,
+    save_backup, save_state,
 };
 
 /// Trade parameters recorded when buyer accepts an RFQ quote
@@ -359,6 +359,11 @@ where
     // Main event loop
     if !options.orders_only {
         loop {
+            // Check shutdown flag directly — the Notify permit can be consumed
+            // by tokio::select! polling without the shutdown arm being selected
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
             tokio::select! {
                 result = async {
                     match &mut settlement_stream {
@@ -495,8 +500,19 @@ where
                     let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
                     let pct = if max > 0 { used * 100 / max } else { 0 };
                     let (alloc, fees, traffic) = settlement_executor.queue_depth();
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic);
+                    let backlog = settlement_executor.traffic_backlog_depth();
+                    let cache_str = if let Some((avail, consumed, reserved, selectable)) = settlement_executor.cache_stats() {
+                        format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
+                    } else {
+                        String::new()
+                    };
+                    let worker_str = if let Some((aa, am, fa, fm, ta, tm)) = settlement_executor.worker_utilization() {
+                        format!(", workers alloc {}/{} fee {}/{} traffic {}/{}", aa, am, fa, fm, ta, tm)
+                    } else {
+                        String::new()
+                    };
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str);
                     settlement_executor.log_cid_waiting_summary();
                     // Every 5 minutes, also list individual settlement IDs
                     if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
@@ -513,6 +529,9 @@ where
     } else {
         // Orders-only mode
         loop {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
             tokio::select! {
                 _ = order_update_timer.tick(), if has_markets && !shutdown_flag.load(Ordering::Relaxed) => {
                     match tokio::time::timeout(
@@ -542,6 +561,7 @@ where
     // Graceful shutdown — save state and exit immediately
     info!("Shutting down...");
     settlement_executor.set_shutting_down();
+    settlement_executor.shutdown_backend();
 
     // Wait for in-flight settlement tasks to finish (they stop looping on shutdown flag)
     let drained = settlement_executor.drain_tasks().await;
@@ -636,6 +656,7 @@ where
                     saved.completed_proposals.len(),
                     saved.rejected_proposals.len(),
                 );
+                save_backup(state_file, &saved);
             }
             Err(e) => {
                 error!("Failed to save state: {:#}", e);

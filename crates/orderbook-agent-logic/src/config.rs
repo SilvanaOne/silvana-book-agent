@@ -116,6 +116,9 @@ pub struct BaseConfig {
 
     // Settlement throttle
     pub max_active_settlements: usize,
+
+    // Settlement expiry (max lifetime before considering expired)
+    pub settle_before_secs: u64,
 }
 
 impl BaseConfig {
@@ -187,6 +190,12 @@ impl BaseConfig {
             .map_err(|_| anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
         let ledger_service_public_key = decode_public_key(&ledger_service_public_key_b58)?;
 
+        let settle_before_secs = agent.markets.iter()
+            .filter_map(|m| m.rfq.as_ref())
+            .map(|r| r.settle_before_secs as u64)
+            .max()
+            .unwrap_or(default_rfq_settle_before_secs() as u64);
+
         Ok(BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
@@ -214,6 +223,7 @@ impl BaseConfig {
             ledger_service_public_key,
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
+            settle_before_secs,
         })
     }
 

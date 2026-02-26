@@ -7,8 +7,11 @@
 //! serialized through a PaymentQueue to avoid LOCKED_CONTRACTS race conditions.
 //! Operations that don't use amulets (propose_dvp, accept_dvp) run concurrently.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use tracing::{debug, info};
 
 use orderbook_agent_logic::config::BaseConfig;
@@ -21,6 +24,8 @@ use orderbook_proto::ledger::{
 
 use tx_verifier::OperationExpectation;
 
+use crate::amulet_cache::AmuletCache;
+use crate::acs_worker::spawn_acs_worker;
 use crate::ledger_client::DAppProviderClient;
 use crate::payment_queue::PaymentQueue;
 
@@ -32,13 +37,19 @@ pub struct CloudSettlementBackend {
     force: bool,
     confirm: bool,
     confirm_lock: ConfirmLock,
-    /// Serializes all amulet-touching operations with priority
-    /// (Allocate > PayFee > TransferTrafficFee)
+    /// Parallel payment queue with amulet cache
     payment_queue: PaymentQueue,
+    /// Shared amulet cache for heartbeat stats
+    amulet_cache: Arc<AmuletCache>,
 }
 
 impl CloudSettlementBackend {
     pub fn new(config: BaseConfig, verbose: bool, dry_run: bool, force: bool, confirm: bool, confirm_lock: ConfirmLock) -> Self {
+        let cache = AmuletCache::new();
+
+        // Spawn ACS worker to refresh amulet cache periodically
+        spawn_acs_worker(config.clone(), cache.clone());
+
         let payment_queue = PaymentQueue::new(
             config.clone(),
             verbose,
@@ -46,8 +57,9 @@ impl CloudSettlementBackend {
             force,
             confirm,
             confirm_lock.clone(),
+            cache.clone(),
         );
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue }
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache }
     }
 
     /// Create a new DAppProviderClient for this request
@@ -60,6 +72,7 @@ impl CloudSettlementBackend {
             self.config.token_ttl_secs,
             Some(self.config.node_name.as_str()),
             &self.config.ledger_service_public_key,
+            Some(self.config.connection_timeout_secs),
         )
         .await
     }
@@ -68,7 +81,7 @@ impl CloudSettlementBackend {
 #[async_trait]
 impl SettlementBackend for CloudSettlementBackend {
     async fn pay_fee(&self, proposal_id: &str, fee_type: &str) -> Result<StepResult> {
-        self.payment_queue.submit_pay_fee(proposal_id, fee_type).await
+        self.payment_queue.submit_pay_fee(proposal_id, fee_type, 0.0).await
     }
 
     async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
@@ -161,8 +174,8 @@ impl SettlementBackend for CloudSettlementBackend {
         })
     }
 
-    async fn allocate(&self, proposal_id: &str, dvp_cid: &str) -> Result<StepResult> {
-        self.payment_queue.submit_allocate(proposal_id, dvp_cid).await
+    async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult> {
+        self.payment_queue.submit_allocate(proposal_id, dvp_cid, allocation_cc).await
     }
 
     async fn transfer_traffic_fee(
@@ -183,7 +196,27 @@ impl SettlementBackend for CloudSettlementBackend {
         self.payment_queue.queue_traffic_fee(traffic_bytes, step_name, proposal_id);
     }
 
-    async fn queue_fee_payment(&self, fee: PendingFee) {
+    async fn queue_fee_payment(&self, mut fee: PendingFee) {
+        // Compute fee CC estimate from USD amount using current CC/USD rate
+        if !fee.fee_amount_usd.is_empty() {
+            if let Ok(fee_usd) = fee.fee_amount_usd.parse::<f64>() {
+                if fee_usd > 0.0 {
+                    if let Ok(mut client) = self.create_client().await {
+                        if let Ok(rates) = client.get_dso_rates().await {
+                            if let Ok(rate) = rates.cc_usd_rate.parse::<f64>() {
+                                if rate > 0.0 {
+                                    fee.fee_cc_estimate = fee_usd / rate;
+                                    debug!(
+                                        "[{}] Fee CC estimate: {} USD / {} rate = {} CC",
+                                        fee.proposal_id, fee_usd, rate, fee.fee_cc_estimate
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.payment_queue.queue_fee_background(fee).await;
     }
 
@@ -205,11 +238,34 @@ impl SettlementBackend for CloudSettlementBackend {
     }
 
     fn restore_pending_traffic_fees(&self, fees: Vec<PendingTrafficFee>) {
-        self.payment_queue.restore_pending_traffic_fees(fees);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.payment_queue.restore_pending_traffic_fees(fees))
+        });
     }
 
     fn queue_depth(&self) -> (u64, u64, u64) {
         self.payment_queue.queue_depth()
+    }
+
+    fn shutdown(&self) {
+        self.payment_queue.shutdown();
+    }
+
+    fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
+        // Use block_in_place since stats() is async (holds read locks)
+        Some(tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.amulet_cache.stats())
+        }))
+    }
+
+    fn traffic_backlog_depth(&self) -> usize {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.payment_queue.traffic_backlog_depth())
+        })
+    }
+
+    fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
+        Some(self.payment_queue.worker_utilization())
     }
 
     async fn sync_contracts(
