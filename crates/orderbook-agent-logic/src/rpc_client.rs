@@ -150,7 +150,7 @@ impl OrderbookRpcClient {
             .settlement_client
             .record_transaction(request)
             .await
-            .map_err(|e| anyhow!("RecordTransaction RPC failed: {}", e))?;
+            .map_err(|e| anyhow!("RecordTransaction RPC failed ({}): {}", e.code(), e.message()))?;
 
         let inner = response.into_inner();
         if !inner.success {
@@ -171,7 +171,7 @@ impl OrderbookRpcClient {
             .settlement_client
             .record_settlement_event(request)
             .await
-            .map_err(|e| anyhow!("RecordSettlementEvent RPC failed: {}", e))?;
+            .map_err(|e| anyhow!("RecordSettlementEvent RPC failed ({}): {}", e.code(), e.message()))?;
 
         let inner = response.into_inner();
         if !inner.success {
@@ -193,7 +193,7 @@ impl OrderbookRpcClient {
             .settlement_client
             .save_disclosed_contract(request)
             .await
-            .map_err(|e| anyhow!("SaveDisclosedContract RPC failed: {}", e))?;
+            .map_err(|e| anyhow!("SaveDisclosedContract RPC failed ({}): {}", e.code(), e.message()))?;
 
         let inner = response.into_inner();
         if !inner.success {
@@ -221,7 +221,7 @@ impl OrderbookRpcClient {
             .settlement_client
             .get_settlement_proposal_by_id(request)
             .await
-            .map_err(|e| anyhow!("GetSettlementProposalById RPC failed: {}", e))?;
+            .map_err(|e| anyhow!("GetSettlementProposalById RPC failed ({}): {}", e.code(), e.message()))?;
 
         let inner = response.into_inner();
         if inner.found {
@@ -267,7 +267,7 @@ impl OrderbookRpcClient {
         self.settlement_client
             .submit_preconfirmation(request)
             .await
-            .map_err(|e| anyhow!("SubmitPreconfirmation RPC failed: {}", e))?;
+            .map_err(|e| anyhow!("SubmitPreconfirmation RPC failed ({}): {}", e.code(), e.message()))?;
 
         Ok(())
     }
@@ -289,7 +289,7 @@ impl OrderbookRpcClient {
             .settlement_client
             .get_settlement_status(request)
             .await
-            .map_err(|e| anyhow!("GetSettlementStatus RPC failed: {}", e))?;
+            .map_err(|e| anyhow!("GetSettlementStatus RPC failed ({}): {}", e.code(), e.message()))?;
 
         Ok(response.into_inner())
     }

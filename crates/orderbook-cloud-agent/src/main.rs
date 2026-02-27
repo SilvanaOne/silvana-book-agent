@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
@@ -16,7 +18,7 @@ use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
-    TransferCcParams, TransferCip56Params, AcceptCip56Params,
+    TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
     prepare_transaction_request::Params,
     d_app_provider_service_client::DAppProviderServiceClient,
@@ -26,6 +28,8 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
+mod amulet_cache;
+mod acs_worker;
 mod backend;
 mod config;
 mod fill_loop;
@@ -78,6 +82,12 @@ enum Commands {
         /// Disable settlement
         #[arg(long)]
         orders_only: bool,
+        /// Skip restoring state from previous session
+        #[arg(long)]
+        no_restore: bool,
+        /// Accept all proposals without verification (for migration from old worker without saved state)
+        #[arg(long)]
+        no_reject: bool,
     },
     /// Query information
     Info {
@@ -247,6 +257,15 @@ enum TransferCommands {
         #[arg(long)]
         contract_id: String,
     },
+    /// Split CC into multiple amulets (MergeSplit via AmuletRules_Transfer)
+    SplitCc {
+        /// Comma-separated output amounts (e.g. "10.5,20.0,5.0")
+        #[arg(long, value_delimiter = ',')]
+        output_amounts: Vec<String>,
+        /// Comma-separated input amulet contract IDs
+        #[arg(long, value_delimiter = ',')]
+        amulet_cids: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -345,7 +364,7 @@ async fn main() -> Result<()> {
     // Initialize logging (LOG_DESTINATION=console|file)
     orderbook_agent_logic::logging::init_logging(
         cli.verbose,
-        &["orderbook_cloud_agent", "orderbook_agent_logic", "tx_verifier"],
+        &["cloud_agent", "orderbook_agent_logic", "tx_verifier"],
         "cloud-agent",
     );
 
@@ -369,7 +388,9 @@ async fn main() -> Result<()> {
         Commands::Agent {
             settlement_only,
             orders_only,
-        } => run_cloud_agent(base_config, settlement_only, orders_only, verbose, dry_run, force, confirm).await,
+            no_restore,
+            no_reject,
+        } => run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm).await,
         Commands::Info { command } => run_info(base_config, command).await,
         Commands::Preapproval { command } => run_preapproval(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Subscription { command } => run_subscription(base_config, command, verbose, dry_run, force, confirm).await,
@@ -407,6 +428,8 @@ async fn run_cloud_agent(
     config: BaseConfig,
     settlement_only: bool,
     orders_only: bool,
+    no_restore: bool,
+    no_reject: bool,
     verbose: bool,
     dry_run: bool,
     force: bool,
@@ -423,19 +446,29 @@ async fn run_cloud_agent(
     );
     info!("Fee reserve: {:.2} CC", config.fee_reserve_cc);
 
-    // Start LP settlement stream if liquidity_provider is configured
-    if let Some(ref lp_config) = config.liquidity_provider {
+    // Create RfqHandler early so we can share its quoted_trades Arc with AgentOptions
+    let lp_shutdown = Arc::new(AtomicBool::new(false));
+    let quoted_rfq_trades = if config.liquidity_provider.is_some() {
+        let rfq_handler = rfq_handler::RfqHandler::new(&config)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
+        let quoted_trades = rfq_handler.quoted_trades();
+
         info!(
             "LP mode enabled: name={}, starting settlement stream",
-            lp_config.name
+            config.liquidity_provider.as_ref().unwrap().name
         );
         let config_clone = config.clone();
+        let lp_shutdown_clone = lp_shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_lp_settlement_stream(config_clone).await {
+            if let Err(e) = run_lp_settlement_stream(config_clone, rfq_handler, lp_shutdown_clone).await {
                 tracing::error!("LP settlement stream failed: {}", e);
             }
         });
-    }
+
+        Some(quoted_trades)
+    } else {
+        None
+    };
 
     let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
     let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock);
@@ -448,6 +481,8 @@ async fn run_cloud_agent(
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await
     .context("Failed to create ledger client")?;
@@ -465,6 +500,13 @@ async fn run_cloud_agent(
             orders_only,
             actionable_count: None,
             shutdown_notify: None,
+            accepted_rfq_trades: None,
+            quoted_rfq_trades,
+            lp_shutdown: Some(lp_shutdown),
+            state_file: Some(PathBuf::from("agent-state.json")),
+            no_restore,
+            fill_state: None,
+            no_reject,
         },
     )
     .await
@@ -502,6 +544,8 @@ async fn run_fill(
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await
     .context("Failed to create ledger client")?;
@@ -520,11 +564,17 @@ async fn run_fill(
         interval_secs: interval,
     };
 
-    fill_loop::run_fill_loop(config, backend, balance_provider, params).await
+    // Check for saved fill state
+    let state_file = PathBuf::from("agent-state.json");
+    let saved_fill_state = orderbook_agent_logic::state::load_state(&state_file)
+        .filter(|s| s.party_id == config.party_id)
+        .and_then(|s| s.fill_state);
+
+    fill_loop::run_fill_loop(config, backend, balance_provider, params, saved_fill_state, Some(state_file)).await
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
+async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Arc<AtomicBool>) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
         CantonToServerMessage, SettlementHandshake, CantonNodeAuth,
@@ -532,14 +582,11 @@ async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
         server_to_canton_message::Message as ServerMessage,
     };
     use tokio_stream::StreamExt;
-    use rfq_handler::{RfqHandler, RfqResponse};
+    use rfq_handler::RfqResponse;
     use orderbook_agent_logic::client::OrderbookClient;
 
     let lp_config = config.liquidity_provider.as_ref()
         .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
-
-    let rfq_handler = RfqHandler::new(&config)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
 
     // Collect RFQ-enabled market_ids for mid-price polling
     let rfq_market_ids: Vec<String> = config
@@ -588,14 +635,14 @@ async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
     });
 
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            info!("LP stream shutting down, not reconnecting");
+            return Ok(());
+        }
+
         info!("Connecting LP settlement stream to {}", config.orderbook_grpc_url);
 
-        let channel = tonic::transport::Channel::from_shared(config.orderbook_grpc_url.clone())
-            .context("Invalid gRPC URL")?
-            .connect()
-            .await;
-
-        let channel = match channel {
+        let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to connect: {}, retrying in 5s", e);
@@ -671,6 +718,10 @@ async fn run_lp_settlement_stream(config: BaseConfig) -> Result<()> {
                     info!("LP handshake acknowledged: accepted={}", ack.accepted);
                 }
                 Some(ServerMessage::RfqRequest(request)) => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        info!("Ignoring RFQ {} - shutting down", request.rfq_id);
+                        break;
+                    }
                     info!(
                         "Received RFQ request: rfq_id={}, market={}, direction={}, qty={}",
                         request.rfq_id, request.market_id, request.direction, request.quantity
@@ -857,6 +908,8 @@ async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -958,6 +1011,8 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1020,6 +1075,8 @@ async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, ver
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1131,6 +1188,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1165,6 +1224,7 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                             description,
                             command_id,
                             settlement_proposal_id: None,
+                            amulet_cids: vec![],
                         })),
                         request_signature: None,
                     },
@@ -1251,6 +1311,51 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                 )
                 .await?;
             println!("CIP-56 transfer accepted ({}): {}", contract_id, result.update_id);
+        }
+        TransferCommands::SplitCc {
+            output_amounts,
+            amulet_cids,
+        } => {
+            if output_amounts.is_empty() {
+                return Err(anyhow::anyhow!("--output-amounts must not be empty"));
+            }
+            if amulet_cids.is_empty() {
+                return Err(anyhow::anyhow!("--amulet-cids must not be empty"));
+            }
+            if confirm && !dry_run {
+                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
+                orderbook_agent_logic::confirm::confirm_transaction(
+                    &lock,
+                    "Split CC",
+                    &format!("outputs: [{}], inputs: {} amulets", output_amounts.join(", "), amulet_cids.len()),
+                ).await?;
+            }
+            let expectation = OperationExpectation::SplitCc {
+                party: config.party_id.clone(),
+                output_amounts: output_amounts.clone(),
+            };
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::SplitCc as i32,
+                        params: Some(Params::SplitCc(SplitCcParams {
+                            output_amounts: output_amounts.clone(),
+                            amulet_cids,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
+            println!("CC split completed: {}", result.update_id);
+            for c in &result.created_contracts {
+                if !c.amount.is_empty() {
+                    println!("  Amulet {} (amount: {})", c.contract_id, c.amount);
+                }
+            }
         }
     }
 
@@ -1648,6 +1753,7 @@ auto_settle = true
 poll_interval_secs = 10
 token_ttl_secs = 3600
 connection_timeout_secs = 30
+request_timeout_secs = 120
 
 [[markets]]
 enabled = false
@@ -1672,6 +1778,8 @@ instrument_admin = ""
         base_config.token_ttl_secs,
         Some(base_config.node_name.as_str()),
         &base_config.ledger_service_public_key,
+        Some(base_config.connection_timeout_secs),
+        Some(base_config.request_timeout_secs),
     )
     .await
     .context("Failed to create authenticated DAppProvider client")?;
@@ -1823,6 +1931,8 @@ async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verb
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 

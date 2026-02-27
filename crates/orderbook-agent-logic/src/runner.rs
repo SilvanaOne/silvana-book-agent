@@ -5,6 +5,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +14,7 @@ use tokio::signal;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::StreamExt;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use orderbook_proto::ledger::TokenBalance;
 
@@ -21,6 +23,29 @@ use crate::config::BaseConfig;
 use crate::order_manager::OrderManager;
 use crate::order_tracker::OrderTracker;
 use crate::settlement::{SettlementBackend, SettlementExecutor};
+use crate::state::{
+    SavedAcceptedRfqTrade, SavedFillState, SavedQuotedTrade, SavedState, delete_state, load_state,
+    save_backup, save_state,
+};
+
+/// Trade parameters recorded when buyer accepts an RFQ quote
+#[derive(Debug, Clone)]
+pub struct AcceptedRfqTrade {
+    pub proposal_id: String,
+    pub market_id: String,
+    pub price: String,
+    pub base_quantity: String,
+    pub quote_quantity: String,
+}
+
+/// Trade parameters recorded when LP sends an RFQ quote
+#[derive(Debug, Clone)]
+pub struct QuotedTrade {
+    pub market_id: String,
+    pub price: String,
+    pub base_quantity: String,
+    pub quote_quantity: String,
+}
 
 /// Trait for fetching token balances
 ///
@@ -40,6 +65,20 @@ pub struct AgentOptions {
     pub actionable_count: Option<Arc<AtomicUsize>>,
     /// Optional external shutdown signal (used by fill loop to stop the background agent)
     pub shutdown_notify: Option<Arc<Notify>>,
+    /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
+    pub accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
+    /// LP: trades we quoted on (for settlement verification by attribute matching)
+    pub quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
+    /// Signal to LP settlement stream to stop accepting new RFQs on shutdown
+    pub lp_shutdown: Option<Arc<AtomicBool>>,
+    /// Path to state file for save/restore on shutdown/restart
+    pub state_file: Option<PathBuf>,
+    /// Skip state restoration even if state file exists
+    pub no_restore: bool,
+    /// Fill loop state for save on shutdown (set by fill loop before signaling shutdown)
+    pub fill_state: Option<Arc<Mutex<Option<SavedFillState>>>>,
+    /// Accept all proposals without verification (for migration from old worker without saved state)
+    pub no_reject: bool,
 }
 
 /// Run the agent event loop
@@ -67,6 +106,35 @@ where
 
     info!("Connected to orderbook service");
 
+    // Try to restore state from previous session
+    let restored_state = if let Some(ref state_file) = options.state_file {
+        if options.no_restore {
+            info!("State restoration disabled (--no-restore)");
+            delete_state(state_file);
+            None
+        } else {
+            match load_state(state_file) {
+                Some(saved) if saved.party_id == config.party_id => {
+                    info!(
+                        "Restoring state from previous session (saved at {}, start_time={})",
+                        saved.saved_at, saved.start_time_ms
+                    );
+                    Some(saved)
+                }
+                Some(saved) => {
+                    warn!(
+                        "State file party_id '{}' != config '{}', ignoring",
+                        saved.party_id, config.party_id
+                    );
+                    None
+                }
+                None => None,
+            }
+        }
+    } else {
+        None
+    };
+
     // Cancel ALL existing orders (all markets) before setting start_time
     info!("Clearing all existing orders...");
     {
@@ -87,9 +155,13 @@ where
         }
     }
 
-    // Set immutable start_time — orders with nonce < start_time are rejected
-    let start_time_ms = chrono::Utc::now().timestamp_millis() as u64;
-    info!("Start time: {} ms", start_time_ms);
+    // Set start_time: use saved value if restoring, else current time
+    let start_time_ms = if let Some(ref saved) = restored_state {
+        saved.start_time_ms
+    } else {
+        chrono::Utc::now().timestamp_millis() as u64
+    };
+    info!("Start time: {} ms{}", start_time_ms, if restored_state.is_some() { " (restored)" } else { "" });
 
     // Create shared order tracker
     let tracker = Arc::new(Mutex::new(OrderTracker::new(
@@ -97,12 +169,97 @@ where
         config.private_key_bytes,
     )));
 
+    // Restore order tracker state if available
+    if let Some(ref saved) = restored_state {
+        let mut t = tracker.lock().await;
+        t.import_state(saved.orders.clone(), saved.settlement_orders.clone());
+    }
+
+    // Restore pending background fee payments from saved state
+    if let Some(ref saved) = restored_state {
+        if !saved.pending_fees.is_empty() {
+            info!("Restoring {} pending fee payment(s) from saved state", saved.pending_fees.len());
+            backend.restore_pending_fees(saved.pending_fees.clone()).await;
+        }
+        if !saved.pending_traffic_fees.is_empty() {
+            info!("Restoring {} pending traffic fee(s) from saved state", saved.pending_traffic_fees.len());
+            backend.restore_pending_traffic_fees(saved.pending_traffic_fees.clone());
+        }
+    }
+
     // Create settlement executor with shared tracker
     let mut settlement_executor = SettlementExecutor::new(&config, tracker.clone(), backend);
+
+    // Enable no-reject mode if requested (skip verification for all proposals)
+    if options.no_reject {
+        settlement_executor.set_no_reject(true);
+    }
+
+    // Restore dedup sets if available
+    if let Some(ref saved) = restored_state {
+        settlement_executor
+            .inject_completed_proposals(saved.completed_proposals.iter().cloned().collect::<HashSet<_>>());
+        settlement_executor
+            .inject_rejected_proposals(saved.rejected_proposals.iter().cloned().collect::<HashSet<_>>());
+        info!(
+            "Restored {} completed and {} rejected proposal(s)",
+            saved.completed_proposals.len(),
+            saved.rejected_proposals.len()
+        );
+    }
 
     // If caller provided an actionable_count Arc, inject it into the executor
     if let Some(ext_count) = &options.actionable_count {
         settlement_executor.set_actionable_count(ext_count.clone());
+    }
+
+    // Inject RFQ verification state if provided
+    if let Some(ref accepted) = options.accepted_rfq_trades {
+        // Restore saved RFQ trades into the shared map
+        if let Some(ref saved) = restored_state {
+            if !saved.accepted_rfq_trades.is_empty() {
+                let mut map = accepted.lock().await;
+                for trade in &saved.accepted_rfq_trades {
+                    map.insert(
+                        trade.proposal_id.clone(),
+                        AcceptedRfqTrade {
+                            proposal_id: trade.proposal_id.clone(),
+                            market_id: trade.market_id.clone(),
+                            price: trade.price.clone(),
+                            base_quantity: trade.base_quantity.clone(),
+                            quote_quantity: trade.quote_quantity.clone(),
+                        },
+                    );
+                }
+                info!("Restored {} accepted RFQ trade(s)", saved.accepted_rfq_trades.len());
+            }
+        }
+        settlement_executor.set_accepted_rfq_trades(accepted.clone());
+    }
+    if let Some(ref quoted) = options.quoted_rfq_trades {
+        // Restore saved quoted trades into the shared vec
+        if let Some(ref saved) = restored_state {
+            if !saved.quoted_rfq_trades.is_empty() {
+                let mut trades = quoted.lock().await;
+                for trade in &saved.quoted_rfq_trades {
+                    trades.push(QuotedTrade {
+                        market_id: trade.market_id.clone(),
+                        price: trade.price.clone(),
+                        base_quantity: trade.base_quantity.clone(),
+                        quote_quantity: trade.quote_quantity.clone(),
+                    });
+                }
+                info!("Restored {} quoted RFQ trade(s)", saved.quoted_rfq_trades.len());
+            }
+        }
+        settlement_executor.set_quoted_rfq_trades(quoted.clone());
+    }
+
+    // Delete state file after successful restore
+    if restored_state.is_some() {
+        if let Some(ref state_file) = options.state_file {
+            delete_state(state_file);
+        }
     }
 
     // Create order manager with shared tracker
@@ -127,8 +284,9 @@ where
     };
 
     // Setup timers — use Skip so accumulated ticks don't starve ctrl_c
-    let mut heartbeat_timer = interval(Duration::from_secs(30));
+    let mut heartbeat_timer = interval(Duration::from_secs(60));
     heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat_count: u64 = 0;
     let mut order_update_timer = interval(Duration::from_secs(5));
     order_update_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut settlement_poll_timer = interval(Duration::from_secs(config.poll_interval_secs));
@@ -158,13 +316,18 @@ where
     // in the same spawned task to guarantee the force-exit always works.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
+    let lp_shutdown = options.lp_shutdown.clone();
     {
         let flag = shutdown_flag.clone();
         let notify = shutdown_notify.clone();
+        let lp_shutdown = lp_shutdown.clone();
         tokio::spawn(async move {
             signal::ctrl_c().await.ok();
             warn!("Ctrl-C received, shutting down gracefully...");
             flag.store(true, Ordering::SeqCst);
+            if let Some(ref lp) = lp_shutdown {
+                lp.store(true, Ordering::SeqCst);
+            }
             notify.notify_one();
 
             // Wait for second Ctrl-C → force exit immediately
@@ -186,12 +349,21 @@ where
         });
     }
 
+    // Share the runner's Ctrl-C flag with the settlement executor so spawned
+    // tasks observe shutdown immediately (not a stale bool copy).
+    settlement_executor.set_shutdown_flag(shutdown_flag.clone());
+
     // Track consecutive poll failures for connectivity detection
     let mut poll_failures: u32 = 0;
 
     // Main event loop
     if !options.orders_only {
         loop {
+            // Check shutdown flag directly — the Notify permit can be consumed
+            // by tokio::select! polling without the shutdown arm being selected
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
             tokio::select! {
                 result = async {
                     match &mut settlement_stream {
@@ -199,6 +371,11 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    // Skip processing new settlement events during shutdown
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
                     match result {
                         Some(Ok(update)) => {
                             let update_desc = format!(
@@ -245,6 +422,11 @@ where
                 }
 
                 _ = settlement_poll_timer.tick() => {
+                    // Skip poll cycle during shutdown — let the notify branch fire
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
                     // Reconnect settlement stream if broken
                     if settlement_stream.is_none() {
                         match orderbook_client.subscribe_settlements(None).await {
@@ -312,10 +494,75 @@ where
                 }
 
                 _ = heartbeat_timer.tick() => {
+                    heartbeat_count += 1;
+
+                    // Poll issuance forecast from orderbook RPC (non-blocking, ignore errors)
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        orderbook_client.get_rounds_data(Some(1)),
+                    ).await {
+                        Ok(Ok(resp)) => {
+                            if let Some(prediction) = resp.prediction {
+                                crate::forecast::update_forecast(
+                                    prediction.forecast,
+                                    prediction.forecast_coefficient,
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => debug!("Forecast poll failed: {:#}", e),
+                        Err(_) => debug!("Forecast poll timed out"),
+                    }
+
                     let active_settlements = settlement_executor.active_settlements();
-                    if !active_settlements.is_empty() {
+                    let n = active_settlements.len();
+                    let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
+                    let pct = if max > 0 { used * 100 / max } else { 0 };
+                    let (alloc, fees, traffic) = settlement_executor.queue_depth();
+                    let backlog = settlement_executor.traffic_backlog_depth();
+                    let cache_str = if let Some((avail, consumed, reserved, selectable)) = settlement_executor.cache_stats() {
+                        format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
+                    } else {
+                        String::new()
+                    };
+                    let worker_str = if let Some((aa, am, fa, fm, ta, tm)) = settlement_executor.worker_utilization() {
+                        format!(", workers alloc {}/{} fee {}/{} traffic {}/{}", aa, am, fa, fm, ta, tm)
+                    } else {
+                        String::new()
+                    };
+                    let pause_str = {
+                        let mut parts = Vec::new();
+                        if let Some(secs) = settlement_executor.fee_pause_secs() {
+                            parts.push(format!("FEES PAUSED {}s", secs));
+                        }
+                        if let Some(secs) = settlement_executor.traffic_fee_pause_secs() {
+                            parts.push(format!("TRAFFIC PAUSED {}s", secs));
+                        }
+                        if crate::forecast::is_traffic_paused_by_forecast() {
+                            parts.push("TRAFFIC PAUSED (low issuance)".to_string());
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", parts.join(", "))
+                        }
+                    };
+                    let forecast_str = {
+                        let label = crate::forecast::forecast_label();
+                        if label != "unknown" {
+                            let coeff = crate::forecast::forecast_coefficient()
+                                .unwrap_or_default();
+                            format!(", forecast {} ({})", label, coeff)
+                        } else {
+                            String::new()
+                        }
+                    };
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str, forecast_str);
+                    settlement_executor.log_cid_waiting_summary();
+                    // Every 5 minutes, also list individual settlement IDs
+                    if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
                         let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
-                        info!("Heartbeat: {} active settlement(s): {}", ids.len(), ids.join(", "));
+                        info!("Active settlements: {}", ids.join(", "));
                     }
                 }
 
@@ -327,6 +574,9 @@ where
     } else {
         // Orders-only mode
         loop {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
             tokio::select! {
                 _ = order_update_timer.tick(), if has_markets && !shutdown_flag.load(Ordering::Relaxed) => {
                     match tokio::time::timeout(
@@ -353,51 +603,111 @@ where
         }
     }
 
-    // Graceful shutdown
+    // Graceful shutdown — save state and exit immediately
     info!("Shutting down...");
     settlement_executor.set_shutting_down();
+    settlement_executor.shutdown_backend();
 
-    let cleanup = async {
-        if has_markets {
-            info!("Cancelling all orders...");
-            if let Err(e) = order_manager.cancel_all_market_orders().await {
-                warn!("Failed to cancel some orders: {}", e);
-            }
+    // Wait for in-flight settlement tasks to finish (they stop looping on shutdown flag)
+    let drained = settlement_executor.drain_tasks().await;
+    if drained > 0 {
+        info!("Drained {} settlement task(s)", drained);
+    }
+
+    // Cancel market orders (quick)
+    if has_markets {
+        info!("Cancelling all orders...");
+        if let Err(e) = order_manager.cancel_all_market_orders().await {
+            warn!("Failed to cancel some orders: {}", e);
+        }
+    }
+
+    // Save state to disk for restoration on next restart
+    if let Some(ref state_file) = options.state_file {
+        let active_count = settlement_executor.active_settlements().len();
+
+        // Export order tracker state
+        let (saved_start_time, saved_orders, saved_settlement_orders) = {
+            let t = tracker.lock().await;
+            t.export_state()
+        };
+
+        // Build saved state
+        let mut saved = SavedState::new(config.party_id.clone(), saved_start_time);
+        saved.completed_proposals = settlement_executor
+            .completed_proposals()
+            .iter()
+            .cloned()
+            .collect();
+        saved.rejected_proposals = settlement_executor
+            .rejected_proposals()
+            .iter()
+            .cloned()
+            .collect();
+        saved.orders = saved_orders;
+        saved.settlement_orders = saved_settlement_orders;
+
+        // Save accepted RFQ trades
+        if let Some(ref accepted) = options.accepted_rfq_trades {
+            let map = accepted.lock().await;
+            saved.accepted_rfq_trades = map
+                .values()
+                .map(|t| SavedAcceptedRfqTrade {
+                    proposal_id: t.proposal_id.clone(),
+                    market_id: t.market_id.clone(),
+                    price: t.price.clone(),
+                    base_quantity: t.base_quantity.clone(),
+                    quote_quantity: t.quote_quantity.clone(),
+                })
+                .collect();
         }
 
-        settlement_executor.reject_unconfirmed().await;
-        settlement_executor.drain_tasks().await;
+        // Save quoted RFQ trades
+        if let Some(ref quoted) = options.quoted_rfq_trades {
+            let trades = quoted.lock().await;
+            saved.quoted_rfq_trades = trades
+                .iter()
+                .map(|t| SavedQuotedTrade {
+                    market_id: t.market_id.clone(),
+                    price: t.price.clone(),
+                    base_quantity: t.base_quantity.clone(),
+                    quote_quantity: t.quote_quantity.clone(),
+                })
+                .collect();
+        }
 
-        let active = settlement_executor.active_settlements().len();
-        if active > 0 {
-            info!(
-                "Waiting for {} confirmed settlement(s) to complete...",
-                active
-            );
-            info!("Press Ctrl+C again to force exit");
+        // Save fill loop state if present
+        if let Some(ref fill_state) = options.fill_state {
+            saved.fill_state = fill_state.lock().await.clone();
+        }
 
-            loop {
-                match tokio::time::timeout(Duration::from_secs(120), async {
-                    settlement_executor.sync_on_chain_contracts().await;
-                    settlement_executor.advance_all_settlements().await;
-                }).await {
-                    Ok(()) => {}
-                    Err(_) => warn!("Shutdown settlement cycle timed out after 120s"),
-                }
+        // Save pending background fee payments
+        saved.pending_fees = settlement_executor.get_pending_fees();
+        if !saved.pending_fees.is_empty() {
+            info!("Saving {} pending fee payment(s) for restart", saved.pending_fees.len());
+        }
 
-                if settlement_executor.active_settlements().is_empty() {
-                    info!("All settlements completed");
-                    break;
-                }
+        // Save pending traffic fee payments
+        saved.pending_traffic_fees = settlement_executor.get_pending_traffic_fees();
+        if !saved.pending_traffic_fees.is_empty() {
+            info!("Saving {} pending traffic fee(s) for restart", saved.pending_traffic_fees.len());
+        }
 
-                tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
+        match save_state(state_file, &saved) {
+            Ok(()) => {
+                info!(
+                    "State saved ({} active settlements, {} completed, {} rejected). Restart to resume.",
+                    active_count,
+                    saved.completed_proposals.len(),
+                    saved.rejected_proposals.len(),
+                );
+                save_backup(state_file, &saved);
+            }
+            Err(e) => {
+                error!("Failed to save state: {:#}", e);
             }
         }
-    };
-
-    // The spawned Ctrl-C handler above handles force-exit on second signal,
-    // so we just await cleanup directly.
-    cleanup.await;
+    }
 
     info!("Agent stopped");
     Ok(())

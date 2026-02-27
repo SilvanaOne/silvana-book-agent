@@ -5,16 +5,19 @@
 //! Runs the settlement agent in the background to process settlements.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn, error};
 
 use orderbook_agent_logic::client::OrderbookClient;
 use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use orderbook_agent_logic::runner::{run_agent, AcceptedRfqTrade, AgentOptions, BalanceProvider};
 use orderbook_agent_logic::settlement::SettlementBackend;
+use orderbook_agent_logic::state::SavedFillState;
 
 /// Direction of the fill operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,8 @@ pub async fn run_fill_loop<B, P>(
     backend: B,
     balance_provider: P,
     params: FillParams,
+    saved_fill_state: Option<SavedFillState>,
+    state_file: Option<PathBuf>,
 ) -> Result<()>
 where
     B: SettlementBackend + 'static,
@@ -66,6 +71,12 @@ where
     let actionable_count = Arc::new(AtomicUsize::new(0));
     let max_active = config.max_active_settlements;
     let agent_shutdown = Arc::new(Notify::new());
+    let accepted_rfq_trades: Arc<Mutex<HashMap<String, AcceptedRfqTrade>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Shared fill state for saving on shutdown
+    let shared_fill_state: Arc<Mutex<Option<orderbook_agent_logic::state::SavedFillState>>> =
+        Arc::new(Mutex::new(None));
 
     // Shutdown signal for the fill loop (Ctrl-C handler notifies this)
     let fill_shutdown = Arc::new(Notify::new());
@@ -81,6 +92,8 @@ where
     let agent_config = config.clone();
     let agent_actionable = actionable_count.clone();
     let agent_shutdown_clone = agent_shutdown.clone();
+    let agent_accepted_trades = accepted_rfq_trades.clone();
+    let agent_fill_state = shared_fill_state.clone();
     let agent_handle = tokio::spawn(async move {
         if let Err(e) = run_agent(
             agent_config,
@@ -91,6 +104,13 @@ where
                 orders_only: false,
                 actionable_count: Some(agent_actionable),
                 shutdown_notify: Some(agent_shutdown_clone),
+                accepted_rfq_trades: Some(agent_accepted_trades),
+                quoted_rfq_trades: None,
+                lp_shutdown: None,
+                state_file: state_file.clone(),
+                no_restore: false,
+                fill_state: Some(agent_fill_state),
+                no_reject: false,
             },
         )
         .await
@@ -104,9 +124,15 @@ where
         .await
         .context("Failed to create orderbook client")?;
 
-    let mut remaining = params.total_amount;
-    let mut filled_total = 0.0_f64;
-    let mut round = 0u32;
+    let (mut remaining, mut filled_total, mut round) = if let Some(ref fs) = saved_fill_state {
+        info!(
+            "Restoring fill state: filled={:.6} remaining={:.6} round={}",
+            fs.filled_total, fs.remaining, fs.round
+        );
+        (fs.remaining, fs.filled_total, fs.round)
+    } else {
+        (params.total_amount, 0.0_f64, 0u32)
+    };
     let interval = Duration::from_secs(params.interval_secs);
     let mut shutdown_received = false;
 
@@ -115,6 +141,8 @@ where
         dir_str, params.total_amount, params.market_id,
         params.min_settlement, params.max_settlement, params.interval_secs
     );
+
+    let dir_name = dir_str; // reuse for fill state snapshots
 
     loop {
         if shutdown_received {
@@ -251,6 +279,15 @@ where
             match client.accept_quote(&rfq_response.rfq_id, &best.quote_id).await {
                 Ok(resp) => {
                     if resp.success {
+                        if let Some(ref pid) = resp.proposal_id {
+                            accepted_rfq_trades.lock().await.insert(pid.clone(), AcceptedRfqTrade {
+                                proposal_id: pid.clone(),
+                                market_id: params.market_id.clone(),
+                                price: best.price.clone(),
+                                base_quantity: best.quantity.clone(),
+                                quote_quantity: best.quote_quantity.clone(),
+                            });
+                        }
                         let qty: f64 = best.quantity.parse().unwrap_or(0.0);
                         filled_total += qty;
                         remaining -= qty;
@@ -334,6 +371,15 @@ where
                         );
                         match client.accept_quote(&retry_resp.rfq_id, &best.quote_id).await {
                             Ok(resp) if resp.success => {
+                                if let Some(ref pid) = resp.proposal_id {
+                                    accepted_rfq_trades.lock().await.insert(pid.clone(), AcceptedRfqTrade {
+                                        proposal_id: pid.clone(),
+                                        market_id: params.market_id.clone(),
+                                        price: best.price.clone(),
+                                        base_quantity: best.quantity.clone(),
+                                        quote_quantity: best.quote_quantity.clone(),
+                                    });
+                                }
                                 let qty: f64 = best.quantity.parse().unwrap_or(0.0);
                                 filled_total += qty;
                                 remaining -= qty;
@@ -359,21 +405,34 @@ where
             }
         }
 
+        // Keep shared fill state up-to-date so the background agent can save it
+        // at any time (eliminates race between fill loop and agent on Ctrl-C)
+        *shared_fill_state.lock().await = Some(SavedFillState {
+            direction: dir_name.to_string(),
+            market_id: params.market_id.clone(),
+            total_amount: params.total_amount,
+            filled_total,
+            remaining: remaining.max(0.0),
+            round,
+        });
+
         // Wait before next round
         if interruptible_sleep(interval, &fill_shutdown).await {
             shutdown_received = true;
         }
     }
 
-    // Signal the background agent to shut down gracefully
-    info!("Fill loop done. Signalling background agent to shut down...");
+    // Signal the background agent to shut down (it will save state including fill state)
+    info!(
+        "Fill loop done (filled={:.6}, remaining={:.6}). Signalling background agent to save and exit...",
+        filled_total, remaining.max(0.0)
+    );
     agent_shutdown.notify_one();
 
-    // Wait for the agent to complete its graceful shutdown (drain settlements)
-    info!("Waiting for settlements to complete (timeout 120s)...");
-    match tokio::time::timeout(Duration::from_secs(120), agent_handle).await {
+    // Wait for the agent to complete its graceful shutdown
+    match tokio::time::timeout(Duration::from_secs(30), agent_handle).await {
         Ok(result) => { let _ = result; }
-        Err(_) => { warn!("Background agent did not shut down within 120s, exiting anyway"); }
+        Err(_) => { warn!("Background agent did not shut down within 30s, exiting anyway"); }
     }
 
     Ok(())

@@ -32,6 +32,8 @@ struct AgentToml {
     token_ttl_secs: u64,
     #[serde(default = "default_connection_timeout_secs")]
     connection_timeout_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    request_timeout_secs: u64,
     #[serde(default)]
     markets: Vec<MarketConfig>,
     /// LP configuration (only for liquidity provider agents)
@@ -103,6 +105,7 @@ pub struct BaseConfig {
     pub role: String,
     pub token_ttl_secs: u64,
     pub connection_timeout_secs: u64,
+    pub request_timeout_secs: u64,
     pub markets: Vec<MarketConfig>,
 
     // Multi-node routing
@@ -116,6 +119,9 @@ pub struct BaseConfig {
 
     // Settlement throttle
     pub max_active_settlements: usize,
+
+    // Settlement expiry (max lifetime before considering expired)
+    pub settle_before_secs: u64,
 }
 
 impl BaseConfig {
@@ -173,7 +179,7 @@ impl BaseConfig {
         let settlement_thread_count = std::env::var("SETTLEMENT_THREAD_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(25);
 
         let max_active_settlements = std::env::var("AGENT_MAX_SETTLEMENTS")
             .ok()
@@ -186,6 +192,12 @@ impl BaseConfig {
         let ledger_service_public_key_b58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
             .map_err(|_| anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
         let ledger_service_public_key = decode_public_key(&ledger_service_public_key_b58)?;
+
+        let settle_before_secs = agent.markets.iter()
+            .filter_map(|m| m.rfq.as_ref())
+            .map(|r| r.settle_before_secs as u64)
+            .max()
+            .unwrap_or(default_rfq_settle_before_secs() as u64);
 
         Ok(BaseConfig {
             orderbook_grpc_url,
@@ -209,11 +221,13 @@ impl BaseConfig {
             role: agent.role,
             token_ttl_secs: agent.token_ttl_secs,
             connection_timeout_secs: agent.connection_timeout_secs,
+            request_timeout_secs: agent.request_timeout_secs,
             markets: agent.markets,
             node_name,
             ledger_service_public_key,
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
+            settle_before_secs,
         })
     }
 
@@ -387,6 +401,10 @@ fn default_connection_timeout_secs() -> u64 {
     30
 }
 
+fn default_request_timeout_secs() -> u64 {
+    120
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -435,6 +453,7 @@ mod tests {
         assert_eq!(agent.role, "trader");
         assert_eq!(agent.token_ttl_secs, 3600);
         assert_eq!(agent.connection_timeout_secs, 30);
+        assert_eq!(agent.request_timeout_secs, 120);
         assert!(agent.markets.is_empty());
     }
 }

@@ -1994,6 +1994,9 @@ pub fn inspect(
             };
             format!("AcceptCip56({})", short)
         }
+        OperationExpectation::SplitCc { output_amounts, .. } => {
+            format!("SplitCc({} outputs)", output_amounts.len())
+        }
     };
 
     // Verbose: dump full JSON

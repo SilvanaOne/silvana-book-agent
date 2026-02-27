@@ -4,9 +4,10 @@
 //! with quotes or rejections based on market configuration and mid-prices.
 
 use orderbook_agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
+use orderbook_agent_logic::runner::QuotedTrade;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -21,6 +22,8 @@ pub struct RfqHandler {
     /// Market mid-prices: market_id -> mid_price
     mid_prices: Arc<RwLock<HashMap<String, f64>>>,
     party_id: String,
+    /// Trades we quoted (for settlement verification)
+    quoted_trades: Arc<Mutex<Vec<QuotedTrade>>>,
 }
 
 /// Result of handling an RFQ request
@@ -38,12 +41,18 @@ impl RfqHandler {
             markets: config.markets.clone(),
             mid_prices: Arc::new(RwLock::new(HashMap::new())),
             party_id: config.party_id.clone(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
     /// Get a reference to mid_prices for external updates
     pub fn mid_prices(&self) -> Arc<RwLock<HashMap<String, f64>>> {
         self.mid_prices.clone()
+    }
+
+    /// Get a reference to quoted trades for settlement verification
+    pub fn quoted_trades(&self) -> Arc<Mutex<Vec<QuotedTrade>>> {
+        self.quoted_trades.clone()
     }
 
     /// Handle an incoming RFQ request
@@ -172,15 +181,22 @@ impl RfqHandler {
         };
         drop(mid_prices);
 
-        // Compute price based on direction and spread
+        // Compute price based on direction and spread.
+        // Widen spreads 2x when issuance forecast is LOW — high demand period means
+        // sequencer under heavy load, protect LP from adverse fills during volatility.
         // direction 1 = BUY (user buys, LP sells → offer price = mid + spread)
         // direction 2 = SELL (user sells, LP buys → bid price = mid - spread)
+        let spread_multiplier = if orderbook_agent_logic::forecast::is_traffic_paused_by_forecast() {
+            2.0
+        } else {
+            1.0
+        };
         let price = if request.direction == 1 {
             // User is buying → LP offers at mid + spread
-            mid_price * (1.0 + rfq_config.offer_spread_percent / 100.0)
+            mid_price * (1.0 + rfq_config.offer_spread_percent * spread_multiplier / 100.0)
         } else {
             // User is selling → LP bids at mid - spread
-            mid_price * (1.0 - rfq_config.bid_spread_percent / 100.0)
+            mid_price * (1.0 - rfq_config.bid_spread_percent * spread_multiplier / 100.0)
         };
 
         let quote_quantity = quantity * price;
@@ -211,15 +227,29 @@ impl RfqHandler {
         let now = chrono::Utc::now();
         let valid_until = now + chrono::Duration::seconds(valid_for_secs as i64);
 
+        let effective_spread = if request.direction == 1 {
+            rfq_config.offer_spread_percent * spread_multiplier
+        } else {
+            rfq_config.bid_spread_percent * spread_multiplier
+        };
         info!(
-            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={}%)",
+            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={}%{})",
             rfq_id,
             quantity,
             request.market_id,
             price,
             mid_price,
-            if request.direction == 1 { rfq_config.offer_spread_percent } else { rfq_config.bid_spread_percent }
+            effective_spread,
+            if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" }
         );
+
+        // Record trade for settlement verification
+        self.quoted_trades.lock().await.push(QuotedTrade {
+            market_id: request.market_id.clone(),
+            price: format!("{:.10}", price),
+            base_quantity: format!("{:.10}", quantity),
+            quote_quantity: format!("{:.10}", quote_quantity),
+        });
 
         RfqResponse::Quote(RfqQuote {
             rfq_id,

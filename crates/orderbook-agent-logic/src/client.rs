@@ -15,6 +15,7 @@ use orderbook_proto::{
         GetSettlementProposalsRequest, SettlementProposal, SettlementStatus,
         RequestQuotesRequest, RequestQuotesResponse,
         AcceptQuoteRequest, AcceptQuoteResponse,
+        GetRoundsDataRequest, GetRoundsDataResponse,
     },
 };
 use std::sync::{Arc, RwLock};
@@ -23,7 +24,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::Request;
 use tokio_stream::Stream;
 use std::pin::Pin;
-use tracing::info;
+use tracing::debug;
 
 use crate::auth::generate_jwt;
 use crate::config::BaseConfig;
@@ -278,22 +279,37 @@ impl OrderbookClient {
         Ok(orders)
     }
 
-    /// Get pending settlement proposals for this party
+    /// Get pending settlement proposals for this party (paginated, fetches all)
     pub async fn get_pending_proposals(&mut self) -> Result<Vec<SettlementProposal>> {
-        let request = Request::new(GetSettlementProposalsRequest {
-            market_id: None,
-            status: Some(SettlementStatus::Pending as i32),
-            limit: Some(50),
-            offset: None,
-        });
+        let page_size = 50u32;
+        let mut all_proposals = Vec::new();
+        let mut offset = 0u32;
 
-        let response = self
-            .orderbook_client
-            .get_settlement_proposals(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_settlement_proposals failed: {}", e.message()))?;
+        loop {
+            let request = Request::new(GetSettlementProposalsRequest {
+                market_id: None,
+                status: Some(SettlementStatus::Pending as i32),
+                limit: Some(page_size),
+                offset: Some(offset),
+            });
 
-        Ok(response.into_inner().proposals)
+            let response = self
+                .orderbook_client
+                .get_settlement_proposals(request)
+                .await
+                .map_err(|e| anyhow::anyhow!("get_settlement_proposals failed: {}", e.message()))?;
+
+            let inner = response.into_inner();
+            let page_count = inner.proposals.len() as u32;
+            all_proposals.extend(inner.proposals);
+
+            if page_count < page_size || all_proposals.len() as u32 >= inner.total {
+                break;
+            }
+            offset += page_size;
+        }
+
+        Ok(all_proposals)
     }
 
     /// Subscribe to settlement updates
@@ -389,6 +405,19 @@ impl OrderbookClient {
     pub fn public_key_hex(&self) -> &str {
         &self.auth_data.public_key_hex
     }
+
+    /// Get rounds data including issuance forecast
+    pub async fn get_rounds_data(&mut self, limit: Option<u32>) -> Result<GetRoundsDataResponse> {
+        let request = Request::new(GetRoundsDataRequest {
+            limit,
+        });
+        let response = self
+            .orderbook_client
+            .get_rounds_data(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_rounds_data failed: {}", e.message()))?;
+        Ok(response.into_inner())
+    }
 }
 
 /// Authentication interceptor for gRPC requests with automatic JWT refresh
@@ -416,7 +445,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
                 Some(self.auth_data.node_name.as_str()),
             ) {
                 Ok(new_jwt) => {
-                    info!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
+                    debug!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
                     *self.token.write().unwrap() = new_jwt;
                     *self.expires_at.write().unwrap() = now + self.auth_data.ttl_secs;
                 }

@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use orderbook_proto::orderbook::SettlementProposal;
+use rust_decimal::Decimal;
 
 /// Settlement stage in the DVP workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +116,14 @@ pub enum AdvanceResult {
     Error { proposal_id: String, error: String },
     /// Timeout — likely transient, retry sooner (fixed 60s)
     Timeout { proposal_id: String },
+    /// Settlement needs allocation — caller should release settlement permit
+    /// before proceeding, since allocate blocks on the payment queue.
+    NeedsAllocate {
+        proposal_id: String,
+        dvp_cid: String,
+        allocation_cc: Option<Decimal>,
+        is_buyer: bool,
+    },
 }
 
 impl AdvanceResult {
@@ -127,7 +136,8 @@ impl AdvanceResult {
             | AdvanceResult::Terminal { proposal_id }
             | AdvanceResult::Wait { proposal_id }
             | AdvanceResult::Error { proposal_id, .. }
-            | AdvanceResult::Timeout { proposal_id } => proposal_id,
+            | AdvanceResult::Timeout { proposal_id }
+            | AdvanceResult::NeedsAllocate { proposal_id, .. } => proposal_id,
         }
     }
 
@@ -162,19 +172,30 @@ impl AdvanceResult {
     }
 }
 
+/// Type of CID the settlement is waiting for (for log aggregation)
+#[derive(Debug, Clone, Copy)]
+pub enum CidWaitingType {
+    DvpProposal,
+    DvpContract,
+}
+
 /// Failed settlement with retry backoff (matches server pattern)
 pub struct FailedSettlement {
     pub retry_count: u32,
     pub next_retry: Instant,
+    /// When this settlement first hit a CID-waiting error (for log escalation after 10 min)
+    pub first_transient_at: Option<Instant>,
+    /// Which CID is missing (for heartbeat summary counts)
+    pub cid_waiting: Option<CidWaitingType>,
 }
 
 impl FailedSettlement {
     pub fn retry_delay(retry_count: u32) -> Duration {
         match retry_count {
             0 => Duration::from_secs(0),
-            1 => Duration::from_secs(60),
-            2 => Duration::from_secs(300),
-            _ => Duration::from_secs(1800),
+            1 => Duration::from_secs(10),
+            2 => Duration::from_secs(30),
+            _ => Duration::from_secs(60),
         }
     }
 
@@ -182,7 +203,7 @@ impl FailedSettlement {
         std::env::var("MAX_SETTLEMENT_RETRIES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10)
+            .unwrap_or(30)
     }
 
     pub fn is_exhausted(&self) -> bool {

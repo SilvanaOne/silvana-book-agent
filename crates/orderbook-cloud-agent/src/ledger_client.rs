@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use once_cell::sync::Lazy;
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -28,6 +29,79 @@ static MAX_RETRIES: Lazy<u32> = Lazy::new(|| {
 
 const BASE_DELAY_MS: u64 = 1000;
 
+/// Duration in seconds to pause regular fee dispatch after SEQUENCER_BACKPRESSURE.
+static FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("FEE_PAUSE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+});
+
+/// Duration in seconds to pause traffic fee dispatch after SEQUENCER_BACKPRESSURE.
+static TRAFFIC_FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("TRAFFIC_FEE_PAUSE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120)
+});
+
+/// Epoch millis after which regular fee dispatch may resume.
+static FEE_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Epoch millis after which traffic fee dispatch may resume.
+static TRAFFIC_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a backpressure event — pauses regular fees for FEE_PAUSE_SECS
+/// and traffic fees for TRAFFIC_FEE_PAUSE_SECS.
+pub fn signal_sequencer_backpressure() {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let fee_resume_at = now_ms + *FEE_PAUSE_SECS * 1000;
+    FEE_PAUSE_UNTIL_MS.fetch_max(fee_resume_at, AtomicOrdering::Relaxed);
+
+    let traffic_resume_at = now_ms + *TRAFFIC_FEE_PAUSE_SECS * 1000;
+    TRAFFIC_PAUSE_UNTIL_MS.fetch_max(traffic_resume_at, AtomicOrdering::Relaxed);
+}
+
+/// Check whether regular fees are currently paused due to sequencer backpressure.
+/// Returns Some(remaining_secs) if paused, None if not.
+pub fn fee_pause_remaining() -> Option<u64> {
+    let resume_at = FEE_PAUSE_UNTIL_MS.load(AtomicOrdering::Relaxed);
+    if resume_at == 0 {
+        return None;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if now_ms < resume_at {
+        Some((resume_at - now_ms + 999) / 1000)
+    } else {
+        None
+    }
+}
+
+/// Check whether traffic fees are currently paused due to sequencer backpressure.
+/// Returns Some(remaining_secs) if paused, None if not.
+pub fn traffic_fee_pause_remaining() -> Option<u64> {
+    let resume_at = TRAFFIC_PAUSE_UNTIL_MS.load(AtomicOrdering::Relaxed);
+    if resume_at == 0 {
+        return None;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if now_ms < resume_at {
+        Some((resume_at - now_ms + 999) / 1000)
+    } else {
+        None
+    }
+}
+
 use orderbook_agent_logic::auth::generate_jwt;
 use message_signing::{
     sign_canonical, verify_canonical, parse_public_key,
@@ -37,7 +111,7 @@ use message_signing::{
     canonical_params_allocate, canonical_params_transfer_cc, canonical_params_request_preapproval,
     canonical_params_request_recurring_prepaid, canonical_params_request_recurring_payasyougo,
     canonical_params_request_user_service, canonical_params_transfer_cip56,
-    canonical_params_accept_cip56,
+    canonical_params_accept_cip56, canonical_params_split_cc,
 };
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use tx_verifier::OperationExpectation;
@@ -80,6 +154,7 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
             &p.amount, p.reference.as_deref(),
         ),
         Params::AcceptCip56(p) => canonical_params_accept_cip56(&p.contract_id),
+        Params::SplitCc(p) => canonical_params_split_cc(&p.output_amounts),
     };
     Ok(canonical_prepare_request(req.operation, &params_canonical))
 }
@@ -113,7 +188,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
                 self.node_name.as_deref(),
             ) {
                 Ok(new_jwt) => {
-                    info!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
+                    debug!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
                     *self.token.write().unwrap() = new_jwt;
                     *self.expires_at.write().unwrap() = now + self.ttl_secs;
                 }
@@ -154,8 +229,10 @@ impl DAppProviderClient {
         ttl_secs: u64,
         node_name: Option<&str>,
         ledger_service_public_key: &[u8; 32],
+        connection_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
     ) -> Result<Self> {
-        let channel = Self::create_channel(grpc_url).await?;
+        let channel = Self::create_channel(grpc_url, connection_timeout_secs, request_timeout_secs).await?;
         let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interceptor = AuthInterceptor {
@@ -175,9 +252,50 @@ impl DAppProviderClient {
         })
     }
 
-    /// Create gRPC channel with optional TLS
-    async fn create_channel(grpc_url: &str) -> Result<Channel> {
+    /// Create a DAppProviderClient from a pre-existing shared channel.
+    ///
+    /// Skips channel creation (no TCP+TLS handshake). Each client gets its own
+    /// `AuthInterceptor` for JWT refresh, but shares the underlying HTTP/2 connection.
+    pub fn from_channel(
+        channel: Channel,
+        party_id: &str,
+        role: &str,
+        private_key_bytes: &[u8; 32],
+        ttl_secs: u64,
+        node_name: Option<&str>,
+        ledger_service_public_key: &[u8; 32],
+    ) -> Result<Self> {
+        let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let interceptor = AuthInterceptor {
+            token: Arc::new(RwLock::new(jwt)),
+            expires_at: Arc::new(RwLock::new(now + ttl_secs)),
+            party_id: party_id.to_string(),
+            role: role.to_string(),
+            private_key_bytes: *private_key_bytes,
+            ttl_secs,
+            node_name: node_name.map(|s| s.to_string()),
+        };
+        let client = DAppProviderServiceClient::with_interceptor(channel, interceptor);
+        Ok(Self {
+            client,
+            private_key_bytes: *private_key_bytes,
+            ledger_service_public_key: *ledger_service_public_key,
+        })
+    }
+
+    /// Create gRPC channel with optional TLS and timeouts
+    ///
+    /// The returned `Channel` is `Clone` and supports HTTP/2 multiplexing —
+    /// it can be shared across multiple workers to avoid per-request TCP+TLS overhead.
+    pub async fn create_channel(
+        grpc_url: &str,
+        connect_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+    ) -> Result<Channel> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let connect_timeout = Duration::from_secs(connect_timeout_secs.unwrap_or(30));
+        let request_timeout = Duration::from_secs(request_timeout_secs.unwrap_or(120));
 
         if grpc_url.starts_with("https://") {
             let tls_config = ClientTlsConfig::new().with_webpki_roots().domain_name(
@@ -192,12 +310,16 @@ impl DAppProviderClient {
                 .context("Invalid gRPC URL")?
                 .tls_config(tls_config)
                 .context("Failed to configure TLS")?
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .connect()
                 .await
                 .context("Failed to connect to DAppProvider service")
         } else {
             Channel::from_shared(grpc_url.to_string())
                 .context("Invalid gRPC URL")?
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .connect()
                 .await
                 .context("Failed to connect to DAppProvider service")
@@ -219,7 +341,7 @@ impl DAppProviderClient {
                 template_filters: template_filters.to_vec(),
             })
             .await
-            .context("GetActiveContracts RPC failed")?;
+            .map_err(|s| anyhow!("GetActiveContracts RPC failed ({}): {}", s.code(), s.message()))?;
 
         let mut stream = resp.into_inner();
         let mut contracts = Vec::new();
@@ -245,7 +367,7 @@ impl DAppProviderClient {
             .client
             .get_ledger_end(GetLedgerEndRequest {})
             .await
-            .context("GetLedgerEnd RPC failed")?;
+            .map_err(|s| anyhow!("GetLedgerEnd RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().offset)
     }
 
@@ -264,7 +386,7 @@ impl DAppProviderClient {
                 template_filters: template_filters.to_vec(),
             })
             .await
-            .context("GetUpdates RPC failed")?;
+            .map_err(|s| anyhow!("GetUpdates RPC failed ({}): {}", s.code(), s.message()))?;
 
         let mut stream = resp.into_inner();
         let mut updates = Vec::new();
@@ -288,7 +410,7 @@ impl DAppProviderClient {
             .client
             .get_balances(GetBalancesRequest {})
             .await
-            .context("GetBalances RPC failed")?;
+            .map_err(|s| anyhow!("GetBalances RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().balances)
     }
 
@@ -298,7 +420,7 @@ impl DAppProviderClient {
             .client
             .get_preapprovals(GetPreapprovalsRequest {})
             .await
-            .context("GetPreapprovals RPC failed")?;
+            .map_err(|s| anyhow!("GetPreapprovals RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().preapprovals)
     }
 
@@ -308,7 +430,7 @@ impl DAppProviderClient {
             .client
             .get_dso_rates(GetDsoRatesRequest {})
             .await
-            .context("GetDsoRates RPC failed")?;
+            .map_err(|s| anyhow!("GetDsoRates RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner())
     }
 
@@ -323,8 +445,58 @@ impl DAppProviderClient {
                 settlement_ids: settlement_ids.to_vec(),
             })
             .await
-            .context("GetSettlementContracts RPC failed")?;
+            .map_err(|s| anyhow!("GetSettlementContracts RPC failed ({}): {}", s.code(), s.message()))?;
         Ok(resp.into_inner().contracts)
+    }
+
+    /// Get unlocked amulets via the dedicated GetAmulets RPC
+    pub async fn get_amulets(&mut self) -> Result<Vec<crate::acs_worker::AmuletInfo>> {
+        use orderbook_proto::ledger::GetAmuletsRequest;
+
+        let resp = self
+            .client
+            .get_amulets(GetAmuletsRequest {})
+            .await
+            .map_err(|s| anyhow!("GetAmulets RPC failed ({}): {}", s.code(), s.message()))?;
+
+        Ok(resp
+            .into_inner()
+            .amulets
+            .into_iter()
+            .map(|a| crate::acs_worker::AmuletInfo {
+                contract_id: a.contract_id,
+                amount: a.amount.parse::<rust_decimal::Decimal>().unwrap_or(rust_decimal::Decimal::ZERO),
+            })
+            .collect())
+    }
+
+    /// Get amulets via GetActiveContracts with Amulet template filter (fallback)
+    pub async fn get_amulets_via_acs(&mut self) -> Result<Vec<crate::acs_worker::AmuletInfo>> {
+        let template = "#splice-amulet:Splice.Amulet:Amulet".to_string();
+        let contracts = self.get_active_contracts(&[template]).await?;
+
+        Ok(contracts
+            .into_iter()
+            .filter(|c| !c.template_id.contains("Locked"))
+            .filter_map(|c| {
+                let args = c.create_arguments?;
+                let amount_str = args.fields.get("amount")
+                    .and_then(|v| match &v.kind {
+                        Some(prost_types::value::Kind::StructValue(s)) =>
+                            s.fields.get("initialAmount"),
+                        _ => None,
+                    })
+                    .and_then(|v| match &v.kind {
+                        Some(prost_types::value::Kind::StringValue(s)) => Some(s.clone()),
+                        _ => None,
+                    })?;
+                let amount = amount_str.parse::<rust_decimal::Decimal>().ok()?;
+                Some(crate::acs_worker::AmuletInfo {
+                    contract_id: c.contract_id,
+                    amount,
+                })
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -352,7 +524,7 @@ impl DAppProviderClient {
             .client
             .prepare_transaction(req)
             .await
-            .context("PrepareTransaction RPC failed")?;
+            .map_err(|s| anyhow!("PrepareTransaction RPC failed ({}): {}", s.code(), s.message()))?;
         let response = resp.into_inner();
 
         // Verify response signature
@@ -399,7 +571,7 @@ impl DAppProviderClient {
                 }),
             })
             .await
-            .context("ExecuteTransaction RPC failed")?;
+            .map_err(|s| anyhow!("ExecuteTransaction RPC failed ({}): {}", s.code(), s.message()))?;
         let response = resp.into_inner();
 
         // Verify response signature
@@ -522,6 +694,7 @@ impl DAppProviderClient {
                     rewards_amount: None,
                     rewards_round: None,
                     response_signature: None,
+                    created_contracts: vec![],
                     transaction_status: 0,
                     provider_error: None,
                 });
@@ -564,7 +737,7 @@ impl DAppProviderClient {
                 Err(e) => {
                     // gRPC/network error — transaction may have succeeded
                     if start_offset > 0 {
-                        warn!("Execute error: {} — checking ledger updates", e);
+                        warn!("Execute error: {:#} — checking ledger updates", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         if let Some(recovered) = self.find_transaction_in_updates(
                             &prepared.command_id, start_offset
@@ -578,7 +751,7 @@ impl DAppProviderClient {
                         let delay = BASE_DELAY_MS * 2_u64.pow(attempt);
                         let jitter = rand::thread_rng().gen_range(0..delay / 10 + 1);
                         warn!(
-                            "Retrying after execute error (attempt {}/{}): {} — in {}ms [{}]",
+                            "Retrying after execute error (attempt {}/{}): {:#} — in {}ms [{}]",
                             attempt + 1, max_retries, e, delay + jitter, prepared.command_id
                         );
                         tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
@@ -590,6 +763,15 @@ impl DAppProviderClient {
 
             if !result.success {
                 let error_msg = result.error_message.as_deref().unwrap_or("unknown error");
+
+                // SEQUENCER_BACKPRESSURE: signal fee pause regardless of retry outcome
+                if error_msg.contains("SEQUENCER_BACKPRESSURE") {
+                    warn!(
+                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing fees {}s / traffic {}s [{}]",
+                        attempt + 1, max_retries, *FEE_PAUSE_SECS, *TRAFFIC_FEE_PAUSE_SECS, prepared.command_id
+                    );
+                    signal_sequencer_backpressure();
+                }
 
                 // DUPLICATE_COMMAND: check ledger updates before giving up
                 if error_msg.contains("DUPLICATE_COMMAND") {
@@ -606,12 +788,18 @@ impl DAppProviderClient {
                     anyhow::bail!("Command already submitted (DUPLICATE_COMMAND): {}", error_msg);
                 }
 
-                // INACTIVE_CONTRACTS: contract was consumed/archived — retrying the
-                // same command will always fail. Bail immediately so the settlement
-                // layer can re-discover contracts via sync_on_chain_contracts().
+                // INACTIVE_CONTRACTS: contract was consumed/archived between
+                // prepare and execute. Re-prepare to get fresh CIDs from ACS.
                 if error_msg.contains("INACTIVE_CONTRACTS") {
-                    warn!("Contract consumed, not retrying [{}]: {}", prepared.command_id, error_msg);
-                    anyhow::bail!("Contract consumed (INACTIVE_CONTRACTS): {}", error_msg);
+                    if attempt < max_retries - 1 {
+                        warn!(
+                            "INACTIVE_CONTRACTS (attempt {}/{}), re-preparing with fresh CIDs in 2s [{}]",
+                            attempt + 1, max_retries, prepared.command_id
+                        );
+                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                        continue;
+                    }
+                    anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
                 }
 
                 if attempt < max_retries - 1 {
@@ -676,6 +864,7 @@ impl DAppProviderClient {
                         rewards_amount: None,
                         rewards_round: None,
                         response_signature: None,
+                        created_contracts: vec![],
                         transaction_status: 0,
                         provider_error: None,
                     });
