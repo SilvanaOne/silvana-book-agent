@@ -49,6 +49,7 @@ async fn refresh_amulets(config: &BaseConfig, cache: &Arc<AmuletCache>) -> anyho
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 

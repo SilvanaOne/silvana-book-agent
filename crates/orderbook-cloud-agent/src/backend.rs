@@ -73,6 +73,7 @@ impl CloudSettlementBackend {
             Some(self.config.node_name.as_str()),
             &self.config.ledger_service_public_key,
             Some(self.config.connection_timeout_secs),
+            Some(self.config.request_timeout_secs),
         )
         .await
     }

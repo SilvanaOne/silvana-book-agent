@@ -591,6 +591,7 @@ impl PaymentQueue {
                 match DAppProviderClient::create_channel(
                     &config.orderbook_grpc_url,
                     Some(config.connection_timeout_secs),
+                    Some(config.request_timeout_secs),
                 ).await {
                     Ok(ch) => {
                         info!("Shared gRPC channel created for payment workers");

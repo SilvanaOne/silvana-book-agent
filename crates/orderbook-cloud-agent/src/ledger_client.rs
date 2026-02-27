@@ -230,8 +230,9 @@ impl DAppProviderClient {
         node_name: Option<&str>,
         ledger_service_public_key: &[u8; 32],
         connection_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
     ) -> Result<Self> {
-        let channel = Self::create_channel(grpc_url, connection_timeout_secs).await?;
+        let channel = Self::create_channel(grpc_url, connection_timeout_secs, request_timeout_secs).await?;
         let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interceptor = AuthInterceptor {
@@ -287,9 +288,14 @@ impl DAppProviderClient {
     ///
     /// The returned `Channel` is `Clone` and supports HTTP/2 multiplexing —
     /// it can be shared across multiple workers to avoid per-request TCP+TLS overhead.
-    pub async fn create_channel(grpc_url: &str, timeout_secs: Option<u64>) -> Result<Channel> {
+    pub async fn create_channel(
+        grpc_url: &str,
+        connect_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+    ) -> Result<Channel> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+        let connect_timeout = Duration::from_secs(connect_timeout_secs.unwrap_or(30));
+        let request_timeout = Duration::from_secs(request_timeout_secs.unwrap_or(120));
 
         if grpc_url.starts_with("https://") {
             let tls_config = ClientTlsConfig::new().with_webpki_roots().domain_name(
@@ -304,16 +310,16 @@ impl DAppProviderClient {
                 .context("Invalid gRPC URL")?
                 .tls_config(tls_config)
                 .context("Failed to configure TLS")?
-                .connect_timeout(timeout)
-                .timeout(timeout)
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .connect()
                 .await
                 .context("Failed to connect to DAppProvider service")
         } else {
             Channel::from_shared(grpc_url.to_string())
                 .context("Invalid gRPC URL")?
-                .connect_timeout(timeout)
-                .timeout(timeout)
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .connect()
                 .await
                 .context("Failed to connect to DAppProvider service")

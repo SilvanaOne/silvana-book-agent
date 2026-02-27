@@ -482,6 +482,7 @@ async fn run_cloud_agent(
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await
     .context("Failed to create ledger client")?;
@@ -544,6 +545,7 @@ async fn run_fill(
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await
     .context("Failed to create ledger client")?;
@@ -907,6 +909,7 @@ async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1009,6 +1012,7 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1072,6 +1076,7 @@ async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, ver
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1184,6 +1189,7 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 
@@ -1747,6 +1753,7 @@ auto_settle = true
 poll_interval_secs = 10
 token_ttl_secs = 3600
 connection_timeout_secs = 30
+request_timeout_secs = 120
 
 [[markets]]
 enabled = false
@@ -1772,6 +1779,7 @@ instrument_admin = ""
         Some(base_config.node_name.as_str()),
         &base_config.ledger_service_public_key,
         Some(base_config.connection_timeout_secs),
+        Some(base_config.request_timeout_secs),
     )
     .await
     .context("Failed to create authenticated DAppProvider client")?;
@@ -1924,6 +1932,7 @@ async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verb
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
     )
     .await?;
 

@@ -32,6 +32,8 @@ struct AgentToml {
     token_ttl_secs: u64,
     #[serde(default = "default_connection_timeout_secs")]
     connection_timeout_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    request_timeout_secs: u64,
     #[serde(default)]
     markets: Vec<MarketConfig>,
     /// LP configuration (only for liquidity provider agents)
@@ -103,6 +105,7 @@ pub struct BaseConfig {
     pub role: String,
     pub token_ttl_secs: u64,
     pub connection_timeout_secs: u64,
+    pub request_timeout_secs: u64,
     pub markets: Vec<MarketConfig>,
 
     // Multi-node routing
@@ -218,6 +221,7 @@ impl BaseConfig {
             role: agent.role,
             token_ttl_secs: agent.token_ttl_secs,
             connection_timeout_secs: agent.connection_timeout_secs,
+            request_timeout_secs: agent.request_timeout_secs,
             markets: agent.markets,
             node_name,
             ledger_service_public_key,
@@ -397,6 +401,10 @@ fn default_connection_timeout_secs() -> u64 {
     30
 }
 
+fn default_request_timeout_secs() -> u64 {
+    120
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -445,6 +453,7 @@ mod tests {
         assert_eq!(agent.role, "trader");
         assert_eq!(agent.token_ttl_secs, 3600);
         assert_eq!(agent.connection_timeout_secs, 30);
+        assert_eq!(agent.request_timeout_secs, 120);
         assert!(agent.markets.is_empty());
     }
 }
