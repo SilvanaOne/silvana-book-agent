@@ -13,6 +13,7 @@ pub mod auth;
 pub mod client;
 pub mod confirm;
 pub mod config;
+pub mod forecast;
 pub mod logging;
 pub mod order_manager;
 pub mod order_tracker;

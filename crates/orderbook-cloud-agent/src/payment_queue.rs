@@ -636,6 +636,15 @@ impl PaymentQueue {
                     continue;
                 }
 
+                // Skip traffic fees while issuance forecast is LOW — heavy sequencer load
+                // means traffic txs would likely hit SEQUENCER_BACKPRESSURE errors
+                if item_priority == PaymentPriority::Low
+                    && orderbook_agent_logic::forecast::is_traffic_paused_by_forecast()
+                {
+                    deferred.push(item);
+                    continue;
+                }
+
                 // Estimate CC needed for this payment
                 let estimated_cc = estimate_cc_needed(&item.request);
 
@@ -858,7 +867,8 @@ impl PaymentQueue {
                 let traffic_in_heap = heap.iter()
                     .filter(|i| matches!(&i.request, PaymentRequest::TransferTrafficFee { .. }))
                     .count();
-                let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some();
+                let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some()
+                    || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
                 if !has_pending_allocations && !traffic_paused && traffic_in_heap < MAX_TRAFFIC_FEES_IN_QUEUE {
                     let mut backlog = traffic_fee_backlog.lock().await;
                     let to_drain = MAX_TRAFFIC_FEES_IN_QUEUE - traffic_in_heap;

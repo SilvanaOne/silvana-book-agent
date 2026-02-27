@@ -15,6 +15,7 @@ use orderbook_proto::{
         GetSettlementProposalsRequest, SettlementProposal, SettlementStatus,
         RequestQuotesRequest, RequestQuotesResponse,
         AcceptQuoteRequest, AcceptQuoteResponse,
+        GetRoundsDataRequest, GetRoundsDataResponse,
     },
 };
 use std::sync::{Arc, RwLock};
@@ -403,6 +404,19 @@ impl OrderbookClient {
     /// Get the public key hex
     pub fn public_key_hex(&self) -> &str {
         &self.auth_data.public_key_hex
+    }
+
+    /// Get rounds data including issuance forecast
+    pub async fn get_rounds_data(&mut self, limit: Option<u32>) -> Result<GetRoundsDataResponse> {
+        let request = Request::new(GetRoundsDataRequest {
+            limit,
+        });
+        let response = self
+            .orderbook_client
+            .get_rounds_data(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_rounds_data failed: {}", e.message()))?;
+        Ok(response.into_inner())
     }
 }
 

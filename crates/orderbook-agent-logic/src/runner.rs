@@ -14,7 +14,7 @@ use tokio::signal;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::StreamExt;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use orderbook_proto::ledger::TokenBalance;
 
@@ -495,6 +495,24 @@ where
 
                 _ = heartbeat_timer.tick() => {
                     heartbeat_count += 1;
+
+                    // Poll issuance forecast from orderbook RPC (non-blocking, ignore errors)
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        orderbook_client.get_rounds_data(Some(1)),
+                    ).await {
+                        Ok(Ok(resp)) => {
+                            if let Some(prediction) = resp.prediction {
+                                crate::forecast::update_forecast(
+                                    prediction.forecast,
+                                    prediction.forecast_coefficient,
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => debug!("Forecast poll failed: {:#}", e),
+                        Err(_) => debug!("Forecast poll timed out"),
+                    }
+
                     let active_settlements = settlement_executor.active_settlements();
                     let n = active_settlements.len();
                     let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
@@ -519,14 +537,27 @@ where
                         if let Some(secs) = settlement_executor.traffic_fee_pause_secs() {
                             parts.push(format!("TRAFFIC PAUSED {}s", secs));
                         }
+                        if crate::forecast::is_traffic_paused_by_forecast() {
+                            parts.push("TRAFFIC PAUSED (low issuance)".to_string());
+                        }
                         if parts.is_empty() {
                             String::new()
                         } else {
                             format!(", {}", parts.join(", "))
                         }
                     };
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str);
+                    let forecast_str = {
+                        let label = crate::forecast::forecast_label();
+                        if label != "unknown" {
+                            let coeff = crate::forecast::forecast_coefficient()
+                                .unwrap_or_default();
+                            format!(", forecast {} ({})", label, coeff)
+                        } else {
+                            String::new()
+                        }
+                    };
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str, forecast_str);
                     settlement_executor.log_cid_waiting_summary();
                     // Every 5 minutes, also list individual settlement IDs
                     if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {

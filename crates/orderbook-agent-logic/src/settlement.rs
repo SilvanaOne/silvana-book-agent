@@ -172,6 +172,13 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
+    /// Check if traffic fees are paused due to low issuance forecast.
+    /// LOW coefficient means heavy sequencer load — traffic txs would hit
+    /// SEQUENCER_BACKPRESSURE errors.
+    fn forecast_paused(&self) -> bool {
+        crate::forecast::is_traffic_paused_by_forecast()
+    }
+
     /// Signal the payment queue to stop dispatching new work (for graceful shutdown).
     fn shutdown(&self) {}
 }
@@ -299,6 +306,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Check if traffic fees are paused (sequencer backpressure).
     pub fn traffic_fee_pause_secs(&self) -> Option<u64> {
         self.backend.traffic_fee_pause_secs()
+    }
+
+    /// Check if traffic fees are paused due to low issuance forecast.
+    pub fn forecast_paused(&self) -> bool {
+        self.backend.forecast_paused()
     }
 
     /// Return (in_progress, max_threads, in_backoff, waiting) for thread utilization logging

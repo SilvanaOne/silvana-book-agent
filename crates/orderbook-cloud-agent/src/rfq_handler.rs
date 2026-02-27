@@ -181,15 +181,22 @@ impl RfqHandler {
         };
         drop(mid_prices);
 
-        // Compute price based on direction and spread
+        // Compute price based on direction and spread.
+        // Widen spreads 2x when issuance forecast is LOW — high demand period means
+        // sequencer under heavy load, protect LP from adverse fills during volatility.
         // direction 1 = BUY (user buys, LP sells → offer price = mid + spread)
         // direction 2 = SELL (user sells, LP buys → bid price = mid - spread)
+        let spread_multiplier = if orderbook_agent_logic::forecast::is_traffic_paused_by_forecast() {
+            2.0
+        } else {
+            1.0
+        };
         let price = if request.direction == 1 {
             // User is buying → LP offers at mid + spread
-            mid_price * (1.0 + rfq_config.offer_spread_percent / 100.0)
+            mid_price * (1.0 + rfq_config.offer_spread_percent * spread_multiplier / 100.0)
         } else {
             // User is selling → LP bids at mid - spread
-            mid_price * (1.0 - rfq_config.bid_spread_percent / 100.0)
+            mid_price * (1.0 - rfq_config.bid_spread_percent * spread_multiplier / 100.0)
         };
 
         let quote_quantity = quantity * price;
@@ -220,14 +227,20 @@ impl RfqHandler {
         let now = chrono::Utc::now();
         let valid_until = now + chrono::Duration::seconds(valid_for_secs as i64);
 
+        let effective_spread = if request.direction == 1 {
+            rfq_config.offer_spread_percent * spread_multiplier
+        } else {
+            rfq_config.bid_spread_percent * spread_multiplier
+        };
         info!(
-            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={}%)",
+            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={}%{})",
             rfq_id,
             quantity,
             request.market_id,
             price,
             mid_price,
-            if request.direction == 1 { rfq_config.offer_spread_percent } else { rfq_config.bid_spread_percent }
+            effective_spread,
+            if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" }
         );
 
         // Record trade for settlement verification
