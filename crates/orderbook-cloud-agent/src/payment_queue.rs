@@ -457,6 +457,12 @@ impl PaymentQueue {
         )
     }
 
+    /// Check if traffic fees are paused due to sequencer backpressure.
+    /// Returns Some(remaining_secs) if paused, None if not.
+    pub fn traffic_fee_pause_secs(&self) -> Option<u64> {
+        crate::ledger_client::traffic_fee_pause_remaining()
+    }
+
     /// Scheduler: picks payments, selects amulets, reserves, spawns workers
     #[allow(clippy::too_many_arguments)]
     async fn scheduler(
@@ -603,6 +609,14 @@ impl PaymentQueue {
                 // Skip non-allocations if an allocation was already deferred —
                 // don't let fees consume amulets that allocations need
                 if allocation_deferred && item_priority != PaymentPriority::High {
+                    deferred.push(item);
+                    continue;
+                }
+
+                // Skip traffic fees while sequencer backpressure pause is active
+                if item_priority == PaymentPriority::Low
+                    && crate::ledger_client::traffic_fee_pause_remaining().is_some()
+                {
                     deferred.push(item);
                     continue;
                 }
@@ -829,7 +843,8 @@ impl PaymentQueue {
                 let traffic_in_heap = heap.iter()
                     .filter(|i| matches!(&i.request, PaymentRequest::TransferTrafficFee { .. }))
                     .count();
-                if !has_pending_allocations && traffic_in_heap < MAX_TRAFFIC_FEES_IN_QUEUE {
+                let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some();
+                if !has_pending_allocations && !traffic_paused && traffic_in_heap < MAX_TRAFFIC_FEES_IN_QUEUE {
                     let mut backlog = traffic_fee_backlog.lock().await;
                     let to_drain = MAX_TRAFFIC_FEES_IN_QUEUE - traffic_in_heap;
                     let mut drained = 0;

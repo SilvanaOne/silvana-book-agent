@@ -511,8 +511,12 @@ where
                     } else {
                         String::new()
                     };
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str);
+                    let pause_str = match settlement_executor.traffic_fee_pause_secs() {
+                        Some(secs) => format!(", TRAFFIC PAUSED {}s", secs),
+                        None => String::new(),
+                    };
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str);
                     settlement_executor.log_cid_waiting_summary();
                     // Every 5 minutes, also list individual settlement IDs
                     if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {

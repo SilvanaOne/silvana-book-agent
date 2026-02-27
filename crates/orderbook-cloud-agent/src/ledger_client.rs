@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use once_cell::sync::Lazy;
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -27,6 +28,47 @@ static MAX_RETRIES: Lazy<u32> = Lazy::new(|| {
 });
 
 const BASE_DELAY_MS: u64 = 1000;
+
+/// Duration in seconds to pause traffic fee dispatch after SEQUENCER_BACKPRESSURE.
+static TRAFFIC_FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("TRAFFIC_FEE_PAUSE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+});
+
+/// Epoch millis after which traffic fee dispatch may resume.
+/// Written by submit_transaction() on SEQUENCER_BACKPRESSURE, read by PaymentQueue scheduler.
+static TRAFFIC_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a backpressure event — pauses traffic fees for TRAFFIC_FEE_PAUSE_SECS.
+pub fn signal_sequencer_backpressure() {
+    let resume_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        + *TRAFFIC_FEE_PAUSE_SECS * 1000;
+    // Only advance the deadline, never shorten it
+    TRAFFIC_PAUSE_UNTIL_MS.fetch_max(resume_at, AtomicOrdering::Relaxed);
+}
+
+/// Check whether traffic fees are currently paused due to sequencer backpressure.
+/// Returns Some(remaining_secs) if paused, None if not.
+pub fn traffic_fee_pause_remaining() -> Option<u64> {
+    let resume_at = TRAFFIC_PAUSE_UNTIL_MS.load(AtomicOrdering::Relaxed);
+    if resume_at == 0 {
+        return None;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if now_ms < resume_at {
+        Some((resume_at - now_ms + 999) / 1000)
+    } else {
+        None
+    }
+}
 
 use orderbook_agent_logic::auth::generate_jwt;
 use message_signing::{
@@ -682,6 +724,15 @@ impl DAppProviderClient {
 
             if !result.success {
                 let error_msg = result.error_message.as_deref().unwrap_or("unknown error");
+
+                // SEQUENCER_BACKPRESSURE: signal traffic fee pause regardless of retry outcome
+                if error_msg.contains("SEQUENCER_BACKPRESSURE") {
+                    warn!(
+                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing traffic fees for {}s [{}]",
+                        attempt + 1, max_retries, *TRAFFIC_FEE_PAUSE_SECS, prepared.command_id
+                    );
+                    signal_sequencer_backpressure();
+                }
 
                 // DUPLICATE_COMMAND: check ledger updates before giving up
                 if error_msg.contains("DUPLICATE_COMMAND") {

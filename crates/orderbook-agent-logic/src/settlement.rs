@@ -160,6 +160,12 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
+    /// Check if traffic fees are paused (sequencer backpressure).
+    /// Returns Some(remaining_secs) if paused, None otherwise.
+    fn traffic_fee_pause_secs(&self) -> Option<u64> {
+        None
+    }
+
     /// Signal the payment queue to stop dispatching new work (for graceful shutdown).
     fn shutdown(&self) {}
 }
@@ -277,6 +283,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Get per-pool worker utilization (delegated to backend).
     pub fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
         self.backend.worker_utilization()
+    }
+
+    /// Check if traffic fees are paused (sequencer backpressure).
+    pub fn traffic_fee_pause_secs(&self) -> Option<u64> {
+        self.backend.traffic_fee_pause_secs()
     }
 
     /// Return (in_progress, max_threads, in_backoff, waiting) for thread utilization logging
