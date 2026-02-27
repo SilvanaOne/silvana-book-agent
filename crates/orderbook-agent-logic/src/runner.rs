@@ -511,9 +511,19 @@ where
                     } else {
                         String::new()
                     };
-                    let pause_str = match settlement_executor.traffic_fee_pause_secs() {
-                        Some(secs) => format!(", TRAFFIC PAUSED {}s", secs),
-                        None => String::new(),
+                    let pause_str = {
+                        let mut parts = Vec::new();
+                        if let Some(secs) = settlement_executor.fee_pause_secs() {
+                            parts.push(format!("FEES PAUSED {}s", secs));
+                        }
+                        if let Some(secs) = settlement_executor.traffic_fee_pause_secs() {
+                            parts.push(format!("TRAFFIC PAUSED {}s", secs));
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", parts.join(", "))
+                        }
                     };
                     info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}",
                         n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str);

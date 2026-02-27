@@ -250,6 +250,13 @@ pub fn canonical_params_accept_cip56(contract_id: &str) -> String {
     format!("param_type=AcceptCip56\ncontract_id={}\n", contract_id)
 }
 
+pub fn canonical_params_split_cc(output_amounts: &[String]) -> String {
+    format!(
+        "param_type=SplitCc\noutput_amounts={}\n",
+        output_amounts.join(",")
+    )
+}
+
 // ============================================================================
 // Canonical payload builders — Onboarding RPCs
 //

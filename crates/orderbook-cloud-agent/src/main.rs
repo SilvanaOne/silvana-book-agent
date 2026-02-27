@@ -18,7 +18,7 @@ use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
-    TransferCcParams, TransferCip56Params, AcceptCip56Params,
+    TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
     prepare_transaction_request::Params,
     d_app_provider_service_client::DAppProviderServiceClient,
@@ -256,6 +256,15 @@ enum TransferCommands {
         /// TransferOffer contract ID to accept
         #[arg(long)]
         contract_id: String,
+    },
+    /// Split CC into multiple amulets (MergeSplit via AmuletRules_Transfer)
+    SplitCc {
+        /// Comma-separated output amounts (e.g. "10.5,20.0,5.0")
+        #[arg(long, value_delimiter = ',')]
+        output_amounts: Vec<String>,
+        /// Comma-separated input amulet contract IDs
+        #[arg(long, value_delimiter = ',')]
+        amulet_cids: Vec<String>,
     },
 }
 
@@ -1296,6 +1305,51 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                 )
                 .await?;
             println!("CIP-56 transfer accepted ({}): {}", contract_id, result.update_id);
+        }
+        TransferCommands::SplitCc {
+            output_amounts,
+            amulet_cids,
+        } => {
+            if output_amounts.is_empty() {
+                return Err(anyhow::anyhow!("--output-amounts must not be empty"));
+            }
+            if amulet_cids.is_empty() {
+                return Err(anyhow::anyhow!("--amulet-cids must not be empty"));
+            }
+            if confirm && !dry_run {
+                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
+                orderbook_agent_logic::confirm::confirm_transaction(
+                    &lock,
+                    "Split CC",
+                    &format!("outputs: [{}], inputs: {} amulets", output_amounts.join(", "), amulet_cids.len()),
+                ).await?;
+            }
+            let expectation = OperationExpectation::SplitCc {
+                party: config.party_id.clone(),
+                output_amounts: output_amounts.clone(),
+            };
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::SplitCc as i32,
+                        params: Some(Params::SplitCc(SplitCcParams {
+                            output_amounts: output_amounts.clone(),
+                            amulet_cids,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
+            println!("CC split completed: {}", result.update_id);
+            for c in &result.created_contracts {
+                if !c.amount.is_empty() {
+                    println!("  Amulet {} (amount: {})", c.contract_id, c.amount);
+                }
+            }
         }
     }
 

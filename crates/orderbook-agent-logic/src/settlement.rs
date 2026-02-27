@@ -160,6 +160,12 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
+    /// Check if regular fees are paused (sequencer backpressure).
+    /// Returns Some(remaining_secs) if paused, None otherwise.
+    fn fee_pause_secs(&self) -> Option<u64> {
+        None
+    }
+
     /// Check if traffic fees are paused (sequencer backpressure).
     /// Returns Some(remaining_secs) if paused, None otherwise.
     fn traffic_fee_pause_secs(&self) -> Option<u64> {
@@ -283,6 +289,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Get per-pool worker utilization (delegated to backend).
     pub fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
         self.backend.worker_utilization()
+    }
+
+    /// Check if regular fees are paused (sequencer backpressure).
+    pub fn fee_pause_secs(&self) -> Option<u64> {
+        self.backend.fee_pause_secs()
     }
 
     /// Check if traffic fees are paused (sequencer backpressure).

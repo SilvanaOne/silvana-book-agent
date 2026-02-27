@@ -457,6 +457,12 @@ impl PaymentQueue {
         )
     }
 
+    /// Check if regular fees are paused due to sequencer backpressure.
+    /// Returns Some(remaining_secs) if paused, None if not.
+    pub fn fee_pause_secs(&self) -> Option<u64> {
+        crate::ledger_client::fee_pause_remaining()
+    }
+
     /// Check if traffic fees are paused due to sequencer backpressure.
     /// Returns Some(remaining_secs) if paused, None if not.
     pub fn traffic_fee_pause_secs(&self) -> Option<u64> {
@@ -609,6 +615,14 @@ impl PaymentQueue {
                 // Skip non-allocations if an allocation was already deferred —
                 // don't let fees consume amulets that allocations need
                 if allocation_deferred && item_priority != PaymentPriority::High {
+                    deferred.push(item);
+                    continue;
+                }
+
+                // Skip regular fees while sequencer backpressure pause is active
+                if item_priority == PaymentPriority::Normal
+                    && crate::ledger_client::fee_pause_remaining().is_some()
+                {
                     deferred.push(item);
                     continue;
                 }

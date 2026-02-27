@@ -62,6 +62,10 @@ pub enum OperationExpectation {
         receiver_party: String,
         contract_id: String,
     },
+    SplitCc {
+        party: String,
+        output_amounts: Vec<String>,
+    },
 }
 
 /// Result of transaction verification

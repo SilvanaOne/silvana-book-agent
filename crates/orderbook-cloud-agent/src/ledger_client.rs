@@ -29,27 +29,59 @@ static MAX_RETRIES: Lazy<u32> = Lazy::new(|| {
 
 const BASE_DELAY_MS: u64 = 1000;
 
-/// Duration in seconds to pause traffic fee dispatch after SEQUENCER_BACKPRESSURE.
-static TRAFFIC_FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
-    std::env::var("TRAFFIC_FEE_PAUSE_SECS")
+/// Duration in seconds to pause regular fee dispatch after SEQUENCER_BACKPRESSURE.
+static FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("FEE_PAUSE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60)
 });
 
+/// Duration in seconds to pause traffic fee dispatch after SEQUENCER_BACKPRESSURE.
+static TRAFFIC_FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("TRAFFIC_FEE_PAUSE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120)
+});
+
+/// Epoch millis after which regular fee dispatch may resume.
+static FEE_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Epoch millis after which traffic fee dispatch may resume.
-/// Written by submit_transaction() on SEQUENCER_BACKPRESSURE, read by PaymentQueue scheduler.
 static TRAFFIC_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Record a backpressure event — pauses traffic fees for TRAFFIC_FEE_PAUSE_SECS.
+/// Record a backpressure event — pauses regular fees for FEE_PAUSE_SECS
+/// and traffic fees for TRAFFIC_FEE_PAUSE_SECS.
 pub fn signal_sequencer_backpressure() {
-    let resume_at = SystemTime::now()
+    let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
-        + *TRAFFIC_FEE_PAUSE_SECS * 1000;
-    // Only advance the deadline, never shorten it
-    TRAFFIC_PAUSE_UNTIL_MS.fetch_max(resume_at, AtomicOrdering::Relaxed);
+        .as_millis() as u64;
+
+    let fee_resume_at = now_ms + *FEE_PAUSE_SECS * 1000;
+    FEE_PAUSE_UNTIL_MS.fetch_max(fee_resume_at, AtomicOrdering::Relaxed);
+
+    let traffic_resume_at = now_ms + *TRAFFIC_FEE_PAUSE_SECS * 1000;
+    TRAFFIC_PAUSE_UNTIL_MS.fetch_max(traffic_resume_at, AtomicOrdering::Relaxed);
+}
+
+/// Check whether regular fees are currently paused due to sequencer backpressure.
+/// Returns Some(remaining_secs) if paused, None if not.
+pub fn fee_pause_remaining() -> Option<u64> {
+    let resume_at = FEE_PAUSE_UNTIL_MS.load(AtomicOrdering::Relaxed);
+    if resume_at == 0 {
+        return None;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if now_ms < resume_at {
+        Some((resume_at - now_ms + 999) / 1000)
+    } else {
+        None
+    }
 }
 
 /// Check whether traffic fees are currently paused due to sequencer backpressure.
@@ -79,7 +111,7 @@ use message_signing::{
     canonical_params_allocate, canonical_params_transfer_cc, canonical_params_request_preapproval,
     canonical_params_request_recurring_prepaid, canonical_params_request_recurring_payasyougo,
     canonical_params_request_user_service, canonical_params_transfer_cip56,
-    canonical_params_accept_cip56,
+    canonical_params_accept_cip56, canonical_params_split_cc,
 };
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use tx_verifier::OperationExpectation;
@@ -122,6 +154,7 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
             &p.amount, p.reference.as_deref(),
         ),
         Params::AcceptCip56(p) => canonical_params_accept_cip56(&p.contract_id),
+        Params::SplitCc(p) => canonical_params_split_cc(&p.output_amounts),
     };
     Ok(canonical_prepare_request(req.operation, &params_canonical))
 }
@@ -725,11 +758,11 @@ impl DAppProviderClient {
             if !result.success {
                 let error_msg = result.error_message.as_deref().unwrap_or("unknown error");
 
-                // SEQUENCER_BACKPRESSURE: signal traffic fee pause regardless of retry outcome
+                // SEQUENCER_BACKPRESSURE: signal fee pause regardless of retry outcome
                 if error_msg.contains("SEQUENCER_BACKPRESSURE") {
                     warn!(
-                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing traffic fees for {}s [{}]",
-                        attempt + 1, max_retries, *TRAFFIC_FEE_PAUSE_SECS, prepared.command_id
+                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing fees {}s / traffic {}s [{}]",
+                        attempt + 1, max_retries, *FEE_PAUSE_SECS, *TRAFFIC_FEE_PAUSE_SECS, prepared.command_id
                     );
                     signal_sequencer_backpressure();
                 }

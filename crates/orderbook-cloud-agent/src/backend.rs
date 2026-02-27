@@ -268,6 +268,10 @@ impl SettlementBackend for CloudSettlementBackend {
         Some(self.payment_queue.worker_utilization())
     }
 
+    fn fee_pause_secs(&self) -> Option<u64> {
+        self.payment_queue.fee_pause_secs()
+    }
+
     fn traffic_fee_pause_secs(&self) -> Option<u64> {
         self.payment_queue.traffic_fee_pause_secs()
     }

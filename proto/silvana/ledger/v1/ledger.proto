@@ -446,6 +446,9 @@ enum TransactionOperation {
   // CIP-56 token transfers
   TRANSACTION_OPERATION_TRANSFER_CIP56 = 11;
   TRANSACTION_OPERATION_ACCEPT_CIP56 = 12;
+
+  // CC split (MergeSplit)
+  TRANSACTION_OPERATION_SPLIT_CC = 13;
 }
 
 // --- PrepareTransaction ---
@@ -465,6 +468,7 @@ message PrepareTransactionRequest {
     RequestUserServiceParams request_user_service = 18;
     TransferCip56Params transfer_cip56 = 19;
     AcceptCip56Params accept_cip56 = 20;
+    SplitCcParams split_cc = 21;
   }
 
   // Message-level signature from cloud agent (Ed25519 over canonical request payload)
@@ -540,6 +544,12 @@ message TransferCip56Params {
 // Accept incoming CIP-56 TransferOffer — registrar extracted from contract payload
 message AcceptCip56Params {
   string contract_id = 1;      // TransferOffer contract ID to accept
+}
+
+// Split CC into multiple amulets via AmuletRules_Transfer (MergeSplit)
+message SplitCcParams {
+  repeated string output_amounts = 1; // Amount for each output amulet (decimal strings)
+  repeated string amulet_cids = 2;    // Input amulet contract IDs
 }
 
 // --- PrepareTransaction Response ---
