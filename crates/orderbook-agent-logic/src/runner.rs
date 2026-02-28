@@ -590,7 +590,7 @@ where
                             parts.push(format!("TRAFFIC PAUSED {}s", secs));
                         }
                         if crate::forecast::is_traffic_paused_by_forecast() {
-                            parts.push("TRAFFIC PAUSED (low issuance)".to_string());
+                            parts.push("TRAFFIC PAUSED (sequencer overload)".to_string());
                         }
                         if crate::forecast::is_fees_paused_by_overload() {
                             parts.push("FEES PAUSED (sequencer overload)".to_string());

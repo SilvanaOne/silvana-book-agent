@@ -252,10 +252,10 @@ impl RfqHandler {
 
         let price = if request.direction == 1 {
             // User is buying → LP offers at mid + spread
-            mid_price * (1.0 + rfq_config.offer_spread_percent * spread_multiplier * (1.0 + depletion_coeff) / 100.0)
+            mid_price * (1.0 + rfq_config.offer_spread_percent * (spread_multiplier + depletion_coeff) / 100.0)
         } else {
             // User is selling → LP bids at mid - spread
-            mid_price * (1.0 - rfq_config.bid_spread_percent * spread_multiplier * (1.0 + depletion_coeff) / 100.0)
+            mid_price * (1.0 - rfq_config.bid_spread_percent * (spread_multiplier + depletion_coeff) / 100.0)
         };
 
         let quote_quantity = quantity * price;
@@ -335,9 +335,9 @@ impl RfqHandler {
         let valid_until = now + chrono::Duration::seconds(valid_for_secs as i64);
 
         let effective_spread = if request.direction == 1 {
-            rfq_config.offer_spread_percent * spread_multiplier * (1.0 + depletion_coeff)
+            rfq_config.offer_spread_percent * (spread_multiplier + depletion_coeff)
         } else {
-            rfq_config.bid_spread_percent * spread_multiplier * (1.0 + depletion_coeff)
+            rfq_config.bid_spread_percent * (spread_multiplier + depletion_coeff)
         };
         info!(
             "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{})",
