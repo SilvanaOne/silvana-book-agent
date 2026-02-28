@@ -446,11 +446,41 @@ async fn run_cloud_agent(
     );
     info!("Fee reserve: {:.2} CC", config.fee_reserve_cc);
 
+    // Create LiquidityManager early so it can be shared with RfqHandler and Backend
+    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+        config.fee_reserve_cc,
+        config.liquidity_margin,
+        config.flow_ema_window_hours,
+        config.depletion_max_hours,
+        config.depletion_min_hours,
+    );
+
+    // Register token aliases from server market data (symbol → instrument_id)
+    {
+        let mut client = orderbook_agent_logic::client::OrderbookClient::new(&config).await?;
+        match client.get_markets().await {
+            Ok(markets) => {
+                for market in &markets {
+                    let parts: Vec<&str> = market.market_id.split('-').collect();
+                    if parts.len() == 2 {
+                        liquidity_manager.register_alias(parts[0], &market.base_instrument).await;
+                        liquidity_manager.register_alias(parts[1], &market.quote_instrument).await;
+                    }
+                }
+                info!("Registered token aliases from {} markets", markets.len());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch markets for alias registration: {}", e);
+            }
+        }
+    }
+
     // Create RfqHandler early so we can share its quoted_trades Arc with AgentOptions
     let lp_shutdown = Arc::new(AtomicBool::new(false));
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
-        let rfq_handler = rfq_handler::RfqHandler::new(&config)
+        let mut rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
+        rfq_handler.set_liquidity_manager(liquidity_manager.clone());
         let quoted_trades = rfq_handler.quoted_trades();
 
         info!(
@@ -471,7 +501,7 @@ async fn run_cloud_agent(
     };
 
     let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
-    let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock);
+    let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock, liquidity_manager);
 
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
@@ -534,7 +564,14 @@ async fn run_fill(
     info!("Starting {} mode: market={}, amount={}, interval={}s", dir_str, market, amount, interval);
 
     let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
-    let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock);
+    let fill_lm = orderbook_agent_logic::liquidity::LiquidityManager::new(
+        config.fee_reserve_cc,
+        config.liquidity_margin,
+        config.flow_ema_window_hours,
+        config.depletion_max_hours,
+        config.depletion_min_hours,
+    );
+    let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock, fill_lm);
 
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,

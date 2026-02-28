@@ -654,6 +654,20 @@ impl PaymentQueue {
                     continue;
                 }
 
+                // Pause traffic fees when CC is critically low — preserve amulets for
+                // allocations and regular fees (critical path)
+                if item_priority == PaymentPriority::Low {
+                    let selectable_total: Decimal = cache.get_selectable_amulets().await
+                        .iter()
+                        .map(|a| a.amount)
+                        .sum();
+                    if selectable_total < Decimal::from_f64_retain(config.fee_reserve_cc).unwrap_or(Decimal::from(5)) {
+                        debug!("Pausing traffic fee — critical CC shortage ({:.2} selectable)", selectable_total);
+                        deferred.push(item);
+                        continue;
+                    }
+                }
+
                 // Estimate CC needed for this payment
                 let estimated_cc = estimate_cc_needed(&item.request);
 
@@ -671,7 +685,7 @@ impl PaymentQueue {
                 };
 
                 if selected.is_empty() && estimated_cc > Decimal::ZERO {
-                    // Not enough amulets — defer this payment
+                    // Not enough amulets — defer this payment (kept until success)
                     deferred.push(item);
                     // If allocation can't get amulets, block lower-priority items
                     // so freed amulets go to allocations first

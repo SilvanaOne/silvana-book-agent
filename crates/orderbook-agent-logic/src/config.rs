@@ -122,6 +122,16 @@ pub struct BaseConfig {
 
     // Settlement expiry (max lifetime before considering expired)
     pub settle_before_secs: u64,
+
+    // Liquidity management
+    /// Safety margin multiplier for fee estimates (e.g. 1.1 = 10%)
+    pub liquidity_margin: f64,
+    /// EMA window in hours for flow depletion tracking
+    pub flow_ema_window_hours: f64,
+    /// Hours to depletion at which spread coefficient = 0
+    pub depletion_max_hours: f64,
+    /// Hours to depletion at which spread coefficient = 10
+    pub depletion_min_hours: f64,
 }
 
 impl BaseConfig {
@@ -199,6 +209,26 @@ impl BaseConfig {
             .max()
             .unwrap_or(default_rfq_settle_before_secs() as u64);
 
+        let liquidity_margin = std::env::var("LIQUIDITY_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.1);
+
+        let flow_ema_window_hours = std::env::var("FLOW_EMA_WINDOW_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4.0);
+
+        let depletion_max_hours = std::env::var("DEPLETION_COEFF_MAX_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.0);
+
+        let depletion_min_hours = std::env::var("DEPLETION_COEFF_MIN_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
+
         Ok(BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
@@ -228,6 +258,10 @@ impl BaseConfig {
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
             settle_before_secs,
+            liquidity_margin,
+            flow_ema_window_hours,
+            depletion_max_hours,
+            depletion_min_hours,
         })
     }
 

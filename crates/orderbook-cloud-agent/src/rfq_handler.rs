@@ -2,9 +2,15 @@
 //!
 //! Handles incoming RFQ requests from the orderbook server and responds
 //! with quotes or rejections based on market configuration and mid-prices.
+//!
+//! When a LiquidityManager is configured, the handler:
+//! 1. Rejects RFQs when the LP lacks sufficient balance for the allocation + fees
+//! 2. Widens spreads based on token depletion rate (depletion coefficient)
 
 use orderbook_agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
+use orderbook_agent_logic::liquidity::LiquidityManager;
 use orderbook_agent_logic::runner::QuotedTrade;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -24,6 +30,8 @@ pub struct RfqHandler {
     party_id: String,
     /// Trades we quoted (for settlement verification)
     quoted_trades: Arc<Mutex<Vec<QuotedTrade>>>,
+    /// Liquidity manager for balance checks and depletion-based spread adjustment
+    liquidity_manager: Option<Arc<LiquidityManager>>,
 }
 
 /// Result of handling an RFQ request
@@ -42,7 +50,13 @@ impl RfqHandler {
             mid_prices: Arc::new(RwLock::new(HashMap::new())),
             party_id: config.party_id.clone(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
+            liquidity_manager: None,
         })
+    }
+
+    /// Set the liquidity manager for balance checks and spread adjustment
+    pub fn set_liquidity_manager(&mut self, lm: Arc<LiquidityManager>) {
+        self.liquidity_manager = Some(lm);
     }
 
     /// Get a reference to mid_prices for external updates
@@ -200,13 +214,21 @@ impl RfqHandler {
         };
         drop(mid_prices);
 
+        // Parse market_id into base/quote tokens (e.g. "CC-USDCx" → ["CC", "USDCx"])
+        let market_parts: Vec<&str> = request.market_id.split('-').collect();
+        let (base_token, quote_token) = if market_parts.len() == 2 {
+            (market_parts[0], market_parts[1])
+        } else {
+            (request.market_id.as_str(), "")
+        };
+
         // Compute price based on direction and spread.
         // Widen spreads when sequencer is under load:
         //   3x when coefficient < SEQUENCER_OVERLOAD_THRESHOLD (extreme load)
         //   2x when forecast is LOW (heavy load)
         //   1x otherwise
-        // direction 1 = BUY (user buys, LP sells → offer price = mid + spread)
-        // direction 2 = SELL (user sells, LP buys → bid price = mid - spread)
+        // direction 1 = BUY (user buys, LP sells base → offer price = mid + spread)
+        // direction 2 = SELL (user sells, LP buys base/sells quote → bid price = mid - spread)
         let spread_multiplier = if orderbook_agent_logic::forecast::is_fees_paused_by_overload() {
             3.0
         } else if orderbook_agent_logic::forecast::is_traffic_paused_by_forecast() {
@@ -214,12 +236,26 @@ impl RfqHandler {
         } else {
             1.0
         };
+
+        // Depletion coefficient: widen spread on the side that depletes a scarce token
+        let depletion_coeff = if let Some(ref lm) = self.liquidity_manager {
+            // The token being sold by the LP is the one that depletes
+            let depleting_token = if request.direction == 1 {
+                base_token // LP sells base (e.g. CC)
+            } else {
+                quote_token // LP sells quote (e.g. USDCx)
+            };
+            lm.depletion_coefficient(depleting_token).await
+        } else {
+            0.0
+        };
+
         let price = if request.direction == 1 {
             // User is buying → LP offers at mid + spread
-            mid_price * (1.0 + rfq_config.offer_spread_percent * spread_multiplier / 100.0)
+            mid_price * (1.0 + rfq_config.offer_spread_percent * spread_multiplier * (1.0 + depletion_coeff) / 100.0)
         } else {
             // User is selling → LP bids at mid - spread
-            mid_price * (1.0 - rfq_config.bid_spread_percent * spread_multiplier / 100.0)
+            mid_price * (1.0 - rfq_config.bid_spread_percent * spread_multiplier * (1.0 + depletion_coeff) / 100.0)
         };
 
         let quote_quantity = quantity * price;
@@ -242,6 +278,54 @@ impl RfqHandler {
             });
         }
 
+        // Liquidity gate: reject if LP lacks sufficient balance for the allocation + estimated fees
+        if let Some(ref lm) = self.liquidity_manager {
+            // LP allocates base when user buys (dir=1), quote when user sells (dir=2)
+            let (alloc_token, alloc_amount) = if request.direction == 1 {
+                (base_token, quantity)     // LP sells base
+            } else {
+                (quote_token, quote_quantity) // LP sells quote
+            };
+
+            // Rough fee estimate: ~2 USD total for LP's dvp + allocation fees
+            let fee_cc = lm.estimate_fee_cc(Decimal::TWO).await;
+            let alloc_dec = Decimal::from_f64_retain(alloc_amount).unwrap_or_default();
+
+            let available = lm.available(alloc_token).await;
+            let needed = if alloc_token == orderbook_agent_logic::liquidity::CC_TOKEN {
+                alloc_dec + fee_cc
+            } else {
+                alloc_dec
+            };
+            // Also check CC for fees when allocating non-CC
+            let cc_ok = if alloc_token != orderbook_agent_logic::liquidity::CC_TOKEN {
+                lm.available_cc().await >= fee_cc
+            } else {
+                true // already checked above
+            };
+
+            if available < needed || !cc_ok {
+                warn!(
+                    "RFQ {}: rejected — insufficient {} ({:.4} available, {:.4} needed){}",
+                    rfq_id, alloc_token, available, needed,
+                    if !cc_ok { format!(", CC for fees: {:.4}", lm.available_cc().await) } else { String::new() }
+                );
+                return RfqResponse::Reject(RfqReject {
+                    rfq_id,
+                    lp_party_id: self.party_id.clone(),
+                    lp_name: self.lp_config.name.clone(),
+                    reason: RfqRejectionReason::TemporarilyUnavailable as i32,
+                    reason_detail: Some("Insufficient liquidity".to_string()),
+                    rejected_at: Some(prost_types::Timestamp {
+                        seconds: chrono::Utc::now().timestamp(),
+                        nanos: 0,
+                    }),
+                    min_quantity: None,
+                    max_quantity: None,
+                });
+            }
+        }
+
         let quote_id = Uuid::now_v7().to_string();
         let valid_for_secs = rfq_config
             .quote_valid_secs
@@ -251,19 +335,20 @@ impl RfqHandler {
         let valid_until = now + chrono::Duration::seconds(valid_for_secs as i64);
 
         let effective_spread = if request.direction == 1 {
-            rfq_config.offer_spread_percent * spread_multiplier
+            rfq_config.offer_spread_percent * spread_multiplier * (1.0 + depletion_coeff)
         } else {
-            rfq_config.bid_spread_percent * spread_multiplier
+            rfq_config.bid_spread_percent * spread_multiplier * (1.0 + depletion_coeff)
         };
         info!(
-            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={}%{})",
+            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{})",
             rfq_id,
             quantity,
             request.market_id,
             price,
             mid_price,
             effective_spread,
-            if spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" }
+            if spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" },
+            if depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() }
         );
 
         // Record trade for settlement verification

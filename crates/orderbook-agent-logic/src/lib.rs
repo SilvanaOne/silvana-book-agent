@@ -14,6 +14,7 @@ pub mod client;
 pub mod confirm;
 pub mod config;
 pub mod forecast;
+pub mod liquidity;
 pub mod logging;
 pub mod order_manager;
 pub mod order_tracker;

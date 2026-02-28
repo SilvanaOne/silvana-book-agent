@@ -26,6 +26,7 @@ use futures::future::join_all;
 use indexmap::IndexMap;
 use rand::Rng;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use orderbook_proto::{
 use crate::auth::generate_jwt;
 use crate::client::OrderbookClient;
 use crate::config::BaseConfig;
+use crate::liquidity::{self, LiquidityManager};
 use crate::order_tracker::{OrderTracker, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
 use crate::runner::{AcceptedRfqTrade, QuotedTrade};
@@ -181,6 +183,11 @@ pub trait SettlementBackend: Send + Sync {
 
     /// Signal the payment queue to stop dispatching new work (for graceful shutdown).
     fn shutdown(&self) {}
+
+    /// Get the liquidity manager (if available).
+    fn liquidity_manager(&self) -> Option<Arc<crate::liquidity::LiquidityManager>> {
+        None
+    }
 }
 
 /// Settlement executor handles the DVP workflow
@@ -214,6 +221,8 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
     /// Skip all verification and accept every proposal (migration from old worker without saved state)
     no_reject: bool,
+    /// Liquidity manager for balance tracking and commitment gating
+    liquidity_manager: Option<Arc<LiquidityManager>>,
 }
 
 impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
@@ -240,6 +249,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
             no_reject: false,
+            liquidity_manager: None,
         }
     }
 
@@ -261,6 +271,30 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Set LP quoted trade tracking (for proposal verification)
     pub fn set_quoted_rfq_trades(&mut self, trades: Arc<Mutex<Vec<QuotedTrade>>>) {
         self.quoted_rfq_trades = Some(trades);
+    }
+
+    /// Set liquidity manager for balance gating
+    pub fn set_liquidity_manager(&mut self, lm: Arc<LiquidityManager>) {
+        self.liquidity_manager = Some(lm);
+    }
+
+    /// Get the liquidity manager (for heartbeat stats)
+    pub fn liquidity_manager(&self) -> Option<&Arc<LiquidityManager>> {
+        self.liquidity_manager.as_ref()
+    }
+
+    /// Release liquidity commitment for a proposal (helper for terminal states)
+    fn release_commitment(&self, proposal_id: &str) {
+        if let Some(ref lm) = self.liquidity_manager {
+            let lm = lm.clone();
+            let pid = proposal_id.to_string();
+            tokio::spawn(async move { lm.release(&pid).await });
+        }
+    }
+
+    /// Get the liquidity manager from the backend (for initial injection)
+    pub fn backend_liquidity_manager(&self) -> Option<Arc<LiquidityManager>> {
+        self.backend.liquidity_manager()
     }
 
     /// Enable no-reject mode: accept all proposals without verification
@@ -558,6 +592,49 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.active_settlements.shift_remove(&proposal_id);
             }
             return Ok(());
+        }
+
+        // Liquidity gate: reject if agent lacks balance for allocation + fees
+        if let Some(ref lm) = self.liquidity_manager {
+            let my_instrument = if is_buyer {
+                &proposal.quote_instrument // buyer allocates quote
+            } else {
+                &proposal.base_instrument // seller allocates base
+            };
+            let allocation_amount = Decimal::from_str(
+                if is_buyer { &proposal.quote_quantity } else { &proposal.base_quantity }
+            ).unwrap_or(Decimal::ONE);
+
+            let allocation_token = match &self.config.cc_token_id {
+                Some(cc_id) if my_instrument == cc_id => liquidity::CC_TOKEN.to_string(),
+                _ => my_instrument.clone(),
+            };
+
+            let my_fees_usd = if is_buyer {
+                Decimal::from_str(&proposal.dvp_processing_fee_buyer).unwrap_or_default()
+                    + Decimal::from_str(&proposal.allocation_processing_fee_buyer).unwrap_or_default()
+            } else {
+                Decimal::from_str(&proposal.dvp_processing_fee_seller).unwrap_or_default()
+                    + Decimal::from_str(&proposal.allocation_processing_fee_seller).unwrap_or_default()
+            };
+            let fee_cc = lm.estimate_fee_cc(my_fees_usd).await;
+
+            if let Err(reason) = lm.try_commit(&proposal_id, &allocation_token, allocation_amount, fee_cc).await {
+                warn!("[{}] Rejecting proposal: {}", proposal_id, reason);
+                let state = SettlementState::new(proposal, is_buyer);
+                self.active_settlements.insert(proposal_id.clone(), state);
+                if let Err(e) = self.reject_proposal(&proposal_id).await {
+                    warn!("[{}] Failed to reject: {}", proposal_id, e);
+                    self.active_settlements.shift_remove(&proposal_id);
+                }
+                return Ok(());
+            }
+
+            // Record outflow for depletion tracking
+            lm.record_outflow(
+                &allocation_token,
+                allocation_amount.to_f64().unwrap_or(0.0),
+            ).await;
         }
 
         // RFQ proposals (no order_match) — verify against agent's in-memory state
@@ -970,12 +1047,35 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.failed_settlements.remove(&proposal_id);
             }
             AdvanceResult::Rejected { proposal_id } => {
+                self.release_commitment(&proposal_id);
                 self.rejected_proposals.insert(proposal_id.clone());
                 self.active_settlements.shift_remove(&proposal_id);
                 self.failed_settlements.remove(&proposal_id);
                 self.needs_readvance.remove(&proposal_id);
             }
             AdvanceResult::Terminal { proposal_id } => {
+                // Record inflow for the token we received from the counterparty
+                if let (Some(lm), Some(state)) = (&self.liquidity_manager, self.active_settlements.get(&proposal_id)) {
+                    let received_token = if state.is_buyer {
+                        &state.proposal.base_instrument
+                    } else {
+                        &state.proposal.quote_instrument
+                    };
+                    let received_amount = if state.is_buyer {
+                        &state.proposal.base_quantity
+                    } else {
+                        &state.proposal.quote_quantity
+                    };
+                    let token_key = match &self.config.cc_token_id {
+                        Some(cc_id) if received_token == cc_id => liquidity::CC_TOKEN.to_string(),
+                        _ => received_token.clone(),
+                    };
+                    if let Ok(amount) = received_amount.parse::<f64>() {
+                        let lm = lm.clone();
+                        tokio::spawn(async move { lm.record_inflow(&token_key, amount).await });
+                    }
+                }
+                self.release_commitment(&proposal_id);
                 self.completed_proposals.insert(proposal_id.clone());
                 self.active_settlements.shift_remove(&proposal_id);
                 self.failed_settlements.remove(&proposal_id);
@@ -1022,6 +1122,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         "[{}] Settlement permanently failed after {} retries: {:#}",
                         proposal_id, entry.retry_count, error
                     );
+                    self.release_commitment(&proposal_id);
                     {
                         let mut t = self.tracker.lock().await;
                         t.mark_failed(&proposal_id);
