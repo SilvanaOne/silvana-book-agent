@@ -628,6 +628,15 @@ impl PaymentQueue {
                     continue;
                 }
 
+                // Skip regular fees when predicted coefficient is below overload threshold
+                // — extremely heavy sequencer load, fee txs would hit SEQUENCER_BACKPRESSURE
+                if item_priority == PaymentPriority::Normal
+                    && orderbook_agent_logic::forecast::is_fees_paused_by_overload()
+                {
+                    deferred.push(item);
+                    continue;
+                }
+
                 // Skip traffic fees while sequencer backpressure pause is active
                 if item_priority == PaymentPriority::Low
                     && crate::ledger_client::traffic_fee_pause_remaining().is_some()

@@ -158,6 +158,25 @@ impl RfqHandler {
             });
         }
 
+        // Reject RFQs when sequencer is critically overloaded (coefficient < OVERLOAD_THRESHOLD - 0.1).
+        // At this level even proposing new trades would fail with SEQUENCER_BACKPRESSURE.
+        if orderbook_agent_logic::forecast::is_rfq_rejected_by_overload() {
+            warn!("RFQ {}: rejected — sequencer critically overloaded", rfq_id);
+            return RfqResponse::Reject(RfqReject {
+                rfq_id,
+                lp_party_id: self.party_id.clone(),
+                lp_name: self.lp_config.name.clone(),
+                reason: RfqRejectionReason::MarketConditions as i32,
+                reason_detail: Some("High demand, try later".to_string()),
+                rejected_at: Some(prost_types::Timestamp {
+                    seconds: chrono::Utc::now().timestamp(),
+                    nanos: 0,
+                }),
+                min_quantity: None,
+                max_quantity: None,
+            });
+        }
+
         // Get mid-price
         let mid_prices = self.mid_prices.read().await;
         let mid_price = match mid_prices.get(&request.market_id) {
@@ -182,11 +201,15 @@ impl RfqHandler {
         drop(mid_prices);
 
         // Compute price based on direction and spread.
-        // Widen spreads 2x when issuance forecast is LOW — high demand period means
-        // sequencer under heavy load, protect LP from adverse fills during volatility.
+        // Widen spreads when sequencer is under load:
+        //   3x when coefficient < SEQUENCER_OVERLOAD_THRESHOLD (extreme load)
+        //   2x when forecast is LOW (heavy load)
+        //   1x otherwise
         // direction 1 = BUY (user buys, LP sells → offer price = mid + spread)
         // direction 2 = SELL (user sells, LP buys → bid price = mid - spread)
-        let spread_multiplier = if orderbook_agent_logic::forecast::is_traffic_paused_by_forecast() {
+        let spread_multiplier = if orderbook_agent_logic::forecast::is_fees_paused_by_overload() {
+            3.0
+        } else if orderbook_agent_logic::forecast::is_traffic_paused_by_forecast() {
             2.0
         } else {
             1.0
@@ -240,7 +263,7 @@ impl RfqHandler {
             price,
             mid_price,
             effective_spread,
-            if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" }
+            if spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" }
         );
 
         // Record trade for settlement verification

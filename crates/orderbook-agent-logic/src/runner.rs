@@ -356,6 +356,29 @@ where
     // Track consecutive poll failures for connectivity detection
     let mut poll_failures: u32 = 0;
 
+    // Initial forecast fetch so protections are active immediately (don't wait for first heartbeat)
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        orderbook_client.get_rounds_data(Some(1)),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            if let Some(prediction) = resp.prediction {
+                crate::forecast::update_forecast(
+                    prediction.forecast,
+                    prediction.forecast_coefficient,
+                );
+                info!(
+                    "Initial forecast: {}",
+                    crate::forecast::forecast_label()
+                );
+            }
+        }
+        Ok(Err(e)) => warn!("Initial forecast fetch failed: {:#}", e),
+        Err(_) => warn!("Initial forecast fetch timed out"),
+    }
+
     // Main event loop
     if !options.orders_only {
         loop {
@@ -539,6 +562,9 @@ where
                         }
                         if crate::forecast::is_traffic_paused_by_forecast() {
                             parts.push("TRAFFIC PAUSED (low issuance)".to_string());
+                        }
+                        if crate::forecast::is_fees_paused_by_overload() {
+                            parts.push("FEES PAUSED (sequencer overload)".to_string());
                         }
                         if parts.is_empty() {
                             String::new()
