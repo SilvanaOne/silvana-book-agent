@@ -141,7 +141,15 @@ impl SettlementBackend for CloudSettlementBackend {
         })
     }
 
-    async fn accept_dvp(&self, proposal_id: &str, dvp_proposal_cid: &str) -> Result<StepResult> {
+    async fn accept_dvp(
+        &self,
+        proposal_id: &str,
+        dvp_proposal_cid: &str,
+        expected_delivery_amount: &str,
+        expected_payment_amount: &str,
+        base_instrument: &str,
+        quote_instrument: &str,
+    ) -> Result<StepResult> {
         if self.confirm && !self.dry_run {
             orderbook_agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
@@ -152,10 +160,20 @@ impl SettlementBackend for CloudSettlementBackend {
 
         let mut client = self.create_client().await?;
 
+        // Resolve instrument IDs and registries from local config (not RPC)
+        let (del_id, del_admin) = self.config.resolve_instrument(base_instrument);
+        let (pay_id, pay_admin) = self.config.resolve_instrument(quote_instrument);
+
         let expectation = OperationExpectation::AcceptDvp {
             seller_party: self.config.party_id.clone(),
             proposal_id: proposal_id.to_string(),
             dvp_proposal_cid: dvp_proposal_cid.to_string(),
+            expected_delivery_amount: expected_delivery_amount.to_string(),
+            expected_payment_amount: expected_payment_amount.to_string(),
+            expected_delivery_instrument_id: del_id,
+            expected_delivery_instrument_admin: del_admin,
+            expected_payment_instrument_id: pay_id,
+            expected_payment_instrument_admin: pay_admin,
         };
 
         let result = client

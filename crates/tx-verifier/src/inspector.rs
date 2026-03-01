@@ -65,6 +65,23 @@ fn get_text(value: &Value) -> Option<&str> {
     }
 }
 
+/// Unwrap a Value as List (slice of elements)
+fn as_list(value: &Value) -> Option<&[Value]> {
+    match value.sum.as_ref()? {
+        Sum::List(l) => Some(&l.elements),
+        _ => None,
+    }
+}
+
+/// Extract (instrument_id, instrument_admin, amount) from an InstrumentQuantity record
+fn extract_instrument_quantity<'a>(iq: &'a Record) -> (Option<&'a str>, Option<&'a str>, Option<&'a str>) {
+    let instrument = get_record_field(iq, "instrument").and_then(as_record);
+    let id = instrument.and_then(|r| get_record_field(r, "id")).and_then(get_text);
+    let admin = instrument.and_then(|r| get_record_field(r, "admin")).and_then(get_party);
+    let amount = get_record_field(iq, "amount").and_then(get_numeric);
+    (id, admin, amount)
+}
+
 /// Check if Identifier matches module_name and entity_name (ignoring package_id)
 fn template_matches(id: &Identifier, module_name: &str, entity_name: &str) -> bool {
     id.module_name == module_name && id.entity_name == entity_name
@@ -1755,6 +1772,12 @@ fn inspect_accept_dvp(
     seller_party: &str,
     proposal_id: &str,
     dvp_proposal_cid: &str,
+    expected_delivery_amount: &str,
+    expected_payment_amount: &str,
+    expected_delivery_instrument_id: &str,
+    expected_delivery_instrument_admin: &str,
+    expected_payment_instrument_id: &str,
+    expected_payment_instrument_admin: &str,
 ) -> Result<InspectionResult> {
     let mut warnings = Vec::new();
 
@@ -1840,6 +1863,223 @@ fn inspect_accept_dvp(
                     }
                 }
             }
+        }
+    }
+
+    // --- Verify DVP terms from input contract (DvpProposal disclosed in metadata) ---
+    use crate::decode::canton_proto::com::daml::ledger::api::v2::interactive::metadata::input_contract::Contract as InputContractOneof;
+
+    let has_amount_check = !expected_delivery_amount.is_empty();
+    let has_instrument_check = !expected_delivery_instrument_id.is_empty()
+        || !expected_payment_instrument_id.is_empty();
+
+    if has_amount_check || has_instrument_check {
+        let mut found_dvp_proposal = false;
+        for ic in &parts.metadata.input_contracts {
+            let create = match &ic.contract {
+                Some(InputContractOneof::V1(c)) => c,
+                _ => continue,
+            };
+            let is_dvp_proposal = create
+                .template_id
+                .as_ref()
+                .map(|t| {
+                    template_matches(
+                        t,
+                        "Utility.Settlement.App.V1.Model.Dvp",
+                        "DvpProposal",
+                    )
+                })
+                .unwrap_or(false);
+            if !is_dvp_proposal {
+                continue;
+            }
+            found_dvp_proposal = true;
+
+            if let Some(arg) = &create.argument {
+                if let Some(rec) = as_record(arg) {
+                    let terms = get_record_field(rec, "terms").and_then(as_record);
+                    if let Some(terms) = terms {
+                        // Extract deliveries[0] InstrumentQuantity
+                        let del_iq = get_record_field(terms, "deliveries")
+                            .and_then(as_list)
+                            .and_then(|l| l.first())
+                            .and_then(as_record);
+                        // Extract payments[0] InstrumentQuantity
+                        let pay_iq = get_record_field(terms, "payments")
+                            .and_then(as_list)
+                            .and_then(|l| l.first())
+                            .and_then(as_record);
+
+                        // --- Delivery checks ---
+                        if let Some(iq) = del_iq {
+                            let (del_id, del_admin, del_amount) =
+                                extract_instrument_quantity(iq);
+
+                            if !expected_delivery_amount.is_empty() {
+                                if let Some(amt) = del_amount {
+                                    if !numeric_eq(amt, expected_delivery_amount) {
+                                        return Ok(InspectionResult {
+                                            accepted: false,
+                                            summary: "AcceptDvp: delivery amount mismatch"
+                                                .into(),
+                                            warnings,
+                                            rejection_reason: Some(format!(
+                                                "DVP delivery={}, expected={}",
+                                                amt, expected_delivery_amount
+                                            )),
+                                        });
+                                    }
+                                } else {
+                                    warnings.push(
+                                        "Could not extract deliveries[0].amount from DvpProposal"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+
+                            if !expected_delivery_instrument_id.is_empty() {
+                                if let Some(id) = del_id {
+                                    if id != expected_delivery_instrument_id {
+                                        return Ok(InspectionResult {
+                                            accepted: false,
+                                            summary: "AcceptDvp: delivery instrument_id mismatch"
+                                                .into(),
+                                            warnings,
+                                            rejection_reason: Some(format!(
+                                                "DVP delivery instrument.id={}, expected={}",
+                                                id, expected_delivery_instrument_id
+                                            )),
+                                        });
+                                    }
+                                } else {
+                                    warnings.push(
+                                        "Could not extract deliveries[0].instrument.id from DvpProposal"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+
+                            if !expected_delivery_instrument_admin.is_empty() {
+                                if let Some(admin) = del_admin {
+                                    if admin != expected_delivery_instrument_admin {
+                                        return Ok(InspectionResult {
+                                            accepted: false,
+                                            summary:
+                                                "AcceptDvp: delivery instrument_admin mismatch"
+                                                    .into(),
+                                            warnings,
+                                            rejection_reason: Some(format!(
+                                                "DVP delivery instrument.admin={}, expected={}",
+                                                &admin[..admin.len().min(20)],
+                                                &expected_delivery_instrument_admin
+                                                    [..expected_delivery_instrument_admin
+                                                        .len()
+                                                        .min(20)]
+                                            )),
+                                        });
+                                    }
+                                } else {
+                                    warnings.push(
+                                        "Could not extract deliveries[0].instrument.admin from DvpProposal"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        } else {
+                            warnings.push(
+                                "Could not extract deliveries[0] from DvpProposal".to_string(),
+                            );
+                        }
+
+                        // --- Payment checks ---
+                        if let Some(iq) = pay_iq {
+                            let (pay_id, pay_admin, pay_amount) =
+                                extract_instrument_quantity(iq);
+
+                            if !expected_payment_amount.is_empty() {
+                                if let Some(amt) = pay_amount {
+                                    if !numeric_eq(amt, expected_payment_amount) {
+                                        return Ok(InspectionResult {
+                                            accepted: false,
+                                            summary: "AcceptDvp: payment amount mismatch".into(),
+                                            warnings,
+                                            rejection_reason: Some(format!(
+                                                "DVP payment={}, expected={}",
+                                                amt, expected_payment_amount
+                                            )),
+                                        });
+                                    }
+                                } else {
+                                    warnings.push(
+                                        "Could not extract payments[0].amount from DvpProposal"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+
+                            if !expected_payment_instrument_id.is_empty() {
+                                if let Some(id) = pay_id {
+                                    if id != expected_payment_instrument_id {
+                                        return Ok(InspectionResult {
+                                            accepted: false,
+                                            summary: "AcceptDvp: payment instrument_id mismatch"
+                                                .into(),
+                                            warnings,
+                                            rejection_reason: Some(format!(
+                                                "DVP payment instrument.id={}, expected={}",
+                                                id, expected_payment_instrument_id
+                                            )),
+                                        });
+                                    }
+                                } else {
+                                    warnings.push(
+                                        "Could not extract payments[0].instrument.id from DvpProposal"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+
+                            if !expected_payment_instrument_admin.is_empty() {
+                                if let Some(admin) = pay_admin {
+                                    if admin != expected_payment_instrument_admin {
+                                        return Ok(InspectionResult {
+                                            accepted: false,
+                                            summary:
+                                                "AcceptDvp: payment instrument_admin mismatch"
+                                                    .into(),
+                                            warnings,
+                                            rejection_reason: Some(format!(
+                                                "DVP payment instrument.admin={}, expected={}",
+                                                &admin[..admin.len().min(20)],
+                                                &expected_payment_instrument_admin
+                                                    [..expected_payment_instrument_admin
+                                                        .len()
+                                                        .min(20)]
+                                            )),
+                                        });
+                                    }
+                                } else {
+                                    warnings.push(
+                                        "Could not extract payments[0].instrument.admin from DvpProposal"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        } else {
+                            warnings.push(
+                                "Could not extract payments[0] from DvpProposal".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            break; // only one DvpProposal expected
+        }
+        if !found_dvp_proposal {
+            warnings.push(
+                "No DvpProposal found in input_contracts to verify terms".to_string(),
+            );
         }
     }
 
@@ -2053,10 +2293,27 @@ pub fn inspect(
             seller_party,
             proposal_id,
             dvp_proposal_cid,
+            expected_delivery_amount,
+            expected_payment_amount,
+            expected_delivery_instrument_id,
+            expected_delivery_instrument_admin,
+            expected_payment_instrument_id,
+            expected_payment_instrument_admin,
         } => {
             let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
                 .context("Failed to decode PreparedTransaction protobuf")?;
-            inspect_accept_dvp(&prepared, seller_party, proposal_id, dvp_proposal_cid)
+            inspect_accept_dvp(
+                &prepared,
+                seller_party,
+                proposal_id,
+                dvp_proposal_cid,
+                expected_delivery_amount,
+                expected_payment_amount,
+                expected_delivery_instrument_id,
+                expected_delivery_instrument_admin,
+                expected_payment_instrument_id,
+                expected_payment_instrument_admin,
+            )
         }
         OperationExpectation::Allocate {
             party,

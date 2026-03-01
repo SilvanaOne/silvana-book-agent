@@ -23,6 +23,12 @@ pub enum OperationExpectation {
         seller_party: String,
         proposal_id: String,
         dvp_proposal_cid: String,
+        expected_delivery_amount: String,
+        expected_payment_amount: String,
+        expected_delivery_instrument_id: String,
+        expected_delivery_instrument_admin: String,
+        expected_payment_instrument_id: String,
+        expected_payment_instrument_admin: String,
     },
     Allocate {
         party: String,

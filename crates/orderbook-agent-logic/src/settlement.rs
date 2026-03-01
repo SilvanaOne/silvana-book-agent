@@ -109,7 +109,15 @@ pub trait SettlementBackend: Send + Sync {
     async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult>;
 
     /// Accept DVP proposal (seller only)
-    async fn accept_dvp(&self, proposal_id: &str, dvp_proposal_cid: &str) -> Result<StepResult>;
+    async fn accept_dvp(
+        &self,
+        proposal_id: &str,
+        dvp_proposal_cid: &str,
+        expected_delivery_amount: &str,
+        expected_payment_amount: &str,
+        base_instrument: &str,
+        quote_instrument: &str,
+    ) -> Result<StepResult>;
 
     /// Allocate tokens for settlement.
     /// `allocation_cc`: Some(amount) if allocating CC amulets (needs amulet pre-selection),
@@ -1794,7 +1802,14 @@ async fn advance_single<B: SettlementBackend>(
                 },
             };
             debug!("[{}] Using DvpProposal from on-chain sync: {}", proposal_id, dvp_proposal_cid);
-            match backend.accept_dvp(&proposal_id, &dvp_proposal_cid).await {
+            match backend.accept_dvp(
+                &proposal_id,
+                &dvp_proposal_cid,
+                &state.proposal.base_quantity,
+                &state.proposal.quote_quantity,
+                &state.proposal.base_instrument,
+                &state.proposal.quote_instrument,
+            ).await {
                 Ok(result) => {
                     record_step_completed(
                         &mut rpc_client, &proposal_id, &config.party_id,
