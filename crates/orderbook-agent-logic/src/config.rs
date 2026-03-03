@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -52,6 +53,8 @@ struct SharedConfiguration {
     registry: Vec<RegistryConfig>,
     #[serde(default)]
     canton_coin: Vec<CantonCoinConfig>,
+    #[serde(default)]
+    instrument: Vec<InstrumentConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +70,13 @@ struct CantonCoinConfig {
     dso_party: String,
     #[allow(dead_code)]
     description: String,
+}
+
+/// Instrument-to-registry mapping from configuration.toml
+#[derive(Debug, Clone, Deserialize)]
+struct InstrumentConfig {
+    id: String,
+    registry: String,
 }
 
 // ============================================================================
@@ -98,6 +108,8 @@ pub struct BaseConfig {
     pub onboarded_registries: Vec<String>,
     pub cc_dso_party: Option<String>,
     pub cc_token_id: Option<String>,
+    /// Instrument ID → registry party mapping (from [[instrument]] + [[canton_coin]])
+    pub instrument_registries: HashMap<String, String>,
 
     // From agent.toml
     pub auto_settle: bool,
@@ -122,6 +134,16 @@ pub struct BaseConfig {
 
     // Settlement expiry (max lifetime before considering expired)
     pub settle_before_secs: u64,
+
+    // Liquidity management
+    /// Safety margin multiplier for fee estimates (e.g. 1.1 = 10%)
+    pub liquidity_margin: f64,
+    /// EMA window in hours for flow depletion tracking
+    pub flow_ema_window_hours: f64,
+    /// Hours to depletion at which spread coefficient = 0
+    pub depletion_max_hours: f64,
+    /// Hours to depletion at which spread coefficient = 10
+    pub depletion_min_hours: f64,
 }
 
 impl BaseConfig {
@@ -134,7 +156,7 @@ impl BaseConfig {
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
 
         // 2. Read configuration.toml (optional, graceful fallback)
-        let (onboarded_registries, cc_dso_party, cc_token_id) =
+        let (onboarded_registries, cc_dso_party, cc_token_id, instrument_registries) =
             load_shared_configuration("configuration.toml");
 
         // 3. Read env vars
@@ -199,6 +221,26 @@ impl BaseConfig {
             .max()
             .unwrap_or(default_rfq_settle_before_secs() as u64);
 
+        let liquidity_margin = std::env::var("LIQUIDITY_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.1);
+
+        let flow_ema_window_hours = std::env::var("FLOW_EMA_WINDOW_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4.0);
+
+        let depletion_max_hours = std::env::var("DEPLETION_COEFF_MAX_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.0);
+
+        let depletion_min_hours = std::env::var("DEPLETION_COEFF_MIN_HOURS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
+
         Ok(BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
@@ -216,6 +258,7 @@ impl BaseConfig {
             onboarded_registries,
             cc_dso_party,
             cc_token_id,
+            instrument_registries,
             auto_settle: agent.auto_settle,
             poll_interval_secs: agent.poll_interval_secs,
             role: agent.role,
@@ -228,12 +271,35 @@ impl BaseConfig {
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
             settle_before_secs,
+            liquidity_margin,
+            flow_ema_window_hours,
+            depletion_max_hours,
+            depletion_min_hours,
         })
     }
 
     /// Get list of enabled markets
     pub fn enabled_markets(&self) -> Vec<&MarketConfig> {
         self.markets.iter().filter(|m| m.enabled).collect()
+    }
+
+    /// Resolve an orderbook instrument ID to (on_chain_id, registry_party).
+    ///
+    /// CC maps to on-chain "Amulet"; other instruments use their ID as-is.
+    /// Registry comes from `[[instrument]]` config entries (+ CC from `[[canton_coin]]`).
+    /// Returns empty strings if instrument not found in config (verification skipped).
+    pub fn resolve_instrument(&self, instrument_id: &str) -> (String, String) {
+        let on_chain_id = if Some(instrument_id) == self.cc_token_id.as_deref() {
+            "Amulet".to_string()
+        } else {
+            instrument_id.to_string()
+        };
+        let registry = self
+            .instrument_registries
+            .get(instrument_id)
+            .cloned()
+            .unwrap_or_default();
+        (on_chain_id, registry)
     }
 }
 
@@ -277,18 +343,18 @@ pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
     Ok(arr)
 }
 
-/// Load shared configuration.toml (registries + canton_coin)
+/// Load shared configuration.toml (registries + canton_coin + instruments)
 ///
-/// Returns (onboarded_registries, cc_dso_party, cc_token_id).
+/// Returns (onboarded_registries, cc_dso_party, cc_token_id, instrument_registries).
 /// Used by both agents and the ledger service.
 pub fn load_shared_configuration(
     path: &str,
-) -> (Vec<String>, Option<String>, Option<String>) {
+) -> (Vec<String>, Option<String>, Option<String>, HashMap<String, String>) {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
             tracing::warn!("{} not found, continuing without registry filtering", path);
-            return (Vec::new(), None, None);
+            return (Vec::new(), None, None, HashMap::new());
         }
     };
 
@@ -307,11 +373,29 @@ pub fn load_shared_configuration(
                     (Some(cc.dso_party), Some(cc.token_id))
                 },
             );
-            (registries, cc_dso, cc_id)
+
+            // Build instrument → registry map from [[instrument]] entries
+            let mut instrument_registries: HashMap<String, String> = config
+                .instrument
+                .into_iter()
+                .map(|i| (i.id, i.registry))
+                .collect();
+            // Add CC → cc_dso_party automatically
+            if let (Some(id), Some(dso)) = (&cc_id, &cc_dso) {
+                instrument_registries.insert(id.clone(), dso.clone());
+            }
+            if !instrument_registries.is_empty() {
+                tracing::info!(
+                    "Loaded {} instrument→registry mappings",
+                    instrument_registries.len()
+                );
+            }
+
+            (registries, cc_dso, cc_id, instrument_registries)
         }
         Err(e) => {
             tracing::warn!("Failed to parse {}: {}", path, e);
-            (Vec::new(), None, None)
+            (Vec::new(), None, None, HashMap::new())
         }
     }
 }

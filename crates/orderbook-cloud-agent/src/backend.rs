@@ -16,6 +16,7 @@ use tracing::{debug, info};
 
 use orderbook_agent_logic::config::BaseConfig;
 use orderbook_agent_logic::confirm::ConfirmLock;
+use orderbook_agent_logic::liquidity::LiquidityManager;
 use orderbook_agent_logic::settlement::{DiscoveredContract, PendingFee, PendingTrafficFee, SettlementBackend, StepResult};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AcceptDvpParams,
@@ -41,14 +42,24 @@ pub struct CloudSettlementBackend {
     payment_queue: PaymentQueue,
     /// Shared amulet cache for heartbeat stats
     amulet_cache: Arc<AmuletCache>,
+    /// Liquidity manager for balance tracking and commitment gating
+    liquidity_manager: Arc<LiquidityManager>,
 }
 
 impl CloudSettlementBackend {
-    pub fn new(config: BaseConfig, verbose: bool, dry_run: bool, force: bool, confirm: bool, confirm_lock: ConfirmLock) -> Self {
+    pub fn new(
+        config: BaseConfig,
+        verbose: bool,
+        dry_run: bool,
+        force: bool,
+        confirm: bool,
+        confirm_lock: ConfirmLock,
+        liquidity_manager: Arc<LiquidityManager>,
+    ) -> Self {
         let cache = AmuletCache::new();
 
-        // Spawn ACS worker to refresh amulet cache periodically
-        spawn_acs_worker(config.clone(), cache.clone());
+        // Spawn ACS worker to refresh amulet cache and update liquidity manager
+        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone());
 
         let payment_queue = PaymentQueue::new(
             config.clone(),
@@ -59,7 +70,7 @@ impl CloudSettlementBackend {
             confirm_lock.clone(),
             cache.clone(),
         );
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache }
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache, liquidity_manager }
     }
 
     /// Create a new DAppProviderClient for this request
@@ -130,7 +141,15 @@ impl SettlementBackend for CloudSettlementBackend {
         })
     }
 
-    async fn accept_dvp(&self, proposal_id: &str, dvp_proposal_cid: &str) -> Result<StepResult> {
+    async fn accept_dvp(
+        &self,
+        proposal_id: &str,
+        dvp_proposal_cid: &str,
+        expected_delivery_amount: &str,
+        expected_payment_amount: &str,
+        base_instrument: &str,
+        quote_instrument: &str,
+    ) -> Result<StepResult> {
         if self.confirm && !self.dry_run {
             orderbook_agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
@@ -141,10 +160,20 @@ impl SettlementBackend for CloudSettlementBackend {
 
         let mut client = self.create_client().await?;
 
+        // Resolve instrument IDs and registries from local config (not RPC)
+        let (del_id, del_admin) = self.config.resolve_instrument(base_instrument);
+        let (pay_id, pay_admin) = self.config.resolve_instrument(quote_instrument);
+
         let expectation = OperationExpectation::AcceptDvp {
             seller_party: self.config.party_id.clone(),
             proposal_id: proposal_id.to_string(),
             dvp_proposal_cid: dvp_proposal_cid.to_string(),
+            expected_delivery_amount: expected_delivery_amount.to_string(),
+            expected_payment_amount: expected_payment_amount.to_string(),
+            expected_delivery_instrument_id: del_id,
+            expected_delivery_instrument_admin: del_admin,
+            expected_payment_instrument_id: pay_id,
+            expected_payment_instrument_admin: pay_admin,
         };
 
         let result = client
@@ -302,5 +331,9 @@ impl SettlementBackend for CloudSettlementBackend {
                 contract_type: c.contract_type,
             })
             .collect())
+    }
+
+    fn liquidity_manager(&self) -> Option<Arc<LiquidityManager>> {
+        Some(self.liquidity_manager.clone())
     }
 }

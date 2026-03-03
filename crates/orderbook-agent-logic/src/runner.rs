@@ -255,6 +255,23 @@ where
         settlement_executor.set_quoted_rfq_trades(quoted.clone());
     }
 
+    // Inject liquidity manager from backend (if available)
+    if let Some(lm) = settlement_executor.backend_liquidity_manager() {
+        // Restore flow tracker from saved state before injecting
+        if let Some(ref saved) = restored_state {
+            if !saved.flow_tracker.is_empty() {
+                info!("Restoring flow tracker ({} tokens) from saved state", saved.flow_tracker.len());
+                let lm_clone = lm.clone();
+                let flows = saved.flow_tracker.clone();
+                // Must run async
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(lm_clone.restore_flows(flows));
+                });
+            }
+        }
+        settlement_executor.set_liquidity_manager(lm);
+    }
+
     // Delete state file after successful restore
     if restored_state.is_some() {
         if let Some(ref state_file) = options.state_file {
@@ -355,6 +372,29 @@ where
 
     // Track consecutive poll failures for connectivity detection
     let mut poll_failures: u32 = 0;
+
+    // Initial forecast fetch so protections are active immediately (don't wait for first heartbeat)
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        orderbook_client.get_rounds_data(Some(1)),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            if let Some(prediction) = resp.prediction {
+                crate::forecast::update_forecast(
+                    prediction.forecast,
+                    prediction.forecast_coefficient,
+                );
+                info!(
+                    "Initial forecast: {}",
+                    crate::forecast::forecast_label()
+                );
+            }
+        }
+        Ok(Err(e)) => warn!("Initial forecast fetch failed: {:#}", e),
+        Err(_) => warn!("Initial forecast fetch timed out"),
+    }
 
     // Main event loop
     if !options.orders_only {
@@ -480,7 +520,19 @@ where
                         Duration::from_secs(10),
                         balance_provider.fetch_balances(),
                     ).await {
-                        Ok(Ok(balances)) => order_manager.set_balances(balances),
+                        Ok(Ok(balances)) => {
+                            // Update non-CC token balances in liquidity manager
+                            if let Some(lm) = settlement_executor.liquidity_manager() {
+                                for b in &balances {
+                                    if !b.is_canton_coin {
+                                        if let Ok(amount) = b.unlocked_amount.parse::<rust_decimal::Decimal>() {
+                                            lm.update_token_balance(&b.instrument_id, amount).await;
+                                        }
+                                    }
+                                }
+                            }
+                            order_manager.set_balances(balances);
+                        }
                         Ok(Err(e)) => warn!("Failed to fetch balances: {:#}", e),
                         Err(_) => warn!("Balance fetch timed out"),
                     }
@@ -538,7 +590,10 @@ where
                             parts.push(format!("TRAFFIC PAUSED {}s", secs));
                         }
                         if crate::forecast::is_traffic_paused_by_forecast() {
-                            parts.push("TRAFFIC PAUSED (low issuance)".to_string());
+                            parts.push("TRAFFIC PAUSED (sequencer overload)".to_string());
+                        }
+                        if crate::forecast::is_fees_paused_by_overload() {
+                            parts.push("FEES PAUSED (sequencer overload)".to_string());
                         }
                         if parts.is_empty() {
                             String::new()
@@ -559,6 +614,33 @@ where
                     info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}{}",
                         n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str, forecast_str);
                     settlement_executor.log_cid_waiting_summary();
+                    // Liquidity stats
+                    if let Some(lm) = settlement_executor.liquidity_manager() {
+                        let stats = lm.stats().await;
+                        for s in &stats {
+                            let depl_str = if s.hours_to_depletion.is_infinite() {
+                                ">12h".to_string()
+                            } else {
+                                format!("{:.1}h", s.hours_to_depletion)
+                            };
+                            info!(
+                                "LIQUIDITY {}: {:.2} bal / {:.2} committed{} / {:.2} avail ({} stlmts), flow {:.1}/hr, depl={:.1} ({})",
+                                s.token,
+                                s.balance,
+                                s.committed,
+                                if s.fee_committed > rust_decimal::Decimal::ZERO {
+                                    format!(" + {:.2} fees", s.fee_committed)
+                                } else {
+                                    String::new()
+                                },
+                                s.available,
+                                s.num_commitments,
+                                s.net_outflow_per_hour,
+                                s.depletion_coefficient,
+                                depl_str,
+                            );
+                        }
+                    }
                     // Every 5 minutes, also list individual settlement IDs
                     if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
                         let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
@@ -583,7 +665,19 @@ where
                         Duration::from_secs(10),
                         balance_provider.fetch_balances(),
                     ).await {
-                        Ok(Ok(balances)) => order_manager.set_balances(balances),
+                        Ok(Ok(balances)) => {
+                            // Update non-CC token balances in liquidity manager
+                            if let Some(lm) = settlement_executor.liquidity_manager() {
+                                for b in &balances {
+                                    if !b.is_canton_coin {
+                                        if let Ok(amount) = b.unlocked_amount.parse::<rust_decimal::Decimal>() {
+                                            lm.update_token_balance(&b.instrument_id, amount).await;
+                                        }
+                                    }
+                                }
+                            }
+                            order_manager.set_balances(balances);
+                        }
                         Ok(Err(e)) => warn!("Failed to fetch balances: {:#}", e),
                         Err(_) => warn!("Balance fetch timed out"),
                     }
@@ -691,6 +785,16 @@ where
         saved.pending_traffic_fees = settlement_executor.get_pending_traffic_fees();
         if !saved.pending_traffic_fees.is_empty() {
             info!("Saving {} pending traffic fee(s) for restart", saved.pending_traffic_fees.len());
+        }
+
+        // Save flow tracker state for depletion detection on restart
+        if let Some(lm) = settlement_executor.liquidity_manager() {
+            saved.flow_tracker = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(lm.save_flows())
+            });
+            if !saved.flow_tracker.is_empty() {
+                info!("Saving flow tracker ({} tokens) for restart", saved.flow_tracker.len());
+            }
         }
 
         match save_state(state_file, &saved) {

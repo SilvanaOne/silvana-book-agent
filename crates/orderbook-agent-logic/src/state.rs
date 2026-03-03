@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{error, info, warn};
 
+use crate::liquidity::SavedTokenFlow;
 use crate::settlement::{PendingFee, PendingTrafficFee};
 
 /// Current state file format version
@@ -48,6 +49,9 @@ pub struct SavedState {
     /// Pending traffic fee payments (queued but not yet completed)
     #[serde(default)]
     pub pending_traffic_fees: Vec<PendingTrafficFee>,
+    /// Flow tracker state for depletion detection (restored on restart)
+    #[serde(default)]
+    pub flow_tracker: Vec<SavedTokenFlow>,
 }
 
 /// Serializable mirror of `TrackedOrder` from order_tracker.rs
@@ -124,6 +128,7 @@ impl SavedState {
             fill_state: None,
             pending_fees: Vec::new(),
             pending_traffic_fees: Vec::new(),
+            flow_tracker: Vec::new(),
         }
     }
 }

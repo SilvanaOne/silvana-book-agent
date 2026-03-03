@@ -34,7 +34,7 @@ static FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
     std::env::var("FEE_PAUSE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(60)
+        .unwrap_or(10)
 });
 
 /// Duration in seconds to pause traffic fee dispatch after SEQUENCER_BACKPRESSURE.
@@ -42,7 +42,7 @@ static TRAFFIC_FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
     std::env::var("TRAFFIC_FEE_PAUSE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(120)
+        .unwrap_or(30)
 });
 
 /// Epoch millis after which regular fee dispatch may resume.
