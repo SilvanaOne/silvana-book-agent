@@ -88,11 +88,15 @@ pub struct PendingFee {
 
 /// A traffic fee queued for background processing (fire-and-forget).
 /// Persisted to state file on shutdown, restored on restart.
+/// Traffic fees are always retried until paid — retry_count is for logging only.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingTrafficFee {
     pub traffic_bytes: u64,
     pub step_name: String,
     pub proposal_id: String,
+    /// Number of failed attempts (for logging/backoff). Never stops retrying.
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 /// Backend for executing settlement operations
@@ -161,6 +165,11 @@ pub trait SettlementBackend: Send + Sync {
 
     /// Get traffic fee backlog depth (fees waiting beyond the active queue).
     fn traffic_backlog_depth(&self) -> usize {
+        0
+    }
+
+    /// Get total pending traffic fee count (backlog + in-flight + awaiting retry).
+    fn pending_traffic_count(&self) -> usize {
         0
     }
 
@@ -333,6 +342,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Get traffic fee backlog depth (fees waiting beyond the active queue).
     pub fn traffic_backlog_depth(&self) -> usize {
         self.backend.traffic_backlog_depth()
+    }
+
+    /// Get total pending traffic fee count (backlog + in-flight + awaiting retry).
+    pub fn pending_traffic_count(&self) -> usize {
+        self.backend.pending_traffic_count()
     }
 
     /// Get per-pool worker utilization (delegated to backend).

@@ -294,6 +294,12 @@ impl SettlementBackend for CloudSettlementBackend {
         })
     }
 
+    fn pending_traffic_count(&self) -> usize {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.payment_queue.pending_traffic_count())
+        })
+    }
+
     fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
         Some(self.payment_queue.worker_utilization())
     }

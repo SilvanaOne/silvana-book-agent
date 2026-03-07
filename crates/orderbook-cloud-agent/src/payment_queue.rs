@@ -385,6 +385,7 @@ impl PaymentQueue {
             traffic_bytes,
             step_name: step_name.to_string(),
             proposal_id: proposal_id.to_string(),
+            retry_count: 0,
         };
         let pending = self.pending_traffic_fees.clone();
         let backlog = self.traffic_fee_backlog.clone();
@@ -418,12 +419,21 @@ impl PaymentQueue {
         self.traffic_fee_backlog.lock().await.len()
     }
 
+    /// Get total pending traffic fee count (backlog + in-flight + awaiting retry).
+    /// This is the true count of traffic fees not yet successfully paid.
+    pub async fn pending_traffic_count(&self) -> usize {
+        self.pending_traffic_fees.lock().await.len()
+    }
+
     /// Restore pending traffic fee payments from saved state (pushed to backlog, throttled).
+    /// retry_count is reset to 0 so restored fees get fresh retries (prior failures may have
+    /// been due to transient sequencer issues that have since resolved).
     pub async fn restore_pending_traffic_fees(&self, fees: Vec<PendingTrafficFee>) {
         let count = fees.len();
         let mut backlog = self.traffic_fee_backlog.lock().await;
         let mut pending = self.pending_traffic_fees.lock().await;
-        for fee in fees {
+        for mut fee in fees {
+            fee.retry_count = 0;
             pending.push(fee.clone());
             backlog.push_back(fee);
         }
@@ -543,7 +553,11 @@ impl PaymentQueue {
                     }
                 }
 
-                // If still empty, block until a new item arrives or shutdown
+                // If still empty, block until a new item arrives or 1s periodic wakeup.
+                // The 1s wakeup handles the post-restore case: restore_pending_traffic_fees()
+                // adds items to the VecDeque backlog AFTER this task has already started
+                // blocking here, so we need a timeout to wake up and drain the backlog.
+                // Shutdown is checked at the top of the outer loop.
                 if heap.is_empty() {
                     tokio::select! {
                         item = rx.recv() => match item {
@@ -553,14 +567,8 @@ impl PaymentQueue {
                                 return;
                             }
                         },
-                        _ = async {
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                if shutdown_flag.load(AtomicOrdering::Relaxed) { break; }
-                            }
-                        } => {
-                            info!("Payment scheduler shutting down");
-                            return;
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            // Periodic wakeup: re-check traffic fee backlog (handles post-restore drain)
                         }
                     }
                 }
@@ -775,6 +783,7 @@ impl PaymentQueue {
                                             traffic_bytes: traffic,
                                             step_name: step_name.clone(),
                                             proposal_id: proposal_id.clone(),
+                                            retry_count: 0,
                                         });
                                         let (tx_resp, _) = oneshot::channel();
                                         let _ = worker_queue_tx.send(QueuedPayment {
@@ -825,6 +834,7 @@ impl PaymentQueue {
                                                 traffic_bytes: step_result.traffic_total,
                                                 step_name: step_name.clone(),
                                                 proposal_id: proposal_id.clone(),
+                                                retry_count: 0,
                                             });
                                             let (tx_resp, _) = oneshot::channel();
                                             let _ = worker_queue_tx.send(QueuedPayment {
@@ -850,8 +860,36 @@ impl PaymentQueue {
                                         &worker_cache,
                                     ).await;
                                     if result.is_ok() {
+                                        // Fee paid — remove from pending tracking
                                         let mut pending = worker_pending_traffic.lock().await;
                                         pending.retain(|f| !(f.step_name == sn && f.proposal_id == pid));
+                                    } else {
+                                        // Fee failed — increment retry_count and re-queue after backoff.
+                                        // Traffic fees are always retried until paid; retry_count is for logging/backoff only.
+                                        let mut pending = worker_pending_traffic.lock().await;
+                                        if let Some(pos) = pending.iter().position(|f| f.step_name == sn && f.proposal_id == pid) {
+                                            pending[pos].retry_count += 1;
+                                            let retry_count = pending[pos].retry_count;
+                                            let retry_fee = pending[pos].clone();
+                                            let retry_tx = worker_queue_tx.clone();
+                                            // Backoff: 60s × min(retry_count, 5), capped at 300s
+                                            let delay_secs = 60u64 * (retry_count as u64).min(5);
+                                            warn!("[{}] Traffic fee failed, retry #{} in {}s ({})", pid, retry_count, delay_secs, sn);
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                                                let (response_tx, _) = oneshot::channel();
+                                                let _ = retry_tx.send(QueuedPayment {
+                                                    priority: PaymentPriority::Low,
+                                                    sequence: u64::MAX / 2,
+                                                    request: PaymentRequest::TransferTrafficFee {
+                                                        traffic_bytes: retry_fee.traffic_bytes,
+                                                        step_name: retry_fee.step_name,
+                                                        proposal_id: retry_fee.proposal_id,
+                                                    },
+                                                    response_tx,
+                                                });
+                                            });
+                                        }
                                     }
                                     let _ = item.response_tx.send(PaymentResponse::TrafficFee(result));
                                 }
@@ -964,8 +1002,13 @@ fn estimate_cc_needed(request: &PaymentRequest) -> Decimal {
         PaymentRequest::Allocate { allocation_cc, .. } => {
             allocation_cc.map(|cc| cc + margin).unwrap_or(Decimal::ZERO)
         }
-        // Traffic fees are typically tiny
-        PaymentRequest::TransferTrafficFee { .. } => margin,
+        // Traffic fees scale with traffic_bytes (actual ~0.38 CC/KB at current rate).
+        // Use 0.001 CC/byte (≈2.6× conservative) to ensure enough amulets are selected.
+        // The exact fee is recomputed from the live rate in execute_transfer_traffic_fee.
+        PaymentRequest::TransferTrafficFee { traffic_bytes, .. } => {
+            let est = Decimal::from(*traffic_bytes) * Decimal::new(1, 3); // 0.001 CC/byte
+            (est + margin).max(margin + Decimal::from(2)) // at least 3 CC
+        }
     }
 }
 
@@ -1443,12 +1486,29 @@ async fn execute_transfer_traffic_fee(
         .await?;
     }
 
-    let mut client = create_client_from_channel(channel, config)?;
+    let mut client = match create_client_from_channel(channel, config) {
+        Ok(c) => c,
+        Err(e) => {
+            cache.release_reservations(&amulet_cids.to_vec()).await;
+            return Err(e);
+        }
+    };
 
     // Get CC/USD rate from server
-    let rates = client.get_dso_rates().await?;
-    let cc_usd_rate = Decimal::from_str(&rates.cc_usd_rate)
-        .map_err(|e| anyhow!("Failed to parse cc_usd_rate: {}", e))?;
+    let rates = match client.get_dso_rates().await {
+        Ok(r) => r,
+        Err(e) => {
+            cache.release_reservations(&amulet_cids.to_vec()).await;
+            return Err(e);
+        }
+    };
+    let cc_usd_rate = match Decimal::from_str(&rates.cc_usd_rate) {
+        Ok(r) => r,
+        Err(e) => {
+            cache.release_reservations(&amulet_cids.to_vec()).await;
+            return Err(anyhow!("Failed to parse cc_usd_rate: {}", e));
+        }
+    };
 
     if cc_usd_rate <= Decimal::ZERO {
         cache.release_reservations(&amulet_cids.to_vec()).await;
