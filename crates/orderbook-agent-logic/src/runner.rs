@@ -571,6 +571,7 @@ where
                     let pct = if max > 0 { used * 100 / max } else { 0 };
                     let (alloc, fees, traffic) = settlement_executor.queue_depth();
                     let backlog = settlement_executor.traffic_backlog_depth();
+                    let pending_traffic = settlement_executor.pending_traffic_count();
                     let cache_str = if let Some((avail, consumed, reserved, selectable)) = settlement_executor.cache_stats() {
                         format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
                     } else {
@@ -611,8 +612,8 @@ where
                             String::new()
                         }
                     };
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog{}{}{}{}",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, cache_str, worker_str, pause_str, forecast_str);
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog {} pending{}{}{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, pending_traffic, cache_str, worker_str, pause_str, forecast_str);
                     settlement_executor.log_cid_waiting_summary();
                     // Liquidity stats
                     if let Some(lm) = settlement_executor.liquidity_manager() {
