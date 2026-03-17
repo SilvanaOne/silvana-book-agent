@@ -76,12 +76,10 @@ async fn refresh_amulets(config: &BaseConfig, cache: &Arc<AmuletCache>, lm: &Arc
     debug!("ACS worker: fetched {} amulets", cached.len());
     cache.refresh_from_acs(cached).await;
 
-    // Update liquidity manager with selectable CC total
-    let selectable: Decimal = cache.get_selectable_amulets().await
-        .iter()
-        .map(|a| a.amount)
-        .sum();
-    lm.update_cc_balance(selectable).await;
+    // Update liquidity manager with total CC (available minus consumed, but including reserved).
+    // Reserved amulets are still on the ledger; their commitment is tracked separately by LM.
+    let total_cc = cache.total_available_amount().await;
+    lm.update_cc_balance(total_cc).await;
 
     // Update CC/USD rate for fee estimation
     match client.get_dso_rates().await {

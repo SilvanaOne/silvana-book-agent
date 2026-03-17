@@ -72,6 +72,10 @@ pub enum OperationExpectation {
         party: String,
         output_amounts: Vec<String>,
     },
+    ExecuteMulticall {
+        party: String,
+        op_count: usize,
+    },
 }
 
 /// Result of transaction verification

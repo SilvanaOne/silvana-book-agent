@@ -112,6 +112,7 @@ use message_signing::{
     canonical_params_request_recurring_prepaid, canonical_params_request_recurring_payasyougo,
     canonical_params_request_user_service, canonical_params_transfer_cip56,
     canonical_params_accept_cip56, canonical_params_split_cc,
+    canonical_params_execute_multicall,
 };
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use tx_verifier::OperationExpectation;
@@ -155,6 +156,7 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
         ),
         Params::AcceptCip56(p) => canonical_params_accept_cip56(&p.contract_id),
         Params::SplitCc(p) => canonical_params_split_cc(&p.output_amounts),
+        Params::ExecuteMulticall(p) => canonical_params_execute_multicall(p.operations.len()),
     };
     Ok(canonical_prepare_request(req.operation, &params_canonical))
 }

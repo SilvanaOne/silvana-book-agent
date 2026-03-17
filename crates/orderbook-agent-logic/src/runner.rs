@@ -625,12 +625,17 @@ where
                                 format!("{:.1}h", s.hours_to_depletion)
                             };
                             info!(
-                                "LIQUIDITY {}: {:.2} bal / {:.2} committed{} / {:.2} avail ({} stlmts), flow {:.1}/hr, depl={:.1} ({})",
+                                "LIQUIDITY {}: {:.2} bal / {:.2} committed{}{} / {:.2} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({})",
                                 s.token,
                                 s.balance,
                                 s.committed,
                                 if s.fee_committed > rust_decimal::Decimal::ZERO {
                                     format!(" + {:.2} fees", s.fee_committed)
+                                } else {
+                                    String::new()
+                                },
+                                if s.fee_reserve > rust_decimal::Decimal::ZERO {
+                                    format!(" + {:.2} reserve", s.fee_reserve)
                                 } else {
                                     String::new()
                                 },
