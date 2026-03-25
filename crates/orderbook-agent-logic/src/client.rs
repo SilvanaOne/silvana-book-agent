@@ -85,14 +85,17 @@ impl OrderbookClient {
         let pricing_client = PricingServiceClient::with_interceptor(
             channel.clone(),
             auth_interceptor.clone(),
-        );
+        )
+        .max_decoding_message_size(16 * 1024 * 1024);
 
         let orderbook_client = OrderbookServiceClient::with_interceptor(
             channel.clone(),
             auth_interceptor,
-        );
+        )
+        .max_decoding_message_size(16 * 1024 * 1024);
 
-        let raw_orderbook_client = OrderbookServiceClient::new(channel);
+        let raw_orderbook_client = OrderbookServiceClient::new(channel)
+            .max_decoding_message_size(16 * 1024 * 1024);
 
         Ok(Self {
             pricing_client,

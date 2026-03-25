@@ -707,7 +707,8 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
             }
         };
 
-        let mut client = SettlementServiceClient::new(channel);
+        let mut client = SettlementServiceClient::new(channel)
+            .max_decoding_message_size(16 * 1024 * 1024);
 
         // Create the outbound channel
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<CantonToServerMessage>(64);
@@ -1773,7 +1774,8 @@ async fn run_onboard(
             if read_env_value(&env_file, "SYNCHRONIZER_ID").is_none() {
                 println!("\nFetching server configuration...");
                 let channel = create_raw_channel(&rpc).await?;
-                let mut client = DAppProviderServiceClient::new(channel);
+                let mut client = DAppProviderServiceClient::new(channel)
+                    .max_decoding_message_size(16 * 1024 * 1024);
                 let config_resp = client
                     .get_agent_config(GetAgentConfigRequest {})
                     .await
@@ -1797,7 +1799,8 @@ async fn run_onboard(
     // Step 2: Connect to RPC (raw channel, no JWT auth needed)
     println!("\nConnecting to {}...", rpc);
     let channel = create_raw_channel(&rpc).await?;
-    let mut client = DAppProviderServiceClient::new(channel);
+    let mut client = DAppProviderServiceClient::new(channel)
+        .max_decoding_message_size(16 * 1024 * 1024);
     println!("Connected.");
 
     // Step 3: Fetch server config

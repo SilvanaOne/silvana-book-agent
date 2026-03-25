@@ -246,7 +246,8 @@ impl DAppProviderClient {
             ttl_secs,
             node_name: node_name.map(|s| s.to_string()),
         };
-        let client = DAppProviderServiceClient::with_interceptor(channel, interceptor);
+        let client = DAppProviderServiceClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(16 * 1024 * 1024);
         Ok(Self {
             client,
             private_key_bytes: *private_key_bytes,
@@ -278,7 +279,8 @@ impl DAppProviderClient {
             ttl_secs,
             node_name: node_name.map(|s| s.to_string()),
         };
-        let client = DAppProviderServiceClient::with_interceptor(channel, interceptor);
+        let client = DAppProviderServiceClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(16 * 1024 * 1024);
         Ok(Self {
             client,
             private_key_bytes: *private_key_bytes,

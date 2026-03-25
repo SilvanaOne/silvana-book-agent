@@ -25,7 +25,7 @@ use crate::order_tracker::OrderTracker;
 use crate::settlement::{SettlementBackend, SettlementExecutor};
 use crate::state::{
     SavedAcceptedRfqTrade, SavedFillState, SavedQuotedTrade, SavedState, delete_state, load_state,
-    save_backup, save_state,
+    prune_state, save_backup, save_state,
 };
 
 /// Trade parameters recorded when buyer accepts an RFQ quote
@@ -802,6 +802,9 @@ where
                 info!("Saving flow tracker ({} tokens) for restart", saved.flow_tracker.len());
             }
         }
+
+        // Prune stale data before saving
+        prune_state(&mut saved);
 
         match save_state(state_file, &saved) {
             Ok(()) => {
