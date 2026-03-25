@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::{error, info, warn};
 
@@ -221,6 +222,85 @@ pub fn load_state(path: &Path) -> Option<SavedState> {
     }
 }
 
+/// Prune stale data from state before saving to disk.
+///
+/// Removes orders, proposals, and RFQ trades that are no longer needed.
+/// Settlement deadlines max out at ~18h (6h allocate + 12h settle),
+/// so anything older than 24h is safe to discard.
+pub fn prune_state(state: &mut SavedState) {
+    // Build reference sets from active settlement_orders
+    let referenced_order_ids: HashSet<u64> = state
+        .settlement_orders
+        .iter()
+        .map(|so| so.order_id)
+        .collect();
+    let active_proposal_ids: HashSet<&str> = state
+        .settlement_orders
+        .iter()
+        .map(|so| so.proposal_id.as_str())
+        .collect();
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() as u64 - (24 * 3600 * 1000);
+
+    // Fix stale pending_quantity on orders not backed by a settlement_order
+    let mut pending_fixed = 0usize;
+    for order in &mut state.orders {
+        if order.pending_quantity != "0"
+            && !referenced_order_ids.contains(&order.order_id)
+        {
+            order.pending_quantity = "0".to_string();
+            pending_fixed += 1;
+        }
+    }
+
+    // Prune orders: keep if active, referenced by settlement, or recent
+    let orders_before = state.orders.len();
+    state.orders.retain(|o| {
+        o.is_active
+            || referenced_order_ids.contains(&o.order_id)
+            || o.nonce > cutoff_ms
+    });
+    let orders_pruned = orders_before - state.orders.len();
+
+    // Cap dedup sets at 1000 (appended chronologically, drain oldest from front)
+    const MAX_DEDUP_SET: usize = 1000;
+    let completed_before = state.completed_proposals.len();
+    if state.completed_proposals.len() > MAX_DEDUP_SET {
+        let drain_count = state.completed_proposals.len() - MAX_DEDUP_SET;
+        state.completed_proposals.drain(..drain_count);
+    }
+    let rejected_before = state.rejected_proposals.len();
+    if state.rejected_proposals.len() > MAX_DEDUP_SET {
+        let drain_count = state.rejected_proposals.len() - MAX_DEDUP_SET;
+        state.rejected_proposals.drain(..drain_count);
+    }
+
+    // Clear quoted RFQ trades (no timestamps; stale after shutdown/restart)
+    let quoted_before = state.quoted_rfq_trades.len();
+    state.quoted_rfq_trades.clear();
+
+    // Prune accepted RFQ trades to only those with active settlements
+    let accepted_before = state.accepted_rfq_trades.len();
+    state
+        .accepted_rfq_trades
+        .retain(|t| active_proposal_ids.contains(t.proposal_id.as_str()));
+
+    info!(
+        "State pruned: orders {}->{} (removed {}, fixed {} stale pending), \
+         completed {}->{}, rejected {}->{}, quoted_rfq cleared {}, accepted_rfq {}->{}",
+        orders_before,
+        state.orders.len(),
+        orders_pruned,
+        pending_fixed,
+        completed_before,
+        state.completed_proposals.len(),
+        rejected_before,
+        state.rejected_proposals.len(),
+        quoted_before,
+        accepted_before,
+        state.accepted_rfq_trades.len(),
+    );
+}
+
 /// Delete the state file after successful restore
 pub fn delete_state(path: &Path) {
     if path.exists() {
@@ -323,5 +403,162 @@ mod tests {
         assert!(load_state(&path).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_state() {
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let old_nonce = now_ms - (48 * 3600 * 1000); // 48h ago
+        let recent_nonce = now_ms - (1 * 3600 * 1000); // 1h ago
+
+        let mut state = SavedState::new("test-party".to_string(), 1000);
+
+        // Order 1: old, inactive, no settlement — should be PRUNED
+        state.orders.push(SavedTrackedOrder {
+            order_id: 1,
+            market_id: "BTC-USD".to_string(),
+            order_type: 1,
+            price: "100".to_string(),
+            quantity: "1.0".to_string(),
+            settled_quantity: "0".to_string(),
+            pending_quantity: "0".to_string(),
+            nonce: old_nonce,
+            signature: "sig1".to_string(),
+            signed_data: "data1".to_string(),
+            placed_by: "agent".to_string(),
+            is_active: false,
+        });
+
+        // Order 2: old, inactive, but referenced by settlement — should be KEPT
+        state.orders.push(SavedTrackedOrder {
+            order_id: 2,
+            market_id: "BTC-USD".to_string(),
+            order_type: 1,
+            price: "100".to_string(),
+            quantity: "1.0".to_string(),
+            settled_quantity: "0".to_string(),
+            pending_quantity: "0.5".to_string(),
+            nonce: old_nonce,
+            signature: "sig2".to_string(),
+            signed_data: "data2".to_string(),
+            placed_by: "agent".to_string(),
+            is_active: false,
+        });
+
+        // Order 3: recent, inactive — should be KEPT (within 24h)
+        state.orders.push(SavedTrackedOrder {
+            order_id: 3,
+            market_id: "BTC-USD".to_string(),
+            order_type: 1,
+            price: "100".to_string(),
+            quantity: "1.0".to_string(),
+            settled_quantity: "0".to_string(),
+            pending_quantity: "0".to_string(),
+            nonce: recent_nonce,
+            signature: "sig3".to_string(),
+            signed_data: "data3".to_string(),
+            placed_by: "agent".to_string(),
+            is_active: false,
+        });
+
+        // Order 4: old, but active — should be KEPT
+        state.orders.push(SavedTrackedOrder {
+            order_id: 4,
+            market_id: "BTC-USD".to_string(),
+            order_type: 1,
+            price: "100".to_string(),
+            quantity: "1.0".to_string(),
+            settled_quantity: "0".to_string(),
+            pending_quantity: "0".to_string(),
+            nonce: old_nonce,
+            signature: "sig4".to_string(),
+            signed_data: "data4".to_string(),
+            placed_by: "agent".to_string(),
+            is_active: true,
+        });
+
+        // Order 5: old, inactive, stale pending (no settlement_order) — should be PRUNED, pending fixed
+        state.orders.push(SavedTrackedOrder {
+            order_id: 5,
+            market_id: "BTC-USD".to_string(),
+            order_type: 1,
+            price: "100".to_string(),
+            quantity: "1.0".to_string(),
+            settled_quantity: "0".to_string(),
+            pending_quantity: "0.5".to_string(),
+            nonce: old_nonce,
+            signature: "sig5".to_string(),
+            signed_data: "data5".to_string(),
+            placed_by: "agent".to_string(),
+            is_active: false,
+        });
+
+        // Settlement order referencing order 2
+        state.settlement_orders.push(SavedSettlementOrder {
+            proposal_id: "prop-active".to_string(),
+            order_id: 2,
+            quantity: "0.5".to_string(),
+        });
+
+        // Completed proposals: 1500 items (should be capped to 1000)
+        state.completed_proposals = (0..1500).map(|i| format!("completed-{}", i)).collect();
+
+        // Rejected proposals: 50 items (under cap, kept as-is)
+        state.rejected_proposals = (0..50).map(|i| format!("rejected-{}", i)).collect();
+
+        // Quoted RFQ trades (should all be cleared)
+        state.quoted_rfq_trades.push(SavedQuotedTrade {
+            market_id: "BTC-USD".to_string(),
+            price: "100".to_string(),
+            base_quantity: "1.0".to_string(),
+            quote_quantity: "100.0".to_string(),
+        });
+
+        // Accepted RFQ trades: one active, one stale
+        state.accepted_rfq_trades.push(SavedAcceptedRfqTrade {
+            proposal_id: "prop-active".to_string(),
+            market_id: "BTC-USD".to_string(),
+            price: "100".to_string(),
+            base_quantity: "1.0".to_string(),
+            quote_quantity: "100.0".to_string(),
+        });
+        state.accepted_rfq_trades.push(SavedAcceptedRfqTrade {
+            proposal_id: "prop-stale".to_string(),
+            market_id: "BTC-USD".to_string(),
+            price: "100".to_string(),
+            base_quantity: "1.0".to_string(),
+            quote_quantity: "100.0".to_string(),
+        });
+
+        // Run pruning
+        prune_state(&mut state);
+
+        // Orders: should keep 2 (referenced), 3 (recent), 4 (active) = 3 orders
+        assert_eq!(state.orders.len(), 3);
+        let kept_ids: Vec<u64> = state.orders.iter().map(|o| o.order_id).collect();
+        assert!(kept_ids.contains(&2), "settlement-referenced order should be kept");
+        assert!(kept_ids.contains(&3), "recent order should be kept");
+        assert!(kept_ids.contains(&4), "active order should be kept");
+        assert!(!kept_ids.contains(&1), "old unreferenced order should be pruned");
+        assert!(!kept_ids.contains(&5), "old stale-pending order should be pruned");
+
+        // Order 2's pending_quantity should stay (has settlement_order)
+        let order2 = state.orders.iter().find(|o| o.order_id == 2).unwrap();
+        assert_eq!(order2.pending_quantity, "0.5");
+
+        // Completed proposals capped at 1000
+        assert_eq!(state.completed_proposals.len(), 1000);
+        // Should keep the latest 1000 (500..1499)
+        assert_eq!(state.completed_proposals[0], "completed-500");
+
+        // Rejected proposals unchanged (under cap)
+        assert_eq!(state.rejected_proposals.len(), 50);
+
+        // Quoted RFQ trades cleared
+        assert!(state.quoted_rfq_trades.is_empty());
+
+        // Accepted RFQ trades: only active one kept
+        assert_eq!(state.accepted_rfq_trades.len(), 1);
+        assert_eq!(state.accepted_rfq_trades[0].proposal_id, "prop-active");
     }
 }

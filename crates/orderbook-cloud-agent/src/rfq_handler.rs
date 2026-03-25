@@ -305,11 +305,22 @@ impl RfqHandler {
             };
 
             if available < needed || !cc_ok {
-                warn!(
-                    "RFQ {}: rejected — insufficient {} ({:.4} available, {:.4} needed){}",
-                    rfq_id, alloc_token, available, needed,
-                    if !cc_ok { format!(", CC for fees: {:.4}", lm.available_cc().await) } else { String::new() }
-                );
+                if available < needed && !cc_ok {
+                    warn!(
+                        "RFQ {}: rejected — insufficient {} ({:.4} available, {:.4} needed) AND insufficient CC for fees ({:.4} available, {:.4} needed)",
+                        rfq_id, alloc_token, available, needed, lm.available_cc().await, fee_cc
+                    );
+                } else if !cc_ok {
+                    warn!(
+                        "RFQ {}: rejected — insufficient CC for fees ({:.4} available, {:.4} needed), {} OK ({:.4} available)",
+                        rfq_id, lm.available_cc().await, fee_cc, alloc_token, available
+                    );
+                } else {
+                    warn!(
+                        "RFQ {}: rejected — insufficient {} ({:.4} available, {:.4} needed)",
+                        rfq_id, alloc_token, available, needed
+                    );
+                }
                 return RfqResponse::Reject(RfqReject {
                     rfq_id,
                     lp_party_id: self.party_id.clone(),

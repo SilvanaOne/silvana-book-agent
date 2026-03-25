@@ -144,6 +144,14 @@ pub struct BaseConfig {
     pub depletion_max_hours: f64,
     /// Hours to depletion at which spread coefficient = 10
     pub depletion_min_hours: f64,
+
+    // Batch pay settings (for background fees + traffic fees via MultiCall)
+    /// Minimum payment items to trigger batch flush
+    pub batch_pay_min_size: usize,
+    /// Max minutes to wait even if below min size
+    pub batch_pay_max_wait_min: u64,
+    /// Max payment items per batch
+    pub batch_pay_max_size: usize,
 }
 
 impl BaseConfig {
@@ -241,6 +249,19 @@ impl BaseConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.0);
 
+        let batch_pay_min_size = std::env::var("BATCH_PAY_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let batch_pay_max_wait_min = std::env::var("BATCH_PAY_MAX_WAIT_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let batch_pay_max_size = std::env::var("BATCH_PAY_MAX_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+
         Ok(BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
@@ -275,6 +296,9 @@ impl BaseConfig {
             flow_ema_window_hours,
             depletion_max_hours,
             depletion_min_hours,
+            batch_pay_min_size,
+            batch_pay_max_wait_min,
+            batch_pay_max_size,
         })
     }
 

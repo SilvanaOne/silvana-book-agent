@@ -2237,6 +2237,9 @@ pub fn inspect(
         OperationExpectation::SplitCc { output_amounts, .. } => {
             format!("SplitCc({} outputs)", output_amounts.len())
         }
+        OperationExpectation::ExecuteMulticall { op_count, .. } => {
+            format!("ExecuteMulticall({} ops)", op_count)
+        }
     };
 
     // Verbose: dump full JSON

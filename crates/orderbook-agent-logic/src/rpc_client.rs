@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Mutex as TokioMutex;
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::Request;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Global cached gRPC channel (created once, reused by all clients)
 static CACHED_CHANNEL: OnceLock<Channel> = OnceLock::new();
@@ -35,6 +35,7 @@ use orderbook_proto::{
     SubmitPreconfirmationRequest, PreconfirmationDecision, PreconfirmationResponse,
     GetSettlementStatusRequest, GetSettlementStatusResponse,
     DisclosedContractMessage,
+    settlement::CancelSettlementRequest,
 };
 
 /// Authentication interceptor for gRPC requests
@@ -126,7 +127,8 @@ impl OrderbookRpcClient {
 
         let token = Arc::new(RwLock::new(jwt.unwrap_or_default()));
         let auth_interceptor = AuthInterceptor { token: token.clone() };
-        let settlement_client = SettlementServiceClient::with_interceptor(channel, auth_interceptor);
+        let settlement_client = SettlementServiceClient::with_interceptor(channel, auth_interceptor)
+            .max_decoding_message_size(16 * 1024 * 1024);
 
         Ok(Self {
             settlement_client,
@@ -270,6 +272,37 @@ impl OrderbookRpcClient {
             .map_err(|e| anyhow!("SubmitPreconfirmation RPC failed ({}): {}", e.code(), e.message()))?;
 
         Ok(())
+    }
+
+    /// Cancel a settlement (buyer or seller can cancel before settlement execution)
+    pub async fn cancel_settlement(
+        &mut self,
+        proposal_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let request = CancelSettlementRequest {
+            auth: None, // External parties use metadata auth
+            proposal_id: proposal_id.to_string(),
+            reason: reason.to_string(),
+        };
+
+        let response = self
+            .settlement_client
+            .cancel_settlement(request)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "CancelSettlement RPC failed ({}): {}",
+                    e.code(),
+                    e.message()
+                )
+            })?;
+
+        let resp = response.into_inner();
+        if !resp.success {
+            warn!("CancelSettlement rejected: {}", resp.message);
+        }
+        Ok(resp.success)
     }
 
     /// Get settlement status including next actions for buyer/seller

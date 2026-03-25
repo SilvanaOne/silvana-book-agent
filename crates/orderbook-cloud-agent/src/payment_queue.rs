@@ -13,7 +13,7 @@
 //! marked and the payment is re-queued for retry with fresh amulet selection.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -31,6 +31,7 @@ use orderbook_agent_logic::settlement::{PendingFee, PendingTrafficFee, StepResul
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AllocateParams, PayFeeParams,
     PrepareTransactionRequest, TransferCcParams, TransactionOperation,
+    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
 };
 use orderbook_proto::{
     RecordSettlementEventRequest, SettlementEventType, SettlementEventResult, RecordedByRole,
@@ -63,6 +64,9 @@ const SCHEDULER_BACKOFF_SECS: u64 = 5;
 
 /// Maximum traffic fees in the scheduler heap at once (rest stay in backlog)
 const MAX_TRAFFIC_FEES_IN_QUEUE: usize = 10;
+
+/// Default max concurrent batch pay workers
+const DEFAULT_MAX_BATCH_WORKERS: usize = 2;
 
 // ============================================================================
 // Types
@@ -146,6 +150,30 @@ impl PartialOrd for QueuedPayment {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+// ============================================================================
+// Batch pay types
+// ============================================================================
+
+/// A payment item accumulated for BatchPay submission
+struct BatchItem {
+    receiver_party: String,
+    amount_cc: Decimal,
+    #[allow(dead_code)]
+    description: String,
+    source: BatchItemSource,
+}
+
+enum BatchItemSource {
+    /// Background fee payment — needs completed event recording after batch
+    Fee(PendingFee),
+    /// Traffic fee payment — needs removal from pending_traffic_fees after batch
+    Traffic {
+        traffic_bytes: u64,
+        step_name: String,
+        proposal_id: String,
+    },
 }
 
 // ============================================================================
@@ -508,16 +536,22 @@ impl PaymentQueue {
         let alloc_semaphore = Arc::new(Semaphore::new(max_alloc_workers));
         let fee_semaphore = Arc::new(Semaphore::new(max_fee_workers));
         let traffic_semaphore = Arc::new(Semaphore::new(max_traffic_workers));
+        let batch_semaphore = Arc::new(Semaphore::new(DEFAULT_MAX_BATCH_WORKERS));
         let mut heap: BinaryHeap<QueuedPayment> = BinaryHeap::new();
         let sequence = AtomicU64::new(u64::MAX / 2);
+
+        // Scheduler-local batch state (not on PaymentQueue struct)
+        let mut batch_items: Vec<BatchItem> = Vec::new();
+        let mut batch_first_item_at: Option<std::time::Instant> = None;
 
         // Shared gRPC channel — created lazily on first dispatch, then reused
         // by all workers via HTTP/2 multiplexing (avoids per-worker TCP+TLS overhead)
         let mut shared_channel: Option<Channel> = None;
 
         info!(
-            "Payment scheduler started: {} allocation, {} fee, {} traffic workers",
-            max_alloc_workers, max_fee_workers, max_traffic_workers
+            "Payment scheduler started: {} allocation, {} fee, {} traffic workers; batch_pay min={} max={} wait={}min",
+            max_alloc_workers, max_fee_workers, max_traffic_workers,
+            config.batch_pay_min_size, config.batch_pay_max_size, config.batch_pay_max_wait_min
         );
 
         loop {
@@ -532,7 +566,7 @@ impl PaymentQueue {
                 // First check if backlog has items to drain
                 {
                     let mut backlog = traffic_fee_backlog.lock().await;
-                    let to_drain = MAX_TRAFFIC_FEES_IN_QUEUE.min(backlog.len());
+                    let to_drain = config.batch_pay_max_size.min(backlog.len());
                     for _ in 0..to_drain {
                         if let Some(fee) = backlog.pop_front() {
                             let (response_tx, _) = oneshot::channel();
@@ -628,49 +662,83 @@ impl PaymentQueue {
                     continue;
                 }
 
-                // Skip regular fees while sequencer backpressure pause is active
-                if item_priority == PaymentPriority::Normal
-                    && crate::ledger_client::fee_pause_remaining().is_some()
-                {
-                    deferred.push(item);
+                // Check if fees or traffic are paused (low issuance pauses BOTH)
+                let fees_paused = crate::ledger_client::fee_pause_remaining().is_some()
+                    || orderbook_agent_logic::forecast::is_fees_paused_by_overload()
+                    || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
+                let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some()
+                    || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
+
+                // Skip sync PayFee while fees paused
+                if item_priority == PaymentPriority::Normal && fees_paused {
+                    if matches!(&item.request, PaymentRequest::PayFee { .. }) {
+                        deferred.push(item);
+                        continue;
+                    }
+                }
+
+                // Divert PayFeeBackground → always batch (never individual worker)
+                if let PaymentRequest::PayFeeBackground { ref fee } = item.request {
+                    if fees_paused {
+                        deferred.push(item);
+                        continue;
+                    }
+                    let amount_cc = Decimal::from_f64_retain(fee.fee_cc_estimate)
+                        .unwrap_or(Decimal::ONE);
+                    batch_items.push(BatchItem {
+                        receiver_party: config.fee_party.clone(),
+                        amount_cc,
+                        description: format!("{} fee for {}", fee.fee_type, fee.proposal_id),
+                        source: BatchItemSource::Fee(fee.clone()),
+                    });
+                    if batch_first_item_at.is_none() {
+                        batch_first_item_at = Some(std::time::Instant::now());
+                    }
+                    debug!("[{}] Background {} fee added to batch (size={})",
+                        fee.proposal_id, fee.fee_type, batch_items.len());
+                    drop(item.response_tx);
                     continue;
                 }
 
-                // Skip regular fees when predicted coefficient is below overload threshold
-                // — extremely heavy sequencer load, fee txs would hit SEQUENCER_BACKPRESSURE
-                if item_priority == PaymentPriority::Normal
-                    && orderbook_agent_logic::forecast::is_fees_paused_by_overload()
-                {
-                    deferred.push(item);
-                    continue;
-                }
-
-                // Skip traffic fees while sequencer backpressure pause is active
-                if item_priority == PaymentPriority::Low
-                    && crate::ledger_client::traffic_fee_pause_remaining().is_some()
-                {
-                    deferred.push(item);
-                    continue;
-                }
-
-                // Skip traffic fees while issuance forecast is LOW — heavy sequencer load
-                // means traffic txs would likely hit SEQUENCER_BACKPRESSURE errors
-                if item_priority == PaymentPriority::Low
-                    && orderbook_agent_logic::forecast::is_traffic_paused_by_forecast()
-                {
-                    deferred.push(item);
-                    continue;
-                }
-
-                // Pause traffic fees when CC is critically low — preserve amulets for
-                // allocations and regular fees (critical path)
-                if item_priority == PaymentPriority::Low {
-                    let selectable_total: Decimal = cache.get_selectable_amulets().await
-                        .iter()
-                        .map(|a| a.amount)
-                        .sum();
-                    if selectable_total < Decimal::from_f64_retain(config.fee_reserve_cc).unwrap_or(Decimal::from(5)) {
-                        debug!("Pausing traffic fee — critical CC shortage ({:.2} selectable)", selectable_total);
+                // Divert fire-and-forget TransferTrafficFee → batch
+                // Sync callers (response_tx not closed) fall through to individual worker
+                if let PaymentRequest::TransferTrafficFee { traffic_bytes, ref step_name, ref proposal_id } = item.request {
+                    if item.response_tx.is_closed() {
+                        // Fire-and-forget path
+                        if traffic_paused {
+                            deferred.push(item);
+                            continue;
+                        }
+                        // CC critically low check
+                        let selectable_total: Decimal = cache.get_selectable_amulets().await
+                            .iter()
+                            .map(|a| a.amount)
+                            .sum();
+                        if selectable_total < Decimal::from_f64_retain(config.fee_reserve_cc).unwrap_or(Decimal::from(5)) {
+                            debug!("Pausing traffic fee — critical CC shortage ({:.2} selectable)", selectable_total);
+                            deferred.push(item);
+                            continue;
+                        }
+                        batch_items.push(BatchItem {
+                            receiver_party: config.traffic_fee_party.clone(),
+                            amount_cc: Decimal::ZERO, // computed at flush time with live rate
+                            description: format!("Traffic fee for {} bytes ({})", traffic_bytes, proposal_id),
+                            source: BatchItemSource::Traffic {
+                                traffic_bytes,
+                                step_name: step_name.clone(),
+                                proposal_id: proposal_id.clone(),
+                            },
+                        });
+                        if batch_first_item_at.is_none() {
+                            batch_first_item_at = Some(std::time::Instant::now());
+                        }
+                        debug!("[{}] Traffic fee ({} bytes) added to batch (size={})",
+                            proposal_id, traffic_bytes, batch_items.len());
+                        drop(item.response_tx);
+                        continue;
+                    }
+                    // Sync caller — check pause and fall through to individual worker
+                    if traffic_paused {
                         deferred.push(item);
                         continue;
                     }
@@ -751,7 +819,6 @@ impl PaymentQueue {
                 let worker_config = config.clone();
                 let worker_cache = cache.clone();
                 let worker_queue_tx = queue_tx.clone();
-                let worker_pending_fees = pending_background_fees.clone();
                 let worker_pending_traffic = pending_traffic_fees.clone();
                 let worker_confirm_lock = confirm_lock.clone();
                 let worker_sequence = sequence.fetch_add(1, AtomicOrdering::Relaxed);
@@ -765,60 +832,9 @@ impl PaymentQueue {
                         std::time::Duration::from_secs(120),
                         async {
                             match item.request {
-                                PaymentRequest::PayFeeBackground { fee } => {
-                                    let fee_type = fee.fee_type.clone();
-                                    let proposal_id = fee.proposal_id.clone();
-                                    let retry_count = fee.retry_count;
-
-                                    let (success, traffic) = execute_background_fee(
-                                        worker_channel.clone(), &worker_config, fee.clone(), &selected_cids,
-                                        verbose, dry_run, force, confirm, &worker_confirm_lock,
-                                        &worker_pending_fees, &worker_cache,
-                                    ).await;
-
-                                    // Queue traffic fee after fee payment
-                                    if traffic > 0 {
-                                        let step_name = format!("{}-fee", fee_type);
-                                        worker_pending_traffic.lock().await.push(PendingTrafficFee {
-                                            traffic_bytes: traffic,
-                                            step_name: step_name.clone(),
-                                            proposal_id: proposal_id.clone(),
-                                            retry_count: 0,
-                                        });
-                                        let (tx_resp, _) = oneshot::channel();
-                                        let _ = worker_queue_tx.send(QueuedPayment {
-                                            priority: PaymentPriority::Low,
-                                            sequence: worker_sequence,
-                                            request: PaymentRequest::TransferTrafficFee {
-                                                traffic_bytes: traffic,
-                                                step_name,
-                                                proposal_id: proposal_id.clone(),
-                                            },
-                                            response_tx: tx_resp,
-                                        });
-                                    }
-
-                                    // Retry failed background fees
-                                    if !success && retry_count < 10 {
-                                        let mut retry_fee = fee;
-                                        retry_fee.retry_count += 1;
-                                        info!("[{}] Scheduling background {} fee retry #{} in 5min",
-                                            proposal_id, fee_type, retry_fee.retry_count);
-                                        let retry_tx = worker_queue_tx.clone();
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                                            let (response_tx, _) = oneshot::channel();
-                                            let _ = retry_tx.send(QueuedPayment {
-                                                priority: PaymentPriority::Normal,
-                                                sequence: u64::MAX / 2,
-                                                request: PaymentRequest::PayFeeBackground { fee: retry_fee },
-                                                response_tx,
-                                            });
-                                        });
-                                    } else if !success {
-                                        warn!("[{}] Background {} fee permanently failed after {} retries",
-                                            proposal_id, fee_type, retry_count);
-                                    }
+                                PaymentRequest::PayFeeBackground { .. } => {
+                                    // PayFeeBackground is always diverted to batch — should never reach here
+                                    warn!("PayFeeBackground reached individual worker — should be batched");
                                 }
                                 PaymentRequest::Allocate { ref proposal_id, ref dvp_cid, .. } => {
                                     let result = execute_allocate(
@@ -920,19 +936,78 @@ impl PaymentQueue {
                 heap.push(item);
             }
 
+            // ================================================================
+            // Batch flush check — spawn batch worker if ready
+            // ================================================================
+            {
+                let batch_len = batch_items.len();
+                let max_wait_elapsed = batch_first_item_at
+                    .map(|t| t.elapsed() >= std::time::Duration::from_secs(config.batch_pay_max_wait_min * 60))
+                    .unwrap_or(false);
+
+                let should_flush = batch_len > 0
+                    && (batch_len >= config.batch_pay_min_size || max_wait_elapsed);
+
+                if should_flush {
+                    if max_wait_elapsed && batch_len < config.batch_pay_min_size {
+                        info!("Max batch wait elapsed, flushing undersized batch ({}/{} items)",
+                            batch_len, config.batch_pay_min_size);
+                    }
+                    if let Some(ref channel) = shared_channel {
+                        match batch_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                // Take up to max_size items; rest stay for next flush
+                                let take_count = batch_len.min(config.batch_pay_max_size);
+                                let worker_items: Vec<BatchItem> = batch_items.drain(..take_count).collect();
+                                if batch_items.is_empty() {
+                                    batch_first_item_at = None;
+                                }
+                                let worker_channel = channel.clone();
+                                let worker_config = config.clone();
+                                let worker_cache = cache.clone();
+                                let worker_queue_tx = queue_tx.clone();
+                                let worker_pending_fees = pending_background_fees.clone();
+                                let worker_pending_traffic = pending_traffic_fees.clone();
+                                info!("Spawning batch worker: {} items ({} remaining in buffer)",
+                                    worker_items.len(), batch_items.len());
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    execute_batch_pay(
+                                        worker_channel,
+                                        &worker_config,
+                                        &worker_cache,
+                                        worker_items,
+                                        &worker_pending_fees,
+                                        &worker_pending_traffic,
+                                        &worker_queue_tx,
+                                    ).await;
+                                });
+                            }
+                            Err(_) => {
+                                debug!("Batch flush deferred: all {} batch workers busy", DEFAULT_MAX_BATCH_WORKERS);
+                            }
+                        }
+                    } else {
+                        warn!("Cannot flush batch: no gRPC channel available");
+                    }
+                } else if batch_len > 0 {
+                    let wait_info = batch_first_item_at
+                        .map(|t| format!("{:.0}s/{:.0}s", t.elapsed().as_secs(), config.batch_pay_max_wait_min * 60))
+                        .unwrap_or_default();
+                    debug!("Batch buffer: {}/{} items, wait {}", batch_len, config.batch_pay_min_size, wait_info);
+                }
+            }
+
             // Drip-feed traffic fees from backlog (max 10 in heap at a time)
             // but NOT when allocations are pending — allocations must take priority
             {
                 let has_pending_allocations = allocation_deferred
                     || heap.iter().any(|i| matches!(&i.request, PaymentRequest::Allocate { .. }));
-                let traffic_in_heap = heap.iter()
-                    .filter(|i| matches!(&i.request, PaymentRequest::TransferTrafficFee { .. }))
-                    .count();
                 let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some()
                     || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
-                if !has_pending_allocations && !traffic_paused && traffic_in_heap < MAX_TRAFFIC_FEES_IN_QUEUE {
+                if !has_pending_allocations && !traffic_paused {
                     let mut backlog = traffic_fee_backlog.lock().await;
-                    let to_drain = MAX_TRAFFIC_FEES_IN_QUEUE - traffic_in_heap;
+                    let to_drain = config.batch_pay_max_size.min(backlog.len());
                     let mut drained = 0;
                     while drained < to_drain {
                         if let Some(fee) = backlog.pop_front() {
@@ -979,6 +1054,283 @@ impl PaymentQueue {
             }
         }
     }
+}
+
+// ============================================================================
+// Batch pay worker
+// ============================================================================
+
+/// Execute a batch payment: aggregate by receiver, submit via ExecuteMulticall BatchPay.
+/// On success: records events, cleans pending lists, queues batch's own traffic fee.
+/// On failure: re-queues all items back through queue_tx for retry.
+async fn execute_batch_pay(
+    channel: Channel,
+    config: &BaseConfig,
+    cache: &Arc<AmuletCache>,
+    mut items: Vec<BatchItem>,
+    pending_background_fees: &Arc<Mutex<Vec<PendingFee>>>,
+    pending_traffic_fees: &Arc<Mutex<Vec<PendingTrafficFee>>>,
+    queue_tx: &mpsc::UnboundedSender<QueuedPayment>,
+) {
+    if items.is_empty() {
+        return;
+    }
+
+    // Fetch live CC/USD rate for traffic fee computation
+    let cc_usd_rate = match fetch_cc_usd_rate(channel.clone(), config).await {
+        Some(rate) => rate,
+        None => {
+            warn!("Batch pay: failed to fetch CC/USD rate, re-queuing {} items", items.len());
+            requeue_batch_items(items, queue_tx).await;
+            return;
+        }
+    };
+
+    // Recompute traffic fee amounts with live rate
+    let mut fee_count = 0u64;
+    let mut traffic_count = 0u64;
+    for item in items.iter_mut() {
+        match &item.source {
+            BatchItemSource::Fee(_) => {
+                fee_count += 1;
+            }
+            BatchItemSource::Traffic { traffic_bytes, .. } => {
+                let fee_usd = Decimal::from(*traffic_bytes)
+                    * Decimal::from_f64_retain(config.traffic_fee_usd_per_byte)
+                        .unwrap_or(Decimal::ZERO);
+                item.amount_cc = (fee_usd / cc_usd_rate).round_dp(10);
+                traffic_count += 1;
+            }
+        }
+    }
+
+    // Partition out zero-amount items and clean their pending list entries
+    let (live, zero): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| item.amount_cc > Decimal::ZERO);
+    items = live;
+    for item in &zero {
+        match &item.source {
+            BatchItemSource::Fee(fee) => {
+                let mut pending = pending_background_fees.lock().await;
+                pending.retain(|f| !(f.proposal_id == fee.proposal_id && f.fee_type == fee.fee_type));
+            }
+            BatchItemSource::Traffic { step_name, proposal_id, .. } => {
+                let mut pending = pending_traffic_fees.lock().await;
+                pending.retain(|f| !(f.step_name == *step_name && f.proposal_id == *proposal_id));
+            }
+        }
+    }
+    if !zero.is_empty() {
+        debug!("Batch pay: removed {} zero-amount items from batch and pending lists", zero.len());
+    }
+    if items.is_empty() {
+        info!("Batch pay: all items had zero amount, nothing to submit");
+        return;
+    }
+
+    // Aggregate targets by receiver_party
+    let mut target_map: HashMap<String, Decimal> = HashMap::new();
+    for item in &items {
+        *target_map.entry(item.receiver_party.clone()).or_insert(Decimal::ZERO) += item.amount_cc;
+    }
+
+    let total_amount: Decimal = target_map.values().sum();
+    let targets: Vec<McPaymentTarget> = target_map
+        .iter()
+        .map(|(party, amount)| McPaymentTarget {
+            receiver_party: party.clone(),
+            amount: amount.round_dp(10).to_string(),
+            description: Some(format!(
+                "Batch payment: {} fees + {} traffic",
+                fee_count, traffic_count
+            )),
+        })
+        .collect();
+
+    info!(
+        "Batch pay: {} items ({} fee, {} traffic) to {} targets, total {:.4} CC",
+        items.len(), fee_count, traffic_count, targets.len(), total_amount
+    );
+
+    // Select amulets for total amount + margin
+    let margin = Decimal::from(2);
+    let selectable = cache.get_selectable_amulets().await;
+    let selected = select_amulets_for_allocation(&selectable, total_amount + margin);
+    if selected.is_empty() {
+        warn!("Batch pay: insufficient amulets for {:.4} CC, re-queuing {} items", total_amount, items.len());
+        requeue_batch_items(items, queue_tx).await;
+        return;
+    }
+
+    let selected_cids: Vec<String> = selected.iter().map(|a| a.contract_id.clone()).collect();
+    let payment_id = format!("batch-pay-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+    if !cache.reserve(&selected_cids, &payment_id).await {
+        warn!("Batch pay: amulet reservation failed, re-queuing {} items", items.len());
+        requeue_batch_items(items, queue_tx).await;
+        return;
+    }
+
+    // Build ExecuteMulticall request
+    let request = PrepareTransactionRequest {
+        operation: TransactionOperation::ExecuteMulticall as i32,
+        params: Some(Params::ExecuteMulticall(ExecuteMultiCallParams {
+            operations: vec![MultiCallOp {
+                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchPay(
+                    McBatchPay { targets },
+                )),
+            }],
+            amulet_cids: selected_cids.clone(),
+            holding_cids: vec![],
+        })),
+        request_signature: None,
+    };
+
+    let expectation = OperationExpectation::ExecuteMulticall {
+        party: config.party_id.clone(),
+        op_count: 1,
+    };
+
+    let mut client = match create_client_from_channel(channel, config) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Batch pay: failed to create client: {:#}, re-queuing {} items", e, items.len());
+            cache.release_reservations(&selected_cids).await;
+            requeue_batch_items(items, queue_tx).await;
+            return;
+        }
+    };
+
+    let result = client
+        .submit_transaction(request, &expectation, false, false, false)
+        .await;
+
+    match result {
+        Ok(ref resp) => {
+            process_tx_result(cache, &selected_cids, resp).await;
+
+            // Record completed events for fee items + remove from pending lists
+            for item in &items {
+                match &item.source {
+                    BatchItemSource::Fee(fee) => {
+                        let completed_event = match (fee.fee_type.as_str(), fee.is_buyer) {
+                            ("dvp", true) => SettlementEventType::DvpProcessingFeeBuyerCompleted,
+                            ("dvp", false) => SettlementEventType::DvpProcessingFeeSellerCompleted,
+                            (_, true) => SettlementEventType::AllocationProcessingFeeBuyerCompleted,
+                            (_, false) => SettlementEventType::AllocationProcessingFeeSellerCompleted,
+                        };
+                        record_completed_event(
+                            config,
+                            &fee.proposal_id,
+                            fee.is_buyer,
+                            completed_event,
+                            &resp.update_id,
+                            resp.contract_id.as_deref().unwrap_or(""),
+                        ).await;
+
+                        // Remove from pending background fees
+                        let mut pending = pending_background_fees.lock().await;
+                        pending.retain(|f| !(f.proposal_id == fee.proposal_id && f.fee_type == fee.fee_type));
+                    }
+                    BatchItemSource::Traffic { step_name, proposal_id, .. } => {
+                        // Remove from pending traffic fees
+                        let mut pending = pending_traffic_fees.lock().await;
+                        let sn = step_name.clone();
+                        let pid = proposal_id.clone();
+                        pending.retain(|f| !(f.step_name == sn && f.proposal_id == pid));
+                    }
+                }
+            }
+
+            // Queue the batch's own traffic fee (from ExecuteMulticall transaction itself)
+            if let Some(traffic) = resp.traffic.as_ref() {
+                if traffic.total_bytes > 0 {
+                    let batch_traffic = PendingTrafficFee {
+                        traffic_bytes: traffic.total_bytes,
+                        step_name: "batch-pay".to_string(),
+                        proposal_id: format!("batch-{}", resp.update_id),
+                        retry_count: 0,
+                    };
+                    pending_traffic_fees.lock().await.push(batch_traffic.clone());
+                    let (tx, _) = oneshot::channel();
+                    let _ = queue_tx.send(QueuedPayment {
+                        priority: PaymentPriority::Low,
+                        sequence: u64::MAX / 2,
+                        request: PaymentRequest::TransferTrafficFee {
+                            traffic_bytes: traffic.total_bytes,
+                            step_name: batch_traffic.step_name,
+                            proposal_id: batch_traffic.proposal_id,
+                        },
+                        response_tx: tx,
+                    });
+                    debug!("Queued traffic fee for batch tx: {} bytes", traffic.total_bytes);
+                }
+            }
+
+            info!(
+                "Batch payment completed: {} items, {:.4} CC (update_id={})",
+                items.len(), total_amount, resp.update_id
+            );
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            if error_msg.contains("INACTIVE_CONTRACTS") {
+                handle_inactive_contracts(cache, &selected_cids).await;
+            } else if error_msg.contains("SEQUENCER_BACKPRESSURE") {
+                crate::ledger_client::signal_sequencer_backpressure();
+                cache.release_reservations(&selected_cids).await;
+            } else {
+                cache.release_reservations(&selected_cids).await;
+            }
+            // Re-queue all items back through the scheduler for retry
+            warn!("Batch payment failed: {:#} — re-queuing {} items", error_msg, items.len());
+            requeue_batch_items(items, queue_tx).await;
+        }
+    }
+}
+
+/// Re-queue batch items back through the scheduler queue for retry.
+/// Waits 30s before re-queuing to avoid tight retry loops on persistent errors.
+async fn requeue_batch_items(
+    items: Vec<BatchItem>,
+    queue_tx: &mpsc::UnboundedSender<QueuedPayment>,
+) {
+    warn!("Waiting 30s before re-queuing {} batch items", items.len());
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    for item in items {
+        let (tx, _) = oneshot::channel();
+        match item.source {
+            BatchItemSource::Fee(fee) => {
+                let _ = queue_tx.send(QueuedPayment {
+                    priority: PaymentPriority::Normal,
+                    sequence: u64::MAX / 2,
+                    request: PaymentRequest::PayFeeBackground { fee },
+                    response_tx: tx,
+                });
+            }
+            BatchItemSource::Traffic { traffic_bytes, step_name, proposal_id } => {
+                let _ = queue_tx.send(QueuedPayment {
+                    priority: PaymentPriority::Low,
+                    sequence: u64::MAX / 2,
+                    request: PaymentRequest::TransferTrafficFee {
+                        traffic_bytes, step_name, proposal_id,
+                    },
+                    response_tx: tx,
+                });
+            }
+        }
+    }
+}
+
+/// Fetch CC/USD rate from DSO via gRPC
+async fn fetch_cc_usd_rate(channel: Channel, config: &BaseConfig) -> Option<Decimal> {
+    let mut client = create_client_from_channel(channel, config).ok()?;
+    let rates = client.get_dso_rates().await.ok()?;
+    let rate = Decimal::from_str(&rates.cc_usd_rate).ok()?;
+    if rate <= Decimal::ZERO {
+        warn!("Invalid CC/USD rate: {}", rate);
+        return None;
+    }
+    Some(rate)
 }
 
 // ============================================================================
@@ -1140,81 +1492,6 @@ fn create_client_from_channel(channel: Channel, config: &BaseConfig) -> Result<D
     )
 }
 
-/// Execute a background fee payment: pay fee, record _Completed event.
-/// Returns (success, traffic_bytes).
-async fn execute_background_fee(
-    channel: Channel,
-    config: &BaseConfig,
-    fee: PendingFee,
-    amulet_cids: &[String],
-    verbose: bool,
-    dry_run: bool,
-    force: bool,
-    confirm: bool,
-    confirm_lock: &ConfirmLock,
-    pending_background_fees: &Arc<Mutex<Vec<PendingFee>>>,
-    cache: &Arc<AmuletCache>,
-) -> (bool, u64) {
-    let proposal_id = &fee.proposal_id;
-    let fee_type = &fee.fee_type;
-
-    info!("[{}] Processing background {} fee (retry #{})", proposal_id, fee_type, fee.retry_count);
-
-    // On retries, check if operator already confirmed receipt
-    if fee.retry_count > 0 {
-        if let Some(confirmed) = check_operator_confirmed_fee(config, proposal_id, fee_type, fee.is_buyer).await {
-            if confirmed {
-                info!("[{}] Background {} fee already confirmed by operator, skipping", proposal_id, fee_type);
-                let mut pending = pending_background_fees.lock().await;
-                pending.retain(|f| !(f.proposal_id == fee.proposal_id && f.fee_type == fee.fee_type));
-                // Release reservations since we're not executing
-                cache.release_reservations(&amulet_cids.to_vec()).await;
-                return (true, 0);
-            }
-        }
-    }
-
-    let result = execute_pay_fee(channel, config, proposal_id, fee_type, amulet_cids, verbose, dry_run, force, confirm, confirm_lock, cache).await;
-
-    match result {
-        Ok(step_result) => {
-            // Record _Completed event
-            let completed_event = if fee_type == "dvp" {
-                if fee.is_buyer {
-                    SettlementEventType::DvpProcessingFeeBuyerCompleted
-                } else {
-                    SettlementEventType::DvpProcessingFeeSellerCompleted
-                }
-            } else {
-                if fee.is_buyer {
-                    SettlementEventType::AllocationProcessingFeeBuyerCompleted
-                } else {
-                    SettlementEventType::AllocationProcessingFeeSellerCompleted
-                }
-            };
-
-            record_completed_event(
-                config, proposal_id, fee.is_buyer, completed_event,
-                &step_result.update_id, &step_result.contract_id,
-            ).await;
-
-            let traffic = step_result.traffic_total;
-
-            // Remove from pending list
-            let mut pending = pending_background_fees.lock().await;
-            pending.retain(|f| !(f.proposal_id == fee.proposal_id && f.fee_type == fee.fee_type));
-
-            info!("[{}] Background {} fee completed (update_id={})", proposal_id, fee_type, step_result.update_id);
-            (true, traffic)
-        }
-        Err(e) => {
-            warn!("[{}] Background {} fee failed: {:#}", proposal_id, fee_type, e);
-            // Amulet cache is already handled by execute_pay_fee on error
-            (false, 0)
-        }
-    }
-}
-
 /// Record a _Completed settlement event via RPC.
 async fn record_completed_event(
     config: &BaseConfig,
@@ -1275,39 +1552,6 @@ async fn record_completed_event(
             warn!("[{}] Failed to record background fee completed event {:?}: {}", proposal_id, event_type, e);
         }
     }
-}
-
-/// Check if the operator has already confirmed receipt of a fee payment.
-async fn check_operator_confirmed_fee(
-    config: &BaseConfig,
-    proposal_id: &str,
-    fee_type: &str,
-    is_buyer: bool,
-) -> Option<bool> {
-    let jwt = generate_jwt(
-        &config.party_id,
-        &config.role,
-        &config.private_key_bytes,
-        config.token_ttl_secs,
-        Some(&config.node_name),
-    ).ok()?;
-
-    let mut rpc_client = OrderbookRpcClient::connect(&config.orderbook_grpc_url, Some(jwt)).await.ok()?;
-    let status = rpc_client.get_settlement_status(proposal_id).await.ok()?;
-
-    let step = match (fee_type, is_buyer) {
-        ("dvp", true) => status.dvp_processing_fee_buyer,
-        ("dvp", false) => status.dvp_processing_fee_seller,
-        ("allocate", true) => status.allocation_processing_fee_buyer,
-        ("allocate", false) => status.allocation_processing_fee_seller,
-        _ => None,
-    };
-
-    let confirmed = step
-        .map(|s| s.status == 4) // DVP_STEP_STATUS_CONFIRMED
-        .unwrap_or(false);
-
-    Some(confirmed)
 }
 
 async fn execute_pay_fee(
