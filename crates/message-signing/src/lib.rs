@@ -257,6 +257,13 @@ pub fn canonical_params_split_cc(output_amounts: &[String]) -> String {
     )
 }
 
+pub fn canonical_params_execute_multicall(op_count: usize) -> String {
+    format!(
+        "param_type=ExecuteMultiCall\nop_count={}\n",
+        op_count
+    )
+}
+
 // ============================================================================
 // Canonical payload builders — Onboarding RPCs
 //

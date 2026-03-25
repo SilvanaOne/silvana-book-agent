@@ -238,6 +238,18 @@ impl AmuletCache {
         }
     }
 
+    /// Total CC from available amulets excluding consumed (but including reserved).
+    /// Used for liquidity tracking — reserved amulets are still on the ledger
+    /// and their commitment is tracked separately by the LiquidityManager.
+    pub async fn total_available_amount(&self) -> Decimal {
+        let available = self.available.read().await;
+        let consumed = self.consumed.read().await;
+        available.values()
+            .filter(|a| !consumed.contains_key(&a.contract_id))
+            .map(|a| a.amount)
+            .sum()
+    }
+
     /// Get cache statistics for heartbeat logging: (available, consumed, reserved, selectable)
     pub async fn stats(&self) -> (usize, usize, usize, usize) {
         let now = Instant::now();

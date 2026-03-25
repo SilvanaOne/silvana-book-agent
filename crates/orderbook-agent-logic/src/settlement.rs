@@ -472,6 +472,28 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.update_actionable_count();
     }
 
+    /// Cancel a settlement proactively (e.g., on timeout or strategy change)
+    ///
+    /// Calls the CancelSettlement RPC and removes from active settlements.
+    /// The streaming event will also arrive via handle_settlement_update.
+    pub async fn cancel_settlement(&mut self, proposal_id: &str, reason: &str, config: &BaseConfig) -> Result<()> {
+        let jwt = generate_jwt(
+            &config.party_id,
+            &config.role,
+            &config.private_key_bytes,
+            config.token_ttl_secs,
+            Some(config.node_name.as_str()),
+        )?;
+        let mut rpc_client = OrderbookRpcClient::connect(&config.orderbook_grpc_url, Some(jwt)).await?;
+        let success = rpc_client.cancel_settlement(proposal_id, reason).await?;
+        if success {
+            info!("[{}] Settlement cancelled: {}", proposal_id, reason);
+            self.active_settlements.shift_remove(proposal_id);
+            self.in_progress.remove(proposal_id);
+        }
+        Ok(())
+    }
+
     /// Handle a settlement update from the stream
     pub async fn handle_settlement_update(&mut self, update: SettlementUpdate) -> Result<()> {
         let event_type = EventType::try_from(update.event_type)

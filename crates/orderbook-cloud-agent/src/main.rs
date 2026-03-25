@@ -19,6 +19,7 @@ use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
     TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
+    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
     prepare_transaction_request::Params,
     d_app_provider_service_client::DAppProviderServiceClient,
@@ -265,6 +266,24 @@ enum TransferCommands {
         /// Comma-separated input amulet contract IDs
         #[arg(long, value_delimiter = ',')]
         amulet_cids: Vec<String>,
+    },
+    /// Batch pay CC to multiple recipients atomically via MultiCall
+    BatchPay {
+        /// Recipient party IDs (repeat for each recipient)
+        #[arg(long = "receiver")]
+        receivers: Vec<String>,
+        /// Amounts in CC (repeat for each recipient, same order as --receiver)
+        #[arg(long = "amount")]
+        amounts: Vec<String>,
+        /// CSV file with columns: party_id, amount (overrides --receiver/--amount)
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Description applied to all payments
+        #[arg(long)]
+        description: Option<String>,
+        /// Comma-separated input amulet contract IDs (optional — server selects if empty)
+        #[arg(long, value_delimiter = ',')]
+        amulet_cids: Option<Vec<String>>,
     },
 }
 
@@ -688,7 +707,8 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
             }
         };
 
-        let mut client = SettlementServiceClient::new(channel);
+        let mut client = SettlementServiceClient::new(channel)
+            .max_decoding_message_size(16 * 1024 * 1024);
 
         // Create the outbound channel
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<CantonToServerMessage>(64);
@@ -1394,9 +1414,184 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                 }
             }
         }
+        TransferCommands::BatchPay {
+            receivers,
+            amounts,
+            file,
+            description,
+            amulet_cids,
+        } => {
+            // Parse targets from CSV file or inline args
+            let targets: Vec<(String, String)> = if let Some(csv_path) = file {
+                parse_batch_pay_csv(&csv_path)?
+            } else {
+                if receivers.len() != amounts.len() {
+                    return Err(anyhow::anyhow!(
+                        "--receiver count ({}) must match --amount count ({})",
+                        receivers.len(),
+                        amounts.len()
+                    ));
+                }
+                receivers.into_iter().zip(amounts.into_iter()).collect()
+            };
+
+            if targets.is_empty() {
+                return Err(anyhow::anyhow!("No payment targets specified"));
+            }
+
+            // Print summary
+            let total: rust_decimal::Decimal = targets
+                .iter()
+                .map(|(_, amt)| amt.parse::<rust_decimal::Decimal>().unwrap_or_default())
+                .sum();
+            println!("Batch pay: {} recipients, total {:.4} CC", targets.len(), total);
+            for (i, (receiver, amount)) in targets.iter().enumerate() {
+                let short_party = if receiver.len() > 24 {
+                    format!("{}...{}", &receiver[..12], &receiver[receiver.len()-8..])
+                } else {
+                    receiver.clone()
+                };
+                println!("  {:>3}. {} — {} CC", i + 1, short_party, amount);
+            }
+
+            // Auto-select amulets if not provided (same strategy as select_amulets_for_allocation)
+            let selected_amulet_cids = if let Some(cids) = amulet_cids {
+                cids
+            } else {
+                let mut amulets = match client.get_amulets().await {
+                    Ok(a) => a,
+                    Err(_) => client.get_amulets_via_acs().await?,
+                };
+                amulets.sort_by(|a, b| a.amount.cmp(&b.amount));
+
+                // Prefer ONE amulet that covers the total (smallest-fit)
+                let indices: Vec<usize> = if let Some(i) = amulets.iter().position(|a| a.amount >= total) {
+                    vec![i]
+                } else {
+                    // Accumulate smallest-first
+                    let mut acc = rust_decimal::Decimal::ZERO;
+                    let mut picked = Vec::new();
+                    for (i, a) in amulets.iter().enumerate() {
+                        picked.push(i);
+                        acc += a.amount;
+                        if acc >= total { break; }
+                    }
+                    picked
+                };
+
+                let selected_total: rust_decimal::Decimal = indices.iter().map(|&i| amulets[i].amount).sum();
+                if selected_total < total {
+                    return Err(anyhow::anyhow!(
+                        "Insufficient CC: need {:.4} but only {:.4} available across {} amulets",
+                        total, selected_total, amulets.len()
+                    ));
+                }
+
+                println!("Auto-selected {} amulet(s) ({:.4} CC):", indices.len(), selected_total);
+                for &i in &indices {
+                    let a = &amulets[i];
+                    let short = if a.contract_id.len() > 24 {
+                        format!("{}...{}", &a.contract_id[..12], &a.contract_id[a.contract_id.len()-8..])
+                    } else { a.contract_id.clone() };
+                    println!("  {} ({:.4} CC)", short, a.amount);
+                }
+
+                indices.into_iter().map(|i| amulets[i].contract_id.clone()).collect()
+            };
+
+            if confirm && !dry_run {
+                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
+                orderbook_agent_logic::confirm::confirm_transaction(
+                    &lock,
+                    "Batch Pay",
+                    &format!("{} recipients, total {} CC", targets.len(), total),
+                ).await?;
+            }
+
+            // Build proto targets
+            let proto_targets: Vec<McPaymentTarget> = targets
+                .iter()
+                .map(|(receiver, amount)| McPaymentTarget {
+                    receiver_party: receiver.clone(),
+                    amount: amount.clone(),
+                    description: description.clone(),
+                })
+                .collect();
+
+            let op_count = 1; // single BatchPay operation
+            let expectation = OperationExpectation::ExecuteMulticall {
+                party: config.party_id.clone(),
+                op_count,
+            };
+
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::ExecuteMulticall as i32,
+                        params: Some(Params::ExecuteMulticall(ExecuteMultiCallParams {
+                            operations: vec![MultiCallOp {
+                                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchPay(
+                                    McBatchPay {
+                                        targets: proto_targets,
+                                    },
+                                )),
+                            }],
+                            amulet_cids: selected_amulet_cids,
+                            holding_cids: vec![],
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
+            println!("Batch pay completed: {}", result.update_id);
+        }
     }
 
     Ok(())
+}
+
+/// Parse a CSV file with batch payment targets.
+/// Supports format: `Recipient Party ID,Amount` (header optional).
+/// Also supports headerless `party_id,amount` rows.
+fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String)>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .trim(csv::Trim::All)
+        .from_path(path)
+        .with_context(|| format!("Failed to open CSV file: {}", path.display()))?;
+
+    let mut targets = Vec::new();
+    for (i, record) in reader.records().enumerate() {
+        let record = record.with_context(|| format!("Failed to parse CSV row {}", i + 1))?;
+        if record.len() < 2 {
+            return Err(anyhow::anyhow!("CSV row {} has fewer than 2 columns", i + 1));
+        }
+        let party = record[0].trim().to_string();
+        let amount = record[1].trim().to_string();
+
+        // Skip header row if present
+        if i == 0 && (party.contains("Party") || party.contains("party") || party.contains("Recipient")) {
+            continue;
+        }
+
+        // Validate amount is a number
+        if amount.parse::<rust_decimal::Decimal>().is_err() {
+            return Err(anyhow::anyhow!(
+                "CSV row {}: invalid amount '{}' for party '{}'",
+                i + 1,
+                amount,
+                party
+            ));
+        }
+
+        targets.push((party, amount));
+    }
+
+    Ok(targets)
 }
 
 // ============================================================================
@@ -1579,7 +1774,8 @@ async fn run_onboard(
             if read_env_value(&env_file, "SYNCHRONIZER_ID").is_none() {
                 println!("\nFetching server configuration...");
                 let channel = create_raw_channel(&rpc).await?;
-                let mut client = DAppProviderServiceClient::new(channel);
+                let mut client = DAppProviderServiceClient::new(channel)
+                    .max_decoding_message_size(16 * 1024 * 1024);
                 let config_resp = client
                     .get_agent_config(GetAgentConfigRequest {})
                     .await
@@ -1603,7 +1799,8 @@ async fn run_onboard(
     // Step 2: Connect to RPC (raw channel, no JWT auth needed)
     println!("\nConnecting to {}...", rpc);
     let channel = create_raw_channel(&rpc).await?;
-    let mut client = DAppProviderServiceClient::new(channel);
+    let mut client = DAppProviderServiceClient::new(channel)
+        .max_decoding_message_size(16 * 1024 * 1024);
     println!("Connected.");
 
     // Step 3: Fetch server config
