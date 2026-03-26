@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+      title:
+        description: "Release title (e.g. Silvana Agents v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: "${{ matrix.agent.bin }} / Linux ${{ matrix.arch.label }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        agent:
+          - { package: "orderbook-cloud-agent", bin: "cloud-agent" }
+          - { package: "agent-spot-dca",        bin: "agent-spot-dca" }
+          - { package: "agent-tpsl",            bin: "agent-tpsl" }
+        arch:
+          - { platform: "linux/arm64", label: "arm64" }
+          - { platform: "linux/amd64", label: "x86_64" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build via Docker
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --platform ${{ matrix.arch.platform }} \
+            --build-arg AGENT_PACKAGE=${{ matrix.agent.package }} \
+            --build-arg AGENT_BIN=${{ matrix.agent.bin }} \
+            -f docker/Dockerfile \
+            -t builder:${{ matrix.agent.bin }}-${{ matrix.arch.label }} \
+            --progress=plain \
+            .
+          docker create --name extract builder:${{ matrix.agent.bin }}-${{ matrix.arch.label }}
+          docker cp extract:/output/${{ matrix.agent.bin }} ${{ matrix.agent.bin }}
+          docker rm extract
+          tar -czf ${{ matrix.agent.bin }}-${{ matrix.arch.label }}-linux.tar.gz ${{ matrix.agent.bin }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.agent.bin }}-${{ matrix.arch.label }}-linux
+          path: ${{ matrix.agent.bin }}-${{ matrix.arch.label }}-linux.tar.gz
+
+  build-macos:
+    name: "${{ matrix.agent.bin }} / macOS Silicon"
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        agent:
+          - { package: "orderbook-cloud-agent", bin: "cloud-agent" }
+          - { package: "agent-spot-dca",        bin: "agent-spot-dca" }
+          - { package: "agent-tpsl",            bin: "agent-tpsl" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf
+        run: brew install protobuf
+
+      - name: Build
+        run: |
+          cargo build --release -p ${{ matrix.agent.package }}
+          tar -czf ${{ matrix.agent.bin }}-macos-silicon.tar.gz -C target/release ${{ matrix.agent.bin }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.agent.bin }}-macos-silicon
+          path: ${{ matrix.agent.bin }}-macos-silicon.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > checksums.txt
+          echo "=== Release Assets ==="
+          ls -lh *.tar.gz
+          echo "=== Checksums ==="
+          cat checksums.txt
+
+      - name: Create tag
+        run: |
+          git tag -a "${{ inputs.tag }}" -m "Release ${{ inputs.tag }}"
+          git push origin "${{ inputs.tag }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.tag }}" \
+            --title "${{ inputs.title }}" \
+            --generate-notes \
+            artifacts/*.tar.gz \
+            artifacts/checksums.txt
