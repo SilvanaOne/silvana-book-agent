@@ -15,6 +15,7 @@ configuration.toml
 agent.toml
 agent-state.json
 tpsl-state.json
+dca-state.json
 /cloud-agent
 /agent-spot-dca
 /agent-tpsl
