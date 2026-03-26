@@ -6,6 +6,8 @@ members = [
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
+    "crates/agent-spot-dca",
+    "crates/agent-tpsl",
 ]
 
 [workspace.package]
