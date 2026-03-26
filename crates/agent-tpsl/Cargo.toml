@@ -1,0 +1,51 @@
+[package]
+name = "agent-tpsl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-tpsl"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+orderbook-proto = { path = "../orderbook-proto" }
+tx-verifier = { path = "../tx-verifier" }
+message-signing = { path = "../message-signing" }
+
+# gRPC
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
+tokio-stream = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "sync", "io-util", "io-std"] }
+
+# Configuration
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+
+# Logging and errors
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+anyhow = { workspace = true }
+async-trait = "0.1"
+
+# Crypto
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+bs58 = "0.5"
+
+# Utilities
+chrono = { workspace = true }
+hex = { workspace = true }
+rust_decimal = { version = "1.36", features = ["serde"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost-types = { workspace = true }
+uuid = { version = "1", features = ["v7"] }
+once_cell = { workspace = true }

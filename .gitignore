@@ -1,9 +1,23 @@
 # Rust
 target/
+to-delete/
+
+# Backups
+backups/
+
+# Logs
+logs/
 
 # Environment
 .env
 .env.*
+configuration.toml
+agent.toml
+agent-state.json
+tpsl-state.json
+/cloud-agent
+/agent-spot-dca
+/agent-tpsl
 
 # IDE
 .vscode/

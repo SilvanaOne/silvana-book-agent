@@ -58,35 +58,29 @@ COPY proto/ ./proto/
 # Copy all crates
 COPY crates/ ./crates/
 
-# Agent to build (cargo package name and binary name)
-ARG AGENT_PACKAGE=orderbook-cloud-agent
-ARG AGENT_BIN=cloud-agent
-
-# Build the agent in release mode for the target architecture
+# Build agent-tpsl in release mode for the target architecture
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc && \
         export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ && \
         export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar && \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
-        cargo build --release --target aarch64-unknown-linux-gnu -p "$AGENT_PACKAGE" && \
-        cp target/aarch64-unknown-linux-gnu/release/"$AGENT_BIN" /tmp/agent-bin; \
+        cargo build --release --target aarch64-unknown-linux-gnu -p agent-tpsl && \
+        cp target/aarch64-unknown-linux-gnu/release/agent-tpsl /tmp/agent-binary; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         export CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc && \
         export CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ && \
         export AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar && \
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc && \
-        cargo build --release --target x86_64-unknown-linux-gnu -p "$AGENT_PACKAGE" && \
-        cp target/x86_64-unknown-linux-gnu/release/"$AGENT_BIN" /tmp/agent-bin; \
+        cargo build --release --target x86_64-unknown-linux-gnu -p agent-tpsl && \
+        cp target/x86_64-unknown-linux-gnu/release/agent-tpsl /tmp/agent-binary; \
     else \
-        cargo build --release -p "$AGENT_PACKAGE" && \
-        cp target/release/"$AGENT_BIN" /tmp/agent-bin; \
+        cargo build --release -p agent-tpsl && \
+        cp target/release/agent-tpsl /tmp/agent-binary; \
     fi
 
-# Create output directory and copy binary (renamed to agent binary name)
-RUN mkdir -p /output && cp /tmp/agent-bin /output/"$AGENT_BIN"
+# Create output directory and copy binary
+RUN mkdir -p /output && cp /tmp/agent-binary /output/agent-tpsl
 
 # List the output
-RUN ls -lh /output/ && echo "$AGENT_BIN built successfully for $TARGETARCH"
-
-# Binary will be at /output/<agent-bin-name>
+RUN ls -lh /output/ && echo "agent-tpsl built successfully for $TARGETARCH"

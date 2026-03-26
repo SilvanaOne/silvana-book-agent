@@ -3,6 +3,70 @@
 version = 4
 
 [[package]]
+name = "agent-spot-dca"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-agent-logic",
+ "orderbook-proto",
+ "prost-types",
+ "rand",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-tpsl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-agent-logic",
+ "orderbook-proto",
+ "prost-types",
+ "rand",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
