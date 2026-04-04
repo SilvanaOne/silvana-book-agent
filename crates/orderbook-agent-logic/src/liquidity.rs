@@ -201,6 +201,13 @@ impl LiquidityManager {
         })
     }
 
+    /// Returns true once at least one balance update has been received.
+    /// Before this, all balances are zero and the liquidity gate should not reject.
+    pub async fn is_ready(&self) -> bool {
+        let s = self.state.read().await;
+        !s.tokens.is_empty()
+    }
+
     // -----------------------------------------------------------------------
     // Balance updates (called by ACS worker / runner balance refresh)
     // -----------------------------------------------------------------------

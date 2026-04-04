@@ -560,6 +560,17 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             return Ok(());
         }
 
+        // Skip proposals that already settled on-chain — on restart the agent may
+        // rediscover them via polling but should not attempt to reject them.
+        if proposal.settled_at.is_some() {
+            info!(
+                "[{}] Already settled on-chain, adding to completed set",
+                proposal.proposal_id
+            );
+            self.completed_proposals.insert(proposal.proposal_id.clone());
+            return Ok(());
+        }
+
         let is_buyer = proposal.buyer == self.config.party_id;
         let is_seller = proposal.seller == self.config.party_id;
 
@@ -639,7 +650,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         // Liquidity gate: reject if agent lacks balance for allocation + fees
+        // Don't reject based on zero balances at startup — wait for ACS worker to load them
         if let Some(ref lm) = self.liquidity_manager {
+            if !lm.is_ready().await {
+                info!("[{}] Balances not loaded yet, deferring preconfirmation", proposal_id);
+                return Ok(());
+            }
             let my_instrument = if is_buyer {
                 &proposal.quote_instrument // buyer allocates quote
             } else {

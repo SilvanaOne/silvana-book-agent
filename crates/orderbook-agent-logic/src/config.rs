@@ -260,7 +260,7 @@ impl BaseConfig {
         let batch_pay_max_size = std::env::var("BATCH_PAY_MAX_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(200);
+            .unwrap_or(100);
 
         Ok(BaseConfig {
             orderbook_grpc_url,
