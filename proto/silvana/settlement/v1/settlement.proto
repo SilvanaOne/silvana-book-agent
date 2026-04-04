@@ -189,8 +189,8 @@ enum NextAction {
   NEXT_ACTION_NONE = 0;            // No action needed (terminal state or all done)
   NEXT_ACTION_PRECONFIRM = 1;      // Confirm the settlement
   NEXT_ACTION_PAY_DVP_FEE = 2;     // Pay DVP processing fee
-  NEXT_ACTION_CREATE_DVP = 3;      // Buyer: create DVP proposal
-  NEXT_ACTION_ACCEPT_DVP = 4;      // Seller: accept DVP proposal
+  NEXT_ACTION_CREATE_DVP = 3;      // Proposer: create DVP proposal (buyer for orderbook, LP for RFQ)
+  NEXT_ACTION_ACCEPT_DVP = 4;      // Acceptor: accept DVP proposal
   NEXT_ACTION_PAY_ALLOC_FEE = 5;   // Pay allocation processing fee
   NEXT_ACTION_ALLOCATE = 6;        // Allocate tokens
   NEXT_ACTION_WAIT = 7;            // Waiting for counterparty/operator
