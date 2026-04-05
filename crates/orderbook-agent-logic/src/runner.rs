@@ -418,6 +418,9 @@ where
 
                     match result {
                         Some(Ok(update)) => {
+                            // Extract proposal_id before handle_settlement_update consumes update
+                            let update_proposal_id = update.proposal.as_ref()
+                                .map(|p| p.proposal_id.clone());
                             let update_desc = format!(
                                 "{} event={} market={}",
                                 update.proposal.as_ref().map(|p| p.proposal_id.as_str()).unwrap_or("?"),
@@ -429,6 +432,11 @@ where
                                 settlement_executor.handle_settlement_update(update),
                             ).await {
                                 Ok(Ok(())) => {
+                                    // Immediately advance the specific settlement that was updated
+                                    // (bypasses poll timer delay, clears backoff)
+                                    if let Some(ref pid) = update_proposal_id {
+                                        settlement_executor.advance_proposal(pid).await;
+                                    }
                                     // Settlement event may have freed tokens or
                                     // caused partial fills — refresh orders.
                                     if has_markets && !shutdown_flag.load(Ordering::Relaxed) {
