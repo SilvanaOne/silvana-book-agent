@@ -1972,8 +1972,8 @@ async fn advance_single<B: SettlementBackend>(
                 is_buyer: state.is_buyer,
             }
         }
-        NextAction::Wait => {
-            debug!("[{}] NextAction: Wait (counterparty's turn)", proposal_id);
+        NextAction::Wait | NextAction::MulticallAccept => {
+            debug!("[{}] NextAction: Wait (counterparty's turn or multicall)", proposal_id);
             AdvanceResult::Wait { proposal_id }
         }
         NextAction::None => {
