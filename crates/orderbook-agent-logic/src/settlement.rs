@@ -702,6 +702,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let rfq_verified = self.verify_rfq_proposal(&proposal).await;
             if !rfq_verified {
                 warn!("[{}] RFQ proposal rejected: not in agent's tracked RFQ state", proposal_id);
+                self.release_commitment(&proposal_id);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -736,6 +737,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             VerifyResult::Accepted { order_id } => order_id,
             VerifyResult::Rejected { reason } => {
                 warn!("[{}] Settlement rejected: {}", proposal_id, reason);
+                self.release_commitment(&proposal_id);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -752,6 +754,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     Ok(oid) => oid,
                     Err(reason) => {
                         warn!("[{}] User order verification failed: {}", proposal_id, reason);
+                        self.release_commitment(&proposal_id);
                         let state = SettlementState::new(proposal, is_buyer);
                         self.active_settlements.insert(proposal_id.clone(), state);
                         if let Err(e) = self.reject_proposal(&proposal_id).await {
