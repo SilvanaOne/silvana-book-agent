@@ -7,6 +7,9 @@ edition.workspace = true
 name = "cloud-agent"
 path = "src/main.rs"
 
+[build-dependencies]
+vergen-gitcl = "1"
+
 [dependencies]
 # Shared logic
 orderbook-agent-logic = { path = "../orderbook-agent-logic" }

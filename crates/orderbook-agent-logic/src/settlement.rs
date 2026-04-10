@@ -702,6 +702,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let rfq_verified = self.verify_rfq_proposal(&proposal).await;
             if !rfq_verified {
                 warn!("[{}] RFQ proposal rejected: not in agent's tracked RFQ state", proposal_id);
+                self.release_commitment(&proposal_id);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -736,6 +737,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             VerifyResult::Accepted { order_id } => order_id,
             VerifyResult::Rejected { reason } => {
                 warn!("[{}] Settlement rejected: {}", proposal_id, reason);
+                self.release_commitment(&proposal_id);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -752,6 +754,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     Ok(oid) => oid,
                     Err(reason) => {
                         warn!("[{}] User order verification failed: {}", proposal_id, reason);
+                        self.release_commitment(&proposal_id);
                         let state = SettlementState::new(proposal, is_buyer);
                         self.active_settlements.insert(proposal_id.clone(), state);
                         if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -859,139 +862,177 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 }
             };
 
-            let state = self.active_settlements.get(&proposal_id).unwrap().clone();
-            let config = self.config.clone();
-            let backend = Arc::clone(&self.backend);
-            let tracker = Arc::clone(&self.tracker);
-            let shutting_down = self.shutting_down.clone();
-            let action_log = Arc::clone(&self.action_log);
-            let pid = proposal_id.clone();
-            let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
-
-            self.in_progress.insert(proposal_id.clone(), Instant::now());
-            self.pending_results.push((proposal_id, rx));
-
-            let handle = tokio::spawn(async move {
-                let mut permit = Some(permit); // droppable before allocate
-                let mut local_state = state;
-
-                // Initial jitter to stagger threads (0-2s) — avoids thundering herd
-                let jitter = rand::thread_rng().gen_range(0..2000u64);
-                tokio::time::sleep(Duration::from_millis(jitter)).await;
-
-                loop {
-                    // Check shutdown flag before each step
-                    let is_shutting_down = shutting_down.load(Ordering::Relaxed);
-
-                    let result = tokio::time::timeout(Duration::from_secs(300), async {
-                        advance_single(
-                            pid.clone(),
-                            local_state.clone(),
-                            config.clone(),
-                            backend.clone(),
-                            tracker.clone(),
-                            is_shutting_down,
-                            action_log.clone(),
-                        )
-                        .await
-                    })
-                    .await;
-
-                    let advance_result = match result {
-                        Ok(r) => r,
-                        Err(_) => {
-                            error!(
-                                "[{}] Settlement step timed out after 300s (role={}, stage={})",
-                                pid,
-                                if local_state.is_buyer { "buyer" } else { "seller" },
-                                local_state.stage,
-                            );
-                            AdvanceResult::Timeout { proposal_id: pid.clone() }
-                        }
-                    };
-
-                    // NeedsAllocate: release settlement permit before blocking on payment queue
-                    if let AdvanceResult::NeedsAllocate {
-                        ref proposal_id, ref dvp_cid, allocation_cc, is_buyer,
-                    } = advance_result {
-                        // Release settlement permit — allows other settlements to start
-                        drop(permit.take());
-
-                        let alloc_result = tokio::time::timeout(
-                            Duration::from_secs(600),
-                            backend.allocate(proposal_id, dvp_cid, allocation_cc),
-                        ).await;
-                        let alloc_result = match alloc_result {
-                            Ok(r) => r,
-                            Err(_) => Err(anyhow::anyhow!("Allocate timed out after 600s")),
-                        };
-                        match alloc_result {
-                            Ok(step_result) => {
-                                // Record allocation completed event
-                                let event_type = if is_buyer {
-                                    SettlementEventType::AllocationBuyerCompleted
-                                } else {
-                                    SettlementEventType::AllocationSellerCompleted
-                                };
-                                let jwt = match generate_jwt(
-                                    &config.party_id, &config.role, &config.private_key_bytes,
-                                    config.token_ttl_secs, Some(config.node_name.as_str()),
-                                ) {
-                                    Ok(j) => j,
-                                    Err(e) => {
-                                        warn!("[{}] JWT gen for alloc event failed: {}", proposal_id, e);
-                                        String::new()
-                                    }
-                                };
-                                if !jwt.is_empty() {
-                                    if let Ok(mut rpc_client) = OrderbookRpcClient::connect(
-                                        &config.orderbook_grpc_url, Some(jwt),
-                                    ).await {
-                                        record_step_completed(
-                                            &mut rpc_client, proposal_id, &config.party_id,
-                                            is_buyer, event_type,
-                                            &step_result.update_id, &step_result.contract_id,
-                                        ).await;
-                                    }
-                                }
-
-                                let final_result = AdvanceResult::StepCompleted {
-                                    proposal_id: proposal_id.clone(),
-                                    stage: SettlementStage::Allocated,
-                                    dvp_proposal_cid: None,
-                                    dvp_cid: None,
-                                    allocation_cid: Some(step_result.contract_id),
-                                    pending_traffic: 0,
-                                };
-                                let _ = tx.send((final_result, local_state));
-                            }
-                            Err(e) => {
-                                let err_result = AdvanceResult::Error {
-                                    proposal_id: proposal_id.clone(),
-                                    error: format!("Allocate failed: {:#}", e),
-                                };
-                                let _ = tx.send((err_result, local_state));
-                            }
-                        }
-                        break;
-                    }
-
-                    if advance_result.should_readvance() && !shutting_down.load(Ordering::Relaxed) {
-                        advance_result.apply_to_state(&mut local_state);
-                        // Jitter between steps (200-1000ms) to spread ledger load
-                        let step_jitter = 200 + rand::thread_rng().gen_range(0..800u64);
-                        tokio::time::sleep(Duration::from_millis(step_jitter)).await;
-                    } else {
-                        let _ = tx.send((advance_result, local_state));
-                        break;
-                    }
-                }
-            });
-            self.task_handles.push(handle);
+            self.spawn_settlement_task(proposal_id, permit, true);
 
             // Stagger spawns to avoid thundering-herd on Canton ledger
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// Advance a single settlement immediately (triggered by stream update).
+    /// Clears backoff, checks preconditions, spawns task if eligible.
+    /// Unlike advance_all_settlements(), does NOT iterate all settlements.
+    pub async fn advance_proposal(&mut self, proposal_id: &str) {
+        // Collect finished results first (frees semaphore permits)
+        let _ = self.collect_results().await;
+
+        // Must be active and not already in-progress
+        if !self.active_settlements.contains_key(proposal_id) { return; }
+        if self.in_progress.contains_key(proposal_id) { return; }
+
+        // Clear backoff — stream update means new state to process
+        self.failed_settlements.remove(proposal_id);
+        self.needs_readvance.remove(proposal_id);
+
+        // Try semaphore permit (non-blocking)
+        let permit = match self.semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return, // All threads busy, poll cycle will pick it up
+        };
+
+        // Spawn without jitter — stream update means act NOW
+        self.spawn_settlement_task(proposal_id.to_string(), permit, false);
+    }
+
+    /// Spawn a single settlement advancement task.
+    /// Shared by advance_all_settlements() and advance_proposal().
+    fn spawn_settlement_task(
+        &mut self,
+        proposal_id: String,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        initial_jitter: bool,
+    ) {
+        let state = self.active_settlements.get(&proposal_id).unwrap().clone();
+        let config = self.config.clone();
+        let backend = Arc::clone(&self.backend);
+        let tracker = Arc::clone(&self.tracker);
+        let shutting_down = self.shutting_down.clone();
+        let action_log = Arc::clone(&self.action_log);
+        let pid = proposal_id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
+
+        self.in_progress.insert(proposal_id.clone(), Instant::now());
+        self.pending_results.push((proposal_id, rx));
+
+        let handle = tokio::spawn(async move {
+            let mut permit = Some(permit); // droppable before allocate
+            let mut local_state = state;
+
+            if initial_jitter {
+                // Initial jitter to stagger threads (0-2s) — avoids thundering herd
+                let jitter = rand::thread_rng().gen_range(0..2000u64);
+                tokio::time::sleep(Duration::from_millis(jitter)).await;
+            }
+
+            loop {
+                // Check shutdown flag before each step
+                let is_shutting_down = shutting_down.load(Ordering::Relaxed);
+
+                let result = tokio::time::timeout(Duration::from_secs(300), async {
+                    advance_single(
+                        pid.clone(),
+                        local_state.clone(),
+                        config.clone(),
+                        backend.clone(),
+                        tracker.clone(),
+                        is_shutting_down,
+                        action_log.clone(),
+                    )
+                    .await
+                })
+                .await;
+
+                let advance_result = match result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        error!(
+                            "[{}] Settlement step timed out after 300s (role={}, stage={})",
+                            pid,
+                            if local_state.is_buyer { "buyer" } else { "seller" },
+                            local_state.stage,
+                        );
+                        AdvanceResult::Timeout { proposal_id: pid.clone() }
+                    }
+                };
+
+                // NeedsAllocate: release settlement permit before blocking on payment queue
+                if let AdvanceResult::NeedsAllocate {
+                    ref proposal_id, ref dvp_cid, allocation_cc, is_buyer,
+                } = advance_result {
+                    // Release settlement permit — allows other settlements to start
+                    drop(permit.take());
+
+                    let alloc_result = tokio::time::timeout(
+                        Duration::from_secs(600),
+                        backend.allocate(proposal_id, dvp_cid, allocation_cc),
+                    ).await;
+                    let alloc_result = match alloc_result {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow::anyhow!("Allocate timed out after 600s")),
+                    };
+                    match alloc_result {
+                        Ok(step_result) => {
+                            // Record allocation completed event
+                            let event_type = if is_buyer {
+                                SettlementEventType::AllocationBuyerCompleted
+                            } else {
+                                SettlementEventType::AllocationSellerCompleted
+                            };
+                            let jwt = match generate_jwt(
+                                &config.party_id, &config.role, &config.private_key_bytes,
+                                config.token_ttl_secs, Some(config.node_name.as_str()),
+                            ) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    warn!("[{}] JWT gen for alloc event failed: {}", proposal_id, e);
+                                    String::new()
+                                }
+                            };
+                            if !jwt.is_empty() {
+                                if let Ok(mut rpc_client) = OrderbookRpcClient::connect(
+                                    &config.orderbook_grpc_url, Some(jwt),
+                                ).await {
+                                    record_step_completed(
+                                        &mut rpc_client, proposal_id, &config.party_id,
+                                        is_buyer, event_type,
+                                        &step_result.update_id, &step_result.contract_id,
+                                    ).await;
+                                }
+                            }
+
+                            let final_result = AdvanceResult::StepCompleted {
+                                proposal_id: proposal_id.clone(),
+                                stage: SettlementStage::Allocated,
+                                dvp_proposal_cid: None,
+                                dvp_cid: None,
+                                allocation_cid: Some(step_result.contract_id),
+                                pending_traffic: 0,
+                            };
+                            let _ = tx.send((final_result, local_state));
+                        }
+                        Err(e) => {
+                            let err_result = AdvanceResult::Error {
+                                proposal_id: proposal_id.clone(),
+                                error: format!("Allocate failed: {:#}", e),
+                            };
+                            let _ = tx.send((err_result, local_state));
+                        }
+                    }
+                    break;
+                }
+
+                if advance_result.should_readvance() && !shutting_down.load(Ordering::Relaxed) {
+                    advance_result.apply_to_state(&mut local_state);
+                    // Jitter between steps (200-1000ms) to spread ledger load
+                    let step_jitter = 200 + rand::thread_rng().gen_range(0..800u64);
+                    tokio::time::sleep(Duration::from_millis(step_jitter)).await;
+                } else {
+                    let _ = tx.send((advance_result, local_state));
+                    break;
+                }
+            }
+        });
+        self.task_handles.push(handle);
     }
 
 
@@ -1222,7 +1263,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                                 proposal_id, delay, error, waiting_secs
                             );
                         } else {
-                            debug!(
+                            info!(
                                 "[{}] Waiting {:?}: {}",
                                 proposal_id, delay, error
                             );
@@ -1929,10 +1970,13 @@ async fn advance_single<B: SettlementBackend>(
             } else {
                 status.allocation_buyer.as_ref()
             };
-            let counterparty_witnessed = counterparty_alloc
-                .map(|s| s.status == 4) // DVP_STEP_STATUS_CONFIRMED (operator witnessed)
-                .unwrap_or(false);
+            let counterparty_status = counterparty_alloc.map(|s| s.status).unwrap_or(0);
+            let counterparty_witnessed = counterparty_status == 4; // DVP_STEP_STATUS_CONFIRMED
             if !counterparty_witnessed {
+                info!(
+                    "[{}] Allocate: waiting for counterparty allocation witness (status={}, need=4)",
+                    proposal_id, counterparty_status
+                );
                 return AdvanceResult::Wait { proposal_id };
             }
 
@@ -1972,8 +2016,8 @@ async fn advance_single<B: SettlementBackend>(
                 is_buyer: state.is_buyer,
             }
         }
-        NextAction::Wait => {
-            debug!("[{}] NextAction: Wait (counterparty's turn)", proposal_id);
+        NextAction::Wait | NextAction::MulticallAccept => {
+            debug!("[{}] NextAction: Wait (counterparty's turn or multicall)", proposal_id);
             AdvanceResult::Wait { proposal_id }
         }
         NextAction::None => {

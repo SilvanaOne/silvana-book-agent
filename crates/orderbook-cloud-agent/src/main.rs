@@ -454,7 +454,12 @@ async fn run_cloud_agent(
     force: bool,
     confirm: bool,
 ) -> Result<()> {
-    info!("Starting Orderbook Cloud Agent");
+    info!(
+        "Starting Orderbook Cloud Agent (build: {}{} commit {})",
+        &env!("VERGEN_GIT_SHA")[..12],
+        if env!("VERGEN_GIT_DIRTY") == "true" { "-dirty" } else { "" },
+        env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
+    );
     info!("Party ID: {}", config.party_id);
     info!("Orderbook URL: {}", config.orderbook_grpc_url);
     info!(
@@ -633,7 +638,7 @@ async fn run_fill(
 async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Arc<AtomicBool>) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
-        CantonToServerMessage, SettlementHandshake, CantonNodeAuth,
+        CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
         canton_to_server_message::Message as CantonMessage,
         server_to_canton_message::Message as ServerMessage,
     };
@@ -760,63 +765,104 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
 
         info!("LP settlement stream connected, listening for RFQ requests");
 
-        // Process incoming messages
-        while let Some(msg_result) = inbound.next().await {
-            let msg = match msg_result {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("Stream error: {}", e);
-                    break;
-                }
-            };
+        // Send a heartbeat every 30s. If the outbound send fails, the stream's
+        // write half is closed — reconnect. Tonic doesn't surface silent
+        // half-closes on the read side, so we can't rely on inbound activity
+        // alone; the heartbeat send-failure is what detects a dead stream.
+        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+        let mut heartbeat_interval = tokio::time::interval(
+            std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+        );
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick so we don't send a heartbeat 0s after connect.
+        heartbeat_interval.tick().await;
+        let mut client_seq: u64 = 0;
 
-            match msg.message {
-                Some(ServerMessage::HandshakeAck(ack)) => {
-                    info!("LP handshake acknowledged: accepted={}", ack.accepted);
-                }
-                Some(ServerMessage::RfqRequest(request)) => {
-                    if shutdown.load(Ordering::SeqCst) {
-                        info!("Ignoring RFQ {} - shutting down", request.rfq_id);
+        loop {
+            tokio::select! {
+                _ = heartbeat_interval.tick() => {
+                    client_seq += 1;
+                    let now = prost_types::Timestamp {
+                        seconds: chrono::Utc::now().timestamp(),
+                        nanos: 0,
+                    };
+                    let hb = CantonToServerMessage {
+                        session_id: String::new(),
+                        sequence_number: client_seq,
+                        message: Some(CantonMessage::Heartbeat(Heartbeat {
+                            session_id: String::new(),
+                            sequence_number: client_seq,
+                            timestamp: Some(now.clone()),
+                        })),
+                        sent_at: Some(now),
+                    };
+                    if outbound_tx.send(hb).await.is_err() {
+                        tracing::warn!("LP settlement stream send-failed on heartbeat, reconnecting");
                         break;
                     }
-                    info!(
-                        "Received RFQ request: rfq_id={}, market={}, direction={}, qty={}",
-                        request.rfq_id, request.market_id, request.direction, request.quantity
-                    );
-
-                    let response = rfq_handler.handle_rfq_request(request).await;
-
-                    let response_msg = match response {
-                        RfqResponse::Quote(quote) => CantonToServerMessage {
-                            session_id: String::new(),
-                            sequence_number: 0,
-                            message: Some(CantonMessage::RfqQuote(quote)),
-                            sent_at: Some(prost_types::Timestamp {
-                                seconds: chrono::Utc::now().timestamp(),
-                                nanos: 0,
-                            }),
-                        },
-                        RfqResponse::Reject(reject) => CantonToServerMessage {
-                            session_id: String::new(),
-                            sequence_number: 0,
-                            message: Some(CantonMessage::RfqReject(reject)),
-                            sent_at: Some(prost_types::Timestamp {
-                                seconds: chrono::Utc::now().timestamp(),
-                                nanos: 0,
-                            }),
-                        },
+                }
+                msg_result = inbound.next() => {
+                    let msg = match msg_result {
+                        None => {
+                            tracing::warn!("LP settlement stream ended (None), reconnecting");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("LP settlement stream error: {}", e);
+                            break;
+                        }
+                        Some(Ok(m)) => m,
                     };
 
-                    if outbound_tx.send(response_msg).await.is_err() {
-                        tracing::error!("Failed to send RFQ response, stream may be closed");
-                        break;
+                    match msg.message {
+                        Some(ServerMessage::HandshakeAck(ack)) => {
+                            info!("LP handshake acknowledged: accepted={}", ack.accepted);
+                        }
+                        Some(ServerMessage::RfqRequest(request)) => {
+                            if shutdown.load(Ordering::SeqCst) {
+                                info!("Ignoring RFQ {} - shutting down", request.rfq_id);
+                                break;
+                            }
+                            info!(
+                                "Received RFQ request: rfq_id={}, market={}, direction={}, qty={}",
+                                request.rfq_id, request.market_id, request.direction, request.quantity
+                            );
+
+                            let response = rfq_handler.handle_rfq_request(request).await;
+
+                            let response_msg = match response {
+                                RfqResponse::Quote(quote) => CantonToServerMessage {
+                                    session_id: String::new(),
+                                    sequence_number: 0,
+                                    message: Some(CantonMessage::RfqQuote(quote)),
+                                    sent_at: Some(prost_types::Timestamp {
+                                        seconds: chrono::Utc::now().timestamp(),
+                                        nanos: 0,
+                                    }),
+                                },
+                                RfqResponse::Reject(reject) => CantonToServerMessage {
+                                    session_id: String::new(),
+                                    sequence_number: 0,
+                                    message: Some(CantonMessage::RfqReject(reject)),
+                                    sent_at: Some(prost_types::Timestamp {
+                                        seconds: chrono::Utc::now().timestamp(),
+                                        nanos: 0,
+                                    }),
+                                },
+                            };
+
+                            if outbound_tx.send(response_msg).await.is_err() {
+                                tracing::error!("Failed to send RFQ response, stream may be closed");
+                                break;
+                            }
+                        }
+                        Some(ServerMessage::Heartbeat(_)) => {
+                            // Server-side keepalive — no action needed.
+                        }
+                        other => {
+                            tracing::debug!("LP stream received unhandled message: {:?}", other.map(|_| "..."));
+                        }
                     }
-                }
-                Some(ServerMessage::Heartbeat(_)) => {
-                    // Ignore heartbeats
-                }
-                other => {
-                    tracing::debug!("LP stream received unhandled message: {:?}", other.map(|_| "..."));
                 }
             }
         }

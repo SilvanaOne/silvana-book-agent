@@ -58,6 +58,9 @@ COPY proto/ ./proto/
 # Copy all crates
 COPY crates/ ./crates/
 
+# Copy .git so vergen-gitcl can embed the commit hash at build time
+COPY .git/ ./.git/
+
 # Build the cloud-agent in release mode for the target architecture
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
