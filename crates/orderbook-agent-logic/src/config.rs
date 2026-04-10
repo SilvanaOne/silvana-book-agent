@@ -55,6 +55,25 @@ struct SharedConfiguration {
     canton_coin: Vec<CantonCoinConfig>,
     #[serde(default)]
     instrument: Vec<InstrumentConfig>,
+    #[serde(default)]
+    ledger_interfaces: Option<LedgerInterfacesConfig>,
+}
+
+/// Optional `[ledger_interfaces]` section in `configuration.toml` consumed by
+/// `orderbook-ledger-service`. Selects which functional groups of the
+/// DAppProviderService are exposed to clients (DVP, transfers, CIP-56, etc.).
+///
+/// If the section is omitted, all interfaces are enabled (backward compatible).
+///
+/// Example:
+/// ```toml
+/// [ledger_interfaces]
+/// enabled = ["core", "transfer", "preapproval", "cip56", "user_service"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct LedgerInterfacesConfig {
+    #[serde(default)]
+    pub enabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -365,6 +384,33 @@ pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&key_bytes[..32]);
     Ok(arr)
+}
+
+/// Load the optional `[ledger_interfaces]` section from `configuration.toml`.
+///
+/// Returns:
+/// - `Ok(None)` — file does not exist (legitimate default; ledger-service
+///   treats this as "all interfaces enabled"), or the file parses cleanly
+///   but omits the `[ledger_interfaces]` section.
+/// - `Ok(Some(cfg))` — file parses cleanly and contains the section.
+/// - `Err(...)` — file exists but TOML parsing failed.
+///
+/// **Fail-loud on parse errors is intentional**: this section drives security-
+/// relevant interface gating. A typo like `[ledger_inerfaces]` or any other
+/// malformed TOML would otherwise silently disable all gating and let every
+/// interface through. Callers MUST propagate the error so startup aborts.
+pub fn load_ledger_interfaces(path: &str) -> Result<Option<LedgerInterfacesConfig>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None), // Missing file = no gating (legitimate default)
+    };
+    let config: SharedConfiguration = toml::from_str(&contents).with_context(|| {
+        format!(
+            "Failed to parse {} while loading [ledger_interfaces] section",
+            path
+        )
+    })?;
+    Ok(config.ledger_interfaces)
 }
 
 /// Load shared configuration.toml (registries + canton_coin + instruments)

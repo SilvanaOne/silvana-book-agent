@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package silvana.ledger.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/SilvanaOne/canton-agent/proto;ledger";
+
+// ============================================================================
+// TransferPreapproval queries and operations.
+// ============================================================================
+
+// --- GetPreapprovals ---
+
+message GetPreapprovalsRequest {
+  // party_id from JWT
+}
+
+message PreapprovalInfo {
+  string contract_id = 1;
+  string provider = 2;
+  string receiver = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  string source = 5;  // "grpc" or "scan"
+}
+
+message GetPreapprovalsResponse {
+  repeated PreapprovalInfo preapprovals = 1;
+}
+
+// --- RequestPreapproval (transaction operation) ---
+
+message RequestPreapprovalParams {
+  // party_id from JWT — no additional params needed
+}

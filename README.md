@@ -258,7 +258,7 @@ The agent communicates with the Silvana orderbook server via 4 gRPC services def
 
 | Service | Proto | Role | Streaming |
 |---------|-------|------|-----------|
-| DAppProviderService | `ledger/v1/ledger.proto` | Two-phase transaction signing, balance and contract queries | Server-streaming (`GetActiveContracts`, `GetUpdates`) |
+| DAppProviderService | `ledger/v1/service.proto` (split across `ledger/v1/*.proto`) | Two-phase transaction signing, balance and contract queries | Server-streaming (`GetActiveContracts`, `GetUpdates`) |
 | SettlementService | `settlement/v1/settlement.proto` | DVP settlement orchestration, RFQ handling | Bidirectional (`SettlementStream`) |
 | OrderbookService | `orderbook/v1/orderbook.proto` | Order submission, market data, RFQ initiation | Server-streaming (`SubscribeOrderbook`, `SubscribeOrders`, `SubscribeSettlements`) |
 | PricingService | `pricing/v1/pricing.proto` | External price feeds (Binance, ByBit, CoinGecko) | Server-streaming (`StreamPrices`) |
