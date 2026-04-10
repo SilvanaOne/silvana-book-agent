@@ -316,6 +316,7 @@ impl OrderbookRpcClient {
         let request = GetSettlementStatusRequest {
             auth: None, // External parties use metadata auth
             settlement_id: settlement_id.to_string(),
+            supports_multicall: false,
         };
 
         let response = self

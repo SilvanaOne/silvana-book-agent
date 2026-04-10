@@ -747,20 +747,34 @@ impl PaymentQueue {
                 // Estimate CC needed for this payment
                 let estimated_cc = estimate_cc_needed(&item.request);
 
-                // Get selectable amulets
                 let selectable = cache.get_selectable_amulets().await;
 
-                // Select amulets using operation-aware strategy
-                let selected = match &item.request {
-                    PaymentRequest::Allocate { allocation_cc: Some(_), .. } => {
-                        select_amulets_for_allocation(&selectable, estimated_cc)
-                    }
-                    _ => {
-                        select_amulets_for_fee(&selectable, estimated_cc)
-                    }
+                let is_allocation = matches!(
+                    &item.request,
+                    PaymentRequest::Allocate { allocation_cc: Some(_), .. }
+                );
+                let selected = if is_allocation {
+                    select_amulets_for_allocation(&selectable, estimated_cc)
+                } else {
+                    select_amulets_for_fee(&selectable, estimated_cc)
                 };
 
-                if selected.is_empty() && estimated_cc > Decimal::ZERO {
+                // Defense in depth: never submit an allocation whose selected amulets
+                // sum below the requested amount — the on-chain transaction would fail
+                // with ITR_InsufficientFunds. The selector already guards this; this
+                // catches any future regression.
+                let insufficient_allocation = is_allocation
+                    && !selected.is_empty()
+                    && selected.iter().map(|a| a.amount).sum::<Decimal>() < estimated_cc;
+                if insufficient_allocation {
+                    let total: Decimal = selected.iter().map(|a| a.amount).sum();
+                    warn!(
+                        "Allocation deferred: selected {} amulets totalling {:.4} CC, need {:.4} CC",
+                        selected.len(), total, estimated_cc
+                    );
+                }
+
+                if (selected.is_empty() || insufficient_allocation) && estimated_cc > Decimal::ZERO {
                     // Not enough amulets — defer this payment (kept until success)
                     deferred.push(item);
                     // If allocation can't get amulets, block lower-priority items
@@ -1133,8 +1147,8 @@ async fn execute_batch_pay(
         *target_map.entry(item.receiver_party.clone()).or_insert(Decimal::ZERO) += item.amount_cc;
     }
 
-    let total_amount: Decimal = target_map.values().sum();
-    let targets: Vec<McPaymentTarget> = target_map
+    let mut total_amount: Decimal = target_map.values().sum();
+    let mut targets: Vec<McPaymentTarget> = target_map
         .iter()
         .map(|(party, amount)| McPaymentTarget {
             receiver_party: party.clone(),
@@ -1151,7 +1165,7 @@ async fn execute_batch_pay(
         items.len(), fee_count, traffic_count, targets.len(), total_amount
     );
 
-    // Select amulets for total amount + margin
+    // Select amulets (capped at 100 inputs by select_amulets_for_allocation)
     let margin = Decimal::from(2);
     let selectable = cache.get_selectable_amulets().await;
     let selected = select_amulets_for_allocation(&selectable, total_amount + margin);
@@ -1159,6 +1173,64 @@ async fn execute_batch_pay(
         warn!("Batch pay: insufficient amulets for {:.4} CC, re-queuing {} items", total_amount, items.len());
         requeue_batch_items(items, queue_tx).await;
         return;
+    }
+
+    // Check if selected amulets cover the full batch; if not, trim items to fit
+    let selected_total: Decimal = selected.iter().map(|a| a.amount).sum();
+    let budget = selected_total - margin;
+    if budget < total_amount && budget > Decimal::ZERO {
+        // Sort items by amount ascending to fit as many as possible
+        items.sort_by(|a, b| a.amount_cc.cmp(&b.amount_cc));
+        let mut running = Decimal::ZERO;
+        let mut keep_count = 0;
+        for item in items.iter() {
+            if running + item.amount_cc > budget {
+                break;
+            }
+            running += item.amount_cc;
+            keep_count += 1;
+        }
+        if keep_count == 0 {
+            warn!("Batch pay: budget {:.4} CC too small for any item, re-queuing {} items", budget, items.len());
+            requeue_batch_items(items, queue_tx).await;
+            return;
+        }
+        let excess: Vec<_> = items.split_off(keep_count);
+        warn!(
+            "Batch pay: trimmed batch from {} to {} items (budget {:.4} CC from {} amulets), re-queuing {} items",
+            keep_count + excess.len(), keep_count, budget, selected.len(), excess.len()
+        );
+        requeue_batch_items(excess, queue_tx).await;
+
+        // Rebuild targets from trimmed items
+        fee_count = 0;
+        traffic_count = 0;
+        for item in &items {
+            match &item.source {
+                BatchItemSource::Fee(_) => fee_count += 1,
+                BatchItemSource::Traffic { .. } => traffic_count += 1,
+            }
+        }
+        target_map.clear();
+        for item in &items {
+            *target_map.entry(item.receiver_party.clone()).or_insert(Decimal::ZERO) += item.amount_cc;
+        }
+        total_amount = target_map.values().sum();
+        targets = target_map
+            .iter()
+            .map(|(party, amount)| McPaymentTarget {
+                receiver_party: party.clone(),
+                amount: amount.round_dp(10).to_string(),
+                description: Some(format!(
+                    "Batch payment: {} fees + {} traffic",
+                    fee_count, traffic_count
+                )),
+            })
+            .collect();
+        info!(
+            "Batch pay (trimmed): {} items ({} fee, {} traffic) to {} targets, total {:.4} CC",
+            items.len(), fee_count, traffic_count, targets.len(), total_amount
+        );
     }
 
     let selected_cids: Vec<String> = selected.iter().map(|a| a.contract_id.clone()).collect();
@@ -1372,21 +1444,55 @@ fn select_amulets_for_fee(selectable: &[CachedAmulet], estimated_cc: Decimal) ->
         return vec![];
     }
     let max_amulet_cc = Decimal::from_str(FEE_AMULET_MAX_CC).unwrap_or(Decimal::from(100));
+    let target = estimated_cc * Decimal::new(105, 2); // 1.05 = 5% margin for holding fee decay
+    const MAX_INPUTS: usize = 100;
 
-    // First pass: only use amulets <= 100 CC (sorted ascending, smallest-fit)
-    let small: Vec<_> = selectable.iter().filter(|a| a.amount <= max_amulet_cc).collect();
-    let mut selected = Vec::new();
-    let mut total = Decimal::ZERO;
-    for amulet in &small {
-        selected.push((*amulet).clone());
-        total += amulet.amount;
-        if total >= estimated_cc {
+    // selectable is sorted ascending by amount, so all small amulets form a contiguous prefix
+    let small_end = selectable.partition_point(|a| a.amount <= max_amulet_cc);
+    let small = &selectable[..small_end];
+
+    if small.len() > MAX_INPUTS {
+        // Consolidation mode: start with 100 smallest to reduce amulet count,
+        // then swap smallest selected with next-larger unselected if total < target
+        let mut selected: Vec<CachedAmulet> = small[..MAX_INPUTS].to_vec();
+        let mut total: Decimal = selected.iter().map(|a| a.amount).sum();
+
+        if total >= target {
             return selected;
+        }
+
+        // Replace smallest selected with next larger unselected
+        let mut replace_idx = 0;
+        let mut supply_idx = MAX_INPUTS;
+        while total < target && replace_idx < selected.len() && supply_idx < small.len() {
+            total -= selected[replace_idx].amount;
+            total += small[supply_idx].amount;
+            selected[replace_idx] = small[supply_idx].clone();
+            replace_idx += 1;
+            supply_idx += 1;
+        }
+
+        if total >= target {
+            return selected;
+        }
+        // Fall through to large amulet fallback
+    } else {
+        // ≤100 small amulets: current smallest-fit logic
+        let mut selected = Vec::new();
+        let mut total = Decimal::ZERO;
+        for amulet in small {
+            if selected.len() >= MAX_INPUTS {
+                break;
+            }
+            selected.push(amulet.clone());
+            total += amulet.amount;
+            if total >= target {
+                return selected;
+            }
         }
     }
 
-    // Fallback: no small amulets cover it — use smallest large amulet
-    // (sorted ascending, so first amulet > max is the smallest large one)
+    // Fallback: use smallest large amulet
     for amulet in selectable {
         if amulet.amount > max_amulet_cc {
             return vec![amulet.clone()];
@@ -1406,27 +1512,38 @@ fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimated_cc: Deci
         return vec![];
     }
 
+    // Add 2% margin to account for CC holding fee decay between selection and execution
+    let target = estimated_cc * Decimal::new(102, 2); // 1.02
+
     // Prefer ONE amulet that covers the amount (smallest such amulet)
-    // selectable is sorted ascending, so find first >= estimated_cc
+    // selectable is sorted ascending, so find first >= target
     for amulet in selectable {
-        if amulet.amount >= estimated_cc {
+        if amulet.amount >= target {
             return vec![amulet.clone()];
         }
     }
 
-    // No single amulet suffices — use smallest-fit with multiple
+    // Multi-amulet fallback: take the LARGEST amulets first (selectable is sorted
+    // ascending, so iterate in reverse). This maximises coverage with the 100-input
+    // limit. Picking smallest-first would often produce a partial set whose total
+    // is below the target, causing the on-chain transaction to fail with
+    // ITR_InsufficientFunds.
+    const MAX_INPUTS: usize = 100;
     let mut selected = Vec::new();
     let mut total = Decimal::ZERO;
-    for amulet in selectable {
+    for amulet in selectable.iter().rev() {
+        if selected.len() >= MAX_INPUTS {
+            break;
+        }
         selected.push(amulet.clone());
         total += amulet.amount;
-        if total >= estimated_cc {
+        if total >= target {
             return selected;
         }
     }
 
-    // Not enough even with all amulets — return empty to defer.
-    // Scheduler will retry on next cycle (waiting for change from other operations).
+    // 100 largest amulets still not enough — return empty so the scheduler defers.
+    // Submitting a partial set would be guaranteed to fail on chain.
     vec![]
 }
 

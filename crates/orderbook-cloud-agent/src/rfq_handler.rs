@@ -280,6 +280,29 @@ impl RfqHandler {
 
         // Liquidity gate: reject if LP lacks sufficient balance for the allocation + estimated fees
         if let Some(ref lm) = self.liquidity_manager {
+            // Reject early if balances haven't been loaded yet (e.g. just after restart),
+            // otherwise lm.available() returns 0 and we'd report "insufficient" when we
+            // simply don't know the balance yet.
+            if !lm.is_ready().await {
+                warn!(
+                    "RFQ {}: rejecting — liquidity manager not yet ready (balances loading)",
+                    rfq_id
+                );
+                return RfqResponse::Reject(RfqReject {
+                    rfq_id,
+                    lp_party_id: self.party_id.clone(),
+                    lp_name: self.lp_config.name.clone(),
+                    reason: RfqRejectionReason::TemporarilyUnavailable as i32,
+                    reason_detail: Some("Balances loading".to_string()),
+                    rejected_at: Some(prost_types::Timestamp {
+                        seconds: chrono::Utc::now().timestamp(),
+                        nanos: 0,
+                    }),
+                    min_quantity: None,
+                    max_quantity: None,
+                });
+            }
+
             // LP allocates base when user buys (dir=1), quote when user sells (dir=2)
             let (alloc_token, alloc_amount) = if request.direction == 1 {
                 (base_token, quantity)     // LP sells base
