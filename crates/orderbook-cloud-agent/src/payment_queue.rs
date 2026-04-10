@@ -747,20 +747,34 @@ impl PaymentQueue {
                 // Estimate CC needed for this payment
                 let estimated_cc = estimate_cc_needed(&item.request);
 
-                // Get selectable amulets
                 let selectable = cache.get_selectable_amulets().await;
 
-                // Select amulets using operation-aware strategy
-                let selected = match &item.request {
-                    PaymentRequest::Allocate { allocation_cc: Some(_), .. } => {
-                        select_amulets_for_allocation(&selectable, estimated_cc)
-                    }
-                    _ => {
-                        select_amulets_for_fee(&selectable, estimated_cc)
-                    }
+                let is_allocation = matches!(
+                    &item.request,
+                    PaymentRequest::Allocate { allocation_cc: Some(_), .. }
+                );
+                let selected = if is_allocation {
+                    select_amulets_for_allocation(&selectable, estimated_cc)
+                } else {
+                    select_amulets_for_fee(&selectable, estimated_cc)
                 };
 
-                if selected.is_empty() && estimated_cc > Decimal::ZERO {
+                // Defense in depth: never submit an allocation whose selected amulets
+                // sum below the requested amount — the on-chain transaction would fail
+                // with ITR_InsufficientFunds. The selector already guards this; this
+                // catches any future regression.
+                let insufficient_allocation = is_allocation
+                    && !selected.is_empty()
+                    && selected.iter().map(|a| a.amount).sum::<Decimal>() < estimated_cc;
+                if insufficient_allocation {
+                    let total: Decimal = selected.iter().map(|a| a.amount).sum();
+                    warn!(
+                        "Allocation deferred: selected {} amulets totalling {:.4} CC, need {:.4} CC",
+                        selected.len(), total, estimated_cc
+                    );
+                }
+
+                if (selected.is_empty() || insufficient_allocation) && estimated_cc > Decimal::ZERO {
                     // Not enough amulets — defer this payment (kept until success)
                     deferred.push(item);
                     // If allocation can't get amulets, block lower-priority items
@@ -1509,11 +1523,15 @@ fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimated_cc: Deci
         }
     }
 
-    // No single amulet suffices — use smallest-fit with multiple (max 100 inputs)
+    // Multi-amulet fallback: take the LARGEST amulets first (selectable is sorted
+    // ascending, so iterate in reverse). This maximises coverage with the 100-input
+    // limit. Picking smallest-first would often produce a partial set whose total
+    // is below the target, causing the on-chain transaction to fail with
+    // ITR_InsufficientFunds.
     const MAX_INPUTS: usize = 100;
     let mut selected = Vec::new();
     let mut total = Decimal::ZERO;
-    for amulet in selectable {
+    for amulet in selectable.iter().rev() {
         if selected.len() >= MAX_INPUTS {
             break;
         }
@@ -1524,9 +1542,9 @@ fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimated_cc: Deci
         }
     }
 
-    // Not enough with 100 amulets — return what we have so caller can trim the batch.
-    // Return empty only if truly nothing available.
-    if selected.is_empty() { vec![] } else { selected }
+    // 100 largest amulets still not enough — return empty so the scheduler defers.
+    // Submitting a partial set would be guaranteed to fail on chain.
+    vec![]
 }
 
 /// Process amulet cache updates after a successful transaction
