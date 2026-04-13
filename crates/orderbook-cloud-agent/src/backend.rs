@@ -44,6 +44,8 @@ pub struct CloudSettlementBackend {
     amulet_cache: Arc<AmuletCache>,
     /// Liquidity manager for balance tracking and commitment gating
     liquidity_manager: Arc<LiquidityManager>,
+    /// Shutdown flag for background tasks (ACS worker)
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CloudSettlementBackend {
@@ -57,9 +59,10 @@ impl CloudSettlementBackend {
         liquidity_manager: Arc<LiquidityManager>,
     ) -> Self {
         let cache = AmuletCache::new();
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Spawn ACS worker to refresh amulet cache and update liquidity manager
-        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone());
+        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown_flag.clone());
 
         let payment_queue = PaymentQueue::new(
             config.clone(),
@@ -70,7 +73,7 @@ impl CloudSettlementBackend {
             confirm_lock.clone(),
             cache.clone(),
         );
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache, liquidity_manager }
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache, liquidity_manager, shutdown_flag }
     }
 
     /// Create a new DAppProviderClient for this request
@@ -278,6 +281,7 @@ impl SettlementBackend for CloudSettlementBackend {
     }
 
     fn shutdown(&self) {
+        self.shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         self.payment_queue.shutdown();
     }
 

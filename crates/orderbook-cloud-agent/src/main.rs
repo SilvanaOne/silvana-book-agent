@@ -661,6 +661,7 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
     let mid_prices = rfq_handler.mid_prices();
     let price_config = config.clone();
     let price_markets = rfq_market_ids.clone();
+    let price_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_secs(10);
         // Initial delay to let the orderbook server start
@@ -675,6 +676,10 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
         };
 
         loop {
+            if price_shutdown.load(Ordering::Relaxed) {
+                info!("Mid-price poller shutting down");
+                return;
+            }
             for market_id in &price_markets {
                 match client.get_price(market_id).await {
                     Ok(resp) => {
@@ -867,6 +872,10 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
             }
         }
 
+        if shutdown.load(Ordering::SeqCst) {
+            info!("LP stream shutting down after disconnect");
+            return Ok(());
+        }
         tracing::warn!("LP settlement stream disconnected, reconnecting in 5s");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }

@@ -5,6 +5,7 @@
 //! Also cleans up expired reservations on each cycle.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
@@ -20,7 +21,12 @@ use crate::ledger_client::DAppProviderClient;
 const REFRESH_INTERVAL_SECS: u64 = 30;
 
 /// Spawn the ACS worker background task
-pub fn spawn_acs_worker(config: BaseConfig, cache: Arc<AmuletCache>, liquidity_manager: Arc<LiquidityManager>) {
+pub fn spawn_acs_worker(
+    config: BaseConfig,
+    cache: Arc<AmuletCache>,
+    liquidity_manager: Arc<LiquidityManager>,
+    shutdown: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         info!("ACS worker started (refresh every {}s)", REFRESH_INTERVAL_SECS);
 
@@ -28,6 +34,11 @@ pub fn spawn_acs_worker(config: BaseConfig, cache: Arc<AmuletCache>, liquidity_m
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         loop {
+            if shutdown.load(Ordering::Relaxed) {
+                info!("ACS worker shutting down");
+                return;
+            }
+
             if let Err(e) = refresh_amulets(&config, &cache, &liquidity_manager).await {
                 warn!("ACS worker refresh failed: {:#}", e);
             }
