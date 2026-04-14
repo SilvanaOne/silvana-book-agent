@@ -9,6 +9,7 @@ import "silvana/ledger/v1/dvp.proto";
 import "silvana/ledger/v1/cip56.proto";
 import "silvana/ledger/v1/recurring.proto";
 import "silvana/ledger/v1/multicall.proto";
+import "silvana/ledger/v1/lock.proto";
 
 option go_package = "github.com/SilvanaOne/canton-agent/proto;ledger";
 
@@ -43,6 +44,10 @@ message PrepareTransactionRequest {
     AcceptCip56Params accept_cip56 = 20;
     SplitCcParams split_cc = 21;
     ExecuteMultiCallParams execute_multicall = 22;
+    LockHoldingsParams lock_holdings = 23;
+    ProcessLockUnlockRequestsParams process_lock_unlock_requests = 24;
+    ResizeLockParams resize_lock = 25;
+    TerminateLockParams terminate_lock = 26;
   }
 
   // Message-level signature from cloud agent (Ed25519 over canonical request payload)

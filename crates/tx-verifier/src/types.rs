@@ -76,6 +76,23 @@ pub enum OperationExpectation {
         party: String,
         op_count: usize,
     },
+    LockHoldings {
+        party: String,
+        amount: String,
+        instrument_id: String,
+        context: String,
+    },
+    ProcessLockUnlockRequests {
+        party: String,
+        request_count: usize,
+    },
+    ResizeLock {
+        party: String,
+        new_amount: String,
+    },
+    TerminateLock {
+        party: String,
+    },
 }
 
 /// Result of transaction verification

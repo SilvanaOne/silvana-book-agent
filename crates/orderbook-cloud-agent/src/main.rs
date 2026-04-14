@@ -21,6 +21,9 @@ use orderbook_proto::ledger::{
     TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
     ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
+    LockHoldingsParams, ProcessLockUnlockRequestsParams, ResizeLockParams, TerminateLockParams,
+    VotingAllocation as ProtoVotingAllocation, VotingRequest as ProtoVotingRequest,
+    FaucetRequest,
     prepare_transaction_request::Params,
     d_app_provider_service_client::DAppProviderServiceClient,
     GetAgentConfigRequest, GetAgentConfigResponse, RegisterAgentRequest,
@@ -119,6 +122,16 @@ enum Commands {
     UserService {
         #[command(subcommand)]
         command: UserServiceCommands,
+    },
+    /// Faucet — request tokens (CC or CIP-56)
+    Faucet {
+        #[command(subcommand)]
+        command: FaucetCommands,
+    },
+    /// Lock operations (LockService / LockController)
+    Lock {
+        #[command(subcommand)]
+        command: LockCommands,
     },
     /// Buy a specified amount via RFQ, repeating until filled
     Buyer {
@@ -371,6 +384,131 @@ enum SubscriptionCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum LockCommands {
+    /// Lock holdings via LockService.LockHoldings
+    Holdings {
+        /// LockService contract ID
+        #[arg(long)]
+        lock_service_cid: String,
+        /// LockService template ID
+        #[arg(long)]
+        lock_service_template_id: String,
+        /// LockService created_event_blob (for disclosure)
+        #[arg(long)]
+        lock_service_blob: String,
+        /// Amount to lock
+        #[arg(long)]
+        amount: String,
+        /// Instrument token ID (e.g., "HECTO")
+        #[arg(long)]
+        instrument_id: String,
+        /// Lock context (UUIDv7; generated if omitted)
+        #[arg(long)]
+        context: Option<String>,
+        /// JSON file with initial voting allocations (array of {context, amount})
+        #[arg(long)]
+        allocations_file: Option<String>,
+        /// Fee recipient party IDs
+        #[arg(long, num_args = 1..)]
+        fee_parties: Vec<String>,
+        /// Fee amounts (one per fee party)
+        #[arg(long, num_args = 1..)]
+        fee_amounts: Vec<String>,
+        /// Amulet contract IDs for fee payment
+        #[arg(long, num_args = 1..)]
+        amulet_cids: Vec<String>,
+    },
+    /// Process voting lock/unlock requests on LockController
+    Vote {
+        /// LockController contract ID
+        #[arg(long)]
+        lock_controller_cid: String,
+        /// LockController template ID
+        #[arg(long)]
+        lock_controller_template_id: String,
+        /// JSON file with voting requests (array of {context, amount, direction})
+        #[arg(long)]
+        requests_file: String,
+        /// Fee recipient party IDs
+        #[arg(long, num_args = 1..)]
+        fee_parties: Vec<String>,
+        /// Fee amounts (one per fee party)
+        #[arg(long, num_args = 1..)]
+        fee_amounts: Vec<String>,
+        /// Amulet contract IDs for fee payment
+        #[arg(long, num_args = 1..)]
+        amulet_cids: Vec<String>,
+    },
+    /// Resize lock amount on LockController
+    Resize {
+        /// LockController contract ID
+        #[arg(long)]
+        lock_controller_cid: String,
+        /// LockController template ID
+        #[arg(long)]
+        lock_controller_template_id: String,
+        /// New lock amount
+        #[arg(long)]
+        new_amount: String,
+        /// Instrument token ID (for querying additional holdings)
+        #[arg(long)]
+        instrument_id: String,
+        /// JSON file with voting requests to apply atomically (optional)
+        #[arg(long)]
+        requests_file: Option<String>,
+        /// Fee recipient party IDs
+        #[arg(long, num_args = 1..)]
+        fee_parties: Vec<String>,
+        /// Fee amounts (one per fee party)
+        #[arg(long, num_args = 1..)]
+        fee_amounts: Vec<String>,
+        /// Amulet contract IDs for fee payment
+        #[arg(long, num_args = 1..)]
+        amulet_cids: Vec<String>,
+    },
+    /// Terminate lock on LockController (requires all allocations unlocked)
+    Terminate {
+        /// LockController contract ID
+        #[arg(long)]
+        lock_controller_cid: String,
+        /// LockController template ID
+        #[arg(long)]
+        lock_controller_template_id: String,
+        /// Fee recipient party IDs
+        #[arg(long, num_args = 1..)]
+        fee_parties: Vec<String>,
+        /// Fee amounts (one per fee party)
+        #[arg(long, num_args = 1..)]
+        fee_amounts: Vec<String>,
+        /// Amulet contract IDs for fee payment
+        #[arg(long, num_args = 1..)]
+        amulet_cids: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FaucetCommands {
+    /// Request tokens from faucet
+    Get {
+        /// Token name ("Amulet" for CC, or CIP-56 token name like "USDC")
+        #[arg(long)]
+        token: String,
+        /// Token admin party (DSO for CC, registrar for CIP-56)
+        #[arg(long)]
+        admin: String,
+        /// Faucet ticket (devnet: any string)
+        #[arg(long, default_value = "devnet")]
+        ticket: String,
+        /// Requested amount (optional — server decides default)
+        #[arg(long)]
+        amount: Option<String>,
+        /// Dry run — check if request would succeed without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -416,6 +554,8 @@ async fn main() -> Result<()> {
         Commands::Transfer { command } => run_transfer(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Sign { command } => run_sign(base_config, command),
         Commands::UserService { command } => run_user_service(base_config, command, verbose, dry_run, force, confirm).await,
+        Commands::Faucet { command } => run_faucet(base_config, command, verbose).await,
+        Commands::Lock { command } => run_lock(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Buyer { market, amount, price_limit, min_settlement, max_settlement, interval } => {
             run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
         }
@@ -2288,5 +2428,257 @@ fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
             println!("{}", orderbook_agent_logic::sign::sign_binary(&key, &input)?);
         }
     }
+    Ok(())
+}
+
+// ============================================================================
+// Faucet commands
+// ============================================================================
+
+async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bool) -> Result<()> {
+    let mut client = ledger_client::DAppProviderClient::new(
+        &config.orderbook_grpc_url,
+        &config.party_id,
+        &config.role,
+        &config.private_key_bytes,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+        &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
+    ).await?;
+
+    match command {
+        FaucetCommands::Get { token, admin, ticket, amount, dry_run } => {
+            let response = client.request_faucet(FaucetRequest {
+                token_name: token.clone(),
+                token_admin: admin.clone(),
+                ticket,
+                amount: amount.unwrap_or_default(),
+                dry_run,
+                request_signature: None,
+            }).await?;
+
+            if response.success {
+                if response.is_dry_run {
+                    println!("Faucet dry run approved:");
+                } else {
+                    println!("Faucet transfer completed:");
+                    println!("  Update ID: {}", response.update_id);
+                }
+                println!("  Token:     {} (admin: {})", response.token_name, response.token_admin);
+                println!("  Amount:    {}", response.amount_approved);
+            } else {
+                println!("Faucet request failed: {}", response.error_message.as_deref().unwrap_or("unknown"));
+            }
+
+            if verbose {
+                println!("\nFull response: {:?}", response);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Lock commands
+// ============================================================================
+
+async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+    let mut client = ledger_client::DAppProviderClient::new(
+        &config.orderbook_grpc_url,
+        &config.party_id,
+        &config.role,
+        &config.private_key_bytes,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+        &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
+    ).await?;
+
+    match command {
+        LockCommands::Holdings {
+            lock_service_cid, lock_service_template_id, lock_service_blob,
+            amount, instrument_id, context, allocations_file,
+            fee_parties, fee_amounts, amulet_cids,
+        } => {
+            let context = context.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+
+            // Load allocations from file if provided
+            let allocations: Vec<ProtoVotingAllocation> = match allocations_file {
+                Some(path) => {
+                    let content = std::fs::read_to_string(&path)
+                        .with_context(|| format!("Failed to read allocations file '{}'", path))?;
+                    let allocs: Vec<serde_json::Value> = serde_json::from_str(&content)
+                        .with_context(|| format!("Invalid allocations JSON in '{}'", path))?;
+                    allocs.iter().map(|a| ProtoVotingAllocation {
+                        context: a.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        amount: a.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                    }).collect()
+                }
+                None => vec![],
+            };
+
+            if confirm && !dry_run {
+                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
+                orderbook_agent_logic::confirm::confirm_transaction(
+                    &lock,
+                    "Lock Holdings",
+                    &format!("amount: {}, instrument: {}, context: {}", amount, instrument_id, context),
+                ).await?;
+            }
+
+            let expectation = OperationExpectation::LockHoldings {
+                party: config.party_id.clone(),
+                amount: amount.clone(),
+                instrument_id: instrument_id.clone(),
+                context: context.clone(),
+            };
+
+            let result = client.submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::LockHoldings as i32,
+                    params: Some(Params::LockHoldings(LockHoldingsParams {
+                        lock_service_cid,
+                        lock_service_template_id,
+                        lock_service_blob,
+                        amount,
+                        instrument_id,
+                        context: context.clone(),
+                        allocations,
+                        fee_party_ids: fee_parties,
+                        fee_amounts,
+                        amulet_cids,
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                verbose,
+                dry_run,
+                force,
+            ).await?;
+
+            println!("Lock holdings submitted, update id: {}", result.update_id);
+            println!("  Context: {}", context);
+        }
+        LockCommands::Vote {
+            lock_controller_cid, lock_controller_template_id, requests_file,
+            fee_parties, fee_amounts, amulet_cids,
+        } => {
+            let content = std::fs::read_to_string(&requests_file)
+                .with_context(|| format!("Failed to read requests file '{}'", requests_file))?;
+            let reqs_json: Vec<serde_json::Value> = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid requests JSON in '{}'", requests_file))?;
+            let requests: Vec<ProtoVotingRequest> = reqs_json.iter().map(|r| ProtoVotingRequest {
+                context: r.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                amount: r.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                direction: r.get("direction").and_then(|v| v.as_str()).unwrap_or("VoteLock").to_string(),
+            }).collect();
+
+            let expectation = OperationExpectation::ProcessLockUnlockRequests {
+                party: config.party_id.clone(),
+                request_count: requests.len(),
+            };
+
+            let result = client.submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::ProcessLockUnlockRequests as i32,
+                    params: Some(Params::ProcessLockUnlockRequests(ProcessLockUnlockRequestsParams {
+                        lock_controller_cid,
+                        lock_controller_template_id,
+                        requests,
+                        fee_party_ids: fee_parties,
+                        fee_amounts,
+                        amulet_cids,
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                verbose,
+                dry_run,
+                force,
+            ).await?;
+
+            println!("Vote submitted, update id: {}", result.update_id);
+        }
+        LockCommands::Resize {
+            lock_controller_cid, lock_controller_template_id, new_amount, instrument_id,
+            requests_file, fee_parties, fee_amounts, amulet_cids,
+        } => {
+            let requests: Vec<ProtoVotingRequest> = match requests_file {
+                Some(path) => {
+                    let content = std::fs::read_to_string(&path)
+                        .with_context(|| format!("Failed to read requests file '{}'", path))?;
+                    let reqs_json: Vec<serde_json::Value> = serde_json::from_str(&content)
+                        .with_context(|| format!("Invalid requests JSON in '{}'", path))?;
+                    reqs_json.iter().map(|r| ProtoVotingRequest {
+                        context: r.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        amount: r.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                        direction: r.get("direction").and_then(|v| v.as_str()).unwrap_or("VoteLock").to_string(),
+                    }).collect()
+                }
+                None => vec![],
+            };
+
+            let expectation = OperationExpectation::ResizeLock {
+                party: config.party_id.clone(),
+                new_amount: new_amount.clone(),
+            };
+
+            let result = client.submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::ResizeLock as i32,
+                    params: Some(Params::ResizeLock(ResizeLockParams {
+                        lock_controller_cid,
+                        lock_controller_template_id,
+                        new_amount,
+                        requests,
+                        instrument_id,
+                        fee_party_ids: fee_parties,
+                        fee_amounts,
+                        amulet_cids,
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                verbose,
+                dry_run,
+                force,
+            ).await?;
+
+            println!("Resize lock submitted, update id: {}", result.update_id);
+        }
+        LockCommands::Terminate {
+            lock_controller_cid, lock_controller_template_id,
+            fee_parties, fee_amounts, amulet_cids,
+        } => {
+            let expectation = OperationExpectation::TerminateLock {
+                party: config.party_id.clone(),
+            };
+
+            let result = client.submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::TerminateLock as i32,
+                    params: Some(Params::TerminateLock(TerminateLockParams {
+                        lock_controller_cid,
+                        lock_controller_template_id,
+                        fee_party_ids: fee_parties,
+                        fee_amounts,
+                        amulet_cids,
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                verbose,
+                dry_run,
+                force,
+            ).await?;
+
+            println!("Terminate lock submitted, update id: {}", result.update_id);
+        }
+    }
+
     Ok(())
 }

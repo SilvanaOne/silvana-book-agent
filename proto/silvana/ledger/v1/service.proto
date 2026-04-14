@@ -7,6 +7,7 @@ import "silvana/ledger/v1/transactions.proto";
 import "silvana/ledger/v1/onboarding.proto";
 import "silvana/ledger/v1/preapproval.proto";  // GetPreapprovalsRequest/Response
 import "silvana/ledger/v1/dvp.proto";          // GetSettlementContractsRequest/Response
+import "silvana/ledger/v1/faucet.proto";       // FaucetRequest/FaucetResponse
 
 option go_package = "github.com/SilvanaOne/canton-agent/proto;ledger";
 
@@ -79,4 +80,9 @@ service DAppProviderService {
 
   // Phase 2: Execute signed transaction
   rpc ExecuteTransaction(ExecuteTransactionRequest) returns (ExecuteTransactionResponse);
+
+  // === Faucet RPC (server-side submission, no two-phase signing needed) ===
+
+  // Request tokens from the faucet (CC or CIP-56)
+  rpc RequestFaucet(FaucetRequest) returns (FaucetResponse);
 }

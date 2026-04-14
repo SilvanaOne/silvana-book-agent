@@ -130,4 +130,10 @@ enum TransactionOperation {
 
   // MultiCall (atomic batch of operations via Execute_MultiCall DAR choice)
   TRANSACTION_OPERATION_EXECUTE_MULTICALL = 14;
+
+  // Lock operations (LockService / LockController choices)
+  TRANSACTION_OPERATION_LOCK_HOLDINGS = 15;
+  TRANSACTION_OPERATION_PROCESS_LOCK_UNLOCK_REQUESTS = 16;
+  TRANSACTION_OPERATION_RESIZE_LOCK = 17;
+  TRANSACTION_OPERATION_TERMINATE_LOCK = 18;
 }

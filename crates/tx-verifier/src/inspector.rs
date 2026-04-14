@@ -2240,6 +2240,16 @@ pub fn inspect(
         OperationExpectation::ExecuteMulticall { op_count, .. } => {
             format!("ExecuteMulticall({} ops)", op_count)
         }
+        OperationExpectation::LockHoldings { amount, instrument_id, .. } => {
+            format!("LockHoldings({} {})", amount, instrument_id)
+        }
+        OperationExpectation::ProcessLockUnlockRequests { request_count, .. } => {
+            format!("ProcessLockUnlockRequests({} reqs)", request_count)
+        }
+        OperationExpectation::ResizeLock { new_amount, .. } => {
+            format!("ResizeLock({})", new_amount)
+        }
+        OperationExpectation::TerminateLock { .. } => "TerminateLock".to_string(),
     };
 
     // Verbose: dump full JSON

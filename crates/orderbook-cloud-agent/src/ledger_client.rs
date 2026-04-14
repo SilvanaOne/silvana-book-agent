@@ -113,6 +113,9 @@ use message_signing::{
     canonical_params_request_user_service, canonical_params_transfer_cip56,
     canonical_params_accept_cip56, canonical_params_split_cc,
     canonical_params_execute_multicall,
+    canonical_params_lock_holdings, canonical_params_process_lock_unlock_requests,
+    canonical_params_resize_lock, canonical_params_terminate_lock,
+    canonical_params_faucet,
 };
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use tx_verifier::OperationExpectation;
@@ -125,6 +128,7 @@ use orderbook_proto::ledger::{
     GetUpdatesResponse, MessageSignature, PreapprovalInfo, PrepareTransactionRequest,
     get_updates_response, ledger_event,
     PrepareTransactionResponse, TokenBalance,
+    FaucetRequest, FaucetResponse,
 };
 
 /// Build canonical payload from a PrepareTransactionRequest for signing
@@ -157,6 +161,10 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
         Params::AcceptCip56(p) => canonical_params_accept_cip56(&p.contract_id),
         Params::SplitCc(p) => canonical_params_split_cc(&p.output_amounts),
         Params::ExecuteMulticall(p) => canonical_params_execute_multicall(p.operations.len()),
+        Params::LockHoldings(p) => canonical_params_lock_holdings(&p.lock_service_cid, &p.amount, &p.context),
+        Params::ProcessLockUnlockRequests(p) => canonical_params_process_lock_unlock_requests(&p.lock_controller_cid, p.requests.len()),
+        Params::ResizeLock(p) => canonical_params_resize_lock(&p.lock_controller_cid, &p.new_amount),
+        Params::TerminateLock(p) => canonical_params_terminate_lock(&p.lock_controller_cid),
     };
     Ok(canonical_prepare_request(req.operation, &params_canonical))
 }
@@ -877,6 +885,26 @@ impl DAppProviderClient {
         }
 
         None
+    }
+
+    /// Request tokens from the faucet
+    pub async fn request_faucet(&mut self, mut req: FaucetRequest) -> Result<FaucetResponse> {
+        // Sign the request
+        let canonical = canonical_params_faucet(
+            &req.token_name, &req.token_admin, &req.ticket, req.dry_run,
+        );
+        let canonical_bytes = canonical_prepare_request(0, &canonical);
+        let sig_data = sign_canonical(&self.private_key_bytes, &canonical_bytes);
+        req.request_signature = Some(MessageSignature {
+            signature: sig_data.signature_b64,
+            public_key: sig_data.public_key_b64url,
+            signing_scheme: sig_data.signing_scheme,
+        });
+
+        let response = self.client.request_faucet(req).await
+            .map_err(|s| anyhow!("RequestFaucet RPC failed ({}): {}", s.code(), s.message()))?;
+
+        Ok(response.into_inner())
     }
 }
 

@@ -264,6 +264,41 @@ pub fn canonical_params_execute_multicall(op_count: usize) -> String {
     )
 }
 
+pub fn canonical_params_lock_holdings(lock_service_cid: &str, amount: &str, context: &str) -> String {
+    format!(
+        "param_type=LockHoldings\nlock_service_cid={}\namount={}\ncontext={}\n",
+        lock_service_cid, amount, context
+    )
+}
+
+pub fn canonical_params_process_lock_unlock_requests(lock_controller_cid: &str, request_count: usize) -> String {
+    format!(
+        "param_type=ProcessLockUnlockRequests\nlock_controller_cid={}\nrequest_count={}\n",
+        lock_controller_cid, request_count
+    )
+}
+
+pub fn canonical_params_resize_lock(lock_controller_cid: &str, new_amount: &str) -> String {
+    format!(
+        "param_type=ResizeLock\nlock_controller_cid={}\nnew_amount={}\n",
+        lock_controller_cid, new_amount
+    )
+}
+
+pub fn canonical_params_terminate_lock(lock_controller_cid: &str) -> String {
+    format!(
+        "param_type=TerminateLock\nlock_controller_cid={}\n",
+        lock_controller_cid
+    )
+}
+
+pub fn canonical_params_faucet(token_name: &str, token_admin: &str, ticket: &str, dry_run: bool) -> String {
+    format!(
+        "param_type=Faucet\ntoken_name={}\ntoken_admin={}\nticket={}\ndry_run={}\n",
+        token_name, token_admin, ticket, dry_run
+    )
+}
+
 // ============================================================================
 // Canonical payload builders — Onboarding RPCs
 //
