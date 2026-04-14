@@ -246,6 +246,9 @@ enum TransferCommands {
         /// Optional description
         #[arg(long)]
         description: Option<String>,
+        /// Set memo to a generated UUIDv7 (overrides --description)
+        #[arg(long)]
+        memo_uuid: bool,
     },
     /// Send CIP-56 instrument token (creates TransferOffer)
     SendCip56 {
@@ -1450,7 +1453,13 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
             receiver,
             amount,
             description,
+            memo_uuid,
         } => {
+            let description = if memo_uuid {
+                Some(uuid::Uuid::now_v7().to_string())
+            } else {
+                description
+            };
             if confirm && !dry_run {
                 let lock = orderbook_agent_logic::confirm::new_confirm_lock();
                 orderbook_agent_logic::confirm::confirm_transaction(
