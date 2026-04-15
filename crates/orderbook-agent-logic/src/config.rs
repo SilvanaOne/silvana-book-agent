@@ -121,6 +121,12 @@ pub struct BaseConfig {
     pub traffic_fee_usd_per_byte: f64,
     pub join_traffic: bool,
     pub fee_reserve_cc: f64,
+    pub agent_fee_cc: Option<String>,
+    pub participant_fee_cc: Option<String>,
+    pub signature_fee_cc: Option<String>,
+    pub merge_threshold: Option<usize>,
+    pub merge_max_amulets: usize,
+    pub merge_poll_interval_sec: u64,
     pub settlement_thread_count: usize,
 
     // From configuration.toml
@@ -225,6 +231,14 @@ impl BaseConfig {
             .parse::<f64>()
             .unwrap_or(5.0);
 
+        let agent_fee_cc = std::env::var("AGENT_FEE_CC").ok();
+        let participant_fee_cc = std::env::var("PARTICIPANT_FEE_CC").ok();
+        let signature_fee_cc = std::env::var("SIGNATURE_FEE_CC").ok();
+
+        let merge_threshold = std::env::var("MERGE_THRESHOLD").ok().and_then(|v| v.parse().ok());
+        let merge_max_amulets = std::env::var("MERGE_MAX_AMULETS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+        let merge_poll_interval_sec = std::env::var("MERGE_POLL_INTERVAL_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+
         let settlement_thread_count = std::env::var("SETTLEMENT_THREAD_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -294,6 +308,12 @@ impl BaseConfig {
             traffic_fee_usd_per_byte,
             join_traffic,
             fee_reserve_cc,
+            agent_fee_cc,
+            participant_fee_cc,
+            signature_fee_cc,
+            merge_threshold,
+            merge_max_amulets,
+            merge_poll_interval_sec,
             settlement_thread_count,
             onboarded_registries,
             cc_dso_party,

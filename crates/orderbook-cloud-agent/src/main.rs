@@ -38,6 +38,7 @@ mod backend;
 mod config;
 mod fill_loop;
 mod ledger_client;
+mod merge_worker;
 mod payment_queue;
 mod rfq_handler;
 

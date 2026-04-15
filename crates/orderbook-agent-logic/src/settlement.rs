@@ -97,6 +97,12 @@ pub struct PendingTrafficFee {
     /// Number of failed attempts (for logging/backoff). Never stops retrying.
     #[serde(default)]
     pub retry_count: u32,
+    /// Override receiver party (None = use config.traffic_fee_party)
+    #[serde(default)]
+    pub receiver_party: Option<String>,
+    /// Fixed CC amount (None = compute from traffic_bytes × rate)
+    #[serde(default)]
+    pub amount_cc_fixed: Option<String>,
 }
 
 /// Backend for executing settlement operations
@@ -134,6 +140,10 @@ pub trait SettlementBackend: Send + Sync {
     /// Queue a traffic fee at lowest priority (fire-and-forget).
     /// The fee will be processed by the payment queue without blocking the caller.
     fn queue_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str);
+
+    /// Queue per-step fixed fees (agent, participant, signature) at lowest priority.
+    /// Each fee is only queued if the corresponding env var is defined in config.
+    fn queue_step_fees(&self, step_name: &str, proposal_id: &str);
 
     /// Sync on-chain contracts for given settlement IDs
     async fn sync_contracts(&self, settlement_ids: &[String]) -> Result<Vec<DiscoveredContract>>;
@@ -1000,6 +1010,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                                 }
                             }
 
+                            backend.queue_step_fees("allocate", proposal_id);
+
                             let final_result = AdvanceResult::StepCompleted {
                                 proposal_id: proposal_id.clone(),
                                 stage: SettlementStage::Allocated,
@@ -1853,6 +1865,7 @@ async fn advance_single<B: SettlementBackend>(
 
                     // Queue traffic fee at lowest priority (fire-and-forget)
                     backend.queue_traffic_fee(result.traffic_total, "propose", &proposal_id);
+                    backend.queue_step_fees("propose", &proposal_id);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpProposed,
@@ -1912,6 +1925,7 @@ async fn advance_single<B: SettlementBackend>(
 
                     // Queue traffic fee at lowest priority (fire-and-forget)
                     backend.queue_traffic_fee(result.traffic_total, "accept", &proposal_id);
+                    backend.queue_step_fees("accept", &proposal_id);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpAccepted,

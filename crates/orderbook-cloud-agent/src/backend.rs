@@ -64,6 +64,13 @@ impl CloudSettlementBackend {
         // Spawn ACS worker to refresh amulet cache and update liquidity manager
         spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown_flag.clone());
 
+        // Spawn merge worker if threshold is configured
+        if config.merge_threshold.is_some() {
+            crate::merge_worker::spawn_merge_worker(
+                config.clone(), cache.clone(), shutdown_flag.clone(),
+            );
+        }
+
         let payment_queue = PaymentQueue::new(
             config.clone(),
             verbose,
@@ -227,6 +234,10 @@ impl SettlementBackend for CloudSettlementBackend {
 
     fn queue_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str) {
         self.payment_queue.queue_traffic_fee(traffic_bytes, step_name, proposal_id);
+    }
+
+    fn queue_step_fees(&self, step_name: &str, proposal_id: &str) {
+        self.payment_queue.queue_step_fees(step_name, proposal_id, &self.config);
     }
 
     async fn queue_fee_payment(&self, mut fee: PendingFee) {

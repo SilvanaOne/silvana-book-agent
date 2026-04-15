@@ -110,6 +110,8 @@ enum PaymentRequest {
         traffic_bytes: u64,
         step_name: String,
         proposal_id: String,
+        receiver_party: Option<String>,
+        amount_cc_fixed: Option<String>,
     },
     /// Background fee payment — processor handles completion event + traffic fee
     PayFeeBackground {
@@ -173,6 +175,8 @@ enum BatchItemSource {
         traffic_bytes: u64,
         step_name: String,
         proposal_id: String,
+        receiver_party: Option<String>,
+        amount_cc_fixed: Option<String>,
     },
 }
 
@@ -380,6 +384,8 @@ impl PaymentQueue {
                     traffic_bytes,
                     step_name: step_name.to_string(),
                     proposal_id: proposal_id.to_string(),
+                    receiver_party: None,
+                    amount_cc_fixed: None,
                 },
                 response_tx,
             })
@@ -414,12 +420,50 @@ impl PaymentQueue {
             step_name: step_name.to_string(),
             proposal_id: proposal_id.to_string(),
             retry_count: 0,
+            receiver_party: None,
+            amount_cc_fixed: None,
         };
         let pending = self.pending_traffic_fees.clone();
         let backlog = self.traffic_fee_backlog.clone();
         tokio::spawn(async move {
             pending.lock().await.push(entry.clone());
             backlog.lock().await.push_back(entry);
+        });
+    }
+
+    /// Queue per-step fixed fees (agent, participant, signature) via the traffic fee backlog.
+    /// Each fee is only queued if the corresponding config value is defined.
+    pub fn queue_step_fees(&self, step_name: &str, proposal_id: &str, config: &BaseConfig) {
+        let fees: Vec<(&str, &Option<String>, &str)> = vec![
+            ("agent-fee", &config.agent_fee_cc, &config.fee_party),
+            ("participant-fee", &config.participant_fee_cc, &config.traffic_fee_party),
+            ("signature-fee", &config.signature_fee_cc, &config.fee_party),
+        ];
+        let mut entries = Vec::new();
+        for (fee_type, amount_opt, receiver) in fees {
+            if let Some(amount) = amount_opt {
+                entries.push(PendingTrafficFee {
+                    traffic_bytes: 0,
+                    step_name: format!("{}:{}", fee_type, step_name),
+                    proposal_id: proposal_id.to_string(),
+                    retry_count: 0,
+                    receiver_party: Some(receiver.to_string()),
+                    amount_cc_fixed: Some(amount.clone()),
+                });
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let pending = self.pending_traffic_fees.clone();
+        let backlog = self.traffic_fee_backlog.clone();
+        tokio::spawn(async move {
+            let mut p = pending.lock().await;
+            let mut b = backlog.lock().await;
+            for entry in entries {
+                p.push(entry.clone());
+                b.push_back(entry);
+            }
         });
     }
 
@@ -577,6 +621,8 @@ impl PaymentQueue {
                                     traffic_bytes: fee.traffic_bytes,
                                     step_name: fee.step_name,
                                     proposal_id: fee.proposal_id,
+                                    receiver_party: fee.receiver_party,
+                                    amount_cc_fixed: fee.amount_cc_fixed,
                                 },
                                 response_tx,
                             });
@@ -702,7 +748,7 @@ impl PaymentQueue {
 
                 // Divert fire-and-forget TransferTrafficFee → batch
                 // Sync callers (response_tx not closed) fall through to individual worker
-                if let PaymentRequest::TransferTrafficFee { traffic_bytes, ref step_name, ref proposal_id } = item.request {
+                if let PaymentRequest::TransferTrafficFee { traffic_bytes, ref step_name, ref proposal_id, ref receiver_party, ref amount_cc_fixed } = item.request {
                     if item.response_tx.is_closed() {
                         // Fire-and-forget path
                         if traffic_paused {
@@ -719,21 +765,33 @@ impl PaymentQueue {
                             deferred.push(item);
                             continue;
                         }
+                        let item_receiver = receiver_party.clone()
+                            .unwrap_or_else(|| config.traffic_fee_party.clone());
+                        let item_amount = amount_cc_fixed.as_ref()
+                            .and_then(|s| Decimal::from_str(s).ok())
+                            .unwrap_or(Decimal::ZERO);
+                        let item_desc = if traffic_bytes > 0 {
+                            format!("Traffic fee for {} bytes ({})", traffic_bytes, proposal_id)
+                        } else {
+                            format!("{} ({})", step_name, proposal_id)
+                        };
                         batch_items.push(BatchItem {
-                            receiver_party: config.traffic_fee_party.clone(),
-                            amount_cc: Decimal::ZERO, // computed at flush time with live rate
-                            description: format!("Traffic fee for {} bytes ({})", traffic_bytes, proposal_id),
+                            receiver_party: item_receiver,
+                            amount_cc: item_amount,
+                            description: item_desc,
                             source: BatchItemSource::Traffic {
                                 traffic_bytes,
                                 step_name: step_name.clone(),
                                 proposal_id: proposal_id.clone(),
+                                receiver_party: receiver_party.clone(),
+                                amount_cc_fixed: amount_cc_fixed.clone(),
                             },
                         });
                         if batch_first_item_at.is_none() {
                             batch_first_item_at = Some(std::time::Instant::now());
                         }
-                        debug!("[{}] Traffic fee ({} bytes) added to batch (size={})",
-                            proposal_id, traffic_bytes, batch_items.len());
+                        debug!("[{}] {} added to batch (size={})",
+                            proposal_id, step_name, batch_items.len());
                         drop(item.response_tx);
                         continue;
                     }
@@ -865,6 +923,8 @@ impl PaymentQueue {
                                                 step_name: step_name.clone(),
                                                 proposal_id: proposal_id.clone(),
                                                 retry_count: 0,
+                                                receiver_party: None,
+                                                amount_cc_fixed: None,
                                             });
                                             let (tx_resp, _) = oneshot::channel();
                                             let _ = worker_queue_tx.send(QueuedPayment {
@@ -874,6 +934,8 @@ impl PaymentQueue {
                                                     traffic_bytes: step_result.traffic_total,
                                                     step_name,
                                                     proposal_id: proposal_id.clone(),
+                                                    receiver_party: None,
+                                                    amount_cc_fixed: None,
                                                 },
                                                 response_tx: tx_resp,
                                             });
@@ -881,7 +943,7 @@ impl PaymentQueue {
                                     }
                                     let _ = item.response_tx.send(PaymentResponse::Step(result));
                                 }
-                                PaymentRequest::TransferTrafficFee { traffic_bytes, ref step_name, ref proposal_id } => {
+                                PaymentRequest::TransferTrafficFee { traffic_bytes, ref step_name, ref proposal_id, .. } => {
                                     let sn = step_name.clone();
                                     let pid = proposal_id.clone();
                                     let result = execute_transfer_traffic_fee(
@@ -915,6 +977,8 @@ impl PaymentQueue {
                                                         traffic_bytes: retry_fee.traffic_bytes,
                                                         step_name: retry_fee.step_name,
                                                         proposal_id: retry_fee.proposal_id,
+                                                        receiver_party: retry_fee.receiver_party,
+                                                        amount_cc_fixed: retry_fee.amount_cc_fixed,
                                                     },
                                                     response_tx,
                                                 });
@@ -1033,6 +1097,8 @@ impl PaymentQueue {
                                     traffic_bytes: fee.traffic_bytes,
                                     step_name: fee.step_name,
                                     proposal_id: fee.proposal_id,
+                                    receiver_party: fee.receiver_party,
+                                    amount_cc_fixed: fee.amount_cc_fixed,
                                 },
                                 response_tx,
                             });
@@ -1109,10 +1175,13 @@ async fn execute_batch_pay(
                 fee_count += 1;
             }
             BatchItemSource::Traffic { traffic_bytes, .. } => {
-                let fee_usd = Decimal::from(*traffic_bytes)
-                    * Decimal::from_f64_retain(config.traffic_fee_usd_per_byte)
-                        .unwrap_or(Decimal::ZERO);
-                item.amount_cc = (fee_usd / cc_usd_rate).round_dp(10);
+                if *traffic_bytes > 0 {
+                    let fee_usd = Decimal::from(*traffic_bytes)
+                        * Decimal::from_f64_retain(config.traffic_fee_usd_per_byte)
+                            .unwrap_or(Decimal::ZERO);
+                    item.amount_cc = (fee_usd / cc_usd_rate).round_dp(10);
+                }
+                // else: step fee — amount_cc already set from amount_cc_fixed
                 traffic_count += 1;
             }
         }
@@ -1321,6 +1390,8 @@ async fn execute_batch_pay(
                         step_name: "batch-pay".to_string(),
                         proposal_id: format!("batch-{}", resp.update_id),
                         retry_count: 0,
+                        receiver_party: None,
+                        amount_cc_fixed: None,
                     };
                     pending_traffic_fees.lock().await.push(batch_traffic.clone());
                     let (tx, _) = oneshot::channel();
@@ -1331,6 +1402,8 @@ async fn execute_batch_pay(
                             traffic_bytes: traffic.total_bytes,
                             step_name: batch_traffic.step_name,
                             proposal_id: batch_traffic.proposal_id,
+                            receiver_party: None,
+                            amount_cc_fixed: None,
                         },
                         response_tx: tx,
                     });
@@ -1379,12 +1452,13 @@ async fn requeue_batch_items(
                     response_tx: tx,
                 });
             }
-            BatchItemSource::Traffic { traffic_bytes, step_name, proposal_id } => {
+            BatchItemSource::Traffic { traffic_bytes, step_name, proposal_id, receiver_party, amount_cc_fixed } => {
                 let _ = queue_tx.send(QueuedPayment {
                     priority: PaymentPriority::Low,
                     sequence: u64::MAX / 2,
                     request: PaymentRequest::TransferTrafficFee {
                         traffic_bytes, step_name, proposal_id,
+                        receiver_party, amount_cc_fixed,
                     },
                     response_tx: tx,
                 });
@@ -1429,9 +1503,13 @@ fn estimate_cc_needed(request: &PaymentRequest) -> Decimal {
         // Traffic fees scale with traffic_bytes (actual ~0.38 CC/KB at current rate).
         // Use 0.001 CC/byte (≈2.6× conservative) to ensure enough amulets are selected.
         // The exact fee is recomputed from the live rate in execute_transfer_traffic_fee.
-        PaymentRequest::TransferTrafficFee { traffic_bytes, .. } => {
-            let est = Decimal::from(*traffic_bytes) * Decimal::new(1, 3); // 0.001 CC/byte
-            (est + margin).max(margin + Decimal::from(2)) // at least 3 CC
+        PaymentRequest::TransferTrafficFee { traffic_bytes, amount_cc_fixed, .. } => {
+            if let Some(fixed) = amount_cc_fixed {
+                Decimal::from_str(fixed).unwrap_or(Decimal::ONE) + margin
+            } else {
+                let est = Decimal::from(*traffic_bytes) * Decimal::new(1, 3); // 0.001 CC/byte
+                (est + margin).max(margin + Decimal::from(2)) // at least 3 CC
+            }
         }
     }
 }
@@ -1548,7 +1626,7 @@ fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimated_cc: Deci
 }
 
 /// Process amulet cache updates after a successful transaction
-async fn process_tx_result(
+pub(crate) async fn process_tx_result(
     cache: &Arc<AmuletCache>,
     input_cids: &[String],
     result: &orderbook_proto::ledger::ExecuteTransactionResponse,
@@ -1586,7 +1664,7 @@ async fn process_tx_result(
 }
 
 /// Handle INACTIVE_CONTRACTS error — mark amulets as consumed and release
-async fn handle_inactive_contracts(cache: &Arc<AmuletCache>, input_cids: &[String]) {
+pub(crate) async fn handle_inactive_contracts(cache: &Arc<AmuletCache>, input_cids: &[String]) {
     if !input_cids.is_empty() {
         cache.mark_consumed(input_cids, "inactive").await;
     }
