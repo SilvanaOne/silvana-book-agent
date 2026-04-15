@@ -129,9 +129,10 @@ pub struct BaseConfig {
     pub merge_poll_interval_sec: u64,
     pub settlement_thread_count: usize,
 
+    pub dso_party: String,
+
     // From configuration.toml
     pub onboarded_registries: Vec<String>,
-    pub cc_dso_party: Option<String>,
     pub cc_token_id: Option<String>,
     /// Instrument ID → registry party mapping (from [[instrument]] + [[canton_coin]])
     pub instrument_registries: HashMap<String, String>,
@@ -189,10 +190,13 @@ impl BaseConfig {
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
 
         // 2. Read configuration.toml (optional, graceful fallback)
-        let (onboarded_registries, cc_dso_party, cc_token_id, instrument_registries) =
+        let (onboarded_registries, cc_token_id, instrument_registries) =
             load_shared_configuration("configuration.toml");
 
         // 3. Read env vars
+        let dso_party = std::env::var("DSO")
+            .map_err(|_| anyhow!("DSO env var is required"))?;
+
         let party_id = std::env::var("PARTY_AGENT")
             .map_err(|_| anyhow!("PARTY_AGENT env var is required"))?;
 
@@ -315,8 +319,8 @@ impl BaseConfig {
             merge_max_amulets,
             merge_poll_interval_sec,
             settlement_thread_count,
+            dso_party,
             onboarded_registries,
-            cc_dso_party,
             cc_token_id,
             instrument_registries,
             auto_settle: agent.auto_settle,
@@ -435,16 +439,16 @@ pub fn load_ledger_interfaces(path: &str) -> Result<Option<LedgerInterfacesConfi
 
 /// Load shared configuration.toml (registries + canton_coin + instruments)
 ///
-/// Returns (onboarded_registries, cc_dso_party, cc_token_id, instrument_registries).
+/// Returns (onboarded_registries, cc_token_id, instrument_registries).
 /// Used by both agents and the ledger service.
 pub fn load_shared_configuration(
     path: &str,
-) -> (Vec<String>, Option<String>, Option<String>, HashMap<String, String>) {
+) -> (Vec<String>, Option<String>, HashMap<String, String>) {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
             tracing::warn!("{} not found, continuing without registry filtering", path);
-            return (Vec::new(), None, None, HashMap::new());
+            return (Vec::new(), None, HashMap::new());
         }
     };
 
@@ -456,13 +460,10 @@ pub fn load_shared_configuration(
                 path
             );
             let registries = config.registry.into_iter().map(|r| r.party).collect();
-            let (cc_dso, cc_id) = config.canton_coin.into_iter().next().map_or(
-                (None, None),
-                |cc| {
-                    tracing::info!("Canton Coin: {} ({})", cc.token_id, cc.dso_party);
-                    (Some(cc.dso_party), Some(cc.token_id))
-                },
-            );
+            let cc_id = config.canton_coin.into_iter().next().map(|cc| {
+                tracing::info!("Canton Coin: {} ({})", cc.token_id, cc.dso_party);
+                cc.token_id
+            });
 
             // Build instrument → registry map from [[instrument]] entries
             let mut instrument_registries: HashMap<String, String> = config
@@ -470,9 +471,11 @@ pub fn load_shared_configuration(
                 .into_iter()
                 .map(|i| (i.id, i.registry))
                 .collect();
-            // Add CC → cc_dso_party automatically
-            if let (Some(id), Some(dso)) = (&cc_id, &cc_dso) {
-                instrument_registries.insert(id.clone(), dso.clone());
+            // Add CC → DSO automatically (DSO comes from env var at load time)
+            if let Some(ref id) = cc_id {
+                if let Ok(dso) = std::env::var("DSO") {
+                    instrument_registries.insert(id.clone(), dso);
+                }
             }
             if !instrument_registries.is_empty() {
                 tracing::info!(
@@ -481,11 +484,11 @@ pub fn load_shared_configuration(
                 );
             }
 
-            (registries, cc_dso, cc_id, instrument_registries)
+            (registries, cc_id, instrument_registries)
         }
         Err(e) => {
             tracing::warn!("Failed to parse {}: {}", path, e);
-            (Vec::new(), None, None, HashMap::new())
+            (Vec::new(), None, HashMap::new())
         }
     }
 }

@@ -31,7 +31,7 @@ use orderbook_agent_logic::settlement::{PendingFee, PendingTrafficFee, StepResul
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AllocateParams, PayFeeParams,
     PrepareTransactionRequest, TransferCcParams, TransactionOperation,
-    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
+    ExecuteMultiCallParams, MultiCallOp, McBatchTransfer, McTransferTarget,
 };
 use orderbook_proto::{
     RecordSettlementEventRequest, SettlementEventType, SettlementEventResult, RecordedByRole,
@@ -1217,10 +1217,10 @@ async fn execute_batch_pay(
     }
 
     let mut total_amount: Decimal = target_map.values().sum();
-    let mut targets: Vec<McPaymentTarget> = target_map
+    let mut targets: Vec<McTransferTarget> = target_map
         .iter()
-        .map(|(party, amount)| McPaymentTarget {
-            receiver_party: party.clone(),
+        .map(|(party, amount)| McTransferTarget {
+            receiver: party.clone(),
             amount: amount.round_dp(10).to_string(),
             description: Some(format!(
                 "Batch payment: {} fees + {} traffic",
@@ -1287,8 +1287,8 @@ async fn execute_batch_pay(
         total_amount = target_map.values().sum();
         targets = target_map
             .iter()
-            .map(|(party, amount)| McPaymentTarget {
-                receiver_party: party.clone(),
+            .map(|(party, amount)| McTransferTarget {
+                receiver: party.clone(),
                 amount: amount.round_dp(10).to_string(),
                 description: Some(format!(
                     "Batch payment: {} fees + {} traffic",
@@ -1311,24 +1311,40 @@ async fn execute_batch_pay(
         return;
     }
 
-    // Build ExecuteMulticall request
+    // Build ExecuteMulticall request — one Op_BatchTransfer per unique receiver
+    let now = chrono::Utc::now();
+    let requested_at = (now - chrono::Duration::seconds(10)).format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let execute_before = (now + chrono::Duration::seconds(30)).format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let dso_party = config.dso_party.clone();
+    let operations: Vec<MultiCallOp> = targets.into_iter().map(|target| {
+        MultiCallOp {
+            op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchTransfer(
+                McBatchTransfer {
+                    transfer_factory_cid: String::new(), // Server fills from MultiCallContext
+                    expected_admin: dso_party.clone(),
+                    instrument_admin: dso_party.clone(),
+                    instrument_id: "Amulet".to_string(),
+                    requested_at: requested_at.clone(),
+                    execute_before: execute_before.clone(),
+                    extra_args_json: None,
+                    targets: vec![target],
+                },
+            )),
+        }
+    }).collect();
+    let op_count = operations.len();
     let request = PrepareTransactionRequest {
         operation: TransactionOperation::ExecuteMulticall as i32,
         params: Some(Params::ExecuteMulticall(ExecuteMultiCallParams {
-            operations: vec![MultiCallOp {
-                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchPay(
-                    McBatchPay { targets },
-                )),
-            }],
-            amulet_cids: selected_cids.clone(),
-            holding_cids: vec![],
+            operations,
+            holding_cids: selected_cids.clone(),
         })),
         request_signature: None,
     };
 
     let expectation = OperationExpectation::ExecuteMulticall {
         party: config.party_id.clone(),
-        op_count: 1,
+        op_count,
     };
 
     let mut client = match create_client_from_channel(channel, config) {

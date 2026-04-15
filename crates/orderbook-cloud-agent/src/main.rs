@@ -19,7 +19,7 @@ use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
     TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
-    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
+    ExecuteMultiCallParams, MultiCallOp, McBatchTransfer, McTransferTarget,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
     LockHoldingsParams, ProcessLockUnlockRequestsParams, ResizeLockParams, TerminateLockParams,
     VotingAllocation as ProtoVotingAllocation, VotingRequest as ProtoVotingRequest,
@@ -1714,10 +1714,10 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
             }
 
             // Build proto targets
-            let proto_targets: Vec<McPaymentTarget> = targets
+            let proto_targets: Vec<McTransferTarget> = targets
                 .iter()
-                .map(|(receiver, amount)| McPaymentTarget {
-                    receiver_party: receiver.clone(),
+                .map(|(receiver, amount)| McTransferTarget {
+                    receiver: receiver.clone(),
                     amount: amount.clone(),
                     description: description.clone(),
                 })
@@ -1735,14 +1735,20 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                         operation: TransactionOperation::ExecuteMulticall as i32,
                         params: Some(Params::ExecuteMulticall(ExecuteMultiCallParams {
                             operations: vec![MultiCallOp {
-                                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchPay(
-                                    McBatchPay {
+                                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchTransfer(
+                                    McBatchTransfer {
+                                        transfer_factory_cid: String::new(),
+                                        expected_admin: String::new(),
+                                        instrument_admin: String::new(),
+                                        instrument_id: "Amulet".to_string(),
+                                        requested_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+                                        execute_before: (chrono::Utc::now() + chrono::Duration::seconds(30)).format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+                                        extra_args_json: None,
                                         targets: proto_targets,
                                     },
                                 )),
                             }],
-                            amulet_cids: selected_amulet_cids,
-                            holding_cids: vec![],
+                            holding_cids: selected_amulet_cids,
                         })),
                         request_signature: None,
                     },
