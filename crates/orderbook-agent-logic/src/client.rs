@@ -9,7 +9,7 @@ use orderbook_proto::{
     pricing::{pricing_service_client::PricingServiceClient, GetPriceRequest, GetPriceResponse},
     orderbook::{
         orderbook_service_client::OrderbookServiceClient, CancelOrderRequest, CancelOrderResponse,
-        GetMarketsRequest, GetOrdersRequest, Market, Order, OrderStatus, OrderType,
+        GetInstrumentsRequest, GetMarketsRequest, GetOrdersRequest, Instrument, Market, Order, OrderStatus, OrderType,
         SubmitOrderRequest, SubmitOrderResponse, TimeInForce,
         SubscribeSettlementsRequest, SettlementUpdate,
         GetSettlementProposalsRequest, SettlementProposal, SettlementStatus,
@@ -174,6 +174,27 @@ impl OrderbookClient {
             .map_err(|e| anyhow::anyhow!("get_markets failed: {}", e.message()))?;
 
         Ok(response.into_inner().markets)
+    }
+
+    /// Get all instruments (includes registry for DVP term verification).
+    ///
+    /// Canton Coin is identified on the client by `instrument_type == "token"`;
+    /// its `instrument_id` drives the CC → Amulet translation in
+    /// `BaseConfig::resolve_instrument`, its `registry` is the DSO party.
+    pub async fn get_instruments(&mut self) -> Result<Vec<Instrument>> {
+        let request = Request::new(GetInstrumentsRequest {
+            instrument_type: None,
+            limit: None,
+            offset: None,
+        });
+
+        let response = self
+            .orderbook_client
+            .get_instruments(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?;
+
+        Ok(response.into_inner().instruments)
     }
 
     /// Submit a new order with pre-computed signature fields

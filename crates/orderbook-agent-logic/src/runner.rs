@@ -67,6 +67,11 @@ pub struct AgentOptions {
     pub shutdown_notify: Option<Arc<Notify>>,
     /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
     pub accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
+    /// Buyer: proposal_ids that the settlement executor has rejected.
+    /// Populated by the background agent, drained by the fill loop to undo
+    /// the optimistic `filled_total` / `remaining` bookkeeping when a
+    /// previously-accepted quote fails to settle.
+    pub rejected_rfq_trades: Option<Arc<Mutex<HashSet<String>>>>,
     /// LP: trades we quoted on (for settlement verification by attribute matching)
     pub quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
     /// Signal to LP settlement stream to stop accepting new RFQs on shutdown
@@ -235,6 +240,9 @@ where
             }
         }
         settlement_executor.set_accepted_rfq_trades(accepted.clone());
+    }
+    if let Some(ref rejected) = options.rejected_rfq_trades {
+        settlement_executor.set_rejected_rfq_trades(rejected.clone());
     }
     if let Some(ref quoted) = options.quoted_rfq_trades {
         // Restore saved quoted trades into the shared vec
@@ -523,13 +531,15 @@ where
                     }
                 }
 
-                _ = order_update_timer.tick(), if has_markets && !shutdown_flag.load(Ordering::Relaxed) => {
+                _ = order_update_timer.tick(), if !shutdown_flag.load(Ordering::Relaxed) => {
+                    // Always refresh balances — LiquidityManager needs non-CC balances
+                    // for settlement allocation gating even when the agent isn't
+                    // placing orders (buyer/seller / settlement_only mode).
                     match tokio::time::timeout(
                         Duration::from_secs(10),
                         balance_provider.fetch_balances(),
                     ).await {
                         Ok(Ok(balances)) => {
-                            // Update non-CC token balances in liquidity manager
                             if let Some(lm) = settlement_executor.liquidity_manager() {
                                 for b in &balances {
                                     if !b.is_canton_coin {
@@ -544,8 +554,13 @@ where
                         Ok(Err(e)) => warn!("Failed to fetch balances: {:#}", e),
                         Err(_) => warn!("Balance fetch timed out"),
                     }
-                    if let Err(e) = order_manager.update_cycle().await {
-                        warn!("Order update cycle failed: {:#}", e);
+
+                    // Order grid only runs when the agent has markets configured
+                    // and isn't in settlement-only mode.
+                    if has_markets {
+                        if let Err(e) = order_manager.update_cycle().await {
+                            warn!("Order update cycle failed: {:#}", e);
+                        }
                     }
                 }
 

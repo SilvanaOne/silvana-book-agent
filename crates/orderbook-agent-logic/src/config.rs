@@ -9,8 +9,9 @@
 //! The local agent wraps this with a `Config` that adds ledger API URLs.
 
 use anyhow::{anyhow, Context, Result};
+use orderbook_proto::orderbook::Instrument;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -181,19 +182,45 @@ pub struct BaseConfig {
 }
 
 impl BaseConfig {
-    /// Load configuration from .env + configuration.toml + agent.toml
+    /// Strict loader — fails if `agent.toml` is missing or unparseable.
+    /// Use from commands that actually consume market/LP settings (i.e. `agent`).
     pub fn load<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
-        // 1. Read agent.toml
         let agent_toml_str = fs::read_to_string(agent_toml_path.as_ref())
             .with_context(|| format!("Failed to read {}", agent_toml_path.as_ref().display()))?;
         let agent: AgentToml = toml::from_str(&agent_toml_str)
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
+        Self::assemble(agent)
+    }
 
-        // 2. Read configuration.toml (optional, graceful fallback)
-        let (onboarded_registries, cc_token_id, instrument_registries) =
-            load_shared_configuration("configuration.toml");
+    /// Lenient loader — if `agent.toml` is missing, use serde defaults
+    /// (empty markets, no LP, default timeouts). Still fails if the file
+    /// exists but is malformed, and still requires the mandatory env vars.
+    /// Use from commands that don't need market/LP config (faucet, transfer, etc.).
+    pub fn load_or_defaults<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
+        let agent: AgentToml = if agent_toml_path.as_ref().exists() {
+            let s = fs::read_to_string(agent_toml_path.as_ref())
+                .with_context(|| format!("Failed to read {}", agent_toml_path.as_ref().display()))?;
+            toml::from_str(&s)
+                .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?
+        } else {
+            // Empty string round-trips to AgentToml with all serde defaults.
+            toml::from_str("").expect("AgentToml serde defaults must parse")
+        };
+        Self::assemble(agent)
+    }
 
-        // 3. Read env vars
+    /// Assemble the full BaseConfig from an already-parsed AgentToml +
+    /// env vars. Instrument/registry info is populated later by
+    /// [`BaseConfig::populate_instruments_from_rpc`]. Shared between
+    /// strict/lenient loaders.
+    fn assemble(agent: AgentToml) -> Result<Self> {
+        // Instrument registry placeholders — filled by populate_instruments_from_rpc
+        // after the cloud-agent fetches them over gRPC at startup.
+        let onboarded_registries: Vec<String> = Vec::new();
+        let cc_token_id: Option<String> = None;
+        let instrument_registries: HashMap<String, String> = HashMap::new();
+
+        // Read env vars
         let dso_party = std::env::var("DSO")
             .map_err(|_| anyhow!("DSO env var is required"))?;
 
@@ -350,11 +377,46 @@ impl BaseConfig {
         self.markets.iter().filter(|m| m.enabled).collect()
     }
 
+    /// Populate `cc_token_id`, `onboarded_registries` and `instrument_registries`
+    /// from instruments fetched over the orderbook-rpc `GetInstruments` endpoint.
+    /// Call this once at startup before running settlement / fill / transfer logic
+    /// that uses [`BaseConfig::resolve_instrument`].
+    ///
+    /// The Canton Coin instrument is identified by `instrument_type == "token"`;
+    /// its `instrument_id` drives the CC → Amulet translation and its `registry`
+    /// is the DSO party. Every other instrument simply maps id → registry.
+    pub fn populate_instruments_from_rpc(&mut self, instruments: Vec<Instrument>) {
+        let mut instrument_registries: HashMap<String, String> = HashMap::new();
+        let mut cc_token_id: Option<String> = None;
+        let mut onboarded_registries: HashSet<String> = HashSet::new();
+
+        for inst in instruments {
+            let registry = inst.registry.clone().unwrap_or_default();
+            if !registry.is_empty() {
+                instrument_registries.insert(inst.instrument_id.clone(), registry.clone());
+                onboarded_registries.insert(registry);
+            }
+            if inst.instrument_type == "token" && cc_token_id.is_none() {
+                cc_token_id = Some(inst.instrument_id.clone());
+            }
+        }
+
+        self.cc_token_id = cc_token_id;
+        self.instrument_registries = instrument_registries;
+        self.onboarded_registries = onboarded_registries.into_iter().collect();
+        tracing::info!(
+            "Instrument registry populated from RPC: {} instruments, {} registries, cc_token_id={:?}",
+            self.instrument_registries.len(),
+            self.onboarded_registries.len(),
+            self.cc_token_id,
+        );
+    }
+
     /// Resolve an orderbook instrument ID to (on_chain_id, registry_party).
     ///
     /// CC maps to on-chain "Amulet"; other instruments use their ID as-is.
-    /// Registry comes from `[[instrument]]` config entries (+ CC from `[[canton_coin]]`).
-    /// Returns empty strings if instrument not found in config (verification skipped).
+    /// Registry comes from instruments fetched via `populate_instruments_from_rpc`.
+    /// Returns empty strings if instrument not found (verification skipped).
     pub fn resolve_instrument(&self, instrument_id: &str) -> (String, String) {
         let on_chain_id = if Some(instrument_id) == self.cc_token_id.as_deref() {
             "Amulet".to_string()

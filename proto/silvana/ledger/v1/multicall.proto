@@ -32,13 +32,14 @@ message MultiCallOp {
     McAcceptDvpAndAllocate accept_dvp_and_allocate = 8;
     McCreateTransferPreapproval create_transfer_preapproval = 9;
     McCreateUserServiceRequest create_user_service_request = 10;
+    McBatchPay batch_pay = 11;  // CC batch payment via multicall-v0 (AppRewards path)
   }
 }
 
 // ── CIP-56 transfer operations ────────────────────────────────────────
 
 // Batch transfer to multiple recipients via chained TransferFactory_Transfer calls.
-// Replaces Op_BatchPay (which used splice-amulet TransferPreapproval_Send).
+// Uses multicall-v1 with CIP-56 TransferFactory_Transfer.
 message McBatchTransfer {
   string transfer_factory_cid = 1;
   string expected_admin = 2;
@@ -132,4 +133,20 @@ message McInstrumentAllowance {
 // Create a UserService request (Daml: Op_CreateUserServiceRequest)
 message McCreateUserServiceRequest {
   string operator = 1;
+}
+
+// ── Batch payment via multicall-v0 (AppRewards path) ─────────────────
+
+// Batch CC payment via multicall-v0 Op_BatchPay (TransferPreapproval_Send).
+// Uses splice-amulet 0.1.16 which creates AppRewardCoupon directly.
+// Server resolves preapprovalCid, amuletRulesCid, openMiningRoundCid,
+// featuredAppRightCid from Scan API / MultiCallContext.
+message McBatchPay {
+  repeated McPaymentTarget targets = 1;
+}
+
+message McPaymentTarget {
+  string receiver = 1;
+  string amount = 2;
+  optional string description = 3;
 }

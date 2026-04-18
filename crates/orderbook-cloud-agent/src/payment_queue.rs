@@ -13,7 +13,7 @@
 //! marked and the payment is re-queued for retry with fresh amulet selection.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use orderbook_agent_logic::settlement::{PendingFee, PendingTrafficFee, StepResul
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AllocateParams, PayFeeParams,
     PrepareTransactionRequest, TransferCcParams, TransactionOperation,
-    ExecuteMultiCallParams, MultiCallOp, McBatchTransfer, McTransferTarget,
+    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
 };
 use orderbook_proto::{
     RecordSettlementEventRequest, SettlementEventType, SettlementEventResult, RecordedByRole,
@@ -1140,7 +1140,42 @@ impl PaymentQueue {
 // Batch pay worker
 // ============================================================================
 
-/// Execute a batch payment: aggregate by receiver, submit via ExecuteMulticall BatchPay.
+/// Build one McPaymentTarget per BatchItem (no aggregation by receiver).
+/// Each item becomes its own TransferPreapproval_Send call in the Daml
+/// Execute_BatchPay choice, preserving per-proposal accounting and generating
+/// one AppRewardCoupon per featured transfer.
+fn build_payment_targets(items: &[BatchItem]) -> Vec<McPaymentTarget> {
+    items.iter().map(|item| {
+        let description = match &item.source {
+            BatchItemSource::Fee(fee) => match fee.fee_type.as_str() {
+                "dvp" => "DVP processing fee".to_string(),
+                "allocate" => "Allocation processing fee".to_string(),
+                other => format!("{} fee", other),
+            },
+            BatchItemSource::Traffic { step_name, traffic_bytes, .. } => {
+                if *traffic_bytes > 0 {
+                    // Actual traffic fee — match swap-test format with zero-padded bytes (6 digits)
+                    format!("Traffic fee for {:06} bytes", traffic_bytes)
+                } else if step_name.starts_with("agent-fee") {
+                    "Agent fee".to_string()
+                } else if step_name.starts_with("participant-fee") {
+                    "Participant fee".to_string()
+                } else if step_name.starts_with("signature-fee") {
+                    "Signature fee".to_string()
+                } else {
+                    step_name.clone()
+                }
+            }
+        };
+        McPaymentTarget {
+            receiver: item.receiver_party.clone(),
+            amount: item.amount_cc.round_dp(10).to_string(),
+            description: Some(description),
+        }
+    }).collect()
+}
+
+/// Execute a batch payment: one target per item (no aggregation), submit via ExecuteMulticall BatchPay.
 /// On success: records events, cleans pending lists, queues batch's own traffic fee.
 /// On failure: re-queues all items back through queue_tx for retry.
 async fn execute_batch_pay(
@@ -1210,27 +1245,12 @@ async fn execute_batch_pay(
         return;
     }
 
-    // Aggregate targets by receiver_party
-    let mut target_map: HashMap<String, Decimal> = HashMap::new();
-    for item in &items {
-        *target_map.entry(item.receiver_party.clone()).or_insert(Decimal::ZERO) += item.amount_cc;
-    }
-
-    let mut total_amount: Decimal = target_map.values().sum();
-    let mut targets: Vec<McTransferTarget> = target_map
-        .iter()
-        .map(|(party, amount)| McTransferTarget {
-            receiver: party.clone(),
-            amount: amount.round_dp(10).to_string(),
-            description: Some(format!(
-                "Batch payment: {} fees + {} traffic",
-                fee_count, traffic_count
-            )),
-        })
-        .collect();
+    // Build one target per item (no aggregation — preserves per-proposal accounting)
+    let mut total_amount: Decimal = items.iter().map(|i| i.amount_cc).sum();
+    let mut targets: Vec<McPaymentTarget> = build_payment_targets(&items);
 
     info!(
-        "Batch pay: {} items ({} fee, {} traffic) to {} targets, total {:.4} CC",
+        "Batch pay: {} items ({} fee, {} traffic), {} targets, total {:.4} CC",
         items.len(), fee_count, traffic_count, targets.len(), total_amount
     );
 
@@ -1280,24 +1300,10 @@ async fn execute_batch_pay(
                 BatchItemSource::Traffic { .. } => traffic_count += 1,
             }
         }
-        target_map.clear();
-        for item in &items {
-            *target_map.entry(item.receiver_party.clone()).or_insert(Decimal::ZERO) += item.amount_cc;
-        }
-        total_amount = target_map.values().sum();
-        targets = target_map
-            .iter()
-            .map(|(party, amount)| McTransferTarget {
-                receiver: party.clone(),
-                amount: amount.round_dp(10).to_string(),
-                description: Some(format!(
-                    "Batch payment: {} fees + {} traffic",
-                    fee_count, traffic_count
-                )),
-            })
-            .collect();
+        total_amount = items.iter().map(|i| i.amount_cc).sum();
+        targets = build_payment_targets(&items);
         info!(
-            "Batch pay (trimmed): {} items ({} fee, {} traffic) to {} targets, total {:.4} CC",
+            "Batch pay (trimmed): {} items ({} fee, {} traffic), {} targets, total {:.4} CC",
             items.len(), fee_count, traffic_count, targets.len(), total_amount
         );
     }
@@ -1311,27 +1317,15 @@ async fn execute_batch_pay(
         return;
     }
 
-    // Build ExecuteMulticall request — one Op_BatchTransfer per unique receiver
-    let now = chrono::Utc::now();
-    let requested_at = (now - chrono::Duration::seconds(10)).format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-    let execute_before = (now + chrono::Duration::seconds(30)).format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-    let dso_party = config.dso_party.clone();
-    let operations: Vec<MultiCallOp> = targets.into_iter().map(|target| {
-        MultiCallOp {
-            op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchTransfer(
-                McBatchTransfer {
-                    transfer_factory_cid: String::new(), // Server fills from MultiCallContext
-                    expected_admin: dso_party.clone(),
-                    instrument_admin: dso_party.clone(),
-                    instrument_id: "Amulet".to_string(),
-                    requested_at: requested_at.clone(),
-                    execute_before: execute_before.clone(),
-                    extra_args_json: None,
-                    targets: vec![target],
-                },
-            )),
-        }
-    }).collect();
+    // Build ExecuteMulticall request — single McBatchPay via multicall-v0 for AppRewards
+    let all_targets: Vec<McPaymentTarget> = targets.into_iter().collect();
+    let operations = vec![MultiCallOp {
+        op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchPay(
+            McBatchPay {
+                targets: all_targets,
+            },
+        )),
+    }];
     let op_count = operations.len();
     let request = PrepareTransactionRequest {
         operation: TransactionOperation::ExecuteMulticall as i32,
@@ -1601,7 +1595,7 @@ fn select_amulets_for_fee(selectable: &[CachedAmulet], estimated_cc: Decimal) ->
 /// Prefers ONE amulet that covers the full amount (smallest-fit single).
 /// Falls back to multiple amulets if no single one suffices.
 /// Returns empty vec if insufficient amulets (scheduler will defer and retry).
-fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimated_cc: Decimal) -> Vec<CachedAmulet> {
+pub(crate) fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimated_cc: Decimal) -> Vec<CachedAmulet> {
     if estimated_cc <= Decimal::ZERO {
         return vec![];
     }
@@ -1980,7 +1974,7 @@ async fn execute_transfer_traffic_fee(
     }
 
     let command_id = format!("traffic-fee-{}-{}", step_name, proposal_id);
-    let memo = format!("Traffic fee for {} bytes", traffic_bytes);
+    let memo = format!("Traffic fee for {:06} bytes", traffic_bytes);
 
     info!(
         "[{}] Traffic fee: {:.4} CC ({:.4} USD) for {} bytes",

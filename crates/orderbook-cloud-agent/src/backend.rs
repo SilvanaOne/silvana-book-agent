@@ -98,6 +98,11 @@ impl CloudSettlementBackend {
         )
         .await
     }
+
+    /// Public accessor for the amulet cache (used by multicall settlement path).
+    pub fn amulet_cache(&self) -> &Arc<AmuletCache> {
+        &self.amulet_cache
+    }
 }
 
 #[async_trait]

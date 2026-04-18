@@ -244,6 +244,9 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     actionable_count: Arc<AtomicUsize>,
     /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
     accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
+    /// Buyer: proposal_ids we've rejected — fill loop drains this to undo
+    /// optimistic `filled_total` bookkeeping when a quote fails to settle.
+    rejected_rfq_trades: Option<Arc<Mutex<HashSet<String>>>>,
     /// LP: trades we quoted on (for settlement verification by attribute matching)
     quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
     /// Skip all verification and accept every proposal (migration from old worker without saved state)
@@ -274,6 +277,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             action_log: Arc::new(Mutex::new(Vec::new())),
             actionable_count: Arc::new(AtomicUsize::new(0)),
             accepted_rfq_trades: None,
+            rejected_rfq_trades: None,
             quoted_rfq_trades: None,
             no_reject: false,
             liquidity_manager: None,
@@ -293,6 +297,13 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Set buyer RFQ trade tracking (for proposal verification)
     pub fn set_accepted_rfq_trades(&mut self, trades: Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>) {
         self.accepted_rfq_trades = Some(trades);
+    }
+
+    /// Set buyer RFQ rejection feedback channel. Proposal ids are pushed here
+    /// whenever the executor rejects a previously-accepted proposal so that
+    /// the fill loop can undo its optimistic bookkeeping.
+    pub fn set_rejected_rfq_trades(&mut self, trades: Arc<Mutex<HashSet<String>>>) {
+        self.rejected_rfq_trades = Some(trades);
     }
 
     /// Set LP quoted trade tracking (for proposal verification)
@@ -697,6 +708,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     warn!("[{}] Failed to reject: {}", proposal_id, e);
                     self.active_settlements.shift_remove(&proposal_id);
                 }
+                if let Some(ref rejected) = self.rejected_rfq_trades {
+                    rejected.lock().await.insert(proposal_id.clone());
+                }
                 return Ok(());
             }
 
@@ -718,6 +732,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
                     warn!("[{}] Failed to reject: {}", proposal_id, e);
                     self.active_settlements.shift_remove(&proposal_id);
+                }
+                if let Some(ref rejected) = self.rejected_rfq_trades {
+                    rejected.lock().await.insert(proposal_id.clone());
                 }
                 return Ok(());
             }

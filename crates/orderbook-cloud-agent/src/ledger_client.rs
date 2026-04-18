@@ -143,7 +143,7 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
             &p.receiver_party, &p.amount, p.description.as_deref(),
             &p.command_id, p.settlement_proposal_id.as_deref(),
         ),
-        Params::RequestPreapproval(_) => canonical_params_request_preapproval(),
+        Params::RequestPreapproval(p) => canonical_params_request_preapproval(&p.instrument_admin),
         Params::RequestRecurringPrepaid(p) => canonical_params_request_recurring_prepaid(
             &p.app_party, &p.amount, &p.locked_amount, p.lock_days,
             p.description.as_deref(), p.reference.as_deref(),

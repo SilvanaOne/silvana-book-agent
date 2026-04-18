@@ -8,10 +8,14 @@ use std::path::Path;
 
 use orderbook_agent_logic::config::BaseConfig;
 
-/// Load cloud agent configuration from .env + configuration.toml + agent.toml
-///
-/// Identical to `BaseConfig::load()` — the cloud agent does not require
-/// `CANTON_LEDGER_API_URL`, `CANTON_SCAN_API_URL`, or `CANTON_LEDGER_GRPC_API_URL`.
+/// Strict loader — `agent.toml` must exist. Use for commands that read
+/// market/LP config (`agent`).
 pub fn load<P: AsRef<Path>>(agent_toml_path: P) -> Result<BaseConfig> {
     BaseConfig::load(agent_toml_path)
+}
+
+/// Lenient loader — missing `agent.toml` is OK (serde defaults fill in).
+/// Use for commands that only touch env-sourced fields (faucet, transfer, etc.).
+pub fn load_or_defaults<P: AsRef<Path>>(agent_toml_path: P) -> Result<BaseConfig> {
+    BaseConfig::load_or_defaults(agent_toml_path)
 }

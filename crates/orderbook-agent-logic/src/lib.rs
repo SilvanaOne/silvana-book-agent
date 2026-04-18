@@ -13,6 +13,7 @@ pub mod auth;
 pub mod client;
 pub mod confirm;
 pub mod config;
+pub mod fees;
 pub mod forecast;
 pub mod liquidity;
 pub mod logging;

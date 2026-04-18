@@ -29,18 +29,8 @@ enum OnboardingStatus {
 message GetAgentConfigRequest {}
 
 message GetAgentConfigResponse {
-  string synchronizer_id = 1;
-  string settlement_operator = 2;
-  string traffic_fee_party = 3;
-  string traffic_fee_price_usd_mb = 4;
-  string fee_party = 5;
-  string node_name = 6;
-  string ledger_service_public_key = 7;       // Base58 public key for response verification
-  string subscription_app_party = 8;           // App party for pay-as-you-go subscription
-  string subscription_amount = 9;              // Default subscription amount
-  string join_traffic_transactions = 10;       // "true" or "false"
-  string agent_fee_reserve_cc = 11;            // Default fee reserve in CC
-  string recurring_payment_package_name = 12;  // Package name for RecurringPayment templates
+  string env = 1;          // Full .env.agent content (raw text, all KEY=VALUE pairs)
+  string agent_toml = 2;   // Full agent.toml content (raw text, if available)
 }
 
 // --- RegisterAgent (signed — proves key ownership before insert) ---

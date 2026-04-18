@@ -171,8 +171,8 @@ pub fn canonical_params_transfer_cc(
     s
 }
 
-pub fn canonical_params_request_preapproval() -> String {
-    "param_type=RequestPreapproval\n".to_string()
+pub fn canonical_params_request_preapproval(instrument_admin: &str) -> String {
+    format!("param_type=RequestPreapproval\ninstrument_admin={}\n", instrument_admin)
 }
 
 pub fn canonical_params_request_recurring_prepaid(
@@ -504,7 +504,7 @@ mod tests {
         assert!(!canonical_params_propose_dvp("p1").is_empty());
         assert!(!canonical_params_accept_dvp("p1", "cid").is_empty());
         assert!(!canonical_params_allocate("p1", "cid").is_empty());
-        assert!(!canonical_params_request_preapproval().is_empty());
+        assert!(!canonical_params_request_preapproval("DSO::1220abc").is_empty());
         assert!(!canonical_params_request_recurring_prepaid("app", "10", "5", 30, None, None).is_empty());
         assert!(!canonical_params_request_recurring_payasyougo("app", "10", None, None).is_empty());
         assert!(!canonical_params_request_user_service(None, None).is_empty());

@@ -19,7 +19,7 @@ use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
     TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
-    ExecuteMultiCallParams, MultiCallOp, McBatchTransfer, McTransferTarget,
+    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
     LockHoldingsParams, ProcessLockUnlockRequestsParams, ResizeLockParams, TerminateLockParams,
     VotingAllocation as ProtoVotingAllocation, VotingRequest as ProtoVotingRequest,
@@ -32,6 +32,7 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
+mod accept_settle;
 mod amulet_cache;
 mod acs_worker;
 mod backend;
@@ -42,6 +43,7 @@ mod merge_worker;
 mod payment_queue;
 mod rfq_handler;
 
+use accept_settle::MulticallSettler;
 use backend::CloudSettlementBackend;
 use ledger_client::DAppProviderClient;
 
@@ -51,7 +53,7 @@ use ledger_client::DAppProviderClient;
 
 #[derive(Parser)]
 #[command(name = "cloud-agent")]
-#[command(about = "Orderbook cloud agent — runs without direct ledger access")]
+#[command(about = "Orderbook cloud agent\n\nGet started:\n  ./cloud-agent onboard --agent-name your-agent-name --email your-email")]
 struct Cli {
     /// Path to agent configuration file
     #[arg(short, long, default_value = "agent.toml")]
@@ -135,7 +137,7 @@ enum Commands {
         command: LockCommands,
     },
     /// Buy a specified amount via RFQ, repeating until filled
-    Buyer {
+    Buy {
         /// Market ID to buy on
         #[arg(long)]
         market: String,
@@ -156,7 +158,7 @@ enum Commands {
         interval: u64,
     },
     /// Sell a specified amount via RFQ, repeating until filled
-    Seller {
+    Sell {
         /// Market ID to sell on
         #[arg(long)]
         market: String,
@@ -179,29 +181,31 @@ enum Commands {
     /// Generate a new Ed25519 private key (no config needed)
     GeneratePrivateKey,
     /// Self-service onboarding: generate keys, register, sign topology, complete ledger setup
+    ///
+    /// Usage: ./cloud-agent onboard --agent-name your-agent-name --email your-email
     Onboard {
-        /// Orderbook gRPC URL to connect to
-        #[arg(long)]
+        /// Orderbook gRPC URL (optional, default: devnet)
+        #[arg(long, default_value = "https://orderbook-devnet.silvana.dev:443")]
         rpc: String,
-        /// Party ID (skip waiting list, go straight to ledger onboarding). Requires --private-key.
+        /// Agent display name (required)
+        #[arg(long)]
+        agent_name: String,
+        /// Contact email (required)
+        #[arg(long)]
+        email: String,
+        /// Party ID — optional, skip waiting list and go straight to ledger onboarding (requires --private-key)
         #[arg(long, requires = "private_key")]
         party: Option<String>,
-        /// Base58-encoded Ed25519 private key (required when --party is provided)
+        /// Base58-encoded Ed25519 private key — optional, required when --party is provided
         #[arg(long)]
         private_key: Option<String>,
-        /// Invite code for waiting list registration
+        /// Invite code — optional, for waiting list registration
         #[arg(long)]
         invite_code: Option<String>,
-        /// Agent display name
-        #[arg(long)]
-        agent_name: Option<String>,
-        /// Contact email
-        #[arg(long)]
-        email: Option<String>,
-        /// Path to .env file to create/update (default: .env)
+        /// Path to .env file — optional (default: .env)
         #[arg(long, default_value = ".env")]
         env_file: PathBuf,
-        /// Seconds between status polls (default: 10)
+        /// Seconds between status polls — optional (default: 10)
         #[arg(long, default_value = "10")]
         poll_interval: u64,
     },
@@ -228,8 +232,12 @@ enum InfoCommands {
 
 #[derive(Subcommand)]
 enum PreapprovalCommands {
-    /// Request a TransferPreapproval
-    Request,
+    /// Create a CIP-56 TransferPreapproval
+    Request {
+        /// Instrument admin party (DSO for CC, registrar for tokens)
+        #[arg(long)]
+        instrument_admin: String,
+    },
     /// Fetch existing preapprovals
     Fetch,
 }
@@ -495,12 +503,14 @@ enum LockCommands {
 enum FaucetCommands {
     /// Request tokens from faucet
     Get {
-        /// Token name ("Amulet" for CC, or CIP-56 token name like "USDC")
+        /// Token name. "Amulet" or "CC" → Canton Coin (admin defaults to DSO).
+        /// Anything else is treated as a CIP-56 token and requires --admin.
         #[arg(long)]
         token: String,
-        /// Token admin party (DSO for CC, registrar for CIP-56)
+        /// Token admin party. Optional for Amulet/CC (defaults to $DSO);
+        /// required for CIP-56 tokens.
         #[arg(long)]
-        admin: String,
+        admin: Option<String>,
         /// Faucet ticket (devnet: any string)
         #[arg(long, default_value = "devnet")]
         ticket: String,
@@ -516,6 +526,21 @@ enum FaucetCommands {
 // ============================================================================
 // Main
 // ============================================================================
+
+/// Fetch instrument registry (CC/Amulet + DSO, CIP-56 registries) from
+/// orderbook-rpc and populate `BaseConfig`. Replaces the old configuration.toml
+/// `[[canton_coin]]` / `[[instrument]]` sections for the client.
+async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
+    let mut client = orderbook_agent_logic::client::OrderbookClient::new(config)
+        .await
+        .context("Failed to create orderbook client for instrument registry fetch")?;
+    let instruments = client
+        .get_instruments()
+        .await
+        .context("Failed to fetch instruments from orderbook-rpc")?;
+    config.populate_instruments_from_rpc(instruments);
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -535,11 +560,36 @@ async fn main() -> Result<()> {
     }
 
     if let Commands::Onboard { rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval } = cli.command {
-        return run_onboard(rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval, cli.config).await;
+        return run_onboard(rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval).await;
     }
 
-    let base_config = config::load(&cli.config)
-        .with_context(|| format!("Failed to load config from {:?}", cli.config))?;
+    // `Agent` runs the full market-making loop and needs agent.toml to be present
+    // and populated. All other subcommands work with serde defaults if the file
+    // is missing (buy/sell/faucet/transfer/etc. only touch env-sourced fields).
+    let needs_agent_toml = matches!(cli.command, Commands::Agent { .. });
+
+    let mut base_config = if needs_agent_toml {
+        if !cli.config.exists() {
+            tracing::warn!(
+                "agent.toml not found at {}. This file is required for `cloud-agent agent`.",
+                cli.config.display()
+            );
+        }
+        config::load(&cli.config)
+            .with_context(|| format!("Failed to load config from {:?}", cli.config))?
+    } else {
+        config::load_or_defaults(&cli.config)
+            .with_context(|| format!("Failed to load config from {:?}", cli.config))?
+    };
+
+    // Populate instrument registry (CC → Amulet + DSO, USDC → registry, …) from
+    // orderbook-rpc. Required by any command that builds DVP/transfer expectations.
+    // Best-effort: failures are logged but don't block commands that don't need it
+    // (e.g. `sign`, `generate-private-key`).
+    if let Err(e) = populate_instruments(&mut base_config).await {
+        tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
+    }
+    let base_config = base_config;
 
     let verbose = cli.verbose;
     let dry_run = cli.dry_run;
@@ -560,10 +610,10 @@ async fn main() -> Result<()> {
         Commands::UserService { command } => run_user_service(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Faucet { command } => run_faucet(base_config, command, verbose).await,
         Commands::Lock { command } => run_lock(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Buyer { market, amount, price_limit, min_settlement, max_settlement, interval } => {
+        Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval } => {
             run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
         }
-        Commands::Seller { market, amount, price_limit, min_settlement, max_settlement, interval } => {
+        Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval } => {
             run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
         }
         Commands::GeneratePrivateKey => unreachable!(),
@@ -699,6 +749,7 @@ async fn run_cloud_agent(
             actionable_count: None,
             shutdown_notify: None,
             accepted_rfq_trades: None,
+            rejected_rfq_trades: None,
             quoted_rfq_trades,
             lp_shutdown: Some(lp_shutdown),
             state_file: Some(PathBuf::from("agent-state.json")),
@@ -726,8 +777,8 @@ async fn run_fill(
     confirm: bool,
 ) -> Result<()> {
     let dir_str = match direction {
-        fill_loop::FillDirection::Buy => "buyer",
-        fill_loop::FillDirection::Sell => "seller",
+        fill_loop::FillDirection::Buy => "buy",
+        fill_loop::FillDirection::Sell => "sell",
     };
     info!("Starting {} mode: market={}, amount={}, interval={}s", dir_str, market, amount, interval);
 
@@ -739,25 +790,22 @@ async fn run_fill(
         config.depletion_max_hours,
         config.depletion_min_hours,
     );
-    let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock, fill_lm);
+    // CloudSettlementBackend spawns the ACS worker which keeps amulet_cache fresh.
+    let backend = CloudSettlementBackend::new(
+        config.clone(), verbose, dry_run, force, confirm, confirm_lock.clone(), fill_lm,
+    );
 
-    let ledger_client = DAppProviderClient::new(
-        &config.orderbook_grpc_url,
-        &config.party_id,
-        &config.role,
-        &config.private_key_bytes,
-        config.token_ttl_secs,
-        Some(config.node_name.as_str()),
-        &config.ledger_service_public_key,
-        Some(config.connection_timeout_secs),
-        Some(config.request_timeout_secs),
-    )
-    .await
-    .context("Failed to create ledger client")?;
-
-    let balance_provider = CloudBalanceProvider {
-        client: TokioMutex::new(ledger_client),
-    };
+    // The fill loop doesn't use the settlement-machine / payment-queue paths.
+    // It settles each accepted quote atomically via MulticallSettler.
+    let settler = Arc::new(MulticallSettler {
+        config: config.clone(),
+        amulet_cache: backend.amulet_cache().clone(),
+        verbose,
+        dry_run,
+        force,
+        confirm,
+        confirm_lock,
+    });
 
     let params = fill_loop::FillParams {
         direction,
@@ -775,7 +823,9 @@ async fn run_fill(
         .filter(|s| s.party_id == config.party_id)
         .and_then(|s| s.fill_state);
 
-    fill_loop::run_fill_loop(config, backend, balance_provider, params, saved_fill_state, Some(state_file)).await
+    // Keep `backend` alive so its ACS worker keeps refreshing amulets until return.
+    let _backend_guard = backend;
+    fill_loop::run_fill_loop(config, settler, params, saved_fill_state, Some(state_file)).await
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
@@ -1029,7 +1079,7 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
 // Info commands
 // ============================================================================
 
-fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+pub(crate) fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
     let map = s
         .fields
         .iter()
@@ -1038,7 +1088,7 @@ fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
+pub(crate) fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
     match &v.kind {
         Some(prost_types::value::Kind::NullValue(_)) => serde_json::Value::Null,
         Some(prost_types::value::Kind::NumberValue(n)) => {
@@ -1273,13 +1323,13 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
     .await?;
 
     match command {
-        PreapprovalCommands::Request => {
+        PreapprovalCommands::Request { instrument_admin } => {
             if confirm && !dry_run {
                 let lock = orderbook_agent_logic::confirm::new_confirm_lock();
                 orderbook_agent_logic::confirm::confirm_transaction(
                     &lock,
-                    "Request Preapproval",
-                    &format!("party: {}", config.party_id),
+                    "Create CIP-56 Preapproval",
+                    &format!("party: {}, admin: {}", config.party_id, instrument_admin),
                 ).await?;
             }
             let expectation = OperationExpectation::RequestPreapproval {
@@ -1289,7 +1339,10 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
                 .submit_transaction(
                     PrepareTransactionRequest {
                         operation: TransactionOperation::RequestPreapproval as i32,
-                        params: Some(Params::RequestPreapproval(RequestPreapprovalParams {})),
+                        params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
+                            instrument_admin,
+                            instrument_allowances: vec![],
+                        })),
                         request_signature: None,
                     },
                     &expectation,
@@ -1298,7 +1351,7 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
                     force,
                 )
                 .await?;
-            println!("Preapproval requested, update id: {}", result.update_id);
+            println!("CIP-56 preapproval created, update id: {}", result.update_id);
         }
         PreapprovalCommands::Fetch => {
             let preapprovals = client.get_preapprovals().await?;
@@ -1306,9 +1359,17 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
                 println!("No preapprovals found");
             } else {
                 for p in &preapprovals {
+                    let allowances = if p.instrument_allowances.is_empty() {
+                        "all".to_string()
+                    } else {
+                        p.instrument_allowances.iter()
+                            .map(|a| a.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     println!(
-                        "{}: {} -> {} (source: {})",
-                        p.contract_id, p.provider, p.receiver, p.source
+                        "{}: operator={} receiver={} admin={} instruments=[{}]",
+                        p.contract_id, p.operator, p.receiver, p.instrument_admin, allowances
                     );
                 }
             }
@@ -1714,9 +1775,9 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
             }
 
             // Build proto targets
-            let proto_targets: Vec<McTransferTarget> = targets
+            let proto_targets: Vec<McPaymentTarget> = targets
                 .iter()
-                .map(|(receiver, amount)| McTransferTarget {
+                .map(|(receiver, amount)| McPaymentTarget {
                     receiver: receiver.clone(),
                     amount: amount.clone(),
                     description: description.clone(),
@@ -1735,15 +1796,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                         operation: TransactionOperation::ExecuteMulticall as i32,
                         params: Some(Params::ExecuteMulticall(ExecuteMultiCallParams {
                             operations: vec![MultiCallOp {
-                                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchTransfer(
-                                    McBatchTransfer {
-                                        transfer_factory_cid: String::new(),
-                                        expected_admin: String::new(),
-                                        instrument_admin: String::new(),
-                                        instrument_id: "Amulet".to_string(),
-                                        requested_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-                                        execute_before: (chrono::Utc::now() + chrono::Duration::seconds(30)).format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-                                        extra_args_json: None,
+                                op: Some(orderbook_proto::ledger::multi_call_op::Op::BatchPay(
+                                    McBatchPay {
                                         targets: proto_targets,
                                     },
                                 )),
@@ -1874,20 +1928,51 @@ fn write_server_config_to_env(
     rpc: &str,
     config_resp: &GetAgentConfigResponse,
 ) -> Result<()> {
-    upsert_env_value(env_file, "ORDERBOOK_GRPC_URL", rpc)?;
-    upsert_env_value(env_file, "SYNCHRONIZER_ID", &config_resp.synchronizer_id)?;
-    upsert_env_value(env_file, "PARTY_SETTLEMENT_OPERATOR", &config_resp.settlement_operator)?;
-    upsert_env_value(env_file, "PARTY_TRAFFIC_FEE", &config_resp.traffic_fee_party)?;
-    upsert_env_value(env_file, "TRAFFIC_FEE_PRICE_USD_MB", &config_resp.traffic_fee_price_usd_mb)?;
-    upsert_env_value(env_file, "PARTY_ORDERBOOK_FEE", &config_resp.fee_party)?;
-    upsert_env_value(env_file, "NODE_NAME", &config_resp.node_name)?;
-    upsert_env_value(env_file, "LEDGER_SERVICE_PUBLIC_KEY", &config_resp.ledger_service_public_key)?;
-    upsert_env_value(env_file, "JOIN_TRAFFIC_TRANSACTIONS", &config_resp.join_traffic_transactions)?;
-    upsert_env_value(env_file, "AGENT_FEE_RESERVE_CC", &config_resp.agent_fee_reserve_cc)?;
-    if !config_resp.recurring_payment_package_name.is_empty() {
-        upsert_env_value(env_file, "RECURRING_PAYMENT_PACKAGE_NAME", &config_resp.recurring_payment_package_name)?;
+    // Write all KEY=VALUE pairs from the server's .env.agent
+    for line in config_resp.env.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.trim().trim_matches('"');
+            // Don't overwrite agent-specific keys
+            if matches!(key, "PARTY_AGENT" | "PARTY_AGENT_PRIVATE_KEY" | "PARTY_AGENT_PUBLIC_KEY" | "ORDERBOOK_GRPC_URL") {
+                continue;
+            }
+            upsert_env_value(env_file, key, value)?;
+        }
     }
+    // Always set the RPC URL from the --rpc flag
+    upsert_env_value(env_file, "ORDERBOOK_GRPC_URL", rpc)?;
     Ok(())
+}
+
+/// Save agent.toml from server config if it doesn't already exist locally.
+/// Customizes `name = "LP agent"` → `name = "LP <agent_name>"` if agent_name is provided.
+fn maybe_write_agent_toml(
+    env_file: &std::path::Path,
+    config_resp: &GetAgentConfigResponse,
+    agent_name: Option<&str>,
+) {
+    if config_resp.agent_toml.is_empty() {
+        return;
+    }
+    let toml_path = env_file.parent().unwrap_or(std::path::Path::new(".")).join("agent.toml");
+    if toml_path.exists() {
+        println!("agent.toml already exists, skipping write");
+        return;
+    }
+    let mut content = config_resp.agent_toml.clone();
+    if let Some(name) = agent_name {
+        content = content.replace(
+            "name = \"LP agent\"",
+            &format!("name = \"LP {}\"", name),
+        );
+    }
+    match std::fs::write(&toml_path, &content) {
+        Ok(_) => println!("Agent config written to {}", toml_path.display()),
+        Err(e) => eprintln!("Warning: could not write agent.toml: {}", e),
+    }
 }
 
 /// Create a raw (unauthenticated) gRPC channel
@@ -1934,11 +2019,10 @@ async fn run_onboard(
     party: Option<String>,
     private_key: Option<String>,
     invite_code: Option<String>,
-    agent_name: Option<String>,
-    email: Option<String>,
+    agent_name: String,
+    email: String,
     env_file: PathBuf,
     poll_interval: u64,
-    agent_toml_path: PathBuf,
 ) -> Result<()> {
     println!("=== Cloud Agent Self-Service Onboarding ===\n");
 
@@ -1994,9 +2078,10 @@ async fn run_onboard(
                     .into_inner();
                 write_server_config_to_env(&env_file, &rpc, &config_resp)?;
                 println!("Server config written to {}", env_file.display());
+                maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
             }
             println!("\nPARTY_AGENT={} — checking ledger onboarding...", party_id);
-            return complete_ledger_onboarding(&env_file, &agent_toml_path, &rpc).await;
+            return complete_ledger_onboarding(&env_file, &rpc).await;
         }
     }
 
@@ -2024,6 +2109,7 @@ async fn run_onboard(
 
     write_server_config_to_env(&env_file, &rpc, &config_resp)?;
     println!("Server config written to {}", env_file.display());
+    maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
 
     // Step 4: Register on waiting list (idempotent)
     println!("\nRegistering agent on waiting list...");
@@ -2037,8 +2123,8 @@ async fn run_onboard(
         .register_agent(RegisterAgentRequest {
             public_key: public_key_b58.clone(),
             invite_code,
-            email,
-            agent_name,
+            email: Some(email.clone()),
+            agent_name: Some(agent_name.clone()),
             request_signature: Some(sig),
         })
         .await
@@ -2126,7 +2212,7 @@ async fn run_onboard(
             break;
         }
 
-        println!("Status: SIGNATURE_REQUIRED — waiting for topology creation (polling every {}s)...", poll_interval);
+        println!("Status: SIGNATURE_SUBMITTED — waiting for topology creation (polling every {}s)...", poll_interval);
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
 
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
@@ -2178,95 +2264,199 @@ async fn run_onboard(
     }
 
     // Steps 9-11: Complete ledger onboarding
-    complete_ledger_onboarding(&env_file, &agent_toml_path, &rpc).await
+    complete_ledger_onboarding(&env_file, &rpc).await
 }
 
-/// Complete ledger onboarding (preapproval, user-service, subscription).
-/// Called after PARTY_AGENT is set in .env.
+/// Minimal config for the `onboard` CLI path.
+///
+/// The full `BaseConfig` is driven by `agent.toml` + `.env` + `configuration.toml`
+/// and is needed for the `cloud-agent agent` runtime (markets, LP settings, etc.).
+/// The `onboard` subcommand only needs identity + endpoint info, all of which live
+/// in `.env` after Step 2 of `run_onboard`. Using this struct lets the onboard
+/// path run without any `agent.toml` at all.
+struct OnboardConfig {
+    party_id: String,
+    role: String,
+    private_key_bytes: [u8; 32],
+    node_name: String,
+    ledger_service_public_key: [u8; 32],
+    token_ttl_secs: u64,
+    connection_timeout_secs: u64,
+    request_timeout_secs: u64,
+}
+
+impl OnboardConfig {
+    fn from_env() -> Result<Self> {
+        let party_id = std::env::var("PARTY_AGENT")
+            .map_err(|_| anyhow::anyhow!("PARTY_AGENT env var is required"))?;
+        let private_key_base58 = std::env::var("PARTY_AGENT_PRIVATE_KEY")
+            .map_err(|_| anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY env var is required"))?;
+        let private_key_bytes = orderbook_agent_logic::config::decode_private_key(&private_key_base58)?;
+        let node_name = std::env::var("NODE_NAME")
+            .map_err(|_| anyhow::anyhow!("NODE_NAME env var is required"))?;
+        let ledger_service_public_key_base58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
+            .map_err(|_| anyhow::anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
+        let ledger_service_public_key = orderbook_agent_logic::config::decode_public_key(
+            &ledger_service_public_key_base58,
+        )?;
+
+        Ok(Self {
+            party_id,
+            role: std::env::var("AGENT_ROLE").unwrap_or_else(|_| "agent".to_string()),
+            private_key_bytes,
+            node_name,
+            ledger_service_public_key,
+            token_ttl_secs: 3600,
+            connection_timeout_secs: 30,
+            request_timeout_secs: 120,
+        })
+    }
+}
+
+/// Complete ledger onboarding (preapproval + user-service).
+/// Called after PARTY_AGENT is set in .env. Does not require `agent.toml`.
 async fn complete_ledger_onboarding(
     env_file: &std::path::Path,
-    agent_toml_path: &std::path::Path,
     rpc: &str,
 ) -> Result<()> {
     // Ensure .env is loaded into process env
     let _ = dotenvy::from_path(env_file);
 
-    // Create default agent.toml if missing
-    if !agent_toml_path.exists() {
-        let default_toml = r#"role = "agent"
-auto_settle = true
-poll_interval_secs = 10
-token_ttl_secs = 3600
-connection_timeout_secs = 30
-request_timeout_secs = 120
+    let cfg = OnboardConfig::from_env()
+        .context("Failed to load onboarding config from .env")?;
 
-[[markets]]
-enabled = false
-instrument_id = ""
-instrument_admin = ""
-"#;
-        std::fs::write(agent_toml_path, default_toml)
-            .context("Failed to create default agent.toml")?;
-        println!("Created default {}", agent_toml_path.display());
-    }
-
-    let base_config = config::load(agent_toml_path)
-        .context("Failed to load config (is .env complete?)")?;
-
-    println!("\nCompleting ledger onboarding for party {}...", base_config.party_id);
+    println!("\nCompleting ledger onboarding for party {}...", cfg.party_id);
 
     let mut client = DAppProviderClient::new(
         rpc,
-        &base_config.party_id,
-        &base_config.role,
-        &base_config.private_key_bytes,
-        base_config.token_ttl_secs,
-        Some(base_config.node_name.as_str()),
-        &base_config.ledger_service_public_key,
-        Some(base_config.connection_timeout_secs),
-        Some(base_config.request_timeout_secs),
+        &cfg.party_id,
+        &cfg.role,
+        &cfg.private_key_bytes,
+        cfg.token_ttl_secs,
+        Some(cfg.node_name.as_str()),
+        &cfg.ledger_service_public_key,
+        Some(cfg.connection_timeout_secs),
+        Some(cfg.request_timeout_secs),
     )
     .await
     .context("Failed to create authenticated DAppProvider client")?;
 
     // Template IDs for on-chain contract lookups
-    const TMPL_PREAPPROVAL_PROPOSAL: &str =
-        "#splice-wallet:Splice.Wallet.TransferPreapproval:TransferPreapprovalProposal";
     const TMPL_USER_SERVICE: &str =
         "#utility-settlement-app-v1:Utility.Settlement.App.V1.Service.User:UserService";
     const TMPL_USER_SERVICE_REQUEST: &str =
         "#utility-settlement-app-v1:Utility.Settlement.App.V1.Service.User:UserServiceRequest";
 
-    // 11a: Request preapproval (check completed AND pending proposals)
-    let preapprovals = client.get_preapprovals().await?;
-    let proposals = client
-        .get_active_contracts(&[TMPL_PREAPPROVAL_PROPOSAL.to_string()])
-        .await
-        .unwrap_or_default();
-    if !preapprovals.is_empty() {
-        println!("Preapproval already exists ({} found).", preapprovals.len());
-    } else if !proposals.is_empty() {
-        println!("Preapproval proposal pending ({} found), waiting for acceptance.", proposals.len());
-    } else {
-        println!("Requesting preapproval...");
-        let expectation = OperationExpectation::RequestPreapproval {
-            party: base_config.party_id.clone(),
-        };
-        client
-            .submit_transaction(
+    // 11a-CC: Create Splice TransferPreapproval for CC (required for CC auto-completion).
+    // Check if Splice preapproval or proposal already exists.
+    let splice_preapproval_templates = [
+        "#splice-amulet:Splice.AmuletRules:TransferPreapproval".to_string(),
+        "#splice-wallet:Splice.Wallet.TransferPreapproval:TransferPreapprovalProposal".to_string(),
+    ];
+    let splice_contracts = client.get_active_contracts(&splice_preapproval_templates).await.unwrap_or_default();
+    if splice_contracts.is_empty() {
+        println!("Creating Splice preapproval for CC...");
+        let dso_for_cc = read_env_value(env_file, "DSO").unwrap_or_default();
+        if !dso_for_cc.is_empty() {
+            let expectation = OperationExpectation::RequestPreapproval {
+                party: cfg.party_id.clone(),
+            };
+            match client.submit_transaction(
                 PrepareTransactionRequest {
                     operation: TransactionOperation::RequestPreapproval as i32,
-                    params: Some(Params::RequestPreapproval(RequestPreapprovalParams {})),
+                    params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
+                        instrument_admin: dso_for_cc,
+                        instrument_allowances: vec![],
+                    })),
                     request_signature: None,
                 },
                 &expectation,
-                false,
-                false,
-                false,
-            )
-            .await
-            .context("Failed to request preapproval")?;
-        println!("Preapproval requested.");
+                false, false, false,
+            ).await {
+                Ok(_) => println!("Splice preapproval proposal created for CC (pending operator acceptance)."),
+                Err(e) => println!("Warning: failed to create CC preapproval: {}", e),
+            }
+        }
+    } else {
+        println!("Splice CC preapproval already exists ({} found).", splice_contracts.len());
+    }
+
+    // 11a-CIP56: Create CIP-56 TransferPreapprovals for utility tokens.
+    let preapprovals = client.get_preapprovals().await?;
+    let existing_admins: std::collections::HashSet<&str> = preapprovals.iter()
+        .map(|p| p.instrument_admin.as_str())
+        .collect();
+
+    // Fetch instruments from orderbook-rpc to discover all registrars.
+    // Each unique registry party needs one CIP-56 TransferPreapproval.
+    let instruments = {
+        use orderbook_proto::orderbook::orderbook_service_client::OrderbookServiceClient;
+        use orderbook_proto::orderbook::GetInstrumentsRequest;
+        let channel = create_raw_channel(rpc).await
+            .context("Failed to connect to orderbook-rpc for instruments")?;
+        let jwt = orderbook_agent_logic::auth::generate_jwt(
+            &cfg.party_id, &cfg.role, &cfg.private_key_bytes,
+            cfg.token_ttl_secs, Some(cfg.node_name.as_str()),
+        ).unwrap_or_default();
+        let mut ob = OrderbookServiceClient::new(channel);
+        let mut req = tonic::Request::new(GetInstrumentsRequest {
+            instrument_type: None, limit: None, offset: None,
+        });
+        if !jwt.is_empty() {
+            req.metadata_mut().insert("authorization",
+                format!("Bearer {}", jwt).parse().unwrap());
+        }
+        ob.get_instruments(req).await
+            .map(|r| r.into_inner().instruments)
+            .unwrap_or_default()
+    };
+
+    // Deduplicate registrars — skip DSO (CC uses Splice preapproval, not CIP-56)
+    let dso_party = read_env_value(env_file, "DSO").unwrap_or_default();
+    let mut needed_admins: Vec<(String, String)> = Vec::new();
+    let mut seen_admins: std::collections::HashSet<String> = existing_admins.iter()
+        .map(|s| s.to_string())
+        .collect();
+    for inst in &instruments {
+        if let Some(ref registry) = inst.registry {
+            if !registry.is_empty() && registry != &dso_party && seen_admins.insert(registry.clone()) {
+                needed_admins.push((registry.clone(), inst.instrument_id.clone()));
+            }
+        }
+    }
+
+    if needed_admins.is_empty() {
+        if preapprovals.is_empty() {
+            println!("Warning: could not determine needed preapprovals (no instruments found). Run onboard again if needed.");
+        } else {
+            println!("CIP-56 preapprovals up to date ({} found).", preapprovals.len());
+        }
+    } else {
+        for (admin, label) in &needed_admins {
+            println!("Creating CIP-56 preapproval for {} (admin={})...", label, admin);
+            let label = label.as_str();
+            let expectation = OperationExpectation::RequestPreapproval {
+                party: cfg.party_id.clone(),
+            };
+            client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::RequestPreapproval as i32,
+                        params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
+                            instrument_admin: admin.clone(),
+                            instrument_allowances: vec![],
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    false,
+                    false,
+                    false,
+                )
+                .await
+                .context(format!("Failed to create CIP-56 preapproval for {}", label))?;
+            println!("CIP-56 preapproval created for {}.", label);
+        }
     }
 
     // 11b: Request user-service (check completed UserService AND pending UserServiceRequest)
@@ -2279,7 +2469,7 @@ instrument_admin = ""
     if user_contracts.is_empty() {
         println!("Requesting user service...");
         let expectation = OperationExpectation::RequestUserService {
-            party: base_config.party_id.clone(),
+            party: cfg.party_id.clone(),
         };
         client
             .submit_transaction(
@@ -2303,63 +2493,120 @@ instrument_admin = ""
         println!("User service already exists or pending ({} contracts found).", user_contracts.len());
     }
 
-    // 11c: Request pay-as-you-go subscription (check completed AND pending)
-    let subscription_app = read_env_value(env_file, "SUBSCRIPTION_APP_PARTY")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| base_config.settlement_operator.clone());
-    let subscription_amount = read_env_value(env_file, "SUBSCRIPTION_AMOUNT")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "0.033".to_string());
+    // Devnet: auto-faucet CC and USDC to bootstrap agent balance
+    let canton_chain = read_env_value(env_file, "CANTON_CHAIN").unwrap_or_default();
+    if canton_chain == "devnet" {
+        let dso = read_env_value(env_file, "DSO").unwrap_or_default();
+        let balances = client.get_balances().await.unwrap_or_default();
+        let has_cc = balances.iter().any(|b| b.is_canton_coin);
+        let has_usdc = balances.iter().any(|b| b.instrument_id == "USDC");
+        if !dso.is_empty() && (!has_cc || !has_usdc) {
+            println!("\nDevnet detected — requesting faucet top-up...");
 
-    let recurring_pkg = read_env_value(env_file, "RECURRING_PAYMENT_PACKAGE_NAME")
-        .filter(|s| !s.is_empty());
-
-    if let Some(pkg) = &recurring_pkg {
-        let payment_tmpl = format!("#{}:RecurringPayment:RecurringPayment", pkg);
-        let request_tmpl = format!("#{}:RecurringPaymentRequest:RecurringPaymentRequest", pkg);
-        let sub_contracts = client
-            .get_active_contracts(&[payment_tmpl, request_tmpl])
-            .await
-            .unwrap_or_default();
-        if sub_contracts.is_empty() {
-            println!("Requesting pay-as-you-go subscription (app={}, amount={})...",
-                subscription_app, subscription_amount);
-            let expectation = OperationExpectation::RequestRecurringPayasyougo {
-                party: base_config.party_id.clone(),
-                app_party: subscription_app.clone(),
-                amount: subscription_amount.clone(),
-            };
-            client
-                .submit_transaction(
-                    PrepareTransactionRequest {
-                        operation: TransactionOperation::RequestRecurringPayasyougo as i32,
-                        params: Some(Params::RequestRecurringPayasyougo(
-                            RequestRecurringPayasyougoParams {
-                                app_party: subscription_app,
-                                amount: subscription_amount,
-                                description: Some("Agent subscription".to_string()),
-                                reference: Some(uuid::Uuid::now_v7().to_string()),
-                            },
-                        )),
+            // USDC first (CIP-56 preapproval is already active, no waiting needed)
+            if has_usdc {
+                println!("  USDC: already funded, skipping");
+            } else {
+                let usdc_admin = {
+                    use orderbook_proto::orderbook::orderbook_service_client::OrderbookServiceClient;
+                    use orderbook_proto::orderbook::GetInstrumentsRequest;
+                    let mut found = None;
+                    if let Ok(ch) = create_raw_channel(rpc).await {
+                        let jwt = orderbook_agent_logic::auth::generate_jwt(
+                            &cfg.party_id, &cfg.role, &cfg.private_key_bytes,
+                            cfg.token_ttl_secs, Some(cfg.node_name.as_str()),
+                        ).unwrap_or_default();
+                        let mut ob = OrderbookServiceClient::new(ch);
+                        let mut req = tonic::Request::new(GetInstrumentsRequest {
+                            instrument_type: None, limit: None, offset: None,
+                        });
+                        if !jwt.is_empty() {
+                            req.metadata_mut().insert("authorization",
+                                format!("Bearer {}", jwt).parse().unwrap());
+                        }
+                        if let Ok(resp) = ob.get_instruments(req).await {
+                            for inst in resp.into_inner().instruments {
+                                if inst.instrument_id == "USDC" {
+                                    found = inst.registry;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found
+                };
+                if let Some(admin) = usdc_admin {
+                    print!("  USDC... ");
+                    match client.request_faucet(FaucetRequest {
+                        token_name: "USDC".into(),
+                        token_admin: admin,
+                        ticket: String::new(),
+                        amount: String::new(),
+                        dry_run: false,
                         request_signature: None,
-                    },
-                    &expectation,
-                    false,
-                    false,
-                    false,
-                )
-                .await
-                .context("Failed to request pay-as-you-go subscription")?;
-            println!("Subscription requested.");
-        } else {
-            println!("Subscription already exists or pending ({} contracts found).", sub_contracts.len());
+                    }).await {
+                        Ok(r) if r.success => println!("OK ({})", r.amount_approved),
+                        Ok(r) => println!("failed: {}", r.error_message.unwrap_or_default()),
+                        Err(e) => println!("error: {}", e),
+                    }
+                }
+            }
+
+            // CC last with retry (Splice preapproval may still be pending operator acceptance)
+            if has_cc {
+                println!("  CC: already funded, skipping");
+            } else {
+                let mut cc_ok = false;
+                let delays = [0u64, 10, 15, 20, 25, 30, 30, 30, 30];
+                for attempt in 0..delays.len() as u64 {
+                    if attempt > 0 {
+                        let delay = delays[attempt as usize];
+                        println!("  CC: retrying in {}s (waiting for preapproval acceptance)...", delay);
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    }
+                    print!("  CC (Amulet)... ");
+                    match client.request_faucet(FaucetRequest {
+                        token_name: "Amulet".into(),
+                        token_admin: dso.clone(),
+                        ticket: String::new(),
+                        amount: String::new(),
+                        dry_run: false,
+                        request_signature: None,
+                    }).await {
+                        Ok(r) if r.success => {
+                            println!("OK ({})", r.amount_approved);
+                            cc_ok = true;
+                            break;
+                        }
+                        Ok(r) => println!("failed: {}", r.error_message.unwrap_or_default()),
+                        Err(e) => println!("error: {}", e),
+                    }
+                }
+                if !cc_ok {
+                    println!("  CC faucet failed after retries. Run './cloud-agent faucet get --token CC' manually.");
+                }
+            }
+
+            // Wait for balances
+            println!("\nWaiting for balances...");
+            for _ in 0..6 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let balances = client.get_balances().await.unwrap_or_default();
+                if !balances.is_empty() {
+                    println!("\n=== Initial Balances ===");
+                    for b in &balances {
+                        let name = if b.is_canton_coin { "CC".to_string() } else { b.instrument_id.clone() };
+                        println!("  {}: {}", name, b.total_amount);
+                    }
+                    break;
+                }
+            }
+        } else if has_cc && has_usdc {
+            println!("\nBalances already funded, skipping faucet.");
         }
-    } else {
-        println!("RECURRING_PAYMENT_PACKAGE_NAME not configured, skipping subscription.");
     }
 
     println!("\n=== Onboarding complete! ===");
-    println!("You can now run: cloud-agent agent");
     Ok(())
 }
 
@@ -2466,9 +2713,26 @@ async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bool) 
 
     match command {
         FaucetCommands::Get { token, admin, ticket, amount, dry_run } => {
+            // "CC" and "Amulet" (case-insensitive) both mean Canton Coin — normalize
+            // to "Amulet" before signing, since the server canonical includes token_name.
+            let is_cc = token.eq_ignore_ascii_case("cc") || token.eq_ignore_ascii_case("amulet");
+            let normalized_token = if is_cc { "Amulet".to_string() } else { token };
+
+            let resolved_admin = match admin {
+                Some(a) => a,
+                None if is_cc => config.dso_party.clone(),
+                None => {
+                    anyhow::bail!(
+                        "--admin is required for CIP-56 tokens. For Canton Coin use \
+                         --token CC (or Amulet) and --admin will default to the DSO \
+                         party from $DSO."
+                    );
+                }
+            };
+
             let response = client.request_faucet(FaucetRequest {
-                token_name: token.clone(),
-                token_admin: admin.clone(),
+                token_name: normalized_token,
+                token_admin: resolved_admin,
                 ticket,
                 amount: amount.unwrap_or_default(),
                 dry_run,
