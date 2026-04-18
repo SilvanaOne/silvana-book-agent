@@ -7,9 +7,9 @@
 //! 1. Rejects RFQs when the LP lacks sufficient balance for the allocation + fees
 //! 2. Widens spreads based on token depletion rate (depletion coefficient)
 
-use orderbook_agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
-use orderbook_agent_logic::liquidity::LiquidityManager;
-use orderbook_agent_logic::runner::QuotedTrade;
+use agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
+use agent_logic::liquidity::LiquidityManager;
+use agent_logic::runner::QuotedTrade;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -174,7 +174,7 @@ impl RfqHandler {
 
         // Reject RFQs when sequencer is critically overloaded (coefficient < OVERLOAD_THRESHOLD - 0.1).
         // At this level even proposing new trades would fail with SEQUENCER_BACKPRESSURE.
-        if orderbook_agent_logic::forecast::is_rfq_rejected_by_overload() {
+        if agent_logic::forecast::is_rfq_rejected_by_overload() {
             warn!("RFQ {}: rejected — sequencer critically overloaded", rfq_id);
             return RfqResponse::Reject(RfqReject {
                 rfq_id,
@@ -229,9 +229,9 @@ impl RfqHandler {
         //   1x otherwise
         // direction 1 = BUY (user buys, LP sells base → offer price = mid + spread)
         // direction 2 = SELL (user sells, LP buys base/sells quote → bid price = mid - spread)
-        let spread_multiplier = if orderbook_agent_logic::forecast::is_fees_paused_by_overload() {
+        let spread_multiplier = if agent_logic::forecast::is_fees_paused_by_overload() {
             3.0
-        } else if orderbook_agent_logic::forecast::is_traffic_paused_by_forecast() {
+        } else if agent_logic::forecast::is_traffic_paused_by_forecast() {
             2.0
         } else {
             1.0
@@ -315,13 +315,13 @@ impl RfqHandler {
             let alloc_dec = Decimal::from_f64_retain(alloc_amount).unwrap_or_default();
 
             let available = lm.available(alloc_token).await;
-            let needed = if alloc_token == orderbook_agent_logic::liquidity::CC_TOKEN {
+            let needed = if alloc_token == agent_logic::liquidity::CC_TOKEN {
                 alloc_dec + fee_cc
             } else {
                 alloc_dec
             };
             // Also check CC for fees when allocating non-CC
-            let cc_ok = if alloc_token != orderbook_agent_logic::liquidity::CC_TOKEN {
+            let cc_ok = if alloc_token != agent_logic::liquidity::CC_TOKEN {
                 lm.available_cc().await >= fee_cc
             } else {
                 true // already checked above

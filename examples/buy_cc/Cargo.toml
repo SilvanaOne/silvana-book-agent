@@ -1,0 +1,16 @@
+[package]
+name = "buy-cc-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cloud-agent = { path = "../../crates/cloud-agent" }
+agent-logic = { path = "../../crates/agent-logic" }
+orderbook-proto = { path = "../../crates/orderbook-proto" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

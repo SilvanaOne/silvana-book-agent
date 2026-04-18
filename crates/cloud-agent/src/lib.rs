@@ -6,15 +6,15 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::config::BaseConfig;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
@@ -32,187 +32,27 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
-mod accept_settle;
-mod amulet_cache;
-mod acs_worker;
-mod backend;
-mod config;
-mod fill_loop;
-mod ledger_client;
-mod merge_worker;
-mod payment_queue;
-mod rfq_handler;
+pub mod accept_settle;
+pub mod amulet_cache;
+pub mod acs_worker;
+pub mod backend;
+pub mod config;
+pub mod fill_loop;
+pub mod ledger_client;
+pub mod merge_worker;
+pub mod payment_queue;
+pub mod rfq_handler;
 
-use accept_settle::MulticallSettler;
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+pub use accept_settle::MulticallSettler;
+pub use backend::CloudSettlementBackend;
+pub use ledger_client::DAppProviderClient;
 
 // ============================================================================
-// CLI
+// Subcommand enums (used by CLI and as function parameters)
 // ============================================================================
 
-#[derive(Parser)]
-#[command(name = "cloud-agent")]
-#[command(about = "Orderbook cloud agent\n\nGet started:\n  ./cloud-agent onboard --agent-name your-agent-name --email your-email")]
-struct Cli {
-    /// Path to agent configuration file
-    #[arg(short, long, default_value = "agent.toml")]
-    config: PathBuf,
-
-    /// Enable verbose logging
-    #[arg(short, long, global = true)]
-    verbose: bool,
-
-    /// Dry run: prepare and verify transaction but do not sign or execute
-    #[arg(long, global = true)]
-    dry_run: bool,
-
-    /// Force: sign and execute even if verification fails
-    #[arg(long, global = true)]
-    force: bool,
-
-    /// Prompt for confirmation before signing each transaction
-    #[arg(long, global = true)]
-    confirm: bool,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
 #[derive(Subcommand)]
-enum Commands {
-    /// Run as settlement agent (long-running, places orders + settles)
-    Agent {
-        /// Disable order placement
-        #[arg(long)]
-        settlement_only: bool,
-        /// Disable settlement
-        #[arg(long)]
-        orders_only: bool,
-        /// Skip restoring state from previous session
-        #[arg(long)]
-        no_restore: bool,
-        /// Accept all proposals without verification (for migration from old worker without saved state)
-        #[arg(long)]
-        no_reject: bool,
-    },
-    /// Query information
-    Info {
-        #[command(subcommand)]
-        command: InfoCommands,
-    },
-    /// Preapproval operations
-    Preapproval {
-        #[command(subcommand)]
-        command: PreapprovalCommands,
-    },
-    /// Subscription payment operations
-    Subscription {
-        #[command(subcommand)]
-        command: SubscriptionCommands,
-    },
-    /// Transfer operations (CC and CIP-56 tokens)
-    Transfer {
-        #[command(subcommand)]
-        command: TransferCommands,
-    },
-    /// Signing operations
-    Sign {
-        #[command(subcommand)]
-        command: SignCommands,
-    },
-    /// User service operations (onboarding)
-    UserService {
-        #[command(subcommand)]
-        command: UserServiceCommands,
-    },
-    /// Faucet — request tokens (CC or CIP-56)
-    Faucet {
-        #[command(subcommand)]
-        command: FaucetCommands,
-    },
-    /// Lock operations (LockService / LockController)
-    Lock {
-        #[command(subcommand)]
-        command: LockCommands,
-    },
-    /// Buy a specified amount via RFQ, repeating until filled
-    Buy {
-        /// Market ID to buy on
-        #[arg(long)]
-        market: String,
-        /// Total amount to buy (base instrument quantity)
-        #[arg(long)]
-        amount: f64,
-        /// Maximum price per unit (default: mid + 3%)
-        #[arg(long)]
-        price_limit: Option<f64>,
-        /// Minimum amount per settlement (default: 5.0)
-        #[arg(long, default_value = "5.0")]
-        min_settlement: f64,
-        /// Maximum amount per settlement (default: total amount)
-        #[arg(long)]
-        max_settlement: Option<f64>,
-        /// Retry interval in seconds (default: 60)
-        #[arg(long, default_value = "60")]
-        interval: u64,
-    },
-    /// Sell a specified amount via RFQ, repeating until filled
-    Sell {
-        /// Market ID to sell on
-        #[arg(long)]
-        market: String,
-        /// Total amount to sell (base instrument quantity)
-        #[arg(long)]
-        amount: f64,
-        /// Minimum price per unit (default: mid - 3%)
-        #[arg(long)]
-        price_limit: Option<f64>,
-        /// Minimum amount per settlement (default: 5.0)
-        #[arg(long, default_value = "5.0")]
-        min_settlement: f64,
-        /// Maximum amount per settlement (default: total amount)
-        #[arg(long)]
-        max_settlement: Option<f64>,
-        /// Retry interval in seconds (default: 60)
-        #[arg(long, default_value = "60")]
-        interval: u64,
-    },
-    /// Generate a new Ed25519 private key (no config needed)
-    GeneratePrivateKey,
-    /// Self-service onboarding: generate keys, register, sign topology, complete ledger setup
-    ///
-    /// Usage: ./cloud-agent onboard --agent-name your-agent-name --email your-email
-    Onboard {
-        /// Orderbook gRPC URL (optional, default: devnet)
-        #[arg(long, default_value = "https://orderbook-devnet.silvana.dev:443")]
-        rpc: String,
-        /// Agent display name (required)
-        #[arg(long)]
-        agent_name: String,
-        /// Contact email (required)
-        #[arg(long)]
-        email: String,
-        /// Party ID — optional, skip waiting list and go straight to ledger onboarding (requires --private-key)
-        #[arg(long, requires = "private_key")]
-        party: Option<String>,
-        /// Base58-encoded Ed25519 private key — optional, required when --party is provided
-        #[arg(long)]
-        private_key: Option<String>,
-        /// Invite code — optional, for waiting list registration
-        #[arg(long)]
-        invite_code: Option<String>,
-        /// Path to .env file — optional (default: .env)
-        #[arg(long, default_value = ".env")]
-        env_file: PathBuf,
-        /// Seconds between status polls — optional (default: 10)
-        #[arg(long, default_value = "10")]
-        poll_interval: u64,
-    },
-}
-
-#[derive(Subcommand)]
-enum InfoCommands {
+pub enum InfoCommands {
     /// List active contracts
     List {
         /// Filter by template ID
@@ -231,7 +71,7 @@ enum InfoCommands {
 }
 
 #[derive(Subcommand)]
-enum PreapprovalCommands {
+pub enum PreapprovalCommands {
     /// Create a CIP-56 TransferPreapproval
     Request {
         /// Instrument admin party (DSO for CC, registrar for tokens)
@@ -243,7 +83,7 @@ enum PreapprovalCommands {
 }
 
 #[derive(Subcommand)]
-enum TransferCommands {
+pub enum TransferCommands {
     /// Send Canton Coin (CC) to another party
     SendCc {
         /// Receiver party ID
@@ -313,7 +153,7 @@ enum TransferCommands {
 }
 
 #[derive(Subcommand)]
-enum SignCommands {
+pub enum SignCommands {
     /// Sign a 34-byte multihash (Canton format) using Ed25519 key
     Multihash {
         /// Base64-encoded 34-byte multihash
@@ -344,7 +184,7 @@ enum SignCommands {
 }
 
 #[derive(Subcommand)]
-enum UserServiceCommands {
+pub enum UserServiceCommands {
     /// Request UserService for this party (one-time onboarding setup)
     Request {
         /// Optional reference ID for transaction tracking
@@ -357,7 +197,7 @@ enum UserServiceCommands {
 }
 
 #[derive(Subcommand)]
-enum SubscriptionCommands {
+pub enum SubscriptionCommands {
     /// Request a prepaid recurring payment
     RequestPrepaid {
         /// Amount per day in USD
@@ -397,7 +237,7 @@ enum SubscriptionCommands {
 }
 
 #[derive(Subcommand)]
-enum LockCommands {
+pub enum LockCommands {
     /// Lock holdings via LockService.LockHoldings
     Holdings {
         /// LockService contract ID
@@ -500,7 +340,7 @@ enum LockCommands {
 }
 
 #[derive(Subcommand)]
-enum FaucetCommands {
+pub enum FaucetCommands {
     /// Request tokens from faucet
     Get {
         /// Token name. "Amulet" or "CC" → Canton Coin (admin defaults to DSO).
@@ -524,14 +364,14 @@ enum FaucetCommands {
 }
 
 // ============================================================================
-// Main
+// Library functions
 // ============================================================================
 
 /// Fetch instrument registry (CC/Amulet + DSO, CIP-56 registries) from
 /// orderbook-rpc and populate `BaseConfig`. Replaces the old configuration.toml
 /// `[[canton_coin]]` / `[[instrument]]` sections for the client.
-async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
-    let mut client = orderbook_agent_logic::client::OrderbookClient::new(config)
+pub async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
+    let mut client = agent_logic::client::OrderbookClient::new(config)
         .await
         .context("Failed to create orderbook client for instrument registry fetch")?;
     let instruments = client
@@ -542,92 +382,13 @@ async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
-    let cli = Cli::parse();
-
-    // Initialize logging (LOG_DESTINATION=console|file)
-    orderbook_agent_logic::logging::init_logging(
-        cli.verbose,
-        &["cloud_agent", "orderbook_agent_logic", "tx_verifier"],
-        "cloud-agent",
-    );
-
-    // Handle commands that don't need config first
-    if let Commands::GeneratePrivateKey = &cli.command {
-        return run_generate_private_key();
-    }
-
-    if let Commands::Onboard { rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval } = cli.command {
-        return run_onboard(rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval).await;
-    }
-
-    // `Agent` runs the full market-making loop and needs agent.toml to be present
-    // and populated. All other subcommands work with serde defaults if the file
-    // is missing (buy/sell/faucet/transfer/etc. only touch env-sourced fields).
-    let needs_agent_toml = matches!(cli.command, Commands::Agent { .. });
-
-    let mut base_config = if needs_agent_toml {
-        if !cli.config.exists() {
-            tracing::warn!(
-                "agent.toml not found at {}. This file is required for `cloud-agent agent`.",
-                cli.config.display()
-            );
-        }
-        config::load(&cli.config)
-            .with_context(|| format!("Failed to load config from {:?}", cli.config))?
-    } else {
-        config::load_or_defaults(&cli.config)
-            .with_context(|| format!("Failed to load config from {:?}", cli.config))?
-    };
-
-    // Populate instrument registry (CC → Amulet + DSO, USDC → registry, …) from
-    // orderbook-rpc. Required by any command that builds DVP/transfer expectations.
-    // Best-effort: failures are logged but don't block commands that don't need it
-    // (e.g. `sign`, `generate-private-key`).
-    if let Err(e) = populate_instruments(&mut base_config).await {
-        tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
-    }
-    let base_config = base_config;
-
-    let verbose = cli.verbose;
-    let dry_run = cli.dry_run;
-    let force = cli.force;
-    let confirm = cli.confirm;
-    match cli.command {
-        Commands::Agent {
-            settlement_only,
-            orders_only,
-            no_restore,
-            no_reject,
-        } => run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm).await,
-        Commands::Info { command } => run_info(base_config, command).await,
-        Commands::Preapproval { command } => run_preapproval(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Subscription { command } => run_subscription(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Transfer { command } => run_transfer(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Sign { command } => run_sign(base_config, command),
-        Commands::UserService { command } => run_user_service(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Faucet { command } => run_faucet(base_config, command, verbose).await,
-        Commands::Lock { command } => run_lock(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval } => {
-            run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
-        }
-        Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval } => {
-            run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
-        }
-        Commands::GeneratePrivateKey => unreachable!(),
-        Commands::Onboard { .. } => unreachable!(),
-    }
-}
-
 // ============================================================================
 // Agent mode
 // ============================================================================
 
 /// Balance provider that fetches holdings via DAppProviderService gRPC proxy
-struct CloudBalanceProvider {
-    client: TokioMutex<DAppProviderClient>,
+pub struct CloudBalanceProvider {
+    pub client: TokioMutex<DAppProviderClient>,
 }
 
 #[async_trait]
@@ -637,7 +398,7 @@ impl BalanceProvider for CloudBalanceProvider {
     }
 }
 
-async fn run_cloud_agent(
+pub async fn run_cloud_agent(
     config: BaseConfig,
     settlement_only: bool,
     orders_only: bool,
@@ -647,13 +408,13 @@ async fn run_cloud_agent(
     dry_run: bool,
     force: bool,
     confirm: bool,
+    version_info: Option<&str>,
 ) -> Result<()> {
-    info!(
-        "Starting Orderbook Cloud Agent (build: {}{} commit {})",
-        &env!("VERGEN_GIT_SHA")[..12],
-        if env!("VERGEN_GIT_DIRTY") == "true" { "-dirty" } else { "" },
-        env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
-    );
+    if let Some(v) = version_info {
+        info!("Starting Orderbook Cloud Agent (build: {})", v);
+    } else {
+        info!("Starting Orderbook Cloud Agent");
+    }
     info!("Party ID: {}", config.party_id);
     info!("Orderbook URL: {}", config.orderbook_grpc_url);
     info!(
@@ -665,7 +426,7 @@ async fn run_cloud_agent(
     info!("Fee reserve: {:.2} CC", config.fee_reserve_cc);
 
     // Create LiquidityManager early so it can be shared with RfqHandler and Backend
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -675,7 +436,7 @@ async fn run_cloud_agent(
 
     // Register token aliases from server market data (symbol → instrument_id)
     {
-        let mut client = orderbook_agent_logic::client::OrderbookClient::new(&config).await?;
+        let mut client = agent_logic::client::OrderbookClient::new(&config).await?;
         match client.get_markets().await {
             Ok(markets) => {
                 for market in &markets {
@@ -718,7 +479,7 @@ async fn run_cloud_agent(
         None
     };
 
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
     let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock, liquidity_manager);
 
     let ledger_client = DAppProviderClient::new(
@@ -762,7 +523,7 @@ async fn run_cloud_agent(
 }
 
 /// Run a buyer/seller fill loop with background settlement processing
-async fn run_fill(
+pub async fn run_fill(
     config: BaseConfig,
     direction: fill_loop::FillDirection,
     market: String,
@@ -782,8 +543,8 @@ async fn run_fill(
     };
     info!("Starting {} mode: market={}, amount={}, interval={}s", dir_str, market, amount, interval);
 
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
-    let fill_lm = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let fill_lm = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -819,7 +580,7 @@ async fn run_fill(
 
     // Check for saved fill state
     let state_file = PathBuf::from("agent-state.json");
-    let saved_fill_state = orderbook_agent_logic::state::load_state(&state_file)
+    let saved_fill_state = agent_logic::state::load_state(&state_file)
         .filter(|s| s.party_id == config.party_id)
         .and_then(|s| s.fill_state);
 
@@ -829,7 +590,7 @@ async fn run_fill(
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Arc<AtomicBool>) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
         CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
@@ -838,7 +599,7 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
     };
     use tokio_stream::StreamExt;
     use rfq_handler::RfqResponse;
-    use orderbook_agent_logic::client::OrderbookClient;
+    use agent_logic::client::OrderbookClient;
 
     let lp_config = config.liquidity_provider.as_ref()
         .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
@@ -1079,7 +840,7 @@ async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::
 // Info commands
 // ============================================================================
 
-pub(crate) fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+pub fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
     let map = s
         .fields
         .iter()
@@ -1088,7 +849,7 @@ pub(crate) fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value
     serde_json::Value::Object(map)
 }
 
-pub(crate) fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
+pub fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
     match &v.kind {
         Some(prost_types::value::Kind::NullValue(_)) => serde_json::Value::Null,
         Some(prost_types::value::Kind::NumberValue(n)) => {
@@ -1104,7 +865,7 @@ pub(crate) fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
     }
 }
 
-fn format_value(val: &serde_json::Value) -> String {
+pub fn format_value(val: &serde_json::Value) -> String {
     match val {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
@@ -1114,7 +875,7 @@ fn format_value(val: &serde_json::Value) -> String {
     }
 }
 
-fn print_json_value(value: &serde_json::Value, indent: usize) {
+pub fn print_json_value(value: &serde_json::Value, indent: usize) {
     let prefix = "   ".repeat(indent);
     match value {
         serde_json::Value::Object(map) => {
@@ -1155,7 +916,7 @@ fn print_json_value(value: &serde_json::Value, indent: usize) {
     }
 }
 
-fn print_info_list_table(contracts: &[orderbook_proto::ledger::ActiveContractInfo]) {
+pub fn print_info_list_table(contracts: &[orderbook_proto::ledger::ActiveContractInfo]) {
     if contracts.is_empty() {
         println!("No contracts found.");
         return;
@@ -1176,7 +937,7 @@ fn print_info_list_table(contracts: &[orderbook_proto::ledger::ActiveContractInf
     }
 }
 
-fn print_info_list_count(contracts: &[orderbook_proto::ledger::ActiveContractInfo]) {
+pub fn print_info_list_count(contracts: &[orderbook_proto::ledger::ActiveContractInfo]) {
     let mut template_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for contract in contracts {
         *template_counts
@@ -1198,7 +959,7 @@ fn print_info_list_count(contracts: &[orderbook_proto::ledger::ActiveContractInf
     println!("{:>6}  {}", contracts.len(), "Total");
 }
 
-async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
+pub async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
     if let InfoCommands::Party = &command {
         println!("Party ID: {}", config.party_id);
         println!("Public key: {}", config.public_key_hex);
@@ -1308,7 +1069,7 @@ async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
 // Preapproval commands
 // ============================================================================
 
-async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -1325,8 +1086,8 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
     match command {
         PreapprovalCommands::Request { instrument_admin } => {
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Create CIP-56 Preapproval",
                     &format!("party: {}, admin: {}", config.party_id, instrument_admin),
@@ -1383,7 +1144,7 @@ async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbo
 // Subscription payment commands
 // ============================================================================
 
-async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -1408,8 +1169,8 @@ async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, ver
         } => {
             let app = config.settlement_operator.clone();
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Request subscription prepaid",
                     &format!("app: {}, amount: {}/day, limit: {}", app, amount, limit),
@@ -1453,8 +1214,8 @@ async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, ver
         } => {
             let app = app.unwrap_or_else(|| config.settlement_operator.clone());
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Request subscription pay-as-you-go",
                     &format!("app: {}, amount: {}", app, amount),
@@ -1496,7 +1257,7 @@ async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, ver
 // Transfer commands
 // ============================================================================
 
-async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -1523,8 +1284,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                 description
             };
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Transfer CC",
                     &format!("receiver: {}, amount: {}", receiver, amount),
@@ -1567,8 +1328,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
             reference,
         } => {
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     &format!("Transfer CIP-56 ({})", instrument_id),
                     &format!("receiver: {}, amount: {}", receiver, amount),
@@ -1607,8 +1368,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
         }
         TransferCommands::AcceptCip56 { contract_id } => {
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Accept CIP-56 transfer",
                     &format!("contract: {}", contract_id),
@@ -1646,8 +1407,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
                 return Err(anyhow::anyhow!("--amulet-cids must not be empty"));
             }
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Split CC",
                     &format!("outputs: [{}], inputs: {} amulets", output_amounts.join(", "), amulet_cids.len()),
@@ -1766,8 +1527,8 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
             };
 
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Batch Pay",
                     &format!("{} recipients, total {} CC", targets.len(), total),
@@ -1822,7 +1583,7 @@ async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bo
 /// Parse a CSV file with batch payment targets.
 /// Supports format: `Recipient Party ID,Amount` (header optional).
 /// Also supports headerless `party_id,amount` rows.
-fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String)>> {
+pub fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String)>> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .trim(csv::Trim::All)
@@ -1863,8 +1624,8 @@ fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String)>> 
 // Sign commands
 // ============================================================================
 
-fn run_generate_private_key() -> Result<()> {
-    let (private_key, public_key) = orderbook_agent_logic::sign::generate_keypair();
+pub fn run_generate_private_key() -> Result<()> {
+    let (private_key, public_key) = agent_logic::sign::generate_keypair();
     println!("PARTY_AGENT_PRIVATE_KEY={}", private_key);
     println!("PARTY_AGENT_PUBLIC_KEY={}", public_key);
     Ok(())
@@ -1875,7 +1636,7 @@ fn run_generate_private_key() -> Result<()> {
 // ============================================================================
 
 /// Read a key=value from .env file, returning None if not found or file doesn't exist
-fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
+pub fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
     let content = std::fs::read_to_string(env_file).ok()?;
     for line in content.lines() {
         let line = line.trim();
@@ -1892,7 +1653,7 @@ fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
 }
 
 /// Write or update a key=value in the .env file
-fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> Result<()> {
+pub fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> Result<()> {
     let mut lines: Vec<String> = if env_file.exists() {
         std::fs::read_to_string(env_file)
             .context("Failed to read .env file")?
@@ -1923,7 +1684,7 @@ fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> Resul
 }
 
 /// Write all server config values from GetAgentConfigResponse to .env
-fn write_server_config_to_env(
+pub fn write_server_config_to_env(
     env_file: &std::path::Path,
     rpc: &str,
     config_resp: &GetAgentConfigResponse,
@@ -1949,7 +1710,7 @@ fn write_server_config_to_env(
 
 /// Save agent.toml from server config if it doesn't already exist locally.
 /// Customizes `name = "LP agent"` → `name = "LP <agent_name>"` if agent_name is provided.
-fn maybe_write_agent_toml(
+pub fn maybe_write_agent_toml(
     env_file: &std::path::Path,
     config_resp: &GetAgentConfigResponse,
     agent_name: Option<&str>,
@@ -1976,7 +1737,7 @@ fn maybe_write_agent_toml(
 }
 
 /// Create a raw (unauthenticated) gRPC channel
-async fn create_raw_channel(grpc_url: &str) -> Result<tonic::transport::Channel> {
+pub async fn create_raw_channel(grpc_url: &str) -> Result<tonic::transport::Channel> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     if grpc_url.starts_with("https://") {
@@ -2005,7 +1766,7 @@ async fn create_raw_channel(grpc_url: &str) -> Result<tonic::transport::Channel>
 }
 
 /// Sign an onboarding RPC request using the agent's private key
-fn sign_onboarding_request(private_key_bytes: &[u8; 32], canonical: &[u8]) -> MessageSignature {
+pub fn sign_onboarding_request(private_key_bytes: &[u8; 32], canonical: &[u8]) -> MessageSignature {
     let sig_data = message_signing::sign_canonical(private_key_bytes, canonical);
     MessageSignature {
         signature: sig_data.signature_b64,
@@ -2014,7 +1775,7 @@ fn sign_onboarding_request(private_key_bytes: &[u8; 32], canonical: &[u8]) -> Me
     }
 }
 
-async fn run_onboard(
+pub async fn run_onboard(
     rpc: String,
     party: Option<String>,
     private_key: Option<String>,
@@ -2029,7 +1790,7 @@ async fn run_onboard(
     // Step 1: Handle keys
     if let Some(ref pk_b58) = private_key {
         // --private-key provided (with --party): write key and derive public key
-        let bytes = orderbook_agent_logic::config::decode_private_key(pk_b58)?;
+        let bytes = agent_logic::config::decode_private_key(pk_b58)?;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
         let pub_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
         upsert_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY", pk_b58)?;
@@ -2040,7 +1801,7 @@ async fn run_onboard(
     } else if let Some(pk) = read_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY") {
         // Existing private key in .env
         println!("Found existing private key in {}", env_file.display());
-        let bytes = orderbook_agent_logic::config::decode_private_key(&pk)?;
+        let bytes = agent_logic::config::decode_private_key(&pk)?;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
         let pub_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
         upsert_env_value(&env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
@@ -2048,7 +1809,7 @@ async fn run_onboard(
     } else {
         // No key provided and none in .env — generate new keypair
         println!("Generating new Ed25519 keypair...");
-        let (priv_b58, pub_b58) = orderbook_agent_logic::sign::generate_keypair();
+        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair();
         upsert_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY", &priv_b58)?;
         upsert_env_value(&env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
         upsert_env_value(&env_file, "ORDERBOOK_GRPC_URL", &rpc)?;
@@ -2088,7 +1849,7 @@ async fn run_onboard(
     // Need private key bytes and public key for the waiting list flow
     let pk = read_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY")
         .ok_or_else(|| anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY missing from .env"))?;
-    let private_key_bytes = orderbook_agent_logic::config::decode_private_key(&pk)?;
+    let private_key_bytes = agent_logic::config::decode_private_key(&pk)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key_bytes);
     let public_key_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
 
@@ -2182,7 +1943,7 @@ async fn run_onboard(
 
         println!("\nSigning multihash...");
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key_bytes);
-        let multihash_signature = orderbook_agent_logic::sign::sign_multihash(&signing_key, &multihash)?;
+        let multihash_signature = agent_logic::sign::sign_multihash(&signing_key, &multihash)?;
 
         let canonical = message_signing::canonical_submit_onboarding_signature(
             &public_key_b58,
@@ -2274,29 +2035,29 @@ async fn run_onboard(
 /// The `onboard` subcommand only needs identity + endpoint info, all of which live
 /// in `.env` after Step 2 of `run_onboard`. Using this struct lets the onboard
 /// path run without any `agent.toml` at all.
-struct OnboardConfig {
-    party_id: String,
-    role: String,
-    private_key_bytes: [u8; 32],
-    node_name: String,
-    ledger_service_public_key: [u8; 32],
-    token_ttl_secs: u64,
-    connection_timeout_secs: u64,
-    request_timeout_secs: u64,
+pub struct OnboardConfig {
+    pub party_id: String,
+    pub role: String,
+    pub private_key_bytes: [u8; 32],
+    pub node_name: String,
+    pub ledger_service_public_key: [u8; 32],
+    pub token_ttl_secs: u64,
+    pub connection_timeout_secs: u64,
+    pub request_timeout_secs: u64,
 }
 
 impl OnboardConfig {
-    fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let party_id = std::env::var("PARTY_AGENT")
             .map_err(|_| anyhow::anyhow!("PARTY_AGENT env var is required"))?;
         let private_key_base58 = std::env::var("PARTY_AGENT_PRIVATE_KEY")
             .map_err(|_| anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY env var is required"))?;
-        let private_key_bytes = orderbook_agent_logic::config::decode_private_key(&private_key_base58)?;
+        let private_key_bytes = agent_logic::config::decode_private_key(&private_key_base58)?;
         let node_name = std::env::var("NODE_NAME")
             .map_err(|_| anyhow::anyhow!("NODE_NAME env var is required"))?;
         let ledger_service_public_key_base58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
             .map_err(|_| anyhow::anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
-        let ledger_service_public_key = orderbook_agent_logic::config::decode_public_key(
+        let ledger_service_public_key = agent_logic::config::decode_public_key(
             &ledger_service_public_key_base58,
         )?;
 
@@ -2315,7 +2076,7 @@ impl OnboardConfig {
 
 /// Complete ledger onboarding (preapproval + user-service).
 /// Called after PARTY_AGENT is set in .env. Does not require `agent.toml`.
-async fn complete_ledger_onboarding(
+pub async fn complete_ledger_onboarding(
     env_file: &std::path::Path,
     rpc: &str,
 ) -> Result<()> {
@@ -2394,7 +2155,7 @@ async fn complete_ledger_onboarding(
         use orderbook_proto::orderbook::GetInstrumentsRequest;
         let channel = create_raw_channel(rpc).await
             .context("Failed to connect to orderbook-rpc for instruments")?;
-        let jwt = orderbook_agent_logic::auth::generate_jwt(
+        let jwt = agent_logic::auth::generate_jwt(
             &cfg.party_id, &cfg.role, &cfg.private_key_bytes,
             cfg.token_ttl_secs, Some(cfg.node_name.as_str()),
         ).unwrap_or_default();
@@ -2512,7 +2273,7 @@ async fn complete_ledger_onboarding(
                     use orderbook_proto::orderbook::GetInstrumentsRequest;
                     let mut found = None;
                     if let Ok(ch) = create_raw_channel(rpc).await {
-                        let jwt = orderbook_agent_logic::auth::generate_jwt(
+                        let jwt = agent_logic::auth::generate_jwt(
                             &cfg.party_id, &cfg.role, &cfg.private_key_bytes,
                             cfg.token_ttl_secs, Some(cfg.node_name.as_str()),
                         ).unwrap_or_default();
@@ -2614,7 +2375,7 @@ async fn complete_ledger_onboarding(
 // User service commands
 // ============================================================================
 
-async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -2631,8 +2392,8 @@ async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verb
     match command {
         UserServiceCommands::Request { reference_id, party_name } => {
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Request UserService",
                     &format!("party: {}", config.party_id),
@@ -2667,28 +2428,28 @@ async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verb
     Ok(())
 }
 
-fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
+pub fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
     match command {
         SignCommands::Multihash { input, private_key } => {
-            let key = orderbook_agent_logic::sign::resolve_signing_key(
+            let key = agent_logic::sign::resolve_signing_key(
                 &config.private_key_bytes,
                 private_key.as_deref(),
             )?;
-            println!("{}", orderbook_agent_logic::sign::sign_multihash(&key, &input)?);
+            println!("{}", agent_logic::sign::sign_multihash(&key, &input)?);
         }
         SignCommands::Message { input, private_key } => {
-            let key = orderbook_agent_logic::sign::resolve_signing_key(
+            let key = agent_logic::sign::resolve_signing_key(
                 &config.private_key_bytes,
                 private_key.as_deref(),
             )?;
-            println!("{}", orderbook_agent_logic::sign::sign_message(&key, &input));
+            println!("{}", agent_logic::sign::sign_message(&key, &input));
         }
         SignCommands::Binary { input, private_key } => {
-            let key = orderbook_agent_logic::sign::resolve_signing_key(
+            let key = agent_logic::sign::resolve_signing_key(
                 &config.private_key_bytes,
                 private_key.as_deref(),
             )?;
-            println!("{}", orderbook_agent_logic::sign::sign_binary(&key, &input)?);
+            println!("{}", agent_logic::sign::sign_binary(&key, &input)?);
         }
     }
     Ok(())
@@ -2698,7 +2459,7 @@ fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
 // Faucet commands
 // ============================================================================
 
-async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bool) -> Result<()> {
+pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bool) -> Result<()> {
     let mut client = ledger_client::DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -2765,7 +2526,7 @@ async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bool) 
 // Lock commands
 // ============================================================================
 
-async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
     let mut client = ledger_client::DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -2802,8 +2563,8 @@ async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, dry_
             };
 
             if confirm && !dry_run {
-                let lock = orderbook_agent_logic::confirm::new_confirm_lock();
-                orderbook_agent_logic::confirm::confirm_transaction(
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Lock Holdings",
                     &format!("amount: {}, instrument: {}, context: {}", amount, instrument_id, context),

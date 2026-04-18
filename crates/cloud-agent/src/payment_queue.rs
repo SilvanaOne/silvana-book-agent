@@ -23,11 +23,11 @@ use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
-use orderbook_agent_logic::auth::generate_jwt;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::confirm::{confirm_transaction, ConfirmLock};
-use orderbook_agent_logic::rpc_client::OrderbookRpcClient;
-use orderbook_agent_logic::settlement::{PendingFee, PendingTrafficFee, StepResult};
+use agent_logic::auth::generate_jwt;
+use agent_logic::config::BaseConfig;
+use agent_logic::confirm::{confirm_transaction, ConfirmLock};
+use agent_logic::rpc_client::OrderbookRpcClient;
+use agent_logic::settlement::{PendingFee, PendingTrafficFee, StepResult};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AllocateParams, PayFeeParams,
     PrepareTransactionRequest, TransferCcParams, TransactionOperation,
@@ -710,10 +710,10 @@ impl PaymentQueue {
 
                 // Check if fees or traffic are paused (low issuance pauses BOTH)
                 let fees_paused = crate::ledger_client::fee_pause_remaining().is_some()
-                    || orderbook_agent_logic::forecast::is_fees_paused_by_overload()
-                    || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
+                    || agent_logic::forecast::is_fees_paused_by_overload()
+                    || agent_logic::forecast::is_traffic_paused_by_forecast();
                 let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some()
-                    || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
+                    || agent_logic::forecast::is_traffic_paused_by_forecast();
 
                 // Skip sync PayFee while fees paused
                 if item_priority == PaymentPriority::Normal && fees_paused {
@@ -1082,7 +1082,7 @@ impl PaymentQueue {
                 let has_pending_allocations = allocation_deferred
                     || heap.iter().any(|i| matches!(&i.request, PaymentRequest::Allocate { .. }));
                 let traffic_paused = crate::ledger_client::traffic_fee_pause_remaining().is_some()
-                    || orderbook_agent_logic::forecast::is_traffic_paused_by_forecast();
+                    || agent_logic::forecast::is_traffic_paused_by_forecast();
                 if !has_pending_allocations && !traffic_paused {
                     let mut backlog = traffic_fee_backlog.lock().await;
                     let to_drain = config.batch_pay_max_size.min(backlog.len());

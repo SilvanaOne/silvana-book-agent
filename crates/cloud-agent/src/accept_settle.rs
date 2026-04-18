@@ -10,7 +10,7 @@
 //!
 //! Fee amounts are sourced from `BaseConfig` / env vars
 //! `AGENT_FEE_CC` / `PARTICIPANT_FEE_CC` / `SIGNATURE_FEE_CC` via
-//! `orderbook_agent_logic::fees::taker_settlement_fees`.
+//! `agent_logic::fees::taker_settlement_fees`.
 //! Traffic fee is estimated in two phases: the first `PrepareTransaction`
 //! returns `traffic_estimate.total_bytes`; the second is submitted with the
 //! actual CC amount computed from bytes × rate.
@@ -22,10 +22,10 @@ use rust_decimal::prelude::FromStr as _;
 use rust_decimal::Decimal;
 use tracing::{debug, info};
 
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::confirm::{confirm_transaction, ConfirmLock};
-use orderbook_agent_logic::fees::{taker_settlement_fees, FeeTarget};
-use orderbook_agent_logic::settlement::StepResult;
+use agent_logic::config::BaseConfig;
+use agent_logic::confirm::{confirm_transaction, ConfirmLock};
+use agent_logic::fees::{taker_settlement_fees, FeeTarget};
+use agent_logic::settlement::StepResult;
 use orderbook_proto::ledger::{
     multi_call_op::Op, prepare_transaction_request::Params, ExecuteMultiCallParams,
     ExecuteTransactionResponse, McAcceptDvpAndAllocate, McBatchTransfer, McTransferTarget,

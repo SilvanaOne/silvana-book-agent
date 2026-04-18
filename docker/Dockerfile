@@ -68,17 +68,17 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
         export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ && \
         export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar && \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
-        cargo build --release --target aarch64-unknown-linux-gnu -p orderbook-cloud-agent && \
+        cargo build --release --target aarch64-unknown-linux-gnu -p cli && \
         cp target/aarch64-unknown-linux-gnu/release/cloud-agent /tmp/cloud-agent; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         export CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc && \
         export CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ && \
         export AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar && \
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc && \
-        cargo build --release --target x86_64-unknown-linux-gnu -p orderbook-cloud-agent && \
+        cargo build --release --target x86_64-unknown-linux-gnu -p cli && \
         cp target/x86_64-unknown-linux-gnu/release/cloud-agent /tmp/cloud-agent; \
     else \
-        cargo build --release -p orderbook-cloud-agent && \
+        cargo build --release -p cli && \
         cp target/release/cloud-agent /tmp/cloud-agent; \
     fi
 

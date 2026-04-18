@@ -1,6 +1,7 @@
 # Rust
 target/
 
+
 # Environment
 .env
 .env.*
@@ -11,6 +12,7 @@ target/
 *.swp
 *.swo
 *~
+plans/
 
 # OS
 .DS_Store
@@ -20,3 +22,4 @@ logs
 
 # Docker build artifacts
 docker/release/
+

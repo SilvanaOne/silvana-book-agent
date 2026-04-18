@@ -16,7 +16,7 @@ Two modes of providing liquidity:
 ## Build
 
 ```bash
-cargo build --release -p orderbook-cloud-agent
+cargo build --release -p cli
 ```
 
 The binary is at `target/release/cloud-agent`.

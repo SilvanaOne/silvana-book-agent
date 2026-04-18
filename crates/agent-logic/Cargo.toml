@@ -1,5 +1,5 @@
 [package]
-name = "orderbook-agent-logic"
+name = "agent-logic"
 version.workspace = true
 edition.workspace = true
 

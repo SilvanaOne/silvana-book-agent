@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::path::Path;
 
-use orderbook_agent_logic::config::BaseConfig;
+use agent_logic::config::BaseConfig;
 
 /// Strict loader — `agent.toml` must exist. Use for commands that read
 /// market/LP config (`agent`).

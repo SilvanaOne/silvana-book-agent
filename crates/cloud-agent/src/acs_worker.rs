@@ -11,8 +11,8 @@ use std::time::Duration;
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::liquidity::LiquidityManager;
+use agent_logic::config::BaseConfig;
+use agent_logic::liquidity::LiquidityManager;
 
 use crate::amulet_cache::{AmuletCache, CachedAmulet};
 use crate::ledger_client::DAppProviderClient;

@@ -1,18 +1,11 @@
 [package]
-name = "orderbook-cloud-agent"
+name = "cloud-agent"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "cloud-agent"
-path = "src/main.rs"
-
-[build-dependencies]
-vergen-gitcl = "1"
-
 [dependencies]
 # Shared logic
-orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+agent-logic = { path = "../agent-logic" }
 orderbook-proto = { path = "../orderbook-proto" }
 tx-verifier = { path = "../tx-verifier" }
 message-signing = { path = "../message-signing" }

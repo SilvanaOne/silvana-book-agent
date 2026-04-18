@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
-use orderbook_agent_logic::config::BaseConfig;
+use agent_logic::config::BaseConfig;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, PrepareTransactionRequest,
     SplitCcParams, TransactionOperation,

@@ -3,6 +3,36 @@
 version = 4
 
 [[package]]
+name = "agent-logic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "indexmap",
+ "orderbook-proto",
+ "prost-types",
+ "rand",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -259,6 +289,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
+name = "buy-cc-example"
+version = "0.1.0"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "orderbook-proto",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bytecheck"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -363,6 +408,56 @@ name = "clap_lex"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
+
+[[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "orderbook-proto",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "vergen-gitcl",
+]
+
+[[package]]
+name = "cloud-agent"
+version = "0.1.0"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "csv",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand",
+ "rust_decimal",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
 
 [[package]]
 name = "cmake"
@@ -1194,70 +1289,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "orderbook-agent-logic"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "ed25519-dalek",
- "futures",
- "hex",
- "indexmap",
- "orderbook-proto",
- "prost-types",
- "rand",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "orderbook-cloud-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "csv",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-agent-logic",
- "orderbook-proto",
- "prost-types",
- "rand",
- "rust_decimal",
- "rustls",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
- "vergen-gitcl",
-]
 
 [[package]]
 name = "orderbook-proto"

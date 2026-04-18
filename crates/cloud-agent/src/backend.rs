@@ -14,10 +14,10 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use tracing::{debug, info};
 
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::confirm::ConfirmLock;
-use orderbook_agent_logic::liquidity::LiquidityManager;
-use orderbook_agent_logic::settlement::{DiscoveredContract, PendingFee, PendingTrafficFee, SettlementBackend, StepResult};
+use agent_logic::config::BaseConfig;
+use agent_logic::confirm::ConfirmLock;
+use agent_logic::liquidity::LiquidityManager;
+use agent_logic::settlement::{DiscoveredContract, PendingFee, PendingTrafficFee, SettlementBackend, StepResult};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AcceptDvpParams,
     PrepareTransactionRequest, ProposeDvpParams, TransactionOperation,
@@ -113,7 +113,7 @@ impl SettlementBackend for CloudSettlementBackend {
 
     async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
         if self.confirm && !self.dry_run {
-            orderbook_agent_logic::confirm::confirm_transaction(
+            agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
                 "Propose DVP",
                 &format!("proposal: {}", proposal_id),
@@ -166,7 +166,7 @@ impl SettlementBackend for CloudSettlementBackend {
         quote_instrument: &str,
     ) -> Result<StepResult> {
         if self.confirm && !self.dry_run {
-            orderbook_agent_logic::confirm::confirm_transaction(
+            agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
                 "Accept DVP",
                 &format!("proposal: {}, dvp_proposal: {}", proposal_id, dvp_proposal_cid),

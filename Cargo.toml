@@ -1,8 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/orderbook-cloud-agent",
-    "crates/orderbook-agent-logic",
+    "crates/cloud-agent",
+    "crates/cli",
+    "crates/agent-logic",
+    "crates/orderbook-proto",
+    "crates/tx-verifier",
+    "crates/message-signing",
+    "examples/buy_cc",
+]
+default-members = [
+    "crates/cloud-agent",
+    "crates/cli",
+    "crates/agent-logic",
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",

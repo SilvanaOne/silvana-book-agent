@@ -23,9 +23,9 @@ use rust_decimal::Decimal;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::state::SavedFillState;
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
+use agent_logic::state::SavedFillState;
 
 use crate::accept_settle::MulticallSettler;
 use crate::ledger_client::DAppProviderClient;
@@ -121,13 +121,13 @@ pub async fn run_fill_loop(
     .context("Failed to create ledger client")?;
 
     // Orderbook-rpc client for fetching settlement proposal fees
-    let mut rpc_client = orderbook_agent_logic::rpc_client::OrderbookRpcClient::connect(
+    let mut rpc_client = agent_logic::rpc_client::OrderbookRpcClient::connect(
         &config.orderbook_grpc_url,
         None,
     )
     .await
     .context("Failed to create orderbook-rpc client")?;
-    rpc_client.set_jwt(orderbook_agent_logic::auth::generate_jwt(
+    rpc_client.set_jwt(agent_logic::auth::generate_jwt(
         &config.party_id,
         &config.role,
         &config.private_key_bytes,
@@ -530,13 +530,13 @@ async fn monitor_settlement_progress(
 ) {
     use orderbook_proto::settlement::NextAction;
 
-    let Ok(mut rpc) = orderbook_agent_logic::rpc_client::OrderbookRpcClient::connect(
+    let Ok(mut rpc) = agent_logic::rpc_client::OrderbookRpcClient::connect(
         &config.orderbook_grpc_url, None,
     ).await else {
         warn!("[round {}] Could not connect RPC for progress monitoring {}", round, proposal_id);
         return;
     };
-    if let Ok(jwt) = orderbook_agent_logic::auth::generate_jwt(
+    if let Ok(jwt) = agent_logic::auth::generate_jwt(
         &config.party_id, &config.role, &config.private_key_bytes,
         config.token_ttl_secs, Some(config.node_name.as_str()),
     ) {
@@ -631,7 +631,7 @@ async fn poll_dvp_proposal_cid(
 /// Fetch the (dvp_processing_fee, allocation_processing_fee) owed by the taker
 /// side (buyer for Buy direction, seller for Sell direction).
 async fn fetch_settlement_fees(
-    rpc: &mut orderbook_agent_logic::rpc_client::OrderbookRpcClient,
+    rpc: &mut agent_logic::rpc_client::OrderbookRpcClient,
     proposal_id: &str,
     direction: FillDirection,
 ) -> Result<(String, String)> {
@@ -676,14 +676,14 @@ fn save_fill_state_only(
     party_id: &str,
     fill_state: SavedFillState,
 ) -> Result<()> {
-    use orderbook_agent_logic::state::SavedState;
+    use agent_logic::state::SavedState;
     // Load existing, patch fill_state, save back. Best-effort.
-    let existing = orderbook_agent_logic::state::load_state(path)
+    let existing = agent_logic::state::load_state(path)
         .filter(|s| s.party_id == party_id);
     let mut state = existing.unwrap_or_else(|| SavedState::new(party_id.to_string(), 0));
     state.fill_state = Some(fill_state);
     state.saved_at = chrono::Utc::now().to_rfc3339();
-    orderbook_agent_logic::state::save_state(path, &state)?;
+    agent_logic::state::save_state(path, &state)?;
     Ok(())
 }
 

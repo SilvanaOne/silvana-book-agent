@@ -102,7 +102,7 @@ pub fn traffic_fee_pause_remaining() -> Option<u64> {
     }
 }
 
-use orderbook_agent_logic::auth::generate_jwt;
+use agent_logic::auth::generate_jwt;
 use message_signing::{
     sign_canonical, verify_canonical, parse_public_key,
     canonical_prepare_request, canonical_prepare_response,
