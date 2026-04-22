@@ -433,23 +433,26 @@ impl PaymentQueue {
 
     /// Queue per-step fixed fees (agent, participant, signature) via the traffic fee backlog.
     /// Each fee is only queued if the corresponding config value is defined.
-    pub fn queue_step_fees(&self, step_name: &str, proposal_id: &str, config: &BaseConfig) {
+    /// Each configured fee type is pushed `count` times.
+    pub fn queue_step_fees(&self, step_name: &str, proposal_id: &str, config: &BaseConfig, count: u32) {
         let fees: Vec<(&str, &Option<String>, &str)> = vec![
             ("agent-fee", &config.agent_fee_cc, &config.fee_party),
             ("participant-fee", &config.participant_fee_cc, &config.traffic_fee_party),
             ("signature-fee", &config.signature_fee_cc, &config.fee_party),
         ];
         let mut entries = Vec::new();
-        for (fee_type, amount_opt, receiver) in fees {
-            if let Some(amount) = amount_opt {
-                entries.push(PendingTrafficFee {
-                    traffic_bytes: 0,
-                    step_name: format!("{}:{}", fee_type, step_name),
-                    proposal_id: proposal_id.to_string(),
-                    retry_count: 0,
-                    receiver_party: Some(receiver.to_string()),
-                    amount_cc_fixed: Some(amount.clone()),
-                });
+        for _ in 0..count {
+            for (fee_type, amount_opt, receiver) in &fees {
+                if let Some(amount) = amount_opt {
+                    entries.push(PendingTrafficFee {
+                        traffic_bytes: 0,
+                        step_name: format!("{}:{}", fee_type, step_name),
+                        proposal_id: proposal_id.to_string(),
+                        retry_count: 0,
+                        receiver_party: Some(receiver.to_string()),
+                        amount_cc_fixed: Some(amount.clone()),
+                    });
+                }
             }
         }
         if entries.is_empty() {

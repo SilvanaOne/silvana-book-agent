@@ -143,7 +143,8 @@ pub trait SettlementBackend: Send + Sync {
 
     /// Queue per-step fixed fees (agent, participant, signature) at lowest priority.
     /// Each fee is only queued if the corresponding env var is defined in config.
-    fn queue_step_fees(&self, step_name: &str, proposal_id: &str);
+    /// Each configured fee type is pushed `count` times.
+    fn queue_step_fees(&self, step_name: &str, proposal_id: &str, count: u32);
 
     /// Sync on-chain contracts for given settlement IDs
     async fn sync_contracts(&self, settlement_ids: &[String]) -> Result<Vec<DiscoveredContract>>;
@@ -1027,7 +1028,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                                 }
                             }
 
-                            backend.queue_step_fees("allocate", proposal_id);
+                            backend.queue_traffic_fee(step_result.traffic_total, "allocate", proposal_id);
+                            backend.queue_step_fees("allocate", proposal_id, 2);
 
                             let final_result = AdvanceResult::StepCompleted {
                                 proposal_id: proposal_id.clone(),
@@ -1861,6 +1863,7 @@ async fn advance_single<B: SettlementBackend>(
                 fee_amount_usd: fee_usd,
                 fee_cc_estimate: 0.0,
             }).await;
+            backend.queue_step_fees("paydvpfee", &proposal_id, 1);
             AdvanceResult::StepCompleted {
                 proposal_id,
                 stage: SettlementStage::DvpFeePaid,
@@ -1882,7 +1885,7 @@ async fn advance_single<B: SettlementBackend>(
 
                     // Queue traffic fee at lowest priority (fire-and-forget)
                     backend.queue_traffic_fee(result.traffic_total, "propose", &proposal_id);
-                    backend.queue_step_fees("propose", &proposal_id);
+                    backend.queue_step_fees("propose", &proposal_id, 2);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpProposed,
@@ -1942,7 +1945,7 @@ async fn advance_single<B: SettlementBackend>(
 
                     // Queue traffic fee at lowest priority (fire-and-forget)
                     backend.queue_traffic_fee(result.traffic_total, "accept", &proposal_id);
-                    backend.queue_step_fees("accept", &proposal_id);
+                    backend.queue_step_fees("accept", &proposal_id, 2);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpAccepted,
@@ -1985,6 +1988,7 @@ async fn advance_single<B: SettlementBackend>(
                 fee_amount_usd: fee_usd,
                 fee_cc_estimate: 0.0,
             }).await;
+            backend.queue_step_fees("payallocfee", &proposal_id, 1);
             AdvanceResult::StepCompleted {
                 proposal_id,
                 stage: SettlementStage::AllocationFeePaid,
@@ -1995,18 +1999,35 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::Allocate => {
-            // LP allocates last — wait for operator to witness counterparty's allocation
-            let counterparty_alloc = if state.is_buyer {
-                status.allocation_seller.as_ref()
+            // LP allocates last — wait for operator to witness counterparty's
+            // DVP fee, allocation fee, and allocation on-chain. Checking only
+            // the allocation is not enough: a cheating user can record
+            // *_completed events for their fees without actually transferring
+            // them to the orderbook-fee party, leaving the orderbook short.
+            let (cp_dvp_fee, cp_alloc_fee, cp_alloc) = if state.is_buyer {
+                (
+                    status.dvp_processing_fee_seller.as_ref(),
+                    status.allocation_processing_fee_seller.as_ref(),
+                    status.allocation_seller.as_ref(),
+                )
             } else {
-                status.allocation_buyer.as_ref()
+                (
+                    status.dvp_processing_fee_buyer.as_ref(),
+                    status.allocation_processing_fee_buyer.as_ref(),
+                    status.allocation_buyer.as_ref(),
+                )
             };
-            let counterparty_status = counterparty_alloc.map(|s| s.status).unwrap_or(0);
-            let counterparty_witnessed = counterparty_status == 4; // DVP_STEP_STATUS_CONFIRMED
-            if !counterparty_witnessed {
+            const CONFIRMED: i32 = 4; // DVP_STEP_STATUS_CONFIRMED
+            let cp_dvp_fee_status = cp_dvp_fee.map(|s| s.status).unwrap_or(0);
+            let cp_alloc_fee_status = cp_alloc_fee.map(|s| s.status).unwrap_or(0);
+            let cp_alloc_status = cp_alloc.map(|s| s.status).unwrap_or(0);
+            if cp_dvp_fee_status != CONFIRMED
+                || cp_alloc_fee_status != CONFIRMED
+                || cp_alloc_status != CONFIRMED
+            {
                 info!(
-                    "[{}] Allocate: waiting for counterparty allocation witness (status={}, need=4)",
-                    proposal_id, counterparty_status
+                    "[{}] Allocate: waiting for counterparty witnesses — dvp_fee={} alloc_fee={} alloc={} (need 4 each)",
+                    proposal_id, cp_dvp_fee_status, cp_alloc_fee_status, cp_alloc_status
                 );
                 return AdvanceResult::Wait { proposal_id };
             }

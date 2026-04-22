@@ -241,8 +241,8 @@ impl SettlementBackend for CloudSettlementBackend {
         self.payment_queue.queue_traffic_fee(traffic_bytes, step_name, proposal_id);
     }
 
-    fn queue_step_fees(&self, step_name: &str, proposal_id: &str) {
-        self.payment_queue.queue_step_fees(step_name, proposal_id, &self.config);
+    fn queue_step_fees(&self, step_name: &str, proposal_id: &str, count: u32) {
+        self.payment_queue.queue_step_fees(step_name, proposal_id, &self.config, count);
     }
 
     async fn queue_fee_payment(&self, mut fee: PendingFee) {
