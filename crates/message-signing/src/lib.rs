@@ -171,8 +171,8 @@ pub fn canonical_params_transfer_cc(
     s
 }
 
-pub fn canonical_params_request_preapproval() -> String {
-    "param_type=RequestPreapproval\n".to_string()
+pub fn canonical_params_request_preapproval(instrument_admin: &str) -> String {
+    format!("param_type=RequestPreapproval\ninstrument_admin={}\n", instrument_admin)
 }
 
 pub fn canonical_params_request_recurring_prepaid(
@@ -261,6 +261,41 @@ pub fn canonical_params_execute_multicall(op_count: usize) -> String {
     format!(
         "param_type=ExecuteMultiCall\nop_count={}\n",
         op_count
+    )
+}
+
+pub fn canonical_params_lock_holdings(lock_service_cid: &str, amount: &str, context: &str) -> String {
+    format!(
+        "param_type=LockHoldings\nlock_service_cid={}\namount={}\ncontext={}\n",
+        lock_service_cid, amount, context
+    )
+}
+
+pub fn canonical_params_process_lock_unlock_requests(lock_controller_cid: &str, request_count: usize) -> String {
+    format!(
+        "param_type=ProcessLockUnlockRequests\nlock_controller_cid={}\nrequest_count={}\n",
+        lock_controller_cid, request_count
+    )
+}
+
+pub fn canonical_params_resize_lock(lock_controller_cid: &str, new_amount: &str) -> String {
+    format!(
+        "param_type=ResizeLock\nlock_controller_cid={}\nnew_amount={}\n",
+        lock_controller_cid, new_amount
+    )
+}
+
+pub fn canonical_params_terminate_lock(lock_controller_cid: &str) -> String {
+    format!(
+        "param_type=TerminateLock\nlock_controller_cid={}\n",
+        lock_controller_cid
+    )
+}
+
+pub fn canonical_params_faucet(token_name: &str, token_admin: &str, ticket: &str, dry_run: bool) -> String {
+    format!(
+        "param_type=Faucet\ntoken_name={}\ntoken_admin={}\nticket={}\ndry_run={}\n",
+        token_name, token_admin, ticket, dry_run
     )
 }
 
@@ -469,7 +504,7 @@ mod tests {
         assert!(!canonical_params_propose_dvp("p1").is_empty());
         assert!(!canonical_params_accept_dvp("p1", "cid").is_empty());
         assert!(!canonical_params_allocate("p1", "cid").is_empty());
-        assert!(!canonical_params_request_preapproval().is_empty());
+        assert!(!canonical_params_request_preapproval("DSO::1220abc").is_empty());
         assert!(!canonical_params_request_recurring_prepaid("app", "10", "5", 30, None, None).is_empty());
         assert!(!canonical_params_request_recurring_payasyougo("app", "10", None, None).is_empty());
         assert!(!canonical_params_request_user_service(None, None).is_empty());
