@@ -89,15 +89,39 @@ impl MulticallSettler {
     /// (e.g. "USDC" for a buy on CC-USDC, "CC" for a sell). When it's not CC,
     /// the settler fetches the party's CIP-56 Holdings and appends their cids
     /// to `holding_cids` alongside the CC amulets used for fee payments.
+    /// `dvp_processing_fee_cc` / `alloc_processing_fee_cc` MUST be CC amounts,
+    /// already converted from the proposal's USD fees via `cc_usd_rate`.
+    /// The matching `*_usd` strings are passed solely so we can assert — at
+    /// this defensive boundary — that the caller did not skip the conversion
+    /// (see `fill_loop.rs::fetch_settlement_fees`).
     pub async fn accept_and_settle(
         &self,
         proposal_id: &str,
         dvp_proposal_cid: &str,
         dvp_processing_fee_cc: &str,
         alloc_processing_fee_cc: &str,
+        dvp_processing_fee_usd: &str,
+        alloc_processing_fee_usd: &str,
         allocation_instrument_id: &str,
         allocation_cc: Option<Decimal>,
     ) -> Result<StepResult> {
+        // Defense-in-depth against the USD-as-CC regression: if the "CC" fee
+        // equals the proposal's USD fee (and USD is non-zero), upstream skipped
+        // the rate conversion — refuse to publish an underpayment on-chain.
+        let dvp_usd = Decimal::from_str(dvp_processing_fee_usd).unwrap_or(Decimal::ZERO);
+        let alloc_usd = Decimal::from_str(alloc_processing_fee_usd).unwrap_or(Decimal::ZERO);
+        let dvp_cc = Decimal::from_str(dvp_processing_fee_cc).unwrap_or(Decimal::ZERO);
+        let alloc_cc = Decimal::from_str(alloc_processing_fee_cc).unwrap_or(Decimal::ZERO);
+        if (dvp_usd > Decimal::ZERO && dvp_cc == dvp_usd)
+            || (alloc_usd > Decimal::ZERO && alloc_cc == alloc_usd)
+        {
+            anyhow::bail!(
+                "fee amounts look un-converted (cc == usd): dvp_cc={} dvp_usd={} alloc_cc={} alloc_usd={} — check fetch_settlement_fees rate conversion",
+                dvp_processing_fee_cc, dvp_processing_fee_usd,
+                alloc_processing_fee_cc, alloc_processing_fee_usd,
+            );
+        }
+
         if self.confirm && !self.dry_run {
             confirm_transaction(
                 &self.confirm_lock,

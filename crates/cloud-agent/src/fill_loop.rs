@@ -403,15 +403,21 @@ pub async fn run_fill_loop(
             }
         };
 
-        // 2. Fetch settlement proposal fees (dvp + allocation processing fees for our role)
-        let (dvp_fee_cc, alloc_fee_cc) = match fetch_settlement_fees(
+        // 2. Fetch settlement proposal fees (dvp + allocation processing fees
+        // for our role). The proposal stores them in **USD**; we must divide
+        // by the current CC/USD rate before handing off to the multicall
+        // builder — otherwise on-chain Canton transfers carry 0.15 CC worth
+        // ~$0.023 for a $0.15 fee, which the orderbook-rpc amount gate
+        // (correctly) rejects as underpayment.
+        let (dvp_fee_cc, alloc_fee_cc, dvp_fee_usd, alloc_fee_usd) = match fetch_settlement_fees(
             &mut rpc_client,
+            &mut ledger,
             &proposal_id,
             params.direction,
         )
         .await
         {
-            Ok(pair) => pair,
+            Ok(tup) => tup,
             Err(e) => {
                 warn!("[round {}] Failed to fetch settlement fees for {}: {}", round, proposal_id, e);
                 continue;
@@ -433,6 +439,8 @@ pub async fn run_fill_loop(
                 &dvp_proposal_cid,
                 &dvp_fee_cc,
                 &alloc_fee_cc,
+                &dvp_fee_usd,
+                &alloc_fee_usd,
                 &allocation_instrument,
                 allocation_cc,
             )
@@ -630,14 +638,21 @@ async fn poll_dvp_proposal_cid(
 
 /// Fetch the (dvp_processing_fee, allocation_processing_fee) owed by the taker
 /// side (buyer for Buy direction, seller for Sell direction).
+///
+/// Returns CC-denominated amounts. The `settlement_proposals` table stores the
+/// fees in **USD**, so this helper also fetches the current CC/USD rate from
+/// scan (via `ledger.get_dso_rates()`) and divides to get CC. Both return
+/// values are formatted as fixed-10-decimal strings so downstream
+/// `Decimal::from_str` round-trips cleanly.
 async fn fetch_settlement_fees(
     rpc: &mut agent_logic::rpc_client::OrderbookRpcClient,
+    ledger: &mut DAppProviderClient,
     proposal_id: &str,
     direction: FillDirection,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String, String)> {
     // Retry a few times — the proposal row may take a moment to appear after accept_quote.
     let mut attempt = 0;
-    loop {
+    let (dvp_usd_str, alloc_usd_str) = loop {
         match rpc.get_settlement_proposal_by_id(proposal_id).await? {
             Some(p) => {
                 let (dvp, alloc) = match direction {
@@ -650,15 +665,10 @@ async fn fetch_settlement_fees(
                         p.allocation_processing_fee_seller.clone(),
                     ),
                 };
-                // Normalise empty strings to "0.0" so the multicall validator accepts them.
+                // Normalise empty strings to "0.0".
                 let dvp = if dvp.trim().is_empty() { "0.0".to_string() } else { dvp };
                 let alloc = if alloc.trim().is_empty() { "0.0".to_string() } else { alloc };
-                // Validate parse
-                let _ = Decimal::from_str(&dvp)
-                    .with_context(|| format!("invalid dvp fee decimal '{}'", dvp))?;
-                let _ = Decimal::from_str(&alloc)
-                    .with_context(|| format!("invalid alloc fee decimal '{}'", alloc))?;
-                return Ok((dvp, alloc));
+                break (dvp, alloc);
             }
             None => {
                 attempt += 1;
@@ -668,7 +678,49 @@ async fn fetch_settlement_fees(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+    };
+
+    let dvp_usd = Decimal::from_str(&dvp_usd_str)
+        .with_context(|| format!("invalid dvp fee decimal '{}'", dvp_usd_str))?;
+    let alloc_usd = Decimal::from_str(&alloc_usd_str)
+        .with_context(|| format!("invalid alloc fee decimal '{}'", alloc_usd_str))?;
+
+    // Convert USD → CC via the current amulet price. A zero rate is a hard
+    // error: we'd rather fail the round than publish a USD-shaped fee on-chain.
+    let rates = ledger
+        .get_dso_rates()
+        .await
+        .context("failed to fetch DSO rates for USD→CC fee conversion")?;
+    let rate = Decimal::from_str(&rates.cc_usd_rate)
+        .with_context(|| format!("invalid cc_usd_rate '{}'", rates.cc_usd_rate))?;
+    if rate <= Decimal::ZERO {
+        anyhow::bail!("cc_usd_rate is {} — cannot convert fees", rate);
     }
+
+    let dvp_cc = (dvp_usd / rate).round_dp(10);
+    let alloc_cc = (alloc_usd / rate).round_dp(10);
+
+    // Defensive sanity check: if the converted CC amount equals the USD value,
+    // the rate is ~1.0 (unlikely in production) OR the conversion silently
+    // no-op'd. Surface immediately rather than publish an underpayment.
+    if dvp_cc == dvp_usd && dvp_usd > Decimal::ZERO {
+        anyhow::bail!(
+            "dvp fee cc==usd ({} at rate {}) — conversion suspiciously identity",
+            dvp_cc, rate
+        );
+    }
+
+    info!(
+        "Taker fees: dvp={} USD → {} CC, alloc={} USD → {} CC (rate={} USD/CC)",
+        dvp_usd, dvp_cc, alloc_usd, alloc_cc, rate
+    );
+
+    Ok((
+        format!("{:.10}", dvp_cc),
+        format!("{:.10}", alloc_cc),
+        dvp_usd_str,
+        alloc_usd_str,
+    ))
 }
 
 fn save_fill_state_only(

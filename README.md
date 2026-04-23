@@ -1,92 +1,247 @@
 # Silvana Book Agent
 
-Cloud agent for liquidity providers on the Silvana orderbook. Runs without direct Canton ledger access — all ledger operations are proxied through the Silvana gRPC service. Your Ed25519 private key never leaves the agent; transactions are signed locally using a two-phase protocol.
+Cloud agent for liquidity providers and takers on the Silvana orderbook. Runs without direct Canton ledger access — all ledger operations are proxied through the Silvana gRPC service. Your Ed25519 private key never leaves the agent; transactions are signed locally using a two-phase protocol.
 
-Two modes of providing liquidity:
+This repo ships both a CLI (`cloud-agent`) and a set of Rust library crates you can import to build your own agents.
 
-- **Grid orders** — passive limit orders placed at configurable price levels around the mid price
-- **RFQ (Request for Quote)** — real-time quote responses to incoming swap requests via bidirectional gRPC stream
+## Quick Start
 
-## Prerequisites
-
-- [Rust](https://rustup.rs/) (stable toolchain)
-- Protocol Buffers compiler: `apt install protobuf-compiler` (Linux) or `brew install protobuf` (macOS)
-- Silvana orderbook RPC endpoint URL (provided by Silvana)
-
-## Build
+### Build
 
 ```bash
 cargo build --release -p cli
 ```
 
-The binary is at `target/release/cloud-agent`.
+Binary at `target/release/cloud-agent`.
 
-## Onboarding
+### Onboard
 
-Self-service onboarding generates an Ed25519 keypair, registers with the orderbook server, signs the Canton topology transaction, and completes ledger setup (preapproval, user service, subscription) — all in one command:
+Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. It writes `.env` + `agent.toml` and is idempotent — re-run safely.
 
 ```bash
-cloud-agent onboard --rpc https://rpc.example.com --agent-name my-agent --email you@example.com --invite-code YOUR_INVITE_CODE
+cloud-agent onboard \
+  --agent-name my-agent \
+  --email me@example.com \
+  --invite-code INVITE1
 ```
 
-This populates your `.env` file with all required configuration. The command is idempotent and can be re-run safely.
+Default RPC is `https://orderbook-devnet.silvana.dev:443` — override with `--rpc`.
 
-### Options
+### Faucet (devnet top-up)
 
-| Flag | Description |
-|------|-------------|
-| `--rpc <URL>` | Orderbook gRPC endpoint (required) |
-| `--invite-code <CODE>` | Invite code for waiting list registration (required) |
-| `--agent-name <NAME>` | Display name for the agent |
-| `--email <EMAIL>` | Contact email |
-| `--party <ID>` | Skip waiting list (requires `--private-key`) |
-| `--private-key <B58>` | Base58-encoded Ed25519 private key |
-| `--env-file <PATH>` | Path to .env file (default: `.env`) |
+```bash
+cloud-agent faucet get --token CC      # 10,000 CC
+cloud-agent faucet get --token USDC    # 1,000 USDC
+cloud-agent info balance
+```
+
+### Buy CC via RFQ
+
+Requests a quote on the `CC-USDC` market, accepts the best offer, and settles atomically via a single multicall. Repeats until the full amount is filled.
+
+```bash
+cloud-agent buy --market CC-USDC --amount 15
+```
+
+### Sell CC via RFQ
+
+```bash
+cloud-agent sell --market CC-USDC --amount 100
+```
+
+### Run as LP / market-maker
+
+Long-running mode: places grid orders on configured markets, responds to incoming RFQs, and settles DVPs end-to-end. Configured via `agent.toml` (see [Reference](#configuration) below).
+
+```bash
+cloud-agent agent
+```
+
+## SDK — Build Your Own Agent
+
+The same crates the CLI uses are available as Rust libraries. Import them from path or git and build custom agents, batch tools, or test harnesses.
+
+### Minimal example
+
+The canonical minimal agent lives at [`examples/buy_cc`](examples/buy_cc). It buys CC on `CC-USDC` in ~120 lines — polling for quotes at a configurable interval until filled.
+
+`examples/buy_cc/Cargo.toml`:
+
+```toml
+[package]
+name = "buy-cc-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cloud-agent = { path = "../../crates/cloud-agent" }
+agent-logic = { path = "../../crates/agent-logic" }
+orderbook-proto = { path = "../../crates/orderbook-proto" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+```
+
+`examples/buy_cc/src/main.rs` (abridged):
+
+```rust
+use std::sync::Arc;
+use anyhow::{Context, Result};
+use clap::Parser;
+
+use agent_logic::config::BaseConfig;
+use agent_logic::confirm::new_confirm_lock;
+use agent_logic::liquidity::LiquidityManager;
+use cloud_agent::accept_settle::MulticallSettler;
+use cloud_agent::backend::CloudSettlementBackend;
+use cloud_agent::fill_loop::{self, FillDirection, FillParams};
+use cloud_agent::populate_instruments;
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long)] amount: f64,
+    #[arg(long)] max_price: Option<f64>,
+    #[arg(long, default_value = "600")] poll_period: u64,
+    #[arg(long, default_value = "5.0")] min_settlement: f64,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+    let args = Args::parse();
+    tracing_subscriber::fmt().with_env_filter("info").init();
+
+    // 1. Load config from .env + agent.toml
+    let mut config = BaseConfig::load_or_defaults("agent.toml")?;
+
+    // 2. Fetch instrument registry (CC/USDC/…) from orderbook-rpc
+    populate_instruments(&mut config).await?;
+
+    // 3. Create backend (spawns ACS worker to keep amulet cache fresh)
+    let confirm_lock = new_confirm_lock();
+    let lm = LiquidityManager::new(
+        config.fee_reserve_cc, config.liquidity_margin,
+        config.flow_ema_window_hours,
+        config.depletion_max_hours, config.depletion_min_hours,
+    );
+    let backend = CloudSettlementBackend::new(
+        config.clone(), false, false, false, false, confirm_lock.clone(), lm,
+    );
+
+    // 4. Create settler for atomic multicall settlement
+    let settler = Arc::new(MulticallSettler {
+        config: config.clone(),
+        amulet_cache: backend.amulet_cache().clone(),
+        verbose: false, dry_run: false, force: false, confirm: false,
+        confirm_lock,
+    });
+
+    // 5. Run the fill loop
+    let params = FillParams {
+        direction: FillDirection::Buy,
+        market_id: "CC-USDC".to_string(),
+        total_amount: args.amount,
+        price_limit: args.max_price,
+        min_settlement: args.min_settlement,
+        max_settlement: args.amount,
+        interval_secs: args.poll_period,
+    };
+    let _backend_guard = backend;
+    fill_loop::run_fill_loop(config, settler, params, None, None).await
+}
+```
+
+Run it:
+
+```bash
+cargo run -p buy-cc-example -- --amount 10.0 --max-price 0.16 --poll-period 600
+```
+
+### What the SDK gives you
+
+| Crate             | Key exports                                                                                                                                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent-logic`     | `BaseConfig`, `SettlementBackend` trait, `BalanceProvider` trait, `run_agent()`, `LiquidityManager`, `OrderbookClient`, `OrderbookRpcClient`, `OrderTracker`, `SettlementExecutor`, state persistence |
+| `cloud-agent`     | `CloudSettlementBackend` (impls `SettlementBackend`), `DAppProviderClient`, `MulticallSettler`, `RfqHandler`, `PaymentQueue`, `AmuletCache`, `fill_loop::run_fill_loop`, onboarding helpers           |
+| `orderbook-proto` | Generated gRPC clients + all protobuf types (`Market`, `Order`, `SettlementProposal`, `TokenBalance`, …) and reflection descriptor pools                                                              |
+| `message-signing` | Canonical Ed25519 signing for `DAppProviderService` RPCs (`sign_canonical`, `verify_canonical`, canonical payload builders per operation type)                                                        |
+| `tx-verifier`     | `verify_and_hash()` — independent Canton transaction verification + 3-layer SHA-256 hashing before signing                                                                                            |
+
+### Patterns
+
+- **Taker / one-shot trades** — use `fill_loop::run_fill_loop` with `CloudSettlementBackend` + `MulticallSettler` (like the example above).
+- **Long-running LP / market-maker** — implement or configure `cloud_agent::run_cloud_agent(...)` directly, or mirror its setup: build a `CloudSettlementBackend`, a `CloudBalanceProvider`, and call `agent_logic::runner::run_agent()` with your own `AgentOptions`.
+- **Custom backend** — implement the `SettlementBackend` trait on your own type (e.g. for a local Canton ledger or a different proxy) and reuse the entire settlement state machine from `agent-logic`.
+- **One-off operations** — use `DAppProviderClient` directly for preapprovals, transfers, faucet requests, CIP-56 settlements, locks, etc.
+
+## Reference
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) (stable toolchain)
+- Protocol Buffers compiler: `apt install protobuf-compiler` (Linux) or `brew install protobuf` (macOS)
+- Silvana orderbook RPC endpoint URL and an invite code (provided by Silvana)
+
+### Onboarding (full detail)
+
+The `onboard` command performs 11 steps automatically:
+
+1. Load or generate an Ed25519 keypair (written to `.env` as `PARTY_AGENT_PRIVATE_KEY`).
+2. Connect to the orderbook RPC (raw gRPC, no auth yet).
+3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`.
+4. Register on the waiting list (`RegisterAgent`, signed).
+5. Poll for `SIGNATURE_REQUIRED` status.
+6. Fetch and sign the Canton topology multihash.
+7. Submit the signature (`SubmitOnboardingSignature`).
+8. Poll until `TOPOLOGY_CREATED`; write `PARTY_AGENT` to `.env`.
+9. Create Splice `TransferPreapproval` for CC (pending operator acceptance).
+10. Create one CIP-56 `TransferPreapproval` per non-DSO registrar discovered from `GetInstruments`.
+11. Request a `UserService` and (on devnet) auto-faucet CC + USDC.
+
+Flags:
+
+| Flag                     | Description                                      |
+| ------------------------ | ------------------------------------------------ |
+| `--rpc <URL>`            | Orderbook gRPC endpoint (default devnet)         |
+| `--agent-name <NAME>`    | Display name (required)                          |
+| `--email <EMAIL>`        | Contact email (required)                         |
+| `--invite-code <CODE>`   | Waiting list invite code (required)              |
+| `--party <ID>`           | Skip waiting list (requires `--private-key`)     |
+| `--private-key <B58>`    | Base58-encoded Ed25519 private key               |
+| `--env-file <PATH>`      | Path to .env file (default: `.env`)              |
 | `--poll-interval <SECS>` | Polling interval during onboarding (default: 10) |
 
-## Configuration
+### Configuration
 
 The agent reads from three files:
 
-### `.env` — Environment Variables
+#### `.env` — Environment Variables
 
 Auto-populated by `cloud-agent onboard`. Key variables:
 
-| Variable | Description |
-|----------|-------------|
-| `PARTY_AGENT` | Your Canton party ID |
-| `PARTY_AGENT_PRIVATE_KEY` | Base58-encoded Ed25519 private key (32-byte seed) |
-| `ORDERBOOK_GRPC_URL` | Orderbook gRPC endpoint |
-| `SYNCHRONIZER_ID` | Canton synchronizer ID |
-| `NODE_NAME` | Canton node name for routing |
-| `LEDGER_SERVICE_PUBLIC_KEY` | Base58-encoded public key of the ledger service (for message verification) |
-| `PARTY_SETTLEMENT_OPERATOR` | Settlement operator party ID |
-| `PARTY_ORDERBOOK_FEE` | Fee collection party ID |
-| `PARTY_TRAFFIC_FEE` | Traffic fee party ID |
-| `TRAFFIC_FEE_PRICE_USD_MB` | Traffic fee rate in USD per MB |
-| `JOIN_TRAFFIC_TRANSACTIONS` | Join traffic fee transactions (default: `true`) |
-| `AGENT_FEE_RESERVE_CC` | Canton Coin reserve for fees (default: `5.0`) |
-| `SETTLEMENT_THREAD_COUNT` | Concurrent settlement threads (default: `5`) |
-| `AGENT_MAX_SETTLEMENTS` | Max active settlements (default: `10`) |
+| Variable                    | Description                                                             |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `PARTY_AGENT`               | Your Canton party ID                                                    |
+| `PARTY_AGENT_PRIVATE_KEY`   | Base58-encoded Ed25519 private key (32-byte seed)                       |
+| `ORDERBOOK_GRPC_URL`        | Orderbook gRPC endpoint                                                 |
+| `SYNCHRONIZER_ID`           | Canton synchronizer ID                                                  |
+| `NODE_NAME`                 | Canton node name for routing                                            |
+| `LEDGER_SERVICE_PUBLIC_KEY` | Base58-encoded public key of the ledger service (response verification) |
+| `PARTY_SETTLEMENT_OPERATOR` | Settlement operator party ID                                            |
+| `PARTY_ORDERBOOK_FEE`       | Fee collection party ID                                                 |
+| `PARTY_TRAFFIC_FEE`         | Traffic fee party ID                                                    |
+| `TRAFFIC_FEE_PRICE_USD_MB`  | Traffic fee rate in USD per MB                                          |
+| `JOIN_TRAFFIC_TRANSACTIONS` | Batch traffic fee transactions (default: `true`)                        |
+| `AGENT_FEE_RESERVE_CC`      | Canton Coin reserve for fees (default: `5.0`)                           |
+| `SETTLEMENT_THREAD_COUNT`   | Concurrent settlement threads (default: `5`)                            |
+| `AGENT_MAX_SETTLEMENTS`     | Max active settlements (default: `10`)                                  |
 
-### `configuration.toml` — Token Configuration
+#### `agent.toml` — Agent Settings
 
-Shared token registry and Canton Coin configuration:
-
-```toml
-[[registry]]
-party = "registry-party-id..."
-description = "Token Registry"
-
-[[canton_coin]]
-token_id = "canton-coin-token-id..."
-dso_party = "dso-party-id..."
-description = "Canton Coin"
-```
-
-### `agent.toml` — Agent Settings
-
-Full example for a liquidity provider with grid orders and RFQ:
+Full example for an LP with grid orders and RFQ:
 
 ```toml
 role = "agent"
@@ -101,44 +256,31 @@ name = "My LP"
 max_concurrent_rfqs = 10
 default_quote_valid_secs = 30
 
-# Market: CBTC/CC
+# Market: CC-USDC
 [[markets]]
-market_id = "market-id-here"
+market_id = "CC-USDC"
 enabled = true
-base_order_size = "0.001"
+base_order_size = "10"
 price_change_threshold_percent = 0.5
 
-# Grid bid levels (below mid price)
 [[markets.bid_levels]]
 delta_percent = 0.5
-quantity = "0.001"
-
+quantity = "10"
 [[markets.bid_levels]]
 delta_percent = 1.0
-quantity = "0.002"
+quantity = "20"
 
-[[markets.bid_levels]]
-delta_percent = 2.0
-quantity = "0.005"
-
-# Grid offer levels (above mid price)
 [[markets.offer_levels]]
 delta_percent = 0.5
-quantity = "0.001"
-
+quantity = "10"
 [[markets.offer_levels]]
 delta_percent = 1.0
-quantity = "0.002"
+quantity = "20"
 
-[[markets.offer_levels]]
-delta_percent = 2.0
-quantity = "0.005"
-
-# RFQ configuration for this market
 [markets.rfq]
 enabled = true
-min_quantity = "0.001"
-max_quantity = "1.0"
+min_quantity = "1"
+max_quantity = "1000"
 bid_spread_percent = 0.5
 offer_spread_percent = 0.5
 quote_valid_secs = 30
@@ -146,210 +288,150 @@ allocate_before_secs = 3600
 settle_before_secs = 7200
 ```
 
-## Grid Orders
+### Grid Orders
 
-The agent places limit orders on a grid of price levels around the current mid price.
+When `agent` runs, it places limit orders on a grid of price levels around the current mid price.
 
 Each level is defined by:
+
 - **`delta_percent`** — offset from mid price (e.g., `1.0` means 1% below mid for bids, 1% above for offers)
 - **`quantity`** — order size at this level
 
 When the mid price moves by more than `price_change_threshold_percent`, all grid orders are cancelled and re-placed at updated levels.
 
-Example with mid price at 100,000:
+### RFQ (Request for Quote)
 
-| Level | delta_percent | Price | Side |
-|-------|--------------|-------|------|
-| Bid 1 | 0.5 | 99,500 | Buy |
-| Bid 2 | 1.0 | 99,000 | Buy |
-| Bid 3 | 2.0 | 98,000 | Buy |
-| Offer 1 | 0.5 | 100,500 | Sell |
-| Offer 2 | 1.0 | 101,000 | Sell |
-| Offer 3 | 2.0 | 102,000 | Sell |
+When `[liquidity_provider]` is configured, the agent connects to the orderbook server via a bidirectional gRPC stream (`SettlementStream`) and receives RFQ requests in real time.
 
-## RFQ (Request for Quote)
+Flow:
 
-When `[liquidity_provider]` is configured, the agent connects to the orderbook server via a bidirectional gRPC stream and receives RFQ requests in real time.
-
-### Flow
-
-1. Agent connects and sends a handshake identifying the LP
-2. Server routes incoming RFQ requests to the LP
-3. Agent computes a quote price based on mid price and configured spread:
+1. Agent connects and sends a handshake identifying the LP.
+2. Server routes incoming RFQ requests to the LP.
+3. Agent computes a quote price from the mid price and configured spread:
    - **Buy request** (user buys, LP sells): `price = mid * (1 + offer_spread_percent / 100)`
    - **Sell request** (user sells, LP buys): `price = mid * (1 - bid_spread_percent / 100)`
-4. Agent validates quantity against `min_quantity` / `max_quantity`
-5. Agent responds with a quote (including price, quantity, validity window, and settlement deadlines) or a rejection
+4. Agent validates quantity against `min_quantity` / `max_quantity` and checks balance via `LiquidityManager`.
+5. Agent responds with a quote (price, quantity, validity window, settlement deadlines) or a rejection.
 
-### Rejection Reasons
-
-The agent rejects an RFQ if:
-- Market is not configured or disabled
-- RFQ is not enabled for the market
-- Quantity is below `min_quantity` or above `max_quantity`
-- No mid-price is available yet (temporary — resolves after first price poll)
-
-### Settlement Deadlines
+Rejection reasons: market disabled, RFQ disabled for market, quantity out of range, no mid-price yet, insufficient balance.
 
 Each quote includes:
-- **`allocate_before_secs`** — seconds from DVP creation to allocate tokens (default: 3600 = 1 hour)
-- **`settle_before_secs`** — seconds from DVP creation to complete settlement (default: 7200 = 2 hours)
 
-## Running the Agent
+- **`allocate_before_secs`** — seconds from DVP creation to allocate tokens (default: 3600)
+- **`settle_before_secs`** — seconds from DVP creation to complete settlement (default: 7200)
 
-Long-running mode — places grid orders, handles RFQ requests, and settles trades automatically:
+### Taker Fill Loops (`buy` / `sell`)
 
-```bash
-cloud-agent agent
-```
-
-### Flags
-
-| Flag | Description |
-|------|-------------|
-| `--settlement-only` | Disable order placement, only settle existing trades |
-| `--orders-only` | Disable settlement, only place/manage grid orders |
-| `--dry-run` | Prepare and verify transactions without signing or executing |
-| `--confirm` | Prompt for confirmation before signing each transaction |
-| `--verbose` | Enable verbose logging |
-| `--config <PATH>` | Path to agent.toml (default: `agent.toml`) |
-
-### Buyer / Seller Fill Loops
-
-Execute a large trade in chunks via RFQ:
+Execute a large trade in chunks via repeated RFQ. Each accepted quote is settled atomically via a single multicall (`Accept_Dvp + Allocate + fees + traffic`).
 
 ```bash
-# Buy 10 units, chunked into 0.5-5.0 per settlement
-cloud-agent buyer --market <ID> --amount 10 --min-settlement 0.5 --max-settlement 5.0
+# Buy 10 CC, chunked 0.5-5.0 per round, 60s interval between retries
+cloud-agent buy --market CC-USDC --amount 10 \
+  --min-settlement 0.5 --max-settlement 5.0 --interval 60
 
-# Sell 10 units with price floor
-cloud-agent seller --market <ID> --amount 10 --price-limit 95000
+# Sell 10 CC with price floor
+cloud-agent sell --market CC-USDC --amount 10 --price-limit 0.14
 ```
 
-## CLI Reference
+Flags (both `buy` and `sell`):
 
-| Command | Description |
-|---------|-------------|
-| `cloud-agent agent` | Run as long-lived agent (orders + settlement + RFQ) |
-| `cloud-agent onboard --rpc <URL>` | Self-service onboarding |
-| `cloud-agent generate-private-key` | Generate a new Ed25519 keypair |
-| `cloud-agent info balance` | Show token balances |
-| `cloud-agent info party` | Show party ID, public key, node name |
-| `cloud-agent info network` | Show DSO rates and mining rounds |
-| `cloud-agent info list [--template <ID>] [--count]` | List active contracts |
-| `cloud-agent transfer send-cc --receiver <ID> --amount <AMT>` | Send Canton Coin |
-| `cloud-agent transfer send-cip56 --receiver <ID> --instrument-id <NAME> --instrument-admin <ID> --amount <AMT>` | Send CIP-56 token |
-| `cloud-agent transfer accept-cip56 --contract-id <CID>` | Accept incoming CIP-56 transfer |
-| `cloud-agent preapproval request` | Request a TransferPreapproval |
-| `cloud-agent preapproval fetch` | List existing preapprovals |
-| `cloud-agent subscription request-prepaid` | Request prepaid recurring payment |
-| `cloud-agent subscription request-payasyougo` | Request pay-as-you-go subscription |
-| `cloud-agent user-service request` | Request UserService (one-time onboarding) |
-| `cloud-agent buyer --market <ID> --amount <AMT>` | Buy via RFQ fill loop |
-| `cloud-agent seller --market <ID> --amount <AMT>` | Sell via RFQ fill loop |
-| `cloud-agent sign multihash --input <B64>` | Sign a Canton multihash |
-| `cloud-agent sign message --input <TEXT>` | Sign a text message |
+| Flag                   | Description                                                |
+| ---------------------- | ---------------------------------------------------------- |
+| `--market <ID>`        | Market ID (e.g. `CC-USDC`)                                 |
+| `--amount <N>`         | Total amount to fill (base instrument)                     |
+| `--price-limit <N>`    | Max (buy) or min (sell) price per unit — default: mid ± 3% |
+| `--min-settlement <N>` | Minimum per-round size (default: 5.0)                      |
+| `--max-settlement <N>` | Maximum per-round size (default: total amount)             |
+| `--interval <SECS>`    | Retry interval when no quote arrives (default: 60)         |
 
-## gRPC API
+### `agent` mode — flags
+
+| Flag                | Description                                                  |
+| ------------------- | ------------------------------------------------------------ |
+| `--settlement-only` | Disable order placement, only settle existing trades         |
+| `--orders-only`     | Disable settlement, only place/manage grid orders            |
+| `--no-restore`      | Skip loading previous state from `agent-state.json`          |
+| `--no-reject`       | Accept all proposals without RFQ-state verification          |
+| `--dry-run`         | Prepare and verify transactions without signing or executing |
+| `--force`           | Sign and execute even if verification fails                  |
+| `--confirm`         | Prompt for confirmation before signing each transaction      |
+| `--verbose`         | Enable verbose logging                                       |
+| `--config <PATH>`   | Path to agent.toml (default: `agent.toml`)                   |
+
+### Full CLI Reference
+
+| Command                                                                                       | Description                                             |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `agent`                                                                                       | Long-running LP agent (grid + RFQ + settlement)         |
+| `onboard`                                                                                     | Self-service onboarding                                 |
+| `generate-private-key`                                                                        | Generate a new Ed25519 keypair (no config needed)       |
+| `info balance`                                                                                | Show token balances                                     |
+| `info party`                                                                                  | Show party ID, public key, node name                    |
+| `info network`                                                                                | Show DSO party, rates, mining rounds                    |
+| `info list [--template ID] [--count]`                                                         | List active contracts                                   |
+| `buy --market <ID> --amount <N>`                                                              | Buy via RFQ until filled                                |
+| `sell --market <ID> --amount <N>`                                                             | Sell via RFQ until filled                               |
+| `faucet get --token <CC\|USDC\|…> [--admin <P>] [--amount <N>]`                               | Request tokens (devnet)                                 |
+| `transfer send-cc --receiver <P> --amount <N>`                                                | Send Canton Coin                                        |
+| `transfer send-cip56 --receiver <P> --instrument-id <ID> --instrument-admin <P> --amount <N>` | Send CIP-56 token                                       |
+| `transfer accept-cip56 --contract-id <CID>`                                                   | Accept incoming CIP-56 transfer                         |
+| `transfer split-cc --output-amounts a,b,c --amulet-cids x,y`                                  | Split CC amulets                                        |
+| `transfer batch-pay --file payments.csv`                                                      | Batch CC payments (atomic multicall)                    |
+| `preapproval request --instrument-admin <P>`                                                  | Create a `TransferPreapproval`                          |
+| `preapproval fetch`                                                                           | List existing preapprovals                              |
+| `subscription request-prepaid`                                                                | Request a prepaid recurring payment                     |
+| `subscription request-payasyougo`                                                             | Request a pay-as-you-go subscription                    |
+| `user-service request`                                                                        | Request a `UserService` contract (one-time onboarding)  |
+| `lock holdings …`                                                                             | Lock holdings via `LockService.LockHoldings`            |
+| `lock vote …`                                                                                 | Process voting lock/unlock requests on `LockController` |
+| `lock resize …`                                                                               | Resize lock amount on `LockController`                  |
+| `lock terminate …`                                                                            | Terminate lock on `LockController`                      |
+| `sign multihash --input <B64>`                                                                | Sign a Canton 34-byte multihash                         |
+| `sign message --input <TEXT>`                                                                 | Sign a UTF-8 text message                               |
+| `sign binary --input <HEX>`                                                                   | Sign hex-encoded binary data                            |
+
+### gRPC API
 
 The agent communicates with the Silvana orderbook server via 4 gRPC services defined in `proto/silvana/*/v1/*.proto`.
 
-### Services Overview
+| Service               | Proto                            | Role                                                        | Streaming                                                                          |
+| --------------------- | -------------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `DAppProviderService` | `ledger/v1/*.proto`              | Two-phase transaction signing, balance and contract queries | Server-streaming (`GetActiveContracts`, `GetUpdates`)                              |
+| `SettlementService`   | `settlement/v1/settlement.proto` | DVP settlement orchestration, RFQ handling                  | Bidirectional (`SettlementStream`)                                                 |
+| `OrderbookService`    | `orderbook/v1/orderbook.proto`   | Order submission, market data, RFQ initiation               | Server-streaming (`SubscribeOrderbook`, `SubscribeOrders`, `SubscribeSettlements`) |
+| `PricingService`      | `pricing/v1/pricing.proto`       | External price feeds (Binance, ByBit, CoinGecko)            | Server-streaming (`StreamPrices`)                                                  |
 
-| Service | Proto | Role | Streaming |
-|---------|-------|------|-----------|
-| DAppProviderService | `ledger/v1/service.proto` (split across `ledger/v1/*.proto`) | Two-phase transaction signing, balance and contract queries | Server-streaming (`GetActiveContracts`, `GetUpdates`) |
-| SettlementService | `settlement/v1/settlement.proto` | DVP settlement orchestration, RFQ handling | Bidirectional (`SettlementStream`) |
-| OrderbookService | `orderbook/v1/orderbook.proto` | Order submission, market data, RFQ initiation | Server-streaming (`SubscribeOrderbook`, `SubscribeOrders`, `SubscribeSettlements`) |
-| PricingService | `pricing/v1/pricing.proto` | External price feeds (Binance, ByBit, CoinGecko) | Server-streaming (`StreamPrices`) |
-
-### Two-Phase Transaction Flow
+#### Two-Phase Transaction Flow
 
 All ledger-mutating operations use a two-phase signing protocol:
 
-1. Agent calls `PrepareTransaction` with an operation type and parameters
-2. Server returns the full `prepared_transaction` bytes and a hash
-3. Agent uses `tx-verifier` to independently verify the transaction matches the requested operation (correct template, parties, amounts)
-4. Agent signs the hash locally with its Ed25519 private key
-5. Agent calls `ExecuteTransaction` with the signature
-6. Server submits the signed transaction to the Canton ledger
+1. Agent calls `PrepareTransaction` with an operation type and parameters.
+2. Server returns the full `prepared_transaction` bytes and a hash.
+3. Agent uses `tx-verifier` to independently verify the transaction matches the requested operation (correct template, parties, amounts).
+4. Agent signs the hash locally with its Ed25519 private key.
+5. Agent calls `ExecuteTransaction` with the signature.
+6. Server submits the signed transaction to the Canton ledger.
 
-Operation types:
+Supported operation types include: `TRANSFER_CC`, `TRANSFER_CIP56`, `ACCEPT_CIP56`, `PAY_DVP_FEE`, `PROPOSE_DVP`, `ACCEPT_DVP`, `PAY_ALLOC_FEE`, `ALLOCATE`, `EXECUTE_MULTICALL`, `SPLIT_CC`, `REQUEST_PREAPPROVAL`, `REQUEST_RECURRING_PREPAID`, `REQUEST_RECURRING_PAYASYOUGO`, `REQUEST_USER_SERVICE`, `LOCK_HOLDINGS`, `PROCESS_LOCK_UNLOCK_REQUESTS`, `RESIZE_LOCK`, `TERMINATE_LOCK`.
 
-| Operation | Description |
-|-----------|-------------|
-| `TRANSFER_CC` | Send Canton Coin |
-| `TRANSFER_CIP56` | Send CIP-56 token |
-| `ACCEPT_CIP56` | Accept incoming CIP-56 transfer |
-| `PAY_DVP_FEE` | Pay DVP processing fee |
-| `PROPOSE_DVP` | Create DVP proposal |
-| `ACCEPT_DVP` | Accept DVP proposal |
-| `PAY_ALLOC_FEE` | Pay allocation processing fee |
-| `ALLOCATE` | Allocate tokens to DVP |
-| `REQUEST_PREAPPROVAL` | Request TransferPreapproval |
-| `REQUEST_RECURRING_PREPAID` | Request prepaid subscription |
-| `REQUEST_RECURRING_PAYASYOUGO` | Request pay-as-you-go subscription |
-| `REQUEST_USER_SERVICE` | Request UserService (onboarding) |
-
-### Settlement Stream (Bidirectional)
+#### Settlement Stream (Bidirectional)
 
 The `SettlementStream` RPC is a long-lived bidirectional gRPC stream used for RFQ handling and settlement lifecycle coordination.
 
-**Agent sends:**
-- Handshake (party ID, operator party, LP name)
-- Heartbeats
-- Preconfirmation decisions (accept/reject)
-- DVP lifecycle events (creation, acceptance, allocation, settlement)
-- RFQ quotes or rejections
+**Agent sends:** handshake, heartbeats, preconfirmations, DVP lifecycle events, RFQ quotes/rejections.
 
-**Server sends:**
-- Handshake acknowledgement
-- Heartbeats
-- Settlement proposals
-- Preconfirmation requests
-- RFQ requests (routed from users requesting quotes)
+**Server sends:** handshake ack, heartbeats, settlement proposals, preconfirmation requests, RFQ requests.
 
-The agent opens this stream when `[liquidity_provider]` is configured in `agent.toml`. RFQ requests arrive on this stream and the agent responds with a quote (price computed from mid-price and configured spread) or a rejection.
+The agent opens this stream when `[liquidity_provider]` is configured in `agent.toml`.
 
-### Key Query RPCs
+#### Authentication
 
-| RPC | Service | Returns |
-|-----|---------|---------|
-| `GetBalances` | Ledger | Token balances (total, locked, unlocked) |
-| `GetActiveContracts` | Ledger | Stream of active contracts by template filter |
-| `GetUpdates` | Ledger | Stream of ledger transactions from a given offset |
-| `GetPrice` | Pricing | Bid, ask, last price for a market |
-| `GetKlines` | Pricing | OHLCV candlestick data (1m to 1w intervals) |
-| `GetOrders` | Orderbook | Orders with status and type filters |
-| `GetOrderbookDepth` | Orderbook | Aggregated bid/offer price levels |
-| `GetSettlementProposals` | Orderbook | Settlement proposals with status filter |
-| `GetSettlementStatus` | Settlement | Step-by-step DVP status with buyer/seller next actions |
-| `GetMarkets` | Orderbook | Available markets and their configuration |
-| `GetMarketData` | Orderbook | Best bid/ask, last price, 24h volume |
+- **JWT** — Self-describing Ed25519 JWT (RFC 8037) with automatic refresh. Used for Orderbook, Pricing, and Settlement RPCs.
+- **Message signing** — Per-request Ed25519 signature on the canonical request payload, used for `DAppProviderService` two-phase transactions. Server responses are also signed and the agent verifies them using `LEDGER_SERVICE_PUBLIC_KEY`.
 
-### Server-Streaming Subscriptions
+### Security Model
 
-| RPC | Service | Payload |
-|-----|---------|---------|
-| `GetActiveContracts` | Ledger | Active contracts matching template filter |
-| `GetUpdates` | Ledger | Ledger transaction stream from a given offset |
-| `SubscribeSettlements` | Orderbook | Settlement status change events |
-| `StreamPrices` | Pricing | Real-time price ticks with optional orderbook and trade data |
-
-The agent currently uses polling (`poll_interval_secs`, default 10s) for mid-price updates rather than `StreamPrices`. Developers can modify this to use streaming for lower latency. `SubscribeOrderbook` and `SubscribeOrders` are also available but not used by the agent.
-
-### Authentication
-
-- **JWT** — Self-describing Ed25519 JWT (RFC 8037) with automatic refresh. Used for Orderbook, Pricing, and Settlement RPCs. The token embeds the Ed25519 public key; the server verifies it matches the registered party.
-- **Message signing** — Per-request Ed25519 signature on the canonical request payload, used for Ledger two-phase transactions. Server responses are also signed; the agent verifies them using `LEDGER_SERVICE_PUBLIC_KEY`.
-
-## Security Model
-
-- **Two-phase signing**: The server prepares a transaction and returns the full prepared transaction bytes along with a hash. The agent independently recomputes the hash from the prepared transaction, verifies the transaction matches the expected operation using `tx-verifier`, and only then signs and submits.
-- **Transaction verification**: Before signing, `tx-verifier` checks that the prepared transaction matches the requested operation (correct template, parties, amounts). This prevents the server from tricking the agent into signing unexpected transactions.
-- **Ed25519 JWT authentication**: The agent creates self-describing JWTs with an embedded Ed25519 public key (RFC 8037). The server verifies the public key fingerprint matches the party ID.
-- **Private key isolation**: The Ed25519 private key is only used locally for signing transaction hashes and JWTs. It is never transmitted to the server.
-
-## License
-
-See [LICENSE](LICENSE) for details.
+- **Two-phase signing** — The server prepares a transaction and returns the bytes and a hash. The agent independently recomputes the hash, verifies the transaction with `tx-verifier`, and only then signs.
+- **Transaction verification** — Before signing, `tx-verifier` checks that the prepared transaction matches the requested operation (correct template, parties, amounts). This prevents the server from tricking the agent into signing unexpected transactions.
+- **Ed25519 JWT authentication** — Self-describing JWTs embed the Ed25519 public key (RFC 8037); the server verifies the public key fingerprint matches the party ID.
+- **Private key isolation** — The Ed25519 private key is only used locally for signing transaction hashes and JWTs. It is never transmitted to the server.
