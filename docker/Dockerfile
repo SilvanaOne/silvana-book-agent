@@ -58,6 +58,9 @@ COPY proto/ ./proto/
 # Copy all crates
 COPY crates/ ./crates/
 
+# Copy examples (workspace members referenced by root Cargo.toml)
+COPY examples/ ./examples/
+
 # Copy .git so vergen-gitcl can embed the commit hash at build time
 COPY .git/ ./.git/
 
