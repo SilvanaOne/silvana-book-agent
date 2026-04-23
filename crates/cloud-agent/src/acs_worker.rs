@@ -30,9 +30,6 @@ pub fn spawn_acs_worker(
     tokio::spawn(async move {
         info!("ACS worker started (refresh every {}s)", REFRESH_INTERVAL_SECS);
 
-        // Initial delay to let connections establish
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("ACS worker shutting down");

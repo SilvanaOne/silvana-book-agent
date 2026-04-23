@@ -26,7 +26,7 @@ The binary is at `target/release/cloud-agent`.
 Self-service onboarding generates an Ed25519 keypair, registers with the orderbook server, signs the Canton topology transaction, and completes ledger setup (preapproval, user service, subscription) — all in one command:
 
 ```bash
-cloud-agent onboard --rpc https://rpc.example.com
+cloud-agent onboard --rpc https://rpc.example.com --agent-name my-agent --email you@example.com --invite-code YOUR_INVITE_CODE
 ```
 
 This populates your `.env` file with all required configuration. The command is idempotent and can be re-run safely.
@@ -36,7 +36,7 @@ This populates your `.env` file with all required configuration. The command is 
 | Flag | Description |
 |------|-------------|
 | `--rpc <URL>` | Orderbook gRPC endpoint (required) |
-| `--invite-code <CODE>` | Invite code for waiting list registration |
+| `--invite-code <CODE>` | Invite code for waiting list registration (required) |
 | `--agent-name <NAME>` | Display name for the agent |
 | `--email <EMAIL>` | Contact email |
 | `--party <ID>` | Skip waiting list (requires `--private-key`) |

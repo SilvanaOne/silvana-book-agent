@@ -149,7 +149,7 @@ enum Commands {
     GeneratePrivateKey,
     /// Self-service onboarding: generate keys, register, sign topology, complete ledger setup
     ///
-    /// Usage: ./cloud-agent onboard --agent-name your-agent-name --email your-email
+    /// Usage: ./cloud-agent onboard --agent-name your-agent-name --email your-email --invite-code your-invite-code
     Onboard {
         /// Orderbook gRPC URL (optional, default: devnet)
         #[arg(long, default_value = "https://orderbook-devnet.silvana.dev:443")]
@@ -160,15 +160,15 @@ enum Commands {
         /// Contact email (required)
         #[arg(long)]
         email: String,
+        /// Invite code — required, for waiting list registration
+        #[arg(long, required = true)]
+        invite_code: String,
         /// Party ID — optional, skip waiting list and go straight to ledger onboarding (requires --private-key)
         #[arg(long, requires = "private_key")]
         party: Option<String>,
         /// Base58-encoded Ed25519 private key — optional, required when --party is provided
         #[arg(long)]
         private_key: Option<String>,
-        /// Invite code — optional, for waiting list registration
-        #[arg(long)]
-        invite_code: Option<String>,
         /// Path to .env file — optional (default: .env)
         #[arg(long, default_value = ".env")]
         env_file: PathBuf,

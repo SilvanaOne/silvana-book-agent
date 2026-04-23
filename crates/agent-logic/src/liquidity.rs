@@ -201,11 +201,14 @@ impl LiquidityManager {
         })
     }
 
-    /// Returns true once at least one balance update has been received.
-    /// Before this, all balances are zero and the liquidity gate should not reject.
+    /// Returns true once both CC and at least one non-CC balance have been loaded.
+    /// Before this, the liquidity gate reports "Balances loading" rather than
+    /// falsely rejecting as "Insufficient liquidity" due to an unknown balance.
     pub async fn is_ready(&self) -> bool {
         let s = self.state.read().await;
-        !s.tokens.is_empty()
+        let has_cc = s.tokens.contains_key(CC_TOKEN);
+        let has_non_cc = s.tokens.keys().any(|k| k != CC_TOKEN);
+        has_cc && has_non_cc
     }
 
     // -----------------------------------------------------------------------

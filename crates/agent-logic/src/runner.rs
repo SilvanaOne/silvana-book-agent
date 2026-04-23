@@ -381,13 +381,21 @@ where
     // Track consecutive poll failures for connectivity detection
     let mut poll_failures: u32 = 0;
 
-    // Initial forecast fetch so protections are active immediately (don't wait for first heartbeat)
-    match tokio::time::timeout(
+    // Initial forecast + balance fetch in parallel so protections AND the liquidity
+    // gate are ready before the first RFQ arrives (don't wait for first heartbeat
+    // or the 5s order_update_timer tick).
+    let initial_started = std::time::Instant::now();
+    let forecast_fut = tokio::time::timeout(
         Duration::from_secs(5),
         orderbook_client.get_rounds_data(Some(1)),
-    )
-    .await
-    {
+    );
+    let balances_fut = tokio::time::timeout(
+        Duration::from_secs(10),
+        balance_provider.fetch_balances(),
+    );
+    let (forecast_res, balances_res) = tokio::join!(forecast_fut, balances_fut);
+
+    match forecast_res {
         Ok(Ok(resp)) => {
             if let Some(prediction) = resp.prediction {
                 crate::forecast::update_forecast(
@@ -402,6 +410,29 @@ where
         }
         Ok(Err(e)) => warn!("Initial forecast fetch failed: {:#}", e),
         Err(_) => warn!("Initial forecast fetch timed out"),
+    }
+
+    match balances_res {
+        Ok(Ok(balances)) => {
+            if let Some(lm) = settlement_executor.liquidity_manager() {
+                for b in &balances {
+                    if !b.is_canton_coin {
+                        if let Ok(amount) = b.unlocked_amount.parse::<rust_decimal::Decimal>() {
+                            lm.update_token_balance(&b.instrument_id, amount).await;
+                        }
+                    }
+                }
+            }
+            let n = balances.len();
+            order_manager.set_balances(balances);
+            info!(
+                "Initial balances loaded: {} tokens in {}ms",
+                n,
+                initial_started.elapsed().as_millis()
+            );
+        }
+        Ok(Err(e)) => warn!("Initial balance fetch failed: {:#}", e),
+        Err(_) => warn!("Initial balance fetch timed out"),
     }
 
     // Main event loop

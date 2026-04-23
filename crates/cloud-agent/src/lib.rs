@@ -1779,7 +1779,7 @@ pub async fn run_onboard(
     rpc: String,
     party: Option<String>,
     private_key: Option<String>,
-    invite_code: Option<String>,
+    invite_code: String,
     agent_name: String,
     email: String,
     env_file: PathBuf,
@@ -1876,14 +1876,14 @@ pub async fn run_onboard(
     println!("\nRegistering agent on waiting list...");
     let canonical = message_signing::canonical_register_agent(
         &public_key_b58,
-        invite_code.as_deref(),
+        Some(&invite_code),
     );
     let sig = sign_onboarding_request(&private_key_bytes, &canonical);
 
     let register_resp = client
         .register_agent(RegisterAgentRequest {
             public_key: public_key_b58.clone(),
-            invite_code,
+            invite_code: Some(invite_code),
             email: Some(email.clone()),
             agent_name: Some(agent_name.clone()),
             request_signature: Some(sig),
