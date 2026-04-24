@@ -347,8 +347,11 @@ pub enum FaucetCommands {
         /// Anything else is treated as a CIP-56 token and requires --admin.
         #[arg(long)]
         token: String,
-        /// Token admin party. Optional for Amulet/CC (defaults to $DSO);
-        /// required for CIP-56 tokens.
+        /// Token admin party. Optional:
+        ///   - Canton Coin / Amulet: defaults to $DSO.
+        ///   - CIP-56: defaults to the registry fetched from orderbook-rpc
+        ///     (`GetInstruments`); pass explicitly to override or when the
+        ///     token is not registered.
         #[arg(long)]
         admin: Option<String>,
         /// Faucet ticket (devnet: any string)
@@ -2483,11 +2486,17 @@ pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bo
                 Some(a) => a,
                 None if is_cc => config.dso_party.clone(),
                 None => {
-                    anyhow::bail!(
-                        "--admin is required for CIP-56 tokens. For Canton Coin use \
-                         --token CC (or Amulet) and --admin will default to the DSO \
-                         party from $DSO."
-                    );
+                    let (_, registry) = config.resolve_instrument(&normalized_token);
+                    if registry.is_empty() {
+                        anyhow::bail!(
+                            "--admin not provided and token '{}' was not found in the \
+                             instrument registry fetched from orderbook-rpc. Pass \
+                             --admin explicitly, or check that the token is onboarded \
+                             (see `cloud-agent info instruments`).",
+                            normalized_token
+                        );
+                    }
+                    registry
                 }
             };
 
