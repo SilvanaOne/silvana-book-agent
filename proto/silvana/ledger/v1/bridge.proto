@@ -58,6 +58,9 @@ message BridgeResponse {
     BridgeError                  error = 20;
     GetAmuletsResponse           get_amulets = 21;
     FaucetResponse               request_faucet = 22;
+    RegisterAgentResponse        register_agent = 23;
+    GetOnboardingStatusResponse  get_onboarding_status = 24;
+    SubmitOnboardingSignatureResponse submit_onboarding_signature = 25;
   }
 }
 
@@ -97,5 +100,8 @@ message BridgeRequest {
     GetLedgerEndRequest          get_ledger_end = 19;
     GetAmuletsRequest            get_amulets = 20;
     FaucetRequest                request_faucet = 21;
+    RegisterAgentRequest         register_agent = 22;
+    GetOnboardingStatusRequest   get_onboarding_status = 23;
+    SubmitOnboardingSignatureRequest submit_onboarding_signature = 24;
   }
 }
