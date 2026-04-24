@@ -1231,7 +1231,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 entry.cid_waiting = None;
             }
             AdvanceResult::Error { proposal_id, error } => {
-                let is_permanent = error.contains("deadline-exceeded");
+                let is_permanent = error.contains("deadline-exceeded")
+                    || error.contains("DA.Exception.PreconditionFailed")
+                    || error.contains("PreconditionFailed")
+                    || error.contains("PRECONDITION_FAILED");
                 let is_inactive = error.contains("INACTIVE_CONTRACTS");
                 let is_transient = !is_permanent && (is_inactive
                     || error.contains("No Dvp contract ID found")

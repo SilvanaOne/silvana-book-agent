@@ -6,7 +6,28 @@ This repo ships both a CLI (`cloud-agent`) and a set of Rust library crates you 
 
 ## Quick Start
 
-### Build
+### Install (prebuilt binary)
+
+Download the latest `cloud-agent` binary from the
+[GitHub Releases page](https://github.com/SilvanaOne/silvana-book-agent/releases/latest):
+
+| Platform            | Archive                            |
+| ------------------- | ---------------------------------- |
+| macOS Apple Silicon | `cloud-agent-macos-silicon.tar.gz` |
+| Linux x86_64        | `cloud-agent-x86_64-linux.tar.gz`  |
+| Linux ARM64         | `cloud-agent-arm64-linux.tar.gz`   |
+
+```bash
+# example: macOS Apple Silicon
+curl -LO https://github.com/SilvanaOne/silvana-book-agent/releases/latest/download/cloud-agent-macos-silicon.tar.gz
+tar -xzf cloud-agent-macos-silicon.tar.gz
+chmod +x cloud-agent
+./cloud-agent --help
+```
+
+Checksums for all archives are in `checksums.txt` on the release page.
+
+### Build from source
 
 ```bash
 cargo build --release -p cli
@@ -16,7 +37,7 @@ Binary at `target/release/cloud-agent`.
 
 ### Onboard
 
-Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. It writes `.env` + `agent.toml` and is idempotent — re-run safely.
+Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. On success, it writes a `.env` (Canton party ID, private key, network parties, fee config) and a starter `agent.toml` (role, poll interval, empty `[[markets]]`) into the current directory. The command is idempotent — re-run safely; existing keys and party IDs are preserved.
 
 ```bash
 cloud-agent onboard \
@@ -216,37 +237,46 @@ Flags:
 
 ### Configuration
 
-The agent reads from three files:
+`.env` and `agent.toml` are both created by `cloud-agent onboard` — you typically don't write them from scratch. The tables below describe each field so you can tune an existing config.
 
 #### `.env` — Environment Variables
 
-Auto-populated by `cloud-agent onboard`. Key variables:
-
-| Variable                    | Description                                                             |
-| --------------------------- | ----------------------------------------------------------------------- |
-| `PARTY_AGENT`               | Your Canton party ID                                                    |
-| `PARTY_AGENT_PRIVATE_KEY`   | Base58-encoded Ed25519 private key (32-byte seed)                       |
-| `ORDERBOOK_GRPC_URL`        | Orderbook gRPC endpoint                                                 |
-| `SYNCHRONIZER_ID`           | Canton synchronizer ID                                                  |
-| `NODE_NAME`                 | Canton node name for routing                                            |
-| `LEDGER_SERVICE_PUBLIC_KEY` | Base58-encoded public key of the ledger service (response verification) |
-| `PARTY_SETTLEMENT_OPERATOR` | Settlement operator party ID                                            |
-| `PARTY_ORDERBOOK_FEE`       | Fee collection party ID                                                 |
-| `PARTY_TRAFFIC_FEE`         | Traffic fee party ID                                                    |
-| `TRAFFIC_FEE_PRICE_USD_MB`  | Traffic fee rate in USD per MB                                          |
-| `JOIN_TRAFFIC_TRANSACTIONS` | Batch traffic fee transactions (default: `true`)                        |
-| `AGENT_FEE_RESERVE_CC`      | Canton Coin reserve for fees (default: `5.0`)                           |
-| `SETTLEMENT_THREAD_COUNT`   | Concurrent settlement threads (default: `5`)                            |
-| `AGENT_MAX_SETTLEMENTS`     | Max active settlements (default: `10`)                                  |
+| Variable                         | Description                                                            | Written by `onboard` |
+| -------------------------------- | ---------------------------------------------------------------------- | :------------------: |
+| `PARTY_AGENT`                    | Your Canton party ID                                                   |         yes          |
+| `PARTY_AGENT_PRIVATE_KEY`        | Base58 Ed25519 private key (32-byte seed)                              |         yes          |
+| `PARTY_AGENT_PUBLIC_KEY`         | Base58 Ed25519 public key (derived from the private key)               |         yes          |
+| `ORDERBOOK_GRPC_URL`             | Orderbook gRPC endpoint                                                |         yes          |
+| `CANTON_CHAIN`                   | `devnet` \| `testnet` \| `mainnet`                                     |         yes          |
+| `SYNCHRONIZER_ID`                | Canton synchronizer ID                                                 |         yes          |
+| `NODE_NAME`                      | Canton node name for routing                                           |         yes          |
+| `LEDGER_SERVICE_PUBLIC_KEY`      | Base58 public key of the ledger service (for verifying responses)      |         yes          |
+| `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
+| `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
+| `PARTY_ORDERBOOK_FEE`            | Orderbook fee collection party                                         |         yes          |
+| `PARTY_TRAFFIC_FEE`              | Sequencer traffic fee party                                            |         yes          |
+| `TRAFFIC_FEE_PRICE_USD_MB`       | Traffic fee rate in USD per MB                                         |         yes          |
+| `JOIN_TRAFFIC_TRANSACTIONS`      | Batch traffic-fee transactions (default: `true`)                       |         yes          |
+| `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`)                         |         yes          |
+| `AGENT_FEE_CC`                   | Per-tx agent fee (CC)                                                  |         yes          |
+| `PARTICIPANT_FEE_CC`             | Per-tx participant fee (CC)                                            |         yes          |
+| `SIGNATURE_FEE_CC`               | Per-tx signature fee (CC)                                              |         yes          |
+| `MERGE_THRESHOLD`                | Merge worker triggers when selectable amulets exceed this count        |         yes          |
+| `MERGE_MAX_AMULETS`              | Max amulets merged per round (default: `100`)                          |         yes          |
+| `MERGE_POLL_INTERVAL_SEC`        | Merge worker poll interval in seconds (default: `600`)                 |         yes          |
+| `LOG_DESTINATION`                | `console` \| `file` (paired with `LOG_DIR`, `LOG_FILE_PREFIX`)         |         yes          |
+| `RECURRING_PAYMENT_PACKAGE_NAME` | Recurring-payment package name; required for `subscription *` commands |         yes          |
+| `SETTLEMENT_THREAD_COUNT`        | Concurrent settlement threads (default used when unset)                |          no          |
+| `AGENT_MAX_SETTLEMENTS`          | Max active settlements (default used when unset)                       |          no          |
 
 #### `agent.toml` — Agent Settings
 
 Full example for an LP with grid orders and RFQ:
 
 ```toml
-role = "agent"
+role = "trader"
 auto_settle = true
-poll_interval_secs = 10
+poll_interval_secs = 7
 token_ttl_secs = 3600
 connection_timeout_secs = 30
 
@@ -254,36 +284,43 @@ connection_timeout_secs = 30
 [liquidity_provider]
 name = "My LP"
 max_concurrent_rfqs = 10
-default_quote_valid_secs = 30
+default_quote_valid_secs = 60
 
-# Market: CC-USDC
 [[markets]]
 market_id = "CC-USDC"
 enabled = true
-base_order_size = "10"
-price_change_threshold_percent = 0.5
+price_change_threshold_percent = 0.1
 
+# 3 bids below mid (negative deltas)
 [[markets.bid_levels]]
-delta_percent = 0.5
+delta_percent = -0.015
 quantity = "10"
 [[markets.bid_levels]]
-delta_percent = 1.0
-quantity = "20"
+delta_percent = -0.2
+quantity = "10"
+[[markets.bid_levels]]
+delta_percent = -0.3
+quantity = "10"
 
+# 3 offers above mid (positive deltas)
 [[markets.offer_levels]]
-delta_percent = 0.5
+delta_percent = 0.015
 quantity = "10"
 [[markets.offer_levels]]
-delta_percent = 1.0
-quantity = "20"
+delta_percent = 0.2
+quantity = "10"
+[[markets.offer_levels]]
+delta_percent = 0.3
+quantity = "10"
 
+# RFQ configuration for this market
 [markets.rfq]
 enabled = true
-min_quantity = "1"
+min_quantity = "5"
 max_quantity = "1000"
 bid_spread_percent = 0.5
 offer_spread_percent = 0.5
-quote_valid_secs = 30
+quote_valid_secs = 60
 allocate_before_secs = 3600
 settle_before_secs = 7200
 ```
@@ -294,7 +331,7 @@ When `agent` runs, it places limit orders on a grid of price levels around the c
 
 Each level is defined by:
 
-- **`delta_percent`** — offset from mid price (e.g., `1.0` means 1% below mid for bids, 1% above for offers)
+- **`delta_percent`** — signed offset from mid price in percent. Bids use negative values (below mid), offers use positive values (above mid). E.g. `-0.5` on a bid = 0.5% below mid; `0.3` on an offer = 0.3% above mid.
 - **`quantity`** — order size at this level
 
 When the mid price moves by more than `price_change_threshold_percent`, all grid orders are cancelled and re-placed at updated levels.
