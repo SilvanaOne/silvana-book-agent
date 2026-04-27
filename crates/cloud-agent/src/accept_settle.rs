@@ -24,7 +24,7 @@ use tracing::{debug, info};
 
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::{confirm_transaction, ConfirmLock};
-use agent_logic::fees::{taker_settlement_fees, FeeTarget};
+use agent_logic::fees::FeeTarget;
 use agent_logic::settlement::StepResult;
 use orderbook_proto::ledger::{
     multi_call_op::Op, prepare_transaction_request::Params, ExecuteMultiCallParams,
@@ -131,39 +131,23 @@ impl MulticallSettler {
             .await?;
         }
 
-        // 1. Build fee list (sans traffic)
-        let fee_targets = taker_settlement_fees(
-            &self.config,
-            dvp_processing_fee_cc,
-            alloc_processing_fee_cc,
-        );
-        let fee_total: Decimal = fee_targets
-            .iter()
-            .filter_map(|t| Decimal::from_str(&t.amount_cc).ok())
-            .sum();
+        // 1. Processing fees are NOT embedded in the multicall payload anymore —
+        //    they're debited off-chain via `client.pay_processing_fee` AFTER
+        //    the multicall commits. Multicall body is `Accept_Dvp + Allocate`
+        //    only.
+        let fee_targets: Vec<FeeTarget> = Vec::new();
 
-        // 2. Select amulets to cover fees + CC allocation + traffic estimate + margin.
-        // For sell (CC allocation), amulets must also cover the trade quantity.
-        // Traffic for a 3-op multicall is ~100-150KB; estimate conservatively.
+        // 2. Select amulets to cover CC allocation + margin only.
+        //    Fees and traffic billing are off-chain (debited from prepaid pool).
         let alloc_cc = allocation_cc.unwrap_or(Decimal::ZERO);
-        let traffic_estimate_bytes = 150_000u64;
-        let traffic_usd = Decimal::from(traffic_estimate_bytes)
-            * Decimal::from_f64_retain(self.config.traffic_fee_usd_per_byte)
-                .unwrap_or(Decimal::ZERO);
-        let est_cc_usd = Decimal::new(15, 2); // conservative CC/USD for estimation
-        let traffic_cc_estimate = if est_cc_usd > Decimal::ZERO {
-            (traffic_usd / est_cc_usd).round_dp(4)
-        } else {
-            Decimal::from(50)
-        };
         let margin = Decimal::from(5);
-        let estimated_cc = fee_total + alloc_cc + traffic_cc_estimate + margin;
+        let estimated_cc = alloc_cc + margin;
         let selectable = self.amulet_cache.get_selectable_amulets().await;
         let selected = select_amulets_for_allocation(&selectable, estimated_cc);
         if selected.is_empty() {
             anyhow::bail!(
-                "Insufficient amulets for multicall settlement: need ~{} CC (fees {} + alloc {} + traffic_est {} + margin {})",
-                estimated_cc, fee_total, alloc_cc, traffic_cc_estimate, margin,
+                "Insufficient amulets for multicall settlement: need ~{} CC (alloc {} + margin {})",
+                estimated_cc, alloc_cc, margin,
             );
         }
         let mut holding_cids: Vec<String> =
@@ -211,9 +195,28 @@ impl MulticallSettler {
         let traffic = exec_result.traffic.as_ref().map(|t| t.total_bytes).unwrap_or(0);
         let cid = exec_result.contract_id.clone().unwrap_or_default();
         info!(
-            "Multicall submitted for {}: accept+allocate cid={} traffic={} bytes fees={:.4} CC",
-            proposal_id, cid, traffic, fee_total,
+            "Multicall submitted for {}: accept+allocate cid={} traffic={} bytes (fees off-chain)",
+            proposal_id, cid, traffic,
         );
+
+        // Pay the two processing fees off-chain. Sequential, not atomic with
+        // the multicall — if either debit fails (e.g. insufficient prepaid
+        // balance) the multicall has already committed; operator reconciles.
+        // The two fees are distinct: dvp first, then allocate. Failures are
+        // logged-and-continued so a transient blip on the alloc fee doesn't
+        // abort settlement reporting.
+        let mut client = self.create_client().await?;
+        for fee_type in ["dvp", "allocate"] {
+            if let Err(e) = client.pay_processing_fee(proposal_id, fee_type).await {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    fee_type = %fee_type,
+                    error = %e,
+                    "Off-chain {} processing fee debit failed (multicall already committed; reconcile manually)",
+                    fee_type,
+                );
+            }
+        }
 
         Ok(StepResult {
             contract_id: cid,
@@ -232,10 +235,9 @@ impl MulticallSettler {
     ) -> Result<ExecuteTransactionResponse> {
         let mut client = self.create_client().await?;
 
-        // Phase 1 — placeholder traffic fee, fixed-width description so the
-        // second prepare produces an identically-sized payload.
-        let placeholder_batches =
-            self.build_batch_transfers(fee_targets, "0.000001", "Traffic fee for 100000 bytes");
+        // Phase 1 — fees are fully off-chain, multicall body is just
+        // Accept_Dvp + Allocate.
+        let placeholder_batches = self.build_batch_transfers(fee_targets);
         let prep = client
             .prepare_transaction(PrepareTransactionRequest {
                 operation: TransactionOperation::ExecuteMulticall as i32,
@@ -259,27 +261,11 @@ impl MulticallSettler {
             traffic_bytes, proposal_id
         );
 
-        // Compute actual traffic-fee CC from bytes × rate
-        let rates = client.get_dso_rates().await?;
-        let cc_usd_rate = Decimal::from_str(&rates.cc_usd_rate).unwrap_or(Decimal::ZERO);
-        let traffic_fee_cc = if cc_usd_rate > Decimal::ZERO && traffic_bytes > 0 {
-            let fee_usd = Decimal::from(traffic_bytes)
-                * Decimal::from_f64_retain(self.config.traffic_fee_usd_per_byte)
-                    .unwrap_or(Decimal::ZERO);
-            (fee_usd / cc_usd_rate).round_dp(10)
-        } else {
-            Decimal::ZERO
-        };
-        let traffic_fee_str = if traffic_fee_cc > Decimal::ZERO {
-            traffic_fee_cc.to_string()
-        } else {
-            "0.000001".to_string()
-        };
-        let traffic_desc = format!("Traffic fee for {:06} bytes", traffic_bytes);
-
-        // Phase 2 — execute with actual traffic fee
-        let final_batches =
-            self.build_batch_transfers(fee_targets, &traffic_fee_str, &traffic_desc);
+        // Phase 2 — execute. Traffic billing and processing/agent/participant
+        // /signature fees are off-chain (debited from prepaid pool by ledger);
+        // multicall body is Accept_Dvp + Allocate only.
+        let _ = (fee_targets, traffic_bytes); // signature/legacy unused
+        let final_batches: Vec<McBatchTransfer> = Vec::new();
         let op_count = final_batches.len() + 1; // + AcceptDvpAndAllocate
         let params_final =
             self.build_multicall_params(proposal_id, dvp_proposal_cid, final_batches, holding_cids);
@@ -302,30 +288,23 @@ impl MulticallSettler {
             .await
     }
 
-    /// Group fee + traffic targets by receiver into a list of `McBatchTransfer`
-    /// ops (multicall-v1). Each BatchTransfer must have a single receiver, so
-    /// we produce one op per unique receiver — typically two:
-    ///   - `fee_party`         (DVP + allocation + agent + signature fees)
-    ///   - `traffic_fee_party` (participant fees + the tx's own traffic fee)
+    /// Group fee targets by receiver into a list of `McBatchTransfer`
+    /// ops (multicall-v1). With all fees off-chain, this is now always
+    /// called with an empty input and returns an empty list. Kept as a
+    /// helper in case future fee categories need to ride on-chain again.
     /// Server-side fallbacks fill `transfer_factory_cid`, `expected_admin`,
     /// `instrument_admin`, and `extra_args_json` when left empty/None
     /// (see `transactions::multicall::build_multicall_command`).
+    #[allow(dead_code)]
     fn build_batch_transfers(
         &self,
         fee_targets: &[FeeTarget],
-        traffic_fee_cc: &str,
-        traffic_desc: &str,
     ) -> Vec<McBatchTransfer> {
-        // Flatten fee targets + the traffic-fee target into (receiver, amount, desc).
-        let mut all: Vec<(String, String, String)> = fee_targets
+        // Flatten fee targets into (receiver, amount, desc).
+        let all: Vec<(String, String, String)> = fee_targets
             .iter()
             .map(|t| (t.receiver.clone(), t.amount_cc.clone(), t.description.clone()))
             .collect();
-        all.push((
-            self.config.traffic_fee_party.clone(),
-            traffic_fee_cc.to_string(),
-            traffic_desc.to_string(),
-        ));
 
         // Stable group-by-receiver (first-seen order).
         let mut by_receiver: std::collections::HashMap<String, Vec<McTransferTarget>> =

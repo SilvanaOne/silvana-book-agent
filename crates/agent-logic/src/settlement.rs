@@ -67,44 +67,6 @@ pub struct DiscoveredContract {
     pub contract_type: String,
 }
 
-/// A fee payment queued for background processing (fire-and-forget).
-/// Persisted to state file on shutdown, restored on restart.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PendingFee {
-    pub proposal_id: String,
-    /// "dvp" or "allocate"
-    pub fee_type: String,
-    pub is_buyer: bool,
-    pub pending_traffic: u64,
-    #[serde(default)]
-    pub retry_count: u32,
-    /// USD fee amount from proposal (for CC conversion at queue time)
-    #[serde(default)]
-    pub fee_amount_usd: String,
-    /// Estimated CC needed (computed by backend using current CC/USD rate)
-    #[serde(default)]
-    pub fee_cc_estimate: f64,
-}
-
-/// A traffic fee queued for background processing (fire-and-forget).
-/// Persisted to state file on shutdown, restored on restart.
-/// Traffic fees are always retried until paid — retry_count is for logging only.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PendingTrafficFee {
-    pub traffic_bytes: u64,
-    pub step_name: String,
-    pub proposal_id: String,
-    /// Number of failed attempts (for logging/backoff). Never stops retrying.
-    #[serde(default)]
-    pub retry_count: u32,
-    /// Override receiver party (None = use config.traffic_fee_party)
-    #[serde(default)]
-    pub receiver_party: Option<String>,
-    /// Fixed CC amount (None = compute from traffic_bytes × rate)
-    #[serde(default)]
-    pub amount_cc_fixed: Option<String>,
-}
-
 /// Backend for executing settlement operations
 ///
 /// Implementations provide the actual transaction execution:
@@ -134,39 +96,11 @@ pub trait SettlementBackend: Send + Sync {
     /// None if allocating CIP-56 tokens.
     async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult>;
 
-    /// Transfer traffic fee to PARTY_TRAFFIC_FEE
-    async fn transfer_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str) -> Result<()>;
-
-    /// Queue a traffic fee at lowest priority (fire-and-forget).
-    /// The fee will be processed by the payment queue without blocking the caller.
-    fn queue_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str);
-
-    /// Queue per-step fixed fees (agent, participant, signature) at lowest priority.
-    /// Each fee is only queued if the corresponding env var is defined in config.
-    /// Each configured fee type is pushed `count` times.
-    fn queue_step_fees(&self, step_name: &str, proposal_id: &str, count: u32);
-
     /// Sync on-chain contracts for given settlement IDs
     async fn sync_contracts(&self, settlement_ids: &[String]) -> Result<Vec<DiscoveredContract>>;
 
-    /// Queue a fee payment for background processing (fire-and-forget).
-    /// The fee will be processed by the payment queue without blocking the caller.
-    async fn queue_fee_payment(&self, fee: PendingFee);
-
-    /// Get all pending background fee payments (for state persistence on shutdown).
-    fn get_pending_fees(&self) -> Vec<PendingFee>;
-
-    /// Restore pending fee payments from saved state (re-queue on restart).
-    async fn restore_pending_fees(&self, fees: Vec<PendingFee>);
-
-    /// Get all pending traffic fee payments (for state persistence on shutdown).
-    fn get_pending_traffic_fees(&self) -> Vec<PendingTrafficFee>;
-
-    /// Restore pending traffic fee payments from saved state (re-queue on restart).
-    fn restore_pending_traffic_fees(&self, fees: Vec<PendingTrafficFee>);
-
-    /// Get current payment queue depth: (allocations, fees, traffic).
-    fn queue_depth(&self) -> (u64, u64, u64);
+    /// Get current payment queue depth: (allocations, fees).
+    fn queue_depth(&self) -> (u64, u64);
 
     /// Get amulet cache stats: (available, consumed, reserved, selectable).
     /// Returns None if the backend doesn't use an amulet cache.
@@ -174,19 +108,9 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
-    /// Get traffic fee backlog depth (fees waiting beyond the active queue).
-    fn traffic_backlog_depth(&self) -> usize {
-        0
-    }
-
-    /// Get total pending traffic fee count (backlog + in-flight + awaiting retry).
-    fn pending_traffic_count(&self) -> usize {
-        0
-    }
-
     /// Get per-pool worker utilization:
-    /// (alloc_active, alloc_max, fee_active, fee_max, traffic_active, traffic_max)
-    fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
+    /// (alloc_active, alloc_max, fee_active, fee_max)
+    fn worker_utilization(&self) -> Option<(u64, usize, u64, usize)> {
         None
     }
 
@@ -196,17 +120,11 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
-    /// Check if traffic fees are paused (sequencer backpressure).
-    /// Returns Some(remaining_secs) if paused, None otherwise.
-    fn traffic_fee_pause_secs(&self) -> Option<u64> {
-        None
-    }
-
-    /// Check if traffic fees are paused due to low issuance forecast.
-    /// LOW coefficient means heavy sequencer load — traffic txs would hit
+    /// Check if fees are paused due to low issuance forecast.
+    /// LOW coefficient means heavy sequencer load — txs would hit
     /// SEQUENCER_BACKPRESSURE errors.
     fn forecast_paused(&self) -> bool {
-        crate::forecast::is_traffic_paused_by_forecast()
+        crate::forecast::is_fees_paused_by_overload()
     }
 
     /// Signal the payment queue to stop dispatching new work (for graceful shutdown).
@@ -341,18 +259,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.no_reject = no_reject;
     }
 
-    /// Get pending background fee payments from the backend (for state persistence).
-    pub fn get_pending_fees(&self) -> Vec<PendingFee> {
-        self.backend.get_pending_fees()
-    }
-
-    /// Get pending traffic fee payments from the backend (for state persistence).
-    pub fn get_pending_traffic_fees(&self) -> Vec<PendingTrafficFee> {
-        self.backend.get_pending_traffic_fees()
-    }
-
-    /// Get current payment queue depth: (allocations, fees, traffic).
-    pub fn queue_depth(&self) -> (u64, u64, u64) {
+    /// Get current payment queue depth: (allocations, fees).
+    pub fn queue_depth(&self) -> (u64, u64) {
         self.backend.queue_depth()
     }
 
@@ -361,18 +269,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.backend.cache_stats()
     }
 
-    /// Get traffic fee backlog depth (fees waiting beyond the active queue).
-    pub fn traffic_backlog_depth(&self) -> usize {
-        self.backend.traffic_backlog_depth()
-    }
-
-    /// Get total pending traffic fee count (backlog + in-flight + awaiting retry).
-    pub fn pending_traffic_count(&self) -> usize {
-        self.backend.pending_traffic_count()
-    }
-
     /// Get per-pool worker utilization (delegated to backend).
-    pub fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
+    pub fn worker_utilization(&self) -> Option<(u64, usize, u64, usize)> {
         self.backend.worker_utilization()
     }
 
@@ -381,12 +279,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.backend.fee_pause_secs()
     }
 
-    /// Check if traffic fees are paused (sequencer backpressure).
-    pub fn traffic_fee_pause_secs(&self) -> Option<u64> {
-        self.backend.traffic_fee_pause_secs()
-    }
-
-    /// Check if traffic fees are paused due to low issuance forecast.
+    /// Check if fees are paused due to low issuance forecast.
     pub fn forecast_paused(&self) -> bool {
         self.backend.forecast_paused()
     }
@@ -1027,9 +920,6 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                                     ).await;
                                 }
                             }
-
-                            backend.queue_traffic_fee(step_result.traffic_total, "allocate", proposal_id);
-                            backend.queue_step_fees("allocate", proposal_id, 2);
 
                             let final_result = AdvanceResult::StepCompleted {
                                 proposal_id: proposal_id.clone(),
@@ -1851,22 +1741,14 @@ async fn advance_single<B: SettlementBackend>(
                 &mut rpc_client, &proposal_id, &config.party_id,
                 state.is_buyer, submitted_event,
             ).await;
-            // Queue fee for background processing (fire-and-forget)
-            let fee_usd = if state.is_buyer {
-                state.proposal.dvp_processing_fee_buyer.clone()
-            } else {
-                state.proposal.dvp_processing_fee_seller.clone()
-            };
-            backend.queue_fee_payment(PendingFee {
-                proposal_id: proposal_id.clone(),
-                fee_type: "dvp".to_string(),
-                is_buyer: state.is_buyer,
-                pending_traffic: 0,
-                retry_count: 0,
-                fee_amount_usd: fee_usd,
-                fee_cc_estimate: 0.0,
-            }).await;
-            backend.queue_step_fees("paydvpfee", &proposal_id, 1);
+            // Trigger the off-chain processing-fee debit via PreparePayFee /
+            // ExecutePayFee. The ledger looks up our role from the proposal
+            // and debits our share of the DVP processing fee. The
+            // (source='pay_fee', external_id='dvp:<proposal_id>') UNIQUE
+            // constraint protects against double-debit on retry.
+            if let Err(e) = backend.pay_fee(&proposal_id, "dvp").await {
+                warn!("[{}] DVP processing fee debit failed: {:#}", proposal_id, e);
+            }
             AdvanceResult::StepCompleted {
                 proposal_id,
                 stage: SettlementStage::DvpFeePaid,
@@ -1886,9 +1768,6 @@ async fn advance_single<B: SettlementBackend>(
                         &result.update_id, &result.contract_id,
                     ).await;
 
-                    // Queue traffic fee at lowest priority (fire-and-forget)
-                    backend.queue_traffic_fee(result.traffic_total, "propose", &proposal_id);
-                    backend.queue_step_fees("propose", &proposal_id, 2);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpProposed,
@@ -1946,9 +1825,6 @@ async fn advance_single<B: SettlementBackend>(
                         &result.update_id, &result.contract_id,
                     ).await;
 
-                    // Queue traffic fee at lowest priority (fire-and-forget)
-                    backend.queue_traffic_fee(result.traffic_total, "accept", &proposal_id);
-                    backend.queue_step_fees("accept", &proposal_id, 2);
                     AdvanceResult::StepCompleted {
                         proposal_id,
                         stage: SettlementStage::DvpAccepted,
@@ -1976,22 +1852,13 @@ async fn advance_single<B: SettlementBackend>(
                 &mut rpc_client, &proposal_id, &config.party_id,
                 state.is_buyer, submitted_event,
             ).await;
-            // Queue fee for background processing (fire-and-forget)
-            let fee_usd = if state.is_buyer {
-                state.proposal.allocation_processing_fee_buyer.clone()
-            } else {
-                state.proposal.allocation_processing_fee_seller.clone()
-            };
-            backend.queue_fee_payment(PendingFee {
-                proposal_id: proposal_id.clone(),
-                fee_type: "allocate".to_string(),
-                is_buyer: state.is_buyer,
-                pending_traffic: 0,
-                retry_count: 0,
-                fee_amount_usd: fee_usd,
-                fee_cc_estimate: 0.0,
-            }).await;
-            backend.queue_step_fees("payallocfee", &proposal_id, 1);
+            // Trigger the off-chain processing-fee debit via PreparePayFee /
+            // ExecutePayFee. The (source='pay_fee',
+            // external_id='allocate:<proposal_id>') UNIQUE constraint
+            // protects against double-debit on retry.
+            if let Err(e) = backend.pay_fee(&proposal_id, "allocate").await {
+                warn!("[{}] Allocation processing fee debit failed: {:#}", proposal_id, e);
+            }
             AdvanceResult::StepCompleted {
                 proposal_id,
                 stage: SettlementStage::AllocationFeePaid,

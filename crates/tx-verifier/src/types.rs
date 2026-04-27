@@ -41,6 +41,14 @@ pub enum OperationExpectation {
         amount: String,
         command_id: String,
     },
+    /// Off-chain prepaid traffic top-up — server-resolved receiver
+    /// (PARTY_PREPAID_TRAFFIC). Inspected as a stub today since the
+    /// cloud-agent doesn't carry the receiver party id locally.
+    PrepayTraffic {
+        sender_party: String,
+        amount: String,
+        command_id: String,
+    },
     RequestPreapproval {
         party: String,
     },

@@ -4,7 +4,7 @@
 //! DAppProviderService (CIP-0103). The agent signs transaction hashes locally
 //! with its Ed25519 private key — the key never leaves the agent.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -19,11 +19,12 @@ use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
     TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
+    PrepayTrafficParams,
     ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
     RequestUserServiceParams, TransactionOperation, TokenBalance,
     LockHoldingsParams, ProcessLockUnlockRequestsParams, ResizeLockParams, TerminateLockParams,
     VotingAllocation as ProtoVotingAllocation, VotingRequest as ProtoVotingRequest,
-    FaucetRequest,
+    FaucetRequest, FaucetInstrument,
     prepare_transaction_request::Params,
     d_app_provider_service_client::DAppProviderServiceClient,
     GetAgentConfigRequest, GetAgentConfigResponse, RegisterAgentRequest,
@@ -42,10 +43,22 @@ pub mod ledger_client;
 pub mod merge_worker;
 pub mod payment_queue;
 pub mod rfq_handler;
+pub mod topup;
 
 pub use accept_settle::MulticallSettler;
 pub use backend::CloudSettlementBackend;
 pub use ledger_client::DAppProviderClient;
+
+/// Off-chain prepaid traffic balance + credit ceiling, parsed from the
+/// `GetPrepaidTrafficBalance` RPC response into typed Decimals.
+#[derive(Debug, Clone)]
+pub struct PrepaidTrafficBalance {
+    pub balance_cc: rust_decimal::Decimal,
+    pub credit_limit_cc: rust_decimal::Decimal,
+    pub available_cc: rust_decimal::Decimal,
+    pub total_credited_cc: rust_decimal::Decimal,
+    pub total_debited_cc: rust_decimal::Decimal,
+}
 
 // ============================================================================
 // Subcommand enums (used by CLI and as function parameters)
@@ -64,6 +77,8 @@ pub enum InfoCommands {
     },
     /// Show token balances
     Balance,
+    /// Show off-chain prepaid traffic balance + credit limit
+    PrepaidTraffic,
     /// Show party identity (party ID, public key, node name)
     Party,
     /// Show network info (DSO party, rates, mining rounds)
@@ -149,6 +164,15 @@ pub enum TransferCommands {
         /// Comma-separated input amulet contract IDs (optional — server selects if empty)
         #[arg(long, value_delimiter = ',')]
         amulet_cids: Option<Vec<String>>,
+    },
+    /// Top up the off-chain prepaid traffic balance by transferring CC to PARTY_PREPAID_TRAFFIC
+    PrepayTraffic {
+        /// CC amount to credit (decimal string)
+        #[arg(long)]
+        amount: String,
+        /// Optional human-readable note
+        #[arg(long)]
+        description: Option<String>,
     },
 }
 
@@ -370,17 +394,27 @@ pub enum FaucetCommands {
 // Library functions
 // ============================================================================
 
-/// Fetch instrument registry (CC/Amulet + DSO, CIP-56 registries) from
-/// orderbook-rpc and populate `BaseConfig`. Replaces the old configuration.toml
+/// Fetch instrument registry (CC/Amulet + CIP-56 registries) from
+/// payments-rpc and populate `BaseConfig`. Replaces the old configuration.toml
 /// `[[canton_coin]]` / `[[instrument]]` sections for the client.
 pub async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
-    let mut client = agent_logic::client::OrderbookClient::new(config)
-        .await
-        .context("Failed to create orderbook client for instrument registry fetch")?;
+    let mut client = DAppProviderClient::new(
+        &config.orderbook_grpc_url,
+        &config.party_id,
+        &config.role,
+        &config.private_key_bytes,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+        &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
+    )
+    .await
+    .context("Failed to create DAppProvider client for instrument registry fetch")?;
     let instruments = client
-        .get_instruments()
+        .list_faucet_instruments()
         .await
-        .context("Failed to fetch instruments from orderbook-rpc")?;
+        .context("Failed to fetch faucet instruments from payments-rpc")?;
     config.populate_instruments_from_rpc(instruments);
     Ok(())
 }
@@ -420,13 +454,7 @@ pub async fn run_cloud_agent(
     }
     info!("Party ID: {}", config.party_id);
     info!("Orderbook URL: {}", config.orderbook_grpc_url);
-    info!(
-        "Traffic fee: {:.2} USD/MB to {:.30}..., join={}",
-        config.traffic_fee_usd_per_byte * 1_000_000.0,
-        config.traffic_fee_party,
-        config.join_traffic
-    );
-    info!("Fee reserve: {:.2} CC", config.fee_reserve_cc);
+    info!("Fee reserve: {:.2} CC (traffic billing handled off-chain by ledger)", config.fee_reserve_cc);
 
     // Create LiquidityManager early so it can be shared with RfqHandler and Backend
     let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
@@ -498,6 +526,55 @@ pub async fn run_cloud_agent(
     )
     .await
     .context("Failed to create ledger client")?;
+
+    // Auto-topup wiring: build a separate DAppProviderClient for the
+    // background topup runner (its own JWT, its own connection — so its
+    // submit_transaction never recurses through the main client's
+    // post-success hook). Returns None when env vars aren't set, in
+    // which case auto-topup is fully disabled.
+    let topup_trigger = match (
+        config.min_prepaid_traffic_balance_cc,
+        config.prepaid_traffic_topup_cc,
+    ) {
+        (Some(_), Some(_)) => {
+            let topup_client = DAppProviderClient::new(
+                &config.orderbook_grpc_url,
+                &config.party_id,
+                &config.role,
+                &config.private_key_bytes,
+                config.token_ttl_secs,
+                Some(config.node_name.as_str()),
+                &config.ledger_service_public_key,
+                Some(config.connection_timeout_secs),
+                Some(config.request_timeout_secs),
+            )
+            .await
+            .context("Failed to create topup ledger client")?;
+            let runner = topup::TopupRunner::new(
+                topup_client,
+                config.party_id.clone(),
+                config.min_prepaid_traffic_balance_cc,
+                config.prepaid_traffic_topup_cc,
+            )
+            .expect("env vars present (matched above)");
+            info!(
+                min_cc = %config.min_prepaid_traffic_balance_cc.unwrap(),
+                topup_cc = %config.prepaid_traffic_topup_cc.unwrap(),
+                "Auto-topup enabled"
+            );
+            Some(Arc::new(runner).spawn())
+        }
+        _ => {
+            info!("Auto-topup disabled (MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC not set)");
+            None
+        }
+    };
+
+    let ledger_client = if let Some(trigger) = topup_trigger {
+        ledger_client.with_topup_trigger(trigger)
+    } else {
+        ledger_client
+    };
 
     let balance_provider = CloudBalanceProvider {
         client: TokioMutex::new(ledger_client),
@@ -1012,6 +1089,15 @@ pub async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
                 }
             }
         }
+        InfoCommands::PrepaidTraffic => {
+            let pt = client.get_prepaid_traffic_balance().await?;
+            println!("\n=== Prepaid Traffic Balance ===\n");
+            println!("Balance:           {} CC", pt.balance_cc);
+            println!("Credit limit:      {} CC", pt.credit_limit_cc);
+            println!("Available:         {} CC", pt.available_cc);
+            println!("Total credited:    {} CC", pt.total_credited_cc);
+            println!("Total debited:     {} CC", pt.total_debited_cc);
+        }
         InfoCommands::Network => {
             let rates = client.get_dso_rates().await?;
 
@@ -1088,12 +1174,29 @@ pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, v
 
     match command {
         PreapprovalCommands::Request { instrument_admin } => {
+            // Resolve the operator party from the faucet instrument list,
+            // matching the requested registry/admin.
+            let faucet_instruments = client
+                .list_faucet_instruments()
+                .await
+                .context("Failed to fetch faucet instruments from payments-rpc")?;
+            let operator = faucet_instruments
+                .iter()
+                .find(|inst| inst.registry == instrument_admin)
+                .map(|inst| inst.operator.clone())
+                .ok_or_else(|| anyhow!(
+                    "No faucet instrument matches admin '{}'; cannot determine operator. \
+                     Available registries: [{}]",
+                    instrument_admin,
+                    faucet_instruments.iter().map(|i| i.registry.as_str())
+                        .collect::<Vec<_>>().join(", "),
+                ))?;
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Create CIP-56 Preapproval",
-                    &format!("party: {}, admin: {}", config.party_id, instrument_admin),
+                    &format!("party: {}, admin: {}, operator: {}", config.party_id, instrument_admin, operator),
                 ).await?;
             }
             let expectation = OperationExpectation::RequestPreapproval {
@@ -1106,6 +1209,7 @@ pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, v
                         params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
                             instrument_admin,
                             instrument_allowances: vec![],
+                            operator,
                         })),
                         request_signature: None,
                     },
@@ -1577,6 +1681,55 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                 )
                 .await?;
             println!("Batch pay completed: {}", result.update_id);
+        }
+        TransferCommands::PrepayTraffic { amount, description } => {
+            if confirm && !dry_run {
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
+                    &lock,
+                    "Prepay traffic",
+                    &format!("amount: {} CC", amount),
+                ).await?;
+            }
+            let command_id = format!("cli-prepay-{}", chrono::Utc::now().timestamp_millis());
+            let expectation = OperationExpectation::PrepayTraffic {
+                sender_party: config.party_id.clone(),
+                amount: amount.clone(),
+                command_id: command_id.clone(),
+            };
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::PrepayTraffic as i32,
+                        params: Some(Params::PrepayTraffic(PrepayTrafficParams {
+                            amount,
+                            description,
+                            command_id,
+                            amulet_cids: vec![],
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
+            println!("Prepaid traffic top-up sent: {}", result.update_id);
+
+            // Show post-topup balance so the user can confirm the credit
+            // landed (record_credit fires after execute completes).
+            match client.get_prepaid_traffic_balance().await {
+                Ok(pt) => {
+                    println!("\n=== Prepaid Traffic Balance ===\n");
+                    println!("Balance:           {} CC", pt.balance_cc);
+                    println!("Credit limit:      {} CC", pt.credit_limit_cc);
+                    println!("Available:         {} CC", pt.available_cc);
+                }
+                Err(e) => {
+                    println!("(unable to fetch post-topup balance: {})", e);
+                }
+            }
         }
     }
 
@@ -2111,6 +2264,14 @@ pub async fn complete_ledger_onboarding(
     const TMPL_USER_SERVICE_REQUEST: &str =
         "#utility-settlement-app-v1:Utility.Settlement.App.V1.Service.User:UserServiceRequest";
 
+    // Fetch the faucet-supported instrument list once. Drives both the Splice
+    // CC preapproval (Amulet entry's operator = PREAPPROVAL_FEATURED_APP) and
+    // the per-registry CIP-56 preapprovals below.
+    let faucet_instruments = client
+        .list_faucet_instruments()
+        .await
+        .context("Failed to fetch faucet instruments from payments-rpc")?;
+
     // 11a-CC: Create Splice TransferPreapproval for CC (required for CC auto-completion).
     // Check if Splice preapproval or proposal already exists.
     let splice_preapproval_templates = [
@@ -2119,9 +2280,21 @@ pub async fn complete_ledger_onboarding(
     ];
     let splice_contracts = client.get_active_contracts(&splice_preapproval_templates).await.unwrap_or_default();
     if splice_contracts.is_empty() {
-        println!("Creating Splice preapproval for CC...");
+        // DSO is the Amulet's instrument admin (issuer baked into the contract);
+        // operator is the featured-app provider used only for preapproval creation.
+        // They are distinct: DSO comes from the local .env, operator from the
+        // ListFaucetInstruments response (Amulet entry).
         let dso_for_cc = read_env_value(env_file, "DSO").unwrap_or_default();
-        if !dso_for_cc.is_empty() {
+        let amulet_operator = faucet_instruments.iter()
+            .find(|i| i.token_name == "Amulet")
+            .map(|i| i.operator.clone())
+            .unwrap_or_default();
+        if dso_for_cc.is_empty() {
+            println!("Warning: DSO not set in .env; skipping CC preapproval.");
+        } else if amulet_operator.is_empty() {
+            println!("Warning: faucet returned no Amulet operator (PREAPPROVAL_FEATURED_APP); skipping CC preapproval.");
+        } else {
+            println!("Creating Splice preapproval for CC...");
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
             };
@@ -2131,13 +2304,14 @@ pub async fn complete_ledger_onboarding(
                     params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
                         instrument_admin: dso_for_cc,
                         instrument_allowances: vec![],
+                        operator: amulet_operator,
                     })),
                     request_signature: None,
                 },
                 &expectation,
                 false, false, false,
             ).await {
-                Ok(_) => println!("Splice preapproval proposal created for CC (pending operator acceptance)."),
+                Ok(_) => println!("Splice preapproval proposal created for CC (pending featured-app acceptance)."),
                 Err(e) => println!("Warning: failed to create CC preapproval: {}", e),
             }
         }
@@ -2151,52 +2325,26 @@ pub async fn complete_ledger_onboarding(
         .map(|p| p.instrument_admin.as_str())
         .collect();
 
-    // Fetch instruments from orderbook-rpc to discover all registrars.
-    // Each unique registry party needs one CIP-56 TransferPreapproval.
-    let instruments = {
-        use orderbook_proto::orderbook::orderbook_service_client::OrderbookServiceClient;
-        use orderbook_proto::orderbook::GetInstrumentsRequest;
-        let channel = create_raw_channel(rpc).await
-            .context("Failed to connect to orderbook-rpc for instruments")?;
-        let jwt = agent_logic::auth::generate_jwt(
-            &cfg.party_id, &cfg.role, &cfg.private_key_bytes,
-            cfg.token_ttl_secs, Some(cfg.node_name.as_str()),
-        ).unwrap_or_default();
-        let mut ob = OrderbookServiceClient::new(channel);
-        let mut req = tonic::Request::new(GetInstrumentsRequest {
-            instrument_type: None, limit: None, offset: None,
-        });
-        if !jwt.is_empty() {
-            req.metadata_mut().insert("authorization",
-                format!("Bearer {}", jwt).parse().unwrap());
+    let mut needed: Vec<(String, String, String)> = Vec::new();  // (registry, token_name, operator)
+    let mut seen_admins: std::collections::HashSet<String> =
+        existing_admins.iter().map(|s| s.to_string()).collect();
+    for inst in &faucet_instruments {
+        if inst.token_name == "Amulet" || inst.registry.is_empty() {
+            continue;
         }
-        ob.get_instruments(req).await
-            .map(|r| r.into_inner().instruments)
-            .unwrap_or_default()
-    };
-
-    // Deduplicate registrars — skip DSO (CC uses Splice preapproval, not CIP-56)
-    let dso_party = read_env_value(env_file, "DSO").unwrap_or_default();
-    let mut needed_admins: Vec<(String, String)> = Vec::new();
-    let mut seen_admins: std::collections::HashSet<String> = existing_admins.iter()
-        .map(|s| s.to_string())
-        .collect();
-    for inst in &instruments {
-        if let Some(ref registry) = inst.registry {
-            if !registry.is_empty() && registry != &dso_party && seen_admins.insert(registry.clone()) {
-                needed_admins.push((registry.clone(), inst.instrument_id.clone()));
-            }
+        if seen_admins.insert(inst.registry.clone()) {
+            needed.push((inst.registry.clone(), inst.token_name.clone(), inst.operator.clone()));
         }
     }
 
-    if needed_admins.is_empty() {
+    if needed.is_empty() {
         if preapprovals.is_empty() {
-            println!("Warning: could not determine needed preapprovals (no instruments found). Run onboard again if needed.");
+            println!("Warning: faucet returned no utility instruments; no CIP-56 preapprovals to create.");
         } else {
             println!("CIP-56 preapprovals up to date ({} found).", preapprovals.len());
         }
     } else {
-        for (admin, label) in &needed_admins {
+        for (admin, label, operator) in &needed {
             println!("Creating CIP-56 preapproval for {} (admin={})...", label, admin);
             let label = label.as_str();
             let expectation = OperationExpectation::RequestPreapproval {
@@ -2209,6 +2357,7 @@ pub async fn complete_ledger_onboarding(
                         params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
                             instrument_admin: admin.clone(),
                             instrument_allowances: vec![],
+                            operator: operator.clone(),
                         })),
                         request_signature: None,
                     },
@@ -2260,66 +2409,42 @@ pub async fn complete_ledger_onboarding(
     // Devnet: auto-faucet CC and USDC to bootstrap agent balance
     let canton_chain = read_env_value(env_file, "CANTON_CHAIN").unwrap_or_default();
     if canton_chain == "devnet" {
-        let dso = read_env_value(env_file, "DSO").unwrap_or_default();
         let balances = client.get_balances().await.unwrap_or_default();
-        let has_cc = balances.iter().any(|b| b.is_canton_coin);
-        let has_usdc = balances.iter().any(|b| b.instrument_id == "USDC");
-        if !dso.is_empty() && (!has_cc || !has_usdc) {
+        // Anything in faucet_instruments that's neither already funded nor Amulet runs first;
+        // CC (Amulet) runs last because Splice preapproval may still be pending operator acceptance.
+        let needs_faucet: Vec<&FaucetInstrument> = faucet_instruments.iter()
+            .filter(|inst| {
+                if inst.token_name == "Amulet" {
+                    !balances.iter().any(|b| b.is_canton_coin)
+                } else {
+                    !balances.iter().any(|b| b.instrument_id == inst.token_name)
+                }
+            })
+            .collect();
+        let has_cc = !needs_faucet.iter().any(|inst| inst.token_name == "Amulet");
+
+        if !needs_faucet.is_empty() {
             println!("\nDevnet detected — requesting faucet top-up...");
 
-            // USDC first (CIP-56 preapproval is already active, no waiting needed)
-            if has_usdc {
-                println!("  USDC: already funded, skipping");
-            } else {
-                let usdc_admin = {
-                    use orderbook_proto::orderbook::orderbook_service_client::OrderbookServiceClient;
-                    use orderbook_proto::orderbook::GetInstrumentsRequest;
-                    let mut found = None;
-                    if let Ok(ch) = create_raw_channel(rpc).await {
-                        let jwt = agent_logic::auth::generate_jwt(
-                            &cfg.party_id, &cfg.role, &cfg.private_key_bytes,
-                            cfg.token_ttl_secs, Some(cfg.node_name.as_str()),
-                        ).unwrap_or_default();
-                        let mut ob = OrderbookServiceClient::new(ch);
-                        let mut req = tonic::Request::new(GetInstrumentsRequest {
-                            instrument_type: None, limit: None, offset: None,
-                        });
-                        if !jwt.is_empty() {
-                            req.metadata_mut().insert("authorization",
-                                format!("Bearer {}", jwt).parse().unwrap());
-                        }
-                        if let Ok(resp) = ob.get_instruments(req).await {
-                            for inst in resp.into_inner().instruments {
-                                if inst.instrument_id == "USDC" {
-                                    found = inst.registry;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    found
-                };
-                if let Some(admin) = usdc_admin {
-                    print!("  USDC... ");
-                    match client.request_faucet(FaucetRequest {
-                        token_name: "USDC".into(),
-                        token_admin: admin,
-                        ticket: String::new(),
-                        amount: String::new(),
-                        dry_run: false,
-                        request_signature: None,
-                    }).await {
-                        Ok(r) if r.success => println!("OK ({})", r.amount_approved),
-                        Ok(r) => println!("failed: {}", r.error_message.unwrap_or_default()),
-                        Err(e) => println!("error: {}", e),
-                    }
+            // Utility tokens first (CIP-56 preapproval is already active, no waiting needed)
+            for inst in needs_faucet.iter().filter(|i| i.token_name != "Amulet") {
+                print!("  {}... ", inst.token_name);
+                match client.request_faucet(FaucetRequest {
+                    token_name: inst.token_name.clone(),
+                    token_admin: inst.registry.clone(),
+                    ticket: String::new(),
+                    amount: String::new(),
+                    dry_run: false,
+                    request_signature: None,
+                }).await {
+                    Ok(r) if r.success => println!("OK ({})", r.amount_approved),
+                    Ok(r) => println!("failed: {}", r.error_message.unwrap_or_default()),
+                    Err(e) => println!("error: {}", e),
                 }
             }
 
             // CC last with retry (Splice preapproval may still be pending operator acceptance)
-            if has_cc {
-                println!("  CC: already funded, skipping");
-            } else {
+            if let Some(cc_inst) = needs_faucet.iter().find(|i| i.token_name == "Amulet") {
                 let mut cc_ok = false;
                 let delays = [0u64, 10, 15, 20, 25, 30, 30, 30, 30];
                 for attempt in 0..delays.len() as u64 {
@@ -2330,8 +2455,8 @@ pub async fn complete_ledger_onboarding(
                     }
                     print!("  CC (Amulet)... ");
                     match client.request_faucet(FaucetRequest {
-                        token_name: "Amulet".into(),
-                        token_admin: dso.clone(),
+                        token_name: cc_inst.token_name.clone(),
+                        token_admin: cc_inst.registry.clone(),
                         ticket: String::new(),
                         amount: String::new(),
                         dry_run: false,
@@ -2365,8 +2490,83 @@ pub async fn complete_ledger_onboarding(
                     break;
                 }
             }
-        } else if has_cc && has_usdc {
+        } else if has_cc {
             println!("\nBalances already funded, skipping faucet.");
+        }
+    }
+
+    // First topup of the off-chain prepaid traffic balance. Without this,
+    // a fresh agent boots with zero prepaid balance and the very first
+    // transaction hits a `Deny` at the canton-agent's preflight. The
+    // per-tx auto-topup hook only fires AFTER a successful submit, so it
+    // can't seed the initial balance — onboarding has to.
+    let min_env = std::env::var("MIN_PREPAID_TRAFFIC_BALANCE_CC").ok();
+    let topup_env = std::env::var("PREPAID_TRAFFIC_TOPUP_CC").ok();
+    match (min_env, topup_env) {
+        (Some(min_str), Some(topup_str)) => {
+            let min_cc: rust_decimal::Decimal = min_str.parse()
+                .with_context(|| format!("MIN_PREPAID_TRAFFIC_BALANCE_CC must be a decimal, got '{}'", min_str))?;
+            let topup_cc: rust_decimal::Decimal = topup_str.parse()
+                .with_context(|| format!("PREPAID_TRAFFIC_TOPUP_CC must be a decimal, got '{}'", topup_str))?;
+            if topup_cc <= rust_decimal::Decimal::ZERO {
+                return Err(anyhow!("PREPAID_TRAFFIC_TOPUP_CC must be > 0, got {}", topup_cc));
+            }
+
+            // Build a dedicated client for the topup. The onboarding
+            // `client` above is consumed by the surrounding flow; using a
+            // fresh client mirrors the runtime wiring and avoids touching
+            // its post-success hook (none here, but safer either way).
+            let topup_client = DAppProviderClient::new(
+                rpc,
+                &cfg.party_id,
+                &cfg.role,
+                &cfg.private_key_bytes,
+                cfg.token_ttl_secs,
+                Some(cfg.node_name.as_str()),
+                &cfg.ledger_service_public_key,
+                Some(cfg.connection_timeout_secs),
+                Some(cfg.request_timeout_secs),
+            )
+            .await
+            .context("Failed to create topup client for onboarding first-topup")?;
+
+            let runner = topup::TopupRunner::new(
+                topup_client,
+                cfg.party_id.clone(),
+                Some(min_cc),
+                Some(topup_cc),
+            )
+            .expect("env vars validated above");
+
+            println!("\nSeeding prepaid traffic balance with first topup of {} CC...", topup_cc);
+            match runner.force_topup().await {
+                Ok(()) => match runner.get_balance().await {
+                    Ok(pt) => {
+                        println!("\n=== Initial Prepaid Traffic Balance ===");
+                        println!("  Balance:      {} CC", pt.balance_cc);
+                        println!("  Credit limit: {} CC", pt.credit_limit_cc);
+                        println!("  Available:    {} CC", pt.available_cc);
+                    }
+                    Err(e) => {
+                        println!("(unable to fetch post-topup prepaid balance: {})", e);
+                    }
+                },
+                Err(e) => {
+                    println!("First topup failed: {}", e);
+                    println!("Agent will start without seed balance — first tx may fail at preflight.");
+                }
+            }
+        }
+        (None, None) => {
+            println!(
+                "\nAuto-topup disabled (MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC not set).\n\
+                 Agent will run without auto-topup; fund the prepaid pool manually via `transfer prepay-traffic`."
+            );
+        }
+        _ => {
+            return Err(anyhow!(
+                "MIN_PREPAID_TRAFFIC_BALANCE_CC and PREPAID_TRAFFIC_TOPUP_CC must both be set (or both unset) — both required for auto-topup"
+            ));
         }
     }
 
