@@ -9,7 +9,7 @@
 //! The local agent wraps this with a `Config` that adds ledger API URLs.
 
 use anyhow::{anyhow, Context, Result};
-use orderbook_proto::ledger::FaucetInstrument;
+use orderbook_proto::orderbook::Instrument;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -384,24 +384,26 @@ impl BaseConfig {
     }
 
     /// Populate `cc_token_id`, `onboarded_registries` and `instrument_registries`
-    /// from the faucet instrument list returned by `ListFaucetInstruments`.
+    /// from instruments fetched over the orderbook-rpc `GetInstruments` endpoint.
     /// Call this once at startup before running settlement / fill / transfer logic
     /// that uses [`BaseConfig::resolve_instrument`].
     ///
-    /// Canton Coin is identified by `token_name == "Amulet"`; its registry is
-    /// the DSO party. Every other instrument simply maps token_name → registry.
-    pub fn populate_instruments_from_rpc(&mut self, instruments: Vec<FaucetInstrument>) {
+    /// The Canton Coin instrument is identified by `instrument_type == "token"`;
+    /// its `instrument_id` drives the CC → Amulet translation and its `registry`
+    /// is the DSO party. Every other instrument simply maps id → registry.
+    pub fn populate_instruments_from_rpc(&mut self, instruments: Vec<Instrument>) {
         let mut instrument_registries: HashMap<String, String> = HashMap::new();
         let mut cc_token_id: Option<String> = None;
         let mut onboarded_registries: HashSet<String> = HashSet::new();
 
         for inst in instruments {
-            if !inst.registry.is_empty() {
-                instrument_registries.insert(inst.token_name.clone(), inst.registry.clone());
-                onboarded_registries.insert(inst.registry.clone());
+            let registry = inst.registry.clone().unwrap_or_default();
+            if !registry.is_empty() {
+                instrument_registries.insert(inst.instrument_id.clone(), registry.clone());
+                onboarded_registries.insert(registry);
             }
-            if inst.token_name == "Amulet" && cc_token_id.is_none() {
-                cc_token_id = Some(inst.token_name.clone());
+            if inst.instrument_type == "token" && cc_token_id.is_none() {
+                cc_token_id = Some(inst.instrument_id.clone());
             }
         }
 

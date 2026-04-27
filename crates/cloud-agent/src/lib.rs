@@ -394,27 +394,17 @@ pub enum FaucetCommands {
 // Library functions
 // ============================================================================
 
-/// Fetch instrument registry (CC/Amulet + CIP-56 registries) from
-/// payments-rpc and populate `BaseConfig`. Replaces the old configuration.toml
+/// Fetch instrument registry (CC/Amulet + DSO, CIP-56 registries) from
+/// orderbook-rpc and populate `BaseConfig`. Replaces the old configuration.toml
 /// `[[canton_coin]]` / `[[instrument]]` sections for the client.
 pub async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
-    let mut client = DAppProviderClient::new(
-        &config.orderbook_grpc_url,
-        &config.party_id,
-        &config.role,
-        &config.private_key_bytes,
-        config.token_ttl_secs,
-        Some(config.node_name.as_str()),
-        &config.ledger_service_public_key,
-        Some(config.connection_timeout_secs),
-        Some(config.request_timeout_secs),
-    )
-    .await
-    .context("Failed to create DAppProvider client for instrument registry fetch")?;
-    let instruments = client
-        .list_faucet_instruments()
+    let mut client = agent_logic::client::OrderbookClient::new(config)
         .await
-        .context("Failed to fetch faucet instruments from payments-rpc")?;
+        .context("Failed to create orderbook client for instrument registry fetch")?;
+    let instruments = client
+        .get_instruments()
+        .await
+        .context("Failed to fetch instruments from orderbook-rpc")?;
     config.populate_instruments_from_rpc(instruments);
     Ok(())
 }
