@@ -30,6 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cip56.proto",
         "recurring.proto",
         "multicall.proto",
+        "fees.proto",
+        "pay_fee.proto",
         "transactions.proto",
         "service.proto",
         "bridge.proto",

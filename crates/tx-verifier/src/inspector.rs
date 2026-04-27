@@ -2217,6 +2217,7 @@ pub fn inspect(
         OperationExpectation::AcceptDvp { .. } => "AcceptDvp".to_string(),
         OperationExpectation::Allocate { .. } => "Allocate".to_string(),
         OperationExpectation::TransferCc { amount, .. } => format!("TransferCc({})", amount),
+        OperationExpectation::PrepayTraffic { amount, .. } => format!("PrepayTraffic({})", amount),
         OperationExpectation::RequestPreapproval { .. } => "RequestPreapproval".to_string(),
         OperationExpectation::RequestRecurringPrepaid { .. } => {
             "RequestRecurringPrepaid".to_string()

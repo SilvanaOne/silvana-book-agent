@@ -117,14 +117,15 @@ pub struct BaseConfig {
     pub private_key_base58: String,
     pub public_key_hex: String,
     pub settlement_operator: String,
-    pub fee_party: String,
-    pub traffic_fee_party: String,
-    pub traffic_fee_usd_per_byte: f64,
-    pub join_traffic: bool,
     pub fee_reserve_cc: f64,
-    pub agent_fee_cc: Option<String>,
-    pub participant_fee_cc: Option<String>,
-    pub signature_fee_cc: Option<String>,
+    // agent_fee_cc / participant_fee_cc / signature_fee_cc moved to
+    // ledger-service (`LedgerServiceConfig`). The ledger now issues these
+    // fees as a server-signed schedule and debits them off-chain.
+    //
+    // PARTY_TRAFFIC_FEE / TRAFFIC_FEE_PRICE_USD_MB / JOIN_TRAFFIC_TRANSACTIONS
+    // also moved off-chain: traffic billing is now handled entirely by the
+    // ledger via the prepaid traffic pool (`PARTY_PREPAID_TRAFFIC` on the
+    // ledger side).
     pub merge_threshold: Option<usize>,
     pub merge_max_amulets: usize,
     pub merge_poll_interval_sec: u64,
@@ -172,13 +173,14 @@ pub struct BaseConfig {
     /// Hours to depletion at which spread coefficient = 10
     pub depletion_min_hours: f64,
 
-    // Batch pay settings (for background fees + traffic fees via MultiCall)
-    /// Minimum payment items to trigger batch flush
-    pub batch_pay_min_size: usize,
-    /// Max minutes to wait even if below min size
-    pub batch_pay_max_wait_min: u64,
-    /// Max payment items per batch
-    pub batch_pay_max_size: usize,
+    // Auto top-up of the off-chain prepaid traffic balance.
+    // Both must be set together. May be negative if the agent's party has
+    // an LP credit_limit_cc on the canton-agent side (balance is allowed
+    // to go negative down to -credit_limit_cc).
+    /// Minimum prepaid traffic balance in CC; below this the agent tops up.
+    pub min_prepaid_traffic_balance_cc: Option<rust_decimal::Decimal>,
+    /// Amount to credit on each top-up, in CC.
+    pub prepaid_traffic_topup_cc: Option<rust_decimal::Decimal>,
 }
 
 impl BaseConfig {
@@ -242,29 +244,25 @@ impl BaseConfig {
         let settlement_operator = std::env::var("PARTY_SETTLEMENT_OPERATOR")
             .map_err(|_| anyhow!("PARTY_SETTLEMENT_OPERATOR env var is required"))?;
 
-        let traffic_fee_party = std::env::var("PARTY_TRAFFIC_FEE")
-            .map_err(|_| anyhow!("PARTY_TRAFFIC_FEE env var is required"))?;
-
-        let traffic_fee_usd_per_byte = std::env::var("TRAFFIC_FEE_PRICE_USD_MB")
-            .map_err(|_| anyhow!("TRAFFIC_FEE_PRICE_USD_MB env var is required"))?
-            .parse::<f64>()
-            .map_err(|_| anyhow!("TRAFFIC_FEE_PRICE_USD_MB must be a valid number"))?
-            / 1_000_000.0;
-
-        let fee_party = std::env::var("PARTY_ORDERBOOK_FEE")
-            .map_err(|_| anyhow!("PARTY_ORDERBOOK_FEE env var is required"))?;
-        let join_traffic = std::env::var("JOIN_TRAFFIC_TRANSACTIONS")
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        // PARTY_ORDERBOOK_FEE is no longer read by the cloud-agent: every
+        // fee that previously flowed through the on-chain BatchPay → fee
+        // party path is now debited off-chain by the ledger via
+        // `record_authorized_debits`, and the orderbook-server's Pass B
+        // drains PARTY_PREPAID_TRAFFIC → PARTY_ORDERBOOK_FEE periodically.
+        //
+        // PARTY_TRAFFIC_FEE / TRAFFIC_FEE_PRICE_USD_MB / JOIN_TRAFFIC_TRANSACTIONS
+        // are also no longer read by the cloud-agent: traffic billing is
+        // handled off-chain by the ledger via the prepaid pool.
 
         let fee_reserve_cc = std::env::var("AGENT_FEE_RESERVE_CC")
             .unwrap_or_else(|_| "5.0".to_string())
             .parse::<f64>()
             .unwrap_or(5.0);
 
-        let agent_fee_cc = std::env::var("AGENT_FEE_CC").ok();
-        let participant_fee_cc = std::env::var("PARTICIPANT_FEE_CC").ok();
-        let signature_fee_cc = std::env::var("SIGNATURE_FEE_CC").ok();
+        // AGENT_FEE_CC / PARTICIPANT_FEE_CC / SIGNATURE_FEE_CC have moved to
+        // the ledger-service config (`LedgerServiceConfig`). The ledger
+        // issues these fees as a server-signed schedule that the cloud-agent
+        // authorizes via `fees_authorization` on ExecuteTransactionRequest.
 
         let merge_threshold = std::env::var("MERGE_THRESHOLD").ok().and_then(|v| v.parse().ok());
         let merge_max_amulets = std::env::var("MERGE_MAX_AMULETS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
@@ -313,18 +311,34 @@ impl BaseConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.0);
 
-        let batch_pay_min_size = std::env::var("BATCH_PAY_MIN_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
-        let batch_pay_max_wait_min = std::env::var("BATCH_PAY_MAX_WAIT_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
-        let batch_pay_max_size = std::env::var("BATCH_PAY_MAX_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
+        // Auto-topup vars: both must be set together. If exactly one is set,
+        // fail at startup so the operator gets a clear signal rather than
+        // silently disabling the feature.
+        let min_prepaid = std::env::var("MIN_PREPAID_TRAFFIC_BALANCE_CC").ok();
+        let topup_prepaid = std::env::var("PREPAID_TRAFFIC_TOPUP_CC").ok();
+        let (min_prepaid_traffic_balance_cc, prepaid_traffic_topup_cc) =
+            match (min_prepaid, topup_prepaid) {
+                (Some(min_str), Some(topup_str)) => {
+                    let min: rust_decimal::Decimal = min_str.parse()
+                        .with_context(|| format!("MIN_PREPAID_TRAFFIC_BALANCE_CC must be a decimal, got '{}'", min_str))?;
+                    let topup: rust_decimal::Decimal = topup_str.parse()
+                        .with_context(|| format!("PREPAID_TRAFFIC_TOPUP_CC must be a decimal, got '{}'", topup_str))?;
+                    if topup <= rust_decimal::Decimal::ZERO {
+                        return Err(anyhow!(
+                            "PREPAID_TRAFFIC_TOPUP_CC must be > 0, got {}",
+                            topup
+                        ));
+                    }
+                    (Some(min), Some(topup))
+                }
+                (None, None) => (None, None),
+                (Some(_), None) => return Err(anyhow!(
+                    "MIN_PREPAID_TRAFFIC_BALANCE_CC is set but PREPAID_TRAFFIC_TOPUP_CC is not — both required for auto-topup"
+                )),
+                (None, Some(_)) => return Err(anyhow!(
+                    "PREPAID_TRAFFIC_TOPUP_CC is set but MIN_PREPAID_TRAFFIC_BALANCE_CC is not — both required for auto-topup"
+                )),
+            };
 
         Ok(BaseConfig {
             orderbook_grpc_url,
@@ -334,14 +348,7 @@ impl BaseConfig {
             private_key_base58,
             public_key_hex,
             settlement_operator,
-            fee_party,
-            traffic_fee_party,
-            traffic_fee_usd_per_byte,
-            join_traffic,
             fee_reserve_cc,
-            agent_fee_cc,
-            participant_fee_cc,
-            signature_fee_cc,
             merge_threshold,
             merge_max_amulets,
             merge_poll_interval_sec,
@@ -366,9 +373,8 @@ impl BaseConfig {
             flow_ema_window_hours,
             depletion_max_hours,
             depletion_min_hours,
-            batch_pay_min_size,
-            batch_pay_max_wait_min,
-            batch_pay_max_size,
+            min_prepaid_traffic_balance_cc,
+            prepaid_traffic_topup_cc,
         })
     }
 

@@ -180,18 +180,6 @@ where
         t.import_state(saved.orders.clone(), saved.settlement_orders.clone());
     }
 
-    // Restore pending background fee payments from saved state
-    if let Some(ref saved) = restored_state {
-        if !saved.pending_fees.is_empty() {
-            info!("Restoring {} pending fee payment(s) from saved state", saved.pending_fees.len());
-            backend.restore_pending_fees(saved.pending_fees.clone()).await;
-        }
-        if !saved.pending_traffic_fees.is_empty() {
-            info!("Restoring {} pending traffic fee(s) from saved state", saved.pending_traffic_fees.len());
-            backend.restore_pending_traffic_fees(saved.pending_traffic_fees.clone());
-        }
-    }
-
     // Create settlement executor with shared tracker
     let mut settlement_executor = SettlementExecutor::new(&config, tracker.clone(), backend);
 
@@ -623,16 +611,14 @@ where
                     let n = active_settlements.len();
                     let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
                     let pct = if max > 0 { used * 100 / max } else { 0 };
-                    let (alloc, fees, traffic) = settlement_executor.queue_depth();
-                    let backlog = settlement_executor.traffic_backlog_depth();
-                    let pending_traffic = settlement_executor.pending_traffic_count();
+                    let (alloc, fees) = settlement_executor.queue_depth();
                     let cache_str = if let Some((avail, consumed, reserved, selectable)) = settlement_executor.cache_stats() {
                         format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
                     } else {
                         String::new()
                     };
-                    let worker_str = if let Some((aa, am, fa, fm, ta, tm)) = settlement_executor.worker_utilization() {
-                        format!(", workers alloc {}/{} fee {}/{} traffic {}/{}", aa, am, fa, fm, ta, tm)
+                    let worker_str = if let Some((aa, am, fa, fm)) = settlement_executor.worker_utilization() {
+                        format!(", workers alloc {}/{} fee {}/{}", aa, am, fa, fm)
                     } else {
                         String::new()
                     };
@@ -640,12 +626,6 @@ where
                         let mut parts = Vec::new();
                         if let Some(secs) = settlement_executor.fee_pause_secs() {
                             parts.push(format!("FEES PAUSED {}s", secs));
-                        }
-                        if let Some(secs) = settlement_executor.traffic_fee_pause_secs() {
-                            parts.push(format!("TRAFFIC PAUSED {}s", secs));
-                        }
-                        if crate::forecast::is_traffic_paused_by_forecast() {
-                            parts.push("TRAFFIC PAUSED (sequencer overload)".to_string());
                         }
                         if crate::forecast::is_fees_paused_by_overload() {
                             parts.push("FEES PAUSED (sequencer overload)".to_string());
@@ -666,8 +646,8 @@ where
                             String::new()
                         }
                     };
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees {} traffic {} backlog {} pending{}{}{}{}",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, traffic, backlog, pending_traffic, cache_str, worker_str, pause_str, forecast_str);
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees{}{}{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, cache_str, worker_str, pause_str, forecast_str);
                     settlement_executor.log_cid_waiting_summary();
                     // Liquidity stats
                     if let Some(lm) = settlement_executor.liquidity_manager() {
@@ -833,18 +813,6 @@ where
         // Save fill loop state if present
         if let Some(ref fill_state) = options.fill_state {
             saved.fill_state = fill_state.lock().await.clone();
-        }
-
-        // Save pending background fee payments
-        saved.pending_fees = settlement_executor.get_pending_fees();
-        if !saved.pending_fees.is_empty() {
-            info!("Saving {} pending fee payment(s) for restart", saved.pending_fees.len());
-        }
-
-        // Save pending traffic fee payments
-        saved.pending_traffic_fees = settlement_executor.get_pending_traffic_fees();
-        if !saved.pending_traffic_fees.is_empty() {
-            info!("Saving {} pending traffic fee(s) for restart", saved.pending_traffic_fees.len());
         }
 
         // Save flow tracker state for depletion detection on restart

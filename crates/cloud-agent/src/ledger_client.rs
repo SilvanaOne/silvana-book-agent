@@ -115,7 +115,7 @@ use message_signing::{
     canonical_params_execute_multicall,
     canonical_params_lock_holdings, canonical_params_process_lock_unlock_requests,
     canonical_params_resize_lock, canonical_params_terminate_lock,
-    canonical_params_faucet,
+    canonical_params_faucet, canonical_params_prepay_traffic,
 };
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use tx_verifier::OperationExpectation;
@@ -123,12 +123,16 @@ use orderbook_proto::ledger::{
     d_app_provider_service_client::DAppProviderServiceClient,
     ActiveContractInfo, DiscoveredContract, ExecuteTransactionRequest,
     ExecuteTransactionResponse, GetActiveContractsRequest, GetBalancesRequest,
+    GetPrepaidTrafficBalanceRequest,
     GetDsoRatesRequest, GetDsoRatesResponse, GetLedgerEndRequest,
     GetPreapprovalsRequest, GetSettlementContractsRequest, GetUpdatesRequest,
     GetUpdatesResponse, MessageSignature, PreapprovalInfo, PrepareTransactionRequest,
     get_updates_response, ledger_event,
     PrepareTransactionResponse, TokenBalance,
     FaucetRequest, FaucetResponse,
+    FaucetInstrument, ListFaucetInstrumentsRequest,
+    PreparePayFeeRequest, PreparePayFeeResponse,
+    ExecutePayFeeRequest, ExecutePayFeeResponse,
 };
 
 /// Build canonical payload from a PrepareTransactionRequest for signing
@@ -165,6 +169,9 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
         Params::ProcessLockUnlockRequests(p) => canonical_params_process_lock_unlock_requests(&p.lock_controller_cid, p.requests.len()),
         Params::ResizeLock(p) => canonical_params_resize_lock(&p.lock_controller_cid, &p.new_amount),
         Params::TerminateLock(p) => canonical_params_terminate_lock(&p.lock_controller_cid),
+        Params::PrepayTraffic(p) => canonical_params_prepay_traffic(
+            &p.amount, p.description.as_deref(), &p.command_id,
+        ),
     };
     Ok(canonical_prepare_request(req.operation, &params_canonical))
 }
@@ -224,9 +231,17 @@ pub struct DAppProviderClient {
     client: DAppProviderServiceClient<
         tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>,
     >,
+    /// The party id whose JWT this client carries. Used to bind fees
+    /// authorization signatures to a specific party.
+    party_id: String,
     private_key_bytes: [u8; 32],
     /// Pre-configured ledger service public key for response signature verification
     ledger_service_public_key: [u8; 32],
+    /// Optional auto-topup trigger. When set, every successful
+    /// `submit_transaction` non-blockingly nudges the background topup
+    /// runner (which owns its own DAppProviderClient and runs in a
+    /// dedicated task — see [`crate::topup::TopupRunner::spawn`]).
+    topup_trigger: Option<crate::topup::TopupTrigger>,
 }
 
 impl DAppProviderClient {
@@ -258,9 +273,20 @@ impl DAppProviderClient {
             .max_decoding_message_size(16 * 1024 * 1024);
         Ok(Self {
             client,
+            party_id: party_id.to_string(),
             private_key_bytes: *private_key_bytes,
             ledger_service_public_key: *ledger_service_public_key,
+            topup_trigger: None,
         })
+    }
+
+    /// Attach an auto-topup trigger. After every successful submit, the
+    /// trigger nudges the background topup runner (non-blocking). Call
+    /// this only on the client used by the agent's main loop — never on
+    /// the runner's own internal client.
+    pub fn with_topup_trigger(mut self, trigger: crate::topup::TopupTrigger) -> Self {
+        self.topup_trigger = Some(trigger);
+        self
     }
 
     /// Create a DAppProviderClient from a pre-existing shared channel.
@@ -291,8 +317,10 @@ impl DAppProviderClient {
             .max_decoding_message_size(16 * 1024 * 1024);
         Ok(Self {
             client,
+            party_id: party_id.to_string(),
             private_key_bytes: *private_key_bytes,
             ledger_service_public_key: *ledger_service_public_key,
+            topup_trigger: None,
         })
     }
 
@@ -426,6 +454,32 @@ impl DAppProviderClient {
         Ok(resp.into_inner().balances)
     }
 
+    /// Get off-chain prepaid traffic balance + credit limit for the
+    /// authenticated party. Returns rust_decimal::Decimal values parsed at
+    /// the boundary so callers don't have to handle decimal strings.
+    pub async fn get_prepaid_traffic_balance(
+        &mut self,
+    ) -> Result<crate::PrepaidTrafficBalance> {
+        let resp = self
+            .client
+            .get_prepaid_traffic_balance(GetPrepaidTrafficBalanceRequest {})
+            .await
+            .map_err(|s| anyhow!("GetPrepaidTrafficBalance RPC failed ({}): {}", s.code(), s.message()))?;
+        let r = resp.into_inner();
+        Ok(crate::PrepaidTrafficBalance {
+            balance_cc: r.balance_cc.parse()
+                .map_err(|e| anyhow!("invalid balance_cc '{}': {}", r.balance_cc, e))?,
+            credit_limit_cc: r.credit_limit_cc.parse()
+                .map_err(|e| anyhow!("invalid credit_limit_cc '{}': {}", r.credit_limit_cc, e))?,
+            available_cc: r.available_cc.parse()
+                .map_err(|e| anyhow!("invalid available_cc '{}': {}", r.available_cc, e))?,
+            total_credited_cc: r.total_credited_cc.parse()
+                .map_err(|e| anyhow!("invalid total_credited_cc '{}': {}", r.total_credited_cc, e))?,
+            total_debited_cc: r.total_debited_cc.parse()
+                .map_err(|e| anyhow!("invalid total_debited_cc '{}': {}", r.total_debited_cc, e))?,
+        })
+    }
+
     /// Fetch TransferPreapproval contracts
     pub async fn get_preapprovals(&mut self) -> Result<Vec<PreapprovalInfo>> {
         let resp = self
@@ -556,30 +610,68 @@ impl DAppProviderClient {
         verify_canonical(&self.ledger_service_public_key, &canonical_resp, &resp_sig.signature, &resp_sig.signing_scheme)
             .context("PrepareTransaction response signature verification failed")?;
 
+        // Independently verify the fees_signature, bound to (party,
+        // transaction_id, fees_json). Out-of-band from the Canton-payload
+        // signature so the multihash signature stays exactly what Canton
+        // expects. The transaction_id binding makes the signature a
+        // single-use token: the server's SessionStore consumes it on
+        // execute, so any replay finds no session.
+        let fees_sig = response.fees_signature.as_ref()
+            .ok_or_else(|| anyhow!("Missing fees_signature from ledger service"))?;
+        self.verify_server_key(&fees_sig.public_key)?;
+        let fees_canonical = message_signing::canonical_tx_fees_authorization(
+            &self.party_id,
+            &response.transaction_id,
+            &response.fees_json,
+        );
+        verify_canonical(&self.ledger_service_public_key, &fees_canonical, &fees_sig.signature, &fees_sig.signing_scheme)
+            .context("PrepareTransaction fees_signature verification failed")?;
+
         Ok(response)
     }
 
     /// Execute a signed transaction (Phase 2)
     ///
     /// Signs the request with our Ed25519 key and verifies the response signature.
+    /// `fees_json` MUST be the exact string echoed from the prepare response —
+    /// the server tampering check will reject mismatches.
     pub async fn execute_transaction(
         &mut self,
         transaction_id: &str,
         signature: &str,
+        fees_json: &str,
     ) -> Result<ExecuteTransactionResponse> {
-        // Sign request
+        // Sign the (Canton-required) request canonical with the existing
+        // request_signature — UNCHANGED so the Canton multihash signature
+        // stays untouched.
         let canonical = canonical_execute_request(transaction_id, signature);
         let sig_data = sign_canonical(&self.private_key_bytes, &canonical);
+
+        // Independently sign the context-bound fees authorization. Bound to
+        // (party, transaction_id, fees_json) — single-use because the
+        // server's SessionStore consumes transaction_id atomically.
+        let fees_canonical = message_signing::canonical_tx_fees_authorization(
+            &self.party_id,
+            transaction_id,
+            fees_json,
+        );
+        let fees_auth_data = sign_canonical(&self.private_key_bytes, &fees_canonical);
 
         let resp = self
             .client
             .execute_transaction(ExecuteTransactionRequest {
                 transaction_id: transaction_id.to_string(),
                 signature: signature.to_string(),
+                fees_json: fees_json.to_string(),
                 request_signature: Some(MessageSignature {
                     signature: sig_data.signature_b64,
                     public_key: sig_data.public_key_b64url,
                     signing_scheme: sig_data.signing_scheme,
+                }),
+                fees_authorization: Some(MessageSignature {
+                    signature: fees_auth_data.signature_b64,
+                    public_key: fees_auth_data.public_key_b64url,
+                    signing_scheme: fees_auth_data.signing_scheme,
                 }),
             })
             .await
@@ -740,9 +832,11 @@ impl DAppProviderClient {
 
             let signature = sign_hash_bytes(&self.private_key_bytes, &hash_to_sign)?;
 
-            // 4. Execute (catch gRPC errors for update-based recovery)
+            // 4. Execute (catch gRPC errors for update-based recovery).
+            //    Echo back the server's fees_json verbatim — the server
+            //    tampering check rejects substitutions.
             let result = match self
-                .execute_transaction(&prepared.transaction_id, &signature)
+                .execute_transaction(&prepared.transaction_id, &signature, &prepared.fees_json)
                 .await
             {
                 Ok(r) => r,
@@ -827,6 +921,13 @@ impl DAppProviderClient {
                 anyhow::bail!("Transaction failed: {}", error_msg);
             }
 
+            // Post-success: nudge the auto-topup runner. Non-blocking;
+            // the runner has its own task and its own client, so this
+            // never recurses or blocks the caller.
+            if let Some(trigger) = self.topup_trigger.as_ref() {
+                trigger.nudge();
+            }
+
             return Ok(result);
         }
 
@@ -905,6 +1006,191 @@ impl DAppProviderClient {
             .map_err(|s| anyhow!("RequestFaucet RPC failed ({}): {}", s.code(), s.message()))?;
 
         Ok(response.into_inner())
+    }
+
+    /// List instruments supported by the faucet (drives both faucet calls and
+    /// CIP-56 preapproval creation on the agent side).
+    pub async fn list_faucet_instruments(&mut self) -> Result<Vec<FaucetInstrument>> {
+        let response = self
+            .client
+            .list_faucet_instruments(ListFaucetInstrumentsRequest {})
+            .await
+            .map_err(|s| anyhow!("ListFaucetInstruments RPC failed ({}): {}", s.code(), s.message()))?;
+        Ok(response.into_inner().instruments)
+    }
+
+    // ========================================================================
+    // Off-chain processing-fee payment (DVP and allocation processing fees).
+    //
+    // Two-phase flow mirrors PrepareTransaction / ExecuteTransaction. Each
+    // call pays exactly ONE fee (DVP or allocation). The two are independent —
+    // settlement.rs invokes `pay_processing_fee("dvp", ...)` and
+    // `pay_processing_fee("allocate", ...)` at separate steps, and the
+    // allocate call only happens if the cloud-agent reaches the Allocate
+    // step (i.e. the counterparty has allocated).
+    // ========================================================================
+
+    /// Phase 1: ask the server to compute the processing fee in CC and
+    /// return a signed schedule + a single-use `session_id`. Verifies BOTH
+    /// `response_signature` (full canonical including session_id) and
+    /// `fees_signature` (context-bound canonical_pay_fee_authorization
+    /// covering party + session_id + proposal_id + fee_type + fees_json).
+    pub async fn prepare_pay_fee(
+        &mut self,
+        proposal_id: &str,
+        fee_type: &str,
+    ) -> Result<PreparePayFeeResponse> {
+        // Sign the request canonical.
+        let canonical = message_signing::canonical_prepare_pay_fee_request(proposal_id, fee_type);
+        let sig_data = message_signing::sign_canonical(&self.private_key_bytes, &canonical);
+
+        let resp = self
+            .client
+            .prepare_pay_fee(PreparePayFeeRequest {
+                proposal_id: proposal_id.to_string(),
+                fee_type: fee_type.to_string(),
+                request_signature: Some(MessageSignature {
+                    signature: sig_data.signature_b64,
+                    public_key: sig_data.public_key_b64url,
+                    signing_scheme: sig_data.signing_scheme,
+                }),
+            })
+            .await
+            .map_err(|s| anyhow!("PreparePayFee RPC failed ({}): {}", s.code(), s.message()))?;
+        let response = resp.into_inner();
+
+        // Verify response_signature over the full canonical (includes session_id).
+        let resp_sig = response
+            .response_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing response_signature from ledger service"))?;
+        self.verify_server_key(&resp_sig.public_key)?;
+        let canonical_resp = message_signing::canonical_prepare_pay_fee_response(
+            &response.proposal_id,
+            &response.fee_type,
+            &response.fees_json,
+            &response.session_id,
+        );
+        verify_canonical(
+            &self.ledger_service_public_key,
+            &canonical_resp,
+            &resp_sig.signature,
+            &resp_sig.signing_scheme,
+        )
+        .context("PreparePayFee response signature verification failed")?;
+
+        // Independently verify fees_signature over the context-bound payload.
+        // Bound to: party + session_id + proposal_id + fee_type + fees_json.
+        let fees_sig = response
+            .fees_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing fees_signature from ledger service"))?;
+        self.verify_server_key(&fees_sig.public_key)?;
+        let fees_canonical = message_signing::canonical_pay_fee_authorization(
+            &self.party_id,
+            &response.session_id,
+            &response.proposal_id,
+            &response.fee_type,
+            &response.fees_json,
+        );
+        verify_canonical(
+            &self.ledger_service_public_key,
+            &fees_canonical,
+            &fees_sig.signature,
+            &fees_sig.signing_scheme,
+        )
+        .context("PreparePayFee fees_signature verification failed")?;
+
+        Ok(response)
+    }
+
+    /// Phase 2: echo the schedule back. Both signatures cover the full
+    /// context (party + session_id + proposal_id + fee_type + fees_json),
+    /// pinning the authorization to the single-use server-issued session.
+    pub async fn execute_pay_fee(
+        &mut self,
+        proposal_id: &str,
+        fee_type: &str,
+        fees_json: &str,
+        session_id: &str,
+    ) -> Result<ExecutePayFeeResponse> {
+        let canonical = message_signing::canonical_execute_pay_fee_request(
+            proposal_id, fee_type, fees_json, session_id,
+        );
+        let sig_data = message_signing::sign_canonical(&self.private_key_bytes, &canonical);
+
+        let fees_canonical = message_signing::canonical_pay_fee_authorization(
+            &self.party_id,
+            session_id,
+            proposal_id,
+            fee_type,
+            fees_json,
+        );
+        let fees_auth_data =
+            message_signing::sign_canonical(&self.private_key_bytes, &fees_canonical);
+
+        let resp = self
+            .client
+            .execute_pay_fee(ExecutePayFeeRequest {
+                proposal_id: proposal_id.to_string(),
+                fee_type: fee_type.to_string(),
+                fees_json: fees_json.to_string(),
+                session_id: session_id.to_string(),
+                request_signature: Some(MessageSignature {
+                    signature: sig_data.signature_b64,
+                    public_key: sig_data.public_key_b64url,
+                    signing_scheme: sig_data.signing_scheme,
+                }),
+                fees_authorization: Some(MessageSignature {
+                    signature: fees_auth_data.signature_b64,
+                    public_key: fees_auth_data.public_key_b64url,
+                    signing_scheme: fees_auth_data.signing_scheme,
+                }),
+            })
+            .await
+            .map_err(|s| anyhow!("ExecutePayFee RPC failed ({}): {}", s.code(), s.message()))?;
+        let response = resp.into_inner();
+
+        // Verify response_signature.
+        let resp_sig = response
+            .response_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing response_signature from ledger service"))?;
+        self.verify_server_key(&resp_sig.public_key)?;
+        let canonical_resp = message_signing::canonical_execute_pay_fee_response(
+            response.success,
+            response.error_message.as_deref(),
+        );
+        verify_canonical(
+            &self.ledger_service_public_key,
+            &canonical_resp,
+            &resp_sig.signature,
+            &resp_sig.signing_scheme,
+        )
+        .context("ExecutePayFee response signature verification failed")?;
+
+        Ok(response)
+    }
+
+    /// Convenience wrapper: prepare → verify → authorize → execute.
+    /// `fee_type` is "dvp" or "allocate".
+    pub async fn pay_processing_fee(
+        &mut self,
+        proposal_id: &str,
+        fee_type: &str,
+    ) -> Result<()> {
+        let prep = self.prepare_pay_fee(proposal_id, fee_type).await?;
+        let exec = self
+            .execute_pay_fee(proposal_id, fee_type, &prep.fees_json, &prep.session_id)
+            .await?;
+        if !exec.success {
+            return Err(anyhow!(
+                "ExecutePayFee returned failure for proposal {} fee_type {}: {}",
+                proposal_id, fee_type,
+                exec.error_message.unwrap_or_else(|| "<no error message>".to_string())
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -14,7 +14,6 @@ use std::path::Path;
 use tracing::{error, info, warn};
 
 use crate::liquidity::SavedTokenFlow;
-use crate::settlement::{PendingFee, PendingTrafficFee};
 
 /// Current state file format version
 const STATE_VERSION: u32 = 1;
@@ -44,12 +43,6 @@ pub struct SavedState {
     pub quoted_rfq_trades: Vec<SavedQuotedTrade>,
     /// Fill loop state (buyer/seller commands only)
     pub fill_state: Option<SavedFillState>,
-    /// Pending background fee payments (queued but not yet completed)
-    #[serde(default)]
-    pub pending_fees: Vec<PendingFee>,
-    /// Pending traffic fee payments (queued but not yet completed)
-    #[serde(default)]
-    pub pending_traffic_fees: Vec<PendingTrafficFee>,
     /// Flow tracker state for depletion detection (restored on restart)
     #[serde(default)]
     pub flow_tracker: Vec<SavedTokenFlow>,
@@ -127,8 +120,6 @@ impl SavedState {
             accepted_rfq_trades: Vec::new(),
             quoted_rfq_trades: Vec::new(),
             fill_state: None,
-            pending_fees: Vec::new(),
-            pending_traffic_fees: Vec::new(),
             flow_tracker: Vec::new(),
         }
     }

@@ -254,13 +254,7 @@ Flags:
 | `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
 | `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
 | `PARTY_ORDERBOOK_FEE`            | Orderbook fee collection party                                         |         yes          |
-| `PARTY_TRAFFIC_FEE`              | Sequencer traffic fee party                                            |         yes          |
-| `TRAFFIC_FEE_PRICE_USD_MB`       | Traffic fee rate in USD per MB                                         |         yes          |
-| `JOIN_TRAFFIC_TRANSACTIONS`      | Batch traffic-fee transactions (default: `true`)                       |         yes          |
 | `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`)                         |         yes          |
-| `AGENT_FEE_CC`                   | Per-tx agent fee (CC)                                                  |         yes          |
-| `PARTICIPANT_FEE_CC`             | Per-tx participant fee (CC)                                            |         yes          |
-| `SIGNATURE_FEE_CC`               | Per-tx signature fee (CC)                                              |         yes          |
 | `MERGE_THRESHOLD`                | Merge worker triggers when selectable amulets exceed this count        |         yes          |
 | `MERGE_MAX_AMULETS`              | Max amulets merged per round (default: `100`)                          |         yes          |
 | `MERGE_POLL_INTERVAL_SEC`        | Merge worker poll interval in seconds (default: `600`)                 |         yes          |

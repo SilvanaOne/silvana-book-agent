@@ -17,7 +17,7 @@ use tracing::{debug, info};
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::ConfirmLock;
 use agent_logic::liquidity::LiquidityManager;
-use agent_logic::settlement::{DiscoveredContract, PendingFee, PendingTrafficFee, SettlementBackend, StepResult};
+use agent_logic::settlement::{DiscoveredContract, SettlementBackend, StepResult};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AcceptDvpParams,
     PrepareTransactionRequest, ProposeDvpParams, TransactionOperation,
@@ -108,7 +108,7 @@ impl CloudSettlementBackend {
 #[async_trait]
 impl SettlementBackend for CloudSettlementBackend {
     async fn pay_fee(&self, proposal_id: &str, fee_type: &str) -> Result<StepResult> {
-        self.payment_queue.submit_pay_fee(proposal_id, fee_type, 0.0).await
+        self.payment_queue.submit_pay_fee(proposal_id, fee_type).await
     }
 
     async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
@@ -223,76 +223,7 @@ impl SettlementBackend for CloudSettlementBackend {
         self.payment_queue.submit_allocate(proposal_id, dvp_cid, allocation_cc).await
     }
 
-    async fn transfer_traffic_fee(
-        &self,
-        traffic_bytes: u64,
-        step_name: &str,
-        proposal_id: &str,
-    ) -> Result<()> {
-        if traffic_bytes == 0 {
-            return Ok(());
-        }
-        self.payment_queue
-            .submit_transfer_traffic_fee(traffic_bytes, step_name, proposal_id)
-            .await
-    }
-
-    fn queue_traffic_fee(&self, traffic_bytes: u64, step_name: &str, proposal_id: &str) {
-        self.payment_queue.queue_traffic_fee(traffic_bytes, step_name, proposal_id);
-    }
-
-    fn queue_step_fees(&self, step_name: &str, proposal_id: &str, count: u32) {
-        self.payment_queue.queue_step_fees(step_name, proposal_id, &self.config, count);
-    }
-
-    async fn queue_fee_payment(&self, mut fee: PendingFee) {
-        // Compute fee CC estimate from USD amount using current CC/USD rate
-        if !fee.fee_amount_usd.is_empty() {
-            if let Ok(fee_usd) = fee.fee_amount_usd.parse::<f64>() {
-                if fee_usd > 0.0 {
-                    if let Ok(mut client) = self.create_client().await {
-                        if let Ok(rates) = client.get_dso_rates().await {
-                            if let Ok(rate) = rates.cc_usd_rate.parse::<f64>() {
-                                if rate > 0.0 {
-                                    fee.fee_cc_estimate = fee_usd / rate;
-                                    debug!(
-                                        "[{}] Fee CC estimate: {} USD / {} rate = {} CC",
-                                        fee.proposal_id, fee_usd, rate, fee.fee_cc_estimate
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.payment_queue.queue_fee_background(fee).await;
-    }
-
-    fn get_pending_fees(&self) -> Vec<PendingFee> {
-        // Block on the async lock — this is called during shutdown (sync context)
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.payment_queue.get_pending_fees())
-        })
-    }
-
-    async fn restore_pending_fees(&self, fees: Vec<PendingFee>) {
-        self.payment_queue.restore_pending_fees(fees).await;
-    }
-
-    fn get_pending_traffic_fees(&self) -> Vec<PendingTrafficFee> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.payment_queue.get_pending_traffic_fees())
-        })
-    }
-
-    fn restore_pending_traffic_fees(&self, fees: Vec<PendingTrafficFee>) {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.payment_queue.restore_pending_traffic_fees(fees))
-        });
-    }
-
-    fn queue_depth(&self) -> (u64, u64, u64) {
+    fn queue_depth(&self) -> (u64, u64) {
         self.payment_queue.queue_depth()
     }
 
@@ -308,28 +239,12 @@ impl SettlementBackend for CloudSettlementBackend {
         }))
     }
 
-    fn traffic_backlog_depth(&self) -> usize {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.payment_queue.traffic_backlog_depth())
-        })
-    }
-
-    fn pending_traffic_count(&self) -> usize {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.payment_queue.pending_traffic_count())
-        })
-    }
-
-    fn worker_utilization(&self) -> Option<(u64, usize, u64, usize, u64, usize)> {
+    fn worker_utilization(&self) -> Option<(u64, usize, u64, usize)> {
         Some(self.payment_queue.worker_utilization())
     }
 
     fn fee_pause_secs(&self) -> Option<u64> {
         self.payment_queue.fee_pause_secs()
-    }
-
-    fn traffic_fee_pause_secs(&self) -> Option<u64> {
-        self.payment_queue.traffic_fee_pause_secs()
     }
 
     async fn sync_contracts(
