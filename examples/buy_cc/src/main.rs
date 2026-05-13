@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
         false, // confirm
         confirm_lock.clone(),
         lm,
+        agent_logic::shutdown::Shutdown::new(),
     );
 
     // Create settler for atomic multicall settlements

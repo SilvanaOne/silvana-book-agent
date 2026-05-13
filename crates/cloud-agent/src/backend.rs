@@ -18,6 +18,7 @@ use agent_logic::config::BaseConfig;
 use agent_logic::confirm::ConfirmLock;
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::settlement::{DiscoveredContract, SettlementBackend, StepResult};
+use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AcceptDvpParams,
     PrepareTransactionRequest, ProposeDvpParams, TransactionOperation,
@@ -44,8 +45,10 @@ pub struct CloudSettlementBackend {
     amulet_cache: Arc<AmuletCache>,
     /// Liquidity manager for balance tracking and commitment gating
     liquidity_manager: Arc<LiquidityManager>,
-    /// Shutdown flag for background tasks (ACS worker)
-    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared shutdown signal for background tasks (ACS / merge / payment queue).
+    /// Cloned from the runner's `Shutdown` so Ctrl-C reaches every worker
+    /// the moment it fires, not only after the main loop has exited.
+    shutdown: Shutdown,
 }
 
 impl CloudSettlementBackend {
@@ -57,17 +60,17 @@ impl CloudSettlementBackend {
         confirm: bool,
         confirm_lock: ConfirmLock,
         liquidity_manager: Arc<LiquidityManager>,
+        shutdown: Shutdown,
     ) -> Self {
         let cache = AmuletCache::new();
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Spawn ACS worker to refresh amulet cache and update liquidity manager
-        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown_flag.clone());
+        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown.clone());
 
         // Spawn merge worker if threshold is configured
         if config.merge_threshold.is_some() {
             crate::merge_worker::spawn_merge_worker(
-                config.clone(), cache.clone(), shutdown_flag.clone(),
+                config.clone(), cache.clone(), shutdown.clone(),
             );
         }
 
@@ -79,8 +82,9 @@ impl CloudSettlementBackend {
             confirm,
             confirm_lock.clone(),
             cache.clone(),
+            shutdown.clone(),
         );
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache, liquidity_manager, shutdown_flag }
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache, liquidity_manager, shutdown }
     }
 
     /// Create a new DAppProviderClient for this request
@@ -228,7 +232,7 @@ impl SettlementBackend for CloudSettlementBackend {
     }
 
     fn shutdown(&self) {
-        self.shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown.signal();
         self.payment_queue.shutdown();
     }
 

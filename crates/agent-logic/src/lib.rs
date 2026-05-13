@@ -22,6 +22,7 @@ pub mod order_tracker;
 pub mod rpc_client;
 pub mod runner;
 pub mod settlement;
+pub mod shutdown;
 pub mod sign;
 pub mod state;
 pub mod types;

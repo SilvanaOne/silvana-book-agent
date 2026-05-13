@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::{confirm_transaction, ConfirmLock};
 use agent_logic::settlement::StepResult;
+use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AllocateParams,
     PrepareTransactionRequest, TransactionOperation,
@@ -147,8 +148,9 @@ pub struct PaymentQueue {
     /// Per-pool max worker counts
     max_alloc_workers: usize,
     max_fee_workers: usize,
-    /// Shutdown flag — stops the scheduler from dispatching new work
-    shutdown_flag: Arc<AtomicBool>,
+    /// Shared shutdown signal — wakes the scheduler's `rx.recv()` and
+    /// `sleep` arms instantly so it exits without waiting on idle backoff.
+    shutdown: Shutdown,
 }
 
 impl PaymentQueue {
@@ -161,13 +163,13 @@ impl PaymentQueue {
         confirm: bool,
         confirm_lock: ConfirmLock,
         cache: Arc<AmuletCache>,
+        shutdown: Shutdown,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let queued_allocations = Arc::new(AtomicU64::new(0));
         let queued_fees = Arc::new(AtomicU64::new(0));
         let active_alloc_workers = Arc::new(AtomicU64::new(0));
         let active_fee_workers = Arc::new(AtomicU64::new(0));
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Backward compat: MAX_PAYMENT_WORKERS overrides all pools if set
         let legacy_override: Option<usize> = std::env::var("MAX_PAYMENT_WORKERS")
@@ -202,7 +204,7 @@ impl PaymentQueue {
             max_fee_workers,
             active_alloc_workers.clone(),
             active_fee_workers.clone(),
-            shutdown_flag.clone(),
+            shutdown.clone(),
         ));
 
         Self {
@@ -214,7 +216,7 @@ impl PaymentQueue {
             active_fee_workers,
             max_alloc_workers,
             max_fee_workers,
-            shutdown_flag,
+            shutdown,
         }
     }
 
@@ -286,7 +288,7 @@ impl PaymentQueue {
 
     /// Signal the scheduler to stop dispatching new work and exit.
     pub fn shutdown(&self) {
-        self.shutdown_flag.store(true, AtomicOrdering::Relaxed);
+        self.shutdown.signal();
     }
 
     /// Get per-pool worker utilization:
@@ -323,7 +325,7 @@ impl PaymentQueue {
         max_fee_workers: usize,
         active_alloc_workers: Arc<AtomicU64>,
         active_fee_workers: Arc<AtomicU64>,
-        shutdown_flag: Arc<AtomicBool>,
+        shutdown: Shutdown,
     ) {
         let alloc_semaphore = Arc::new(Semaphore::new(max_alloc_workers));
         let fee_semaphore = Arc::new(Semaphore::new(max_fee_workers));
@@ -341,18 +343,28 @@ impl PaymentQueue {
 
         loop {
             // Check shutdown before dispatching new work
-            if shutdown_flag.load(AtomicOrdering::Relaxed) {
+            if shutdown.is_shutting_down() {
                 info!("Payment scheduler shutting down ({} items in heap)", heap.len());
                 return;
             }
 
-            // If the heap is empty, block until a new item arrives.
+            // If the heap is empty, block until a new item arrives — but
+            // also wake on shutdown so we don't sit on an empty channel.
             if heap.is_empty() {
-                match rx.recv().await {
-                    Some(item) => heap.push(item),
-                    None => {
-                        debug!("Payment queue channel closed, scheduler exiting");
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => {
+                        info!("Payment scheduler shutting down (idle, 0 items in heap)");
                         return;
+                    }
+                    item = rx.recv() => {
+                        match item {
+                            Some(item) => heap.push(item),
+                            None => {
+                                debug!("Payment queue channel closed, scheduler exiting");
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -388,7 +400,10 @@ impl PaymentQueue {
                     }
                     Err(e) => {
                         warn!("Failed to create shared gRPC channel: {:#} — will retry", e);
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                            info!("Payment scheduler shutting down (channel-create retry)");
+                            return;
+                        }
                         continue;
                     }
                 }
@@ -560,8 +575,13 @@ impl PaymentQueue {
                     heap.len(),
                     SCHEDULER_BACKOFF_SECS
                 );
-                // While backing off, also drain new items
+                // While backing off, also drain new items and observe shutdown
                 tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => {
+                        info!("Payment scheduler shutting down (backoff)");
+                        return;
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(SCHEDULER_BACKOFF_SECS)) => {}
                     item = rx.recv() => {
                         if let Some(item) = item {
