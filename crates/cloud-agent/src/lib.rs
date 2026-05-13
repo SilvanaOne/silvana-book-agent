@@ -8,13 +8,13 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::Subcommand;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
 use agent_logic::config::BaseConfig;
 use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
     PrepareTransactionRequest, RequestPreapprovalParams,
     RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
@@ -475,8 +475,11 @@ pub async fn run_cloud_agent(
         }
     }
 
-    // Create RfqHandler early so we can share its quoted_trades Arc with AgentOptions
-    let lp_shutdown = Arc::new(AtomicBool::new(false));
+    // Single Shutdown shared by every background task (LP stream, mid-price
+    // poller, ACS / merge / payment-queue / topup workers, runner main loop).
+    // The runner's Ctrl-C handler signals it on first Ctrl-C; every loop with
+    // a clone wakes immediately.
+    let lp_shutdown = Shutdown::new();
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
         let mut rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
@@ -501,7 +504,10 @@ pub async fn run_cloud_agent(
     };
 
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
-    let backend = CloudSettlementBackend::new(config.clone(), verbose, dry_run, force, confirm, confirm_lock, liquidity_manager);
+    let backend = CloudSettlementBackend::new(
+        config.clone(), verbose, dry_run, force, confirm, confirm_lock,
+        liquidity_manager, lp_shutdown.clone(),
+    );
 
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
@@ -552,7 +558,7 @@ pub async fn run_cloud_agent(
                 topup_cc = %config.prepaid_traffic_topup_cc.unwrap(),
                 "Auto-topup enabled"
             );
-            Some(Arc::new(runner).spawn())
+            Some(Arc::new(runner).spawn(lp_shutdown.clone()))
         }
         _ => {
             info!("Auto-topup disabled (MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC not set)");
@@ -578,7 +584,7 @@ pub async fn run_cloud_agent(
             settlement_only,
             orders_only,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: None,
             accepted_rfq_trades: None,
             rejected_rfq_trades: None,
             quoted_rfq_trades,
@@ -621,9 +627,23 @@ pub async fn run_fill(
         config.depletion_max_hours,
         config.depletion_min_hours,
     );
-    // CloudSettlementBackend spawns the ACS worker which keeps amulet_cache fresh.
+    // CloudSettlementBackend spawns the ACS / merge / payment-queue workers.
+    // Wire Ctrl-C and natural fill-loop completion to its `Shutdown` so those
+    // workers exit promptly instead of being cleaned up only when the runtime
+    // drops at process exit. (`run_fill_loop` has its own independent Ctrl-C
+    // handling — both observe the same signal; `tokio::signal::ctrl_c()` is
+    // idempotent across multiple awaiters.)
+    let fill_backend_shutdown = Shutdown::new();
+    {
+        let s = fill_backend_shutdown.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            s.signal();
+        });
+    }
     let backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock.clone(), fill_lm,
+        fill_backend_shutdown.clone(),
     );
 
     // The fill loop doesn't use the settlement-machine / payment-queue paths.
@@ -656,11 +676,15 @@ pub async fn run_fill(
 
     // Keep `backend` alive so its ACS worker keeps refreshing amulets until return.
     let _backend_guard = backend;
-    fill_loop::run_fill_loop(config, settler, params, saved_fill_state, Some(state_file)).await
+    let result = fill_loop::run_fill_loop(config, settler, params, saved_fill_state, Some(state_file)).await;
+    // Signal backend shutdown on natural completion too — covers paths where
+    // the fill loop returns without a Ctrl-C (target filled, error, etc.).
+    fill_backend_shutdown.signal();
+    result
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Shutdown) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
         CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
@@ -689,44 +713,54 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
     let price_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_secs(10);
-        // Initial delay to let the orderbook server start
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let mut client = match OrderbookClient::new(&price_config).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Mid-price poller: failed to create client: {}", e);
-                return;
+        // Inner future returns when the poller has nothing left to do (shutdown
+        // observed at any sleep / top-of-loop check). Single log site below.
+        let result: Result<(), ()> = async {
+            if price_shutdown.sleep(std::time::Duration::from_secs(2)).await {
+                return Err(());
             }
-        };
 
-        loop {
-            if price_shutdown.load(Ordering::Relaxed) {
-                info!("Mid-price poller shutting down");
-                return;
-            }
-            for market_id in &price_markets {
-                match client.get_price(market_id).await {
-                    Ok(resp) => {
-                        let mid = match (resp.bid, resp.ask) {
-                            (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
-                            _ => resp.last,
-                        };
-                        if mid > 0.0 {
-                            mid_prices.write().await.insert(market_id.clone(), mid);
+            let mut client = match OrderbookClient::new(&price_config).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Mid-price poller: failed to create client: {}", e);
+                    return Ok(());
+                }
+            };
+
+            loop {
+                if price_shutdown.is_shutting_down() {
+                    return Err(());
+                }
+                for market_id in &price_markets {
+                    match client.get_price(market_id).await {
+                        Ok(resp) => {
+                            let mid = match (resp.bid, resp.ask) {
+                                (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
+                                _ => resp.last,
+                            };
+                            if mid > 0.0 {
+                                mid_prices.write().await.insert(market_id.clone(), mid);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Mid-price poller: {} error: {}", market_id, e);
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!("Mid-price poller: {} error: {}", market_id, e);
-                    }
+                }
+                if price_shutdown.sleep(poll_interval).await {
+                    return Err(());
                 }
             }
-            tokio::time::sleep(poll_interval).await;
+        }
+        .await;
+        if result.is_err() {
+            info!("Mid-price poller shutting down");
         }
     });
 
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.is_shutting_down() {
             info!("LP stream shutting down, not reconnecting");
             return Ok(());
         }
@@ -737,7 +771,9 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to connect: {}, retrying in 5s", e);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -754,7 +790,9 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Failed to open settlement stream: {}, retrying in 5s", e);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -789,7 +827,9 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
 
         if outbound_tx.send(handshake).await.is_err() {
             tracing::error!("Failed to send handshake, retrying");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                return Ok(());
+            }
             continue;
         }
 
@@ -810,6 +850,15 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
 
         loop {
             tokio::select! {
+                biased;
+                // Observe shutdown the moment select is idle. This does NOT
+                // cancel an in-flight RFQ-handling body — once `inbound.next()`
+                // has fired and we're processing a message, the body runs to
+                // completion. The shutdown arm only fires when waiting.
+                _ = shutdown.wait() => {
+                    info!("LP settlement stream observed shutdown, breaking inner loop");
+                    break;
+                }
                 _ = heartbeat_interval.tick() => {
                     client_seq += 1;
                     let now = prost_types::Timestamp {
@@ -849,7 +898,7 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
                             info!("LP handshake acknowledged: accepted={}", ack.accepted);
                         }
                         Some(ServerMessage::RfqRequest(request)) => {
-                            if shutdown.load(Ordering::SeqCst) {
+                            if shutdown.is_shutting_down() {
                                 info!("Ignoring RFQ {} - shutting down", request.rfq_id);
                                 break;
                             }
@@ -897,12 +946,14 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
             }
         }
 
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.is_shutting_down() {
             info!("LP stream shutting down after disconnect");
             return Ok(());
         }
         tracing::warn!("LP settlement stream disconnected, reconnecting in 5s");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+            return Ok(());
+        }
     }
 }
 

@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tracing::{debug, info, warn};
 use tx_verifier::OperationExpectation;
 
+use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, PrepareTransactionRequest, PrepayTrafficParams,
     TransactionOperation,
@@ -214,7 +215,7 @@ impl TopupRunner {
     /// - Fires `maybe_topup` every 10 minutes regardless.
     /// Both go through `maybe_topup`'s try_lock guard, so they coalesce
     /// cleanly — a flood of per-tx nudges results in one topup attempt.
-    pub fn spawn(self: Arc<Self>) -> TopupTrigger {
+    pub fn spawn(self: Arc<Self>, shutdown: Shutdown) -> TopupTrigger {
         let (tx, mut rx) = mpsc::channel::<()>(16);
         let runner = self.clone();
         tokio::spawn(async move {
@@ -223,6 +224,11 @@ impl TopupRunner {
             ticker.tick().await; // consume immediate-fire initial tick
             loop {
                 tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => {
+                        info!("Topup runner shutting down");
+                        break;
+                    }
                     _ = ticker.tick() => {
                         runner.maybe_topup().await;
                     }

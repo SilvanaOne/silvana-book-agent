@@ -6,13 +6,13 @@
 //! consolidates the inputs into fewer output amulets.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use agent_logic::config::BaseConfig;
+use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, PrepareTransactionRequest,
     SplitCcParams, TransactionOperation,
@@ -28,7 +28,7 @@ use crate::payment_queue::{process_tx_result, handle_inactive_contracts};
 pub fn spawn_merge_worker(
     config: BaseConfig,
     cache: Arc<AmuletCache>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Shutdown,
 ) {
     let threshold = config.merge_threshold.unwrap_or(200);
     let max_amulets = config.merge_max_amulets;
@@ -40,11 +40,14 @@ pub fn spawn_merge_worker(
             threshold, max_amulets, interval.as_secs()
         );
 
-        // Initial delay to let ACS cache populate
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // Initial delay to let ACS cache populate (cancellable)
+        if shutdown.sleep(Duration::from_secs(30)).await {
+            info!("Merge worker shutting down");
+            return;
+        }
 
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.is_shutting_down() {
                 info!("Merge worker shutting down");
                 return;
             }
@@ -55,7 +58,10 @@ pub fn spawn_merge_worker(
                 Err(e) => warn!("Merge failed: {:#}", e),
             }
 
-            tokio::time::sleep(interval).await;
+            if shutdown.sleep(interval).await {
+                info!("Merge worker shutting down");
+                return;
+            }
         }
     });
 }

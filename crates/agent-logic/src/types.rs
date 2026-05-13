@@ -182,6 +182,10 @@ pub enum CidWaitingType {
 /// Failed settlement with retry backoff (matches server pattern)
 pub struct FailedSettlement {
     pub retry_count: u32,
+    /// Consecutive `Wait` cycles for this proposal. Separate from `retry_count`
+    /// (which only accumulates on Error) so Wait backoff can grow exponentially
+    /// without interfering with error-retry exhaustion.
+    pub wait_count: u32,
     pub next_retry: Instant,
     /// When this settlement first hit a CID-waiting error (for log escalation after 10 min)
     pub first_transient_at: Option<Instant>,
@@ -197,6 +201,16 @@ impl FailedSettlement {
             2 => Duration::from_secs(30),
             _ => Duration::from_secs(60),
         }
+    }
+
+    /// Exponential backoff for consecutive `Wait` cycles.
+    /// 30, 60, 120, 240, 480, 600 (capped). Reset to 0 whenever
+    /// `failed_settlements` entry is cleared (sync finds new state, stream
+    /// event, step completes — all of which already call `.remove()`).
+    pub fn wait_delay(wait_count: u32) -> Duration {
+        let exp = wait_count.saturating_sub(1).min(5);
+        let secs = 30u64.saturating_mul(1u64 << exp);
+        Duration::from_secs(secs.min(600))
     }
 
     pub fn max_retries() -> u32 {

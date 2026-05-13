@@ -5,7 +5,6 @@
 //! Also cleans up expired reservations on each cycle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
@@ -13,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use agent_logic::config::BaseConfig;
 use agent_logic::liquidity::LiquidityManager;
+use agent_logic::shutdown::Shutdown;
 
 use crate::amulet_cache::{AmuletCache, CachedAmulet};
 use crate::ledger_client::DAppProviderClient;
@@ -25,13 +25,13 @@ pub fn spawn_acs_worker(
     config: BaseConfig,
     cache: Arc<AmuletCache>,
     liquidity_manager: Arc<LiquidityManager>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Shutdown,
 ) {
     tokio::spawn(async move {
         info!("ACS worker started (refresh every {}s)", REFRESH_INTERVAL_SECS);
 
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.is_shutting_down() {
                 info!("ACS worker shutting down");
                 return;
             }
@@ -42,7 +42,10 @@ pub fn spawn_acs_worker(
 
             cache.cleanup_expired_reservations().await;
 
-            tokio::time::sleep(Duration::from_secs(REFRESH_INTERVAL_SECS)).await;
+            if shutdown.sleep(Duration::from_secs(REFRESH_INTERVAL_SECS)).await {
+                info!("ACS worker shutting down");
+                return;
+            }
         }
     });
 }

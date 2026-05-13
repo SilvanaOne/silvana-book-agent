@@ -36,6 +36,8 @@ struct AgentToml {
     connection_timeout_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     request_timeout_secs: u64,
+    #[serde(default = "default_canton_op_timeout_secs")]
+    canton_op_timeout_secs: u64,
     #[serde(default)]
     markets: Vec<MarketConfig>,
     /// LP configuration (only for liquidity provider agents)
@@ -146,6 +148,11 @@ pub struct BaseConfig {
     pub token_ttl_secs: u64,
     pub connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// Backstop timeout for any single Canton-touching await in the runner main
+    /// loop (per RPC / per `update_cycle` etc). Generous by design — Canton
+    /// blockchain ops can legitimately take minutes. The point is that it is
+    /// finite, so a stuck connection cannot hang shutdown forever.
+    pub canton_op_timeout_secs: u64,
     pub markets: Vec<MarketConfig>,
 
     // Multi-node routing
@@ -175,8 +182,8 @@ pub struct BaseConfig {
 
     // Auto top-up of the off-chain prepaid traffic balance.
     // Both must be set together. May be negative if the agent's party has
-    // an LP credit_limit_cc on the canton-agent side (balance is allowed
-    // to go negative down to -credit_limit_cc).
+    // a credit_limit_cc in canton-agent's `party_credit_limits` table
+    // (balance is allowed to go negative down to -credit_limit_cc).
     /// Minimum prepaid traffic balance in CC; below this the agent tops up.
     pub min_prepaid_traffic_balance_cc: Option<rust_decimal::Decimal>,
     /// Amount to credit on each top-up, in CC.
@@ -363,6 +370,7 @@ impl BaseConfig {
             token_ttl_secs: agent.token_ttl_secs,
             connection_timeout_secs: agent.connection_timeout_secs,
             request_timeout_secs: agent.request_timeout_secs,
+            canton_op_timeout_secs: agent.canton_op_timeout_secs,
             markets: agent.markets,
             node_name,
             ledger_service_public_key,
@@ -650,6 +658,12 @@ fn default_request_timeout_secs() -> u64 {
     120
 }
 
+/// 10 minutes — much higher than 120s to accommodate slow Canton txs, but
+/// still finite so a dead gRPC connection cannot trap the runner forever.
+fn default_canton_op_timeout_secs() -> u64 {
+    600
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -699,6 +713,7 @@ mod tests {
         assert_eq!(agent.token_ttl_secs, 3600);
         assert_eq!(agent.connection_timeout_secs, 30);
         assert_eq!(agent.request_timeout_secs, 120);
+        assert_eq!(agent.canton_op_timeout_secs, 600);
         assert!(agent.markets.is_empty());
     }
 }

@@ -30,7 +30,7 @@ use rust_decimal::prelude::ToPrimitive;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -48,6 +48,7 @@ use crate::liquidity::{self, LiquidityManager};
 use crate::order_tracker::{OrderTracker, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
 use crate::runner::{AcceptedRfqTrade, QuotedTrade};
+use crate::shutdown::Shutdown;
 use crate::types::{AdvanceResult, CidWaitingType, FailedSettlement, SettlementStage, SettlementState};
 
 /// Result from a settlement step operation
@@ -56,6 +57,29 @@ pub struct StepResult {
     pub contract_id: String,
     pub update_id: String,
     pub traffic_total: u64,
+}
+
+/// Maximum number of spawn-loop iterations that may actually spawn a task in a
+/// single `advance_all_settlements` call. Bounds worst-case spawn-loop cost
+/// when `failed_settlements` is empty (post-restart) or when many cooldowns
+/// expire simultaneously. Remaining proposals are picked up by the next 2s
+/// `collect_and_readvance` tick.
+const MAX_ADVANCE_SPAWNS_PER_CYCLE: usize = 50;
+
+/// Extract the 48-bit ms-since-epoch timestamp from a UUID-v7 string.
+/// Used to sort the spawn queue freshest-first so a brand-new RFQ-driven
+/// proposal is never starved behind stale buyer-abandoned ones.
+/// Returns 0 on parse failure (sorts oldest — never starves valid work).
+fn uuid_v7_ms(id: &str) -> u64 {
+    let mut chars = id.chars().filter(|c| *c != '-');
+    let mut hex = String::with_capacity(12);
+    for _ in 0..12 {
+        match chars.next() {
+            Some(c) => hex.push(c),
+            None => return 0,
+        }
+    }
+    u64::from_str_radix(&hex, 16).unwrap_or(0)
 }
 
 /// A contract discovered via on-chain sync
@@ -145,7 +169,10 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     rejected_proposals: HashSet<String>,
     /// Proposals that completed successfully — skip in polling to avoid re-processing
     completed_proposals: HashSet<String>,
-    shutting_down: Arc<AtomicBool>,
+    /// Shared with the runner — same `AtomicBool` + `Notify`. Polled at the
+    /// top of every loop iteration and used to cancel all bare jitter sleeps
+    /// inside spawn_settlement_task.
+    shutdown: Shutdown,
     tracker: Arc<Mutex<OrderTracker>>,
     /// Client for querying orders from server (user order lookup)
     query_client: Option<OrderbookClient>,
@@ -184,7 +211,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             active_settlements: IndexMap::new(),
             rejected_proposals: HashSet::new(),
             completed_proposals: HashSet::new(),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown: Shutdown::new(),
             tracker,
             query_client: None,
             semaphore: Arc::new(Semaphore::new(thread_count)),
@@ -353,7 +380,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Signal that we are shutting down — reject new proposals, drain confirmed ones
     pub fn set_shutting_down(&mut self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        self.shutdown.signal();
     }
 
     /// Signal the backend's payment queue to stop dispatching new work.
@@ -361,9 +388,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.backend.shutdown();
     }
 
-    /// Replace the shutdown flag with an externally-provided one (shares runner's Ctrl-C flag)
-    pub fn set_shutdown_flag(&mut self, flag: Arc<AtomicBool>) {
-        self.shutting_down = flag;
+    /// Replace the shutdown signal with an externally-provided one (shares
+    /// the runner's Ctrl-C `Shutdown`). Used so spawned settlement tasks
+    /// observe Ctrl-C the moment it fires and so jitter sleeps inside this
+    /// module wake up immediately on shutdown.
+    pub fn set_shutdown(&mut self, shutdown: Shutdown) {
+        self.shutdown = shutdown;
     }
 
     /// Reject all unconfirmed settlements (still at ProposalReceived stage)
@@ -553,7 +583,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         );
 
         // Reject new proposals during shutdown
-        if self.shutting_down.load(Ordering::Relaxed) {
+        if self.shutdown.is_shutting_down() {
             info!("[{}] Rejecting proposal (shutting down)", proposal_id);
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
@@ -739,32 +769,58 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         // (on-chain state change detected, step completed in-task, etc.).
         // Clear their cooldowns so they're immediately eligible, and spawn
         // them before the rest to prevent starvation by Wait polling.
-        let priority_ids: Vec<String> = self.needs_readvance.drain()
+        let mut priority_ids: Vec<String> = self.needs_readvance.drain()
             .filter(|pid| self.active_settlements.contains_key(pid))
             .collect();
         for pid in &priority_ids {
             self.failed_settlements.remove(pid);
         }
+        // Within priority bucket, newest first.
+        priority_ids.sort_by(|a, b| uuid_v7_ms(b).cmp(&uuid_v7_ms(a)));
 
         // Build spawn list: priority IDs first, then remaining active settlements
-        let mut proposal_ids = priority_ids;
-        for key in self.active_settlements.keys() {
-            if !proposal_ids.contains(key) {
-                proposal_ids.push(key.clone());
-            }
-        }
+        // sorted newest-first by UUID-v7 timestamp. Fresh RFQ-driven proposals
+        // must never queue behind stale buyer-abandoned flows.
+        // HashSet for O(1) membership checks (avoids O(n²) Vec::contains at scale).
+        let seen: HashSet<&str> = priority_ids.iter().map(|s| s.as_str()).collect();
+        let mut tail: Vec<String> = self.active_settlements.keys()
+            .filter(|k| !seen.contains(k.as_str()))
+            .cloned()
+            .collect();
+        drop(seen);
+        tail.sort_by(|a, b| uuid_v7_ms(b).cmp(&uuid_v7_ms(a)));
+
+        let mut proposal_ids: Vec<String> = Vec::with_capacity(priority_ids.len() + tail.len());
+        proposal_ids.extend(priority_ids);
+        proposal_ids.extend(tail);
+
+        let total_proposals = proposal_ids.len();
+        let mut spawned: usize = 0;
+        let mut skipped_in_progress: usize = 0;
+        let mut skipped_backoff: usize = 0;
+        let mut hit_cap = false;
 
         for proposal_id in proposal_ids {
             // Skip if already being processed by a spawned task
             if self.in_progress.contains_key(&proposal_id) {
+                skipped_in_progress += 1;
                 continue;
             }
 
             // Skip if in backoff from a previous failure
             if let Some(f) = self.failed_settlements.get(&proposal_id) {
                 if Instant::now() < f.next_retry {
+                    skipped_backoff += 1;
                     continue;
                 }
+            }
+
+            // Cap actual spawns per cycle. Remaining proposals get picked up
+            // on the next 2s `collect_and_readvance` tick. Skipped items
+            // (already in_progress / in backoff) don't count toward the cap.
+            if spawned >= MAX_ADVANCE_SPAWNS_PER_CYCLE {
+                hit_cap = true;
+                break;
             }
 
             // Try to acquire a semaphore permit (non-blocking)
@@ -784,9 +840,25 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             };
 
             self.spawn_settlement_task(proposal_id, permit, true);
+            spawned += 1;
 
-            // Stagger spawns to avoid thundering-herd on Canton ledger
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // No spawn-site stagger: spawned tasks each do 0–2s jitter inside
+            // before any Canton tx (see spawn_settlement_task initial_jitter),
+            // and the semaphore caps RPC concurrency.
+            if self.shutdown.is_shutting_down() {
+                break;
+            }
+        }
+
+        if hit_cap {
+            let deferred = total_proposals
+                .saturating_sub(spawned)
+                .saturating_sub(skipped_in_progress)
+                .saturating_sub(skipped_backoff);
+            info!(
+                "advance_all hit spawn cap ({}): {} deferred to next cycle (in_progress={}, backoff={})",
+                MAX_ADVANCE_SPAWNS_PER_CYCLE, deferred, skipped_in_progress, skipped_backoff,
+            );
         }
     }
 
@@ -827,7 +899,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let config = self.config.clone();
         let backend = Arc::clone(&self.backend);
         let tracker = Arc::clone(&self.tracker);
-        let shutting_down = self.shutting_down.clone();
+        let shutdown = self.shutdown.clone();
         let action_log = Arc::clone(&self.action_log);
         let pid = proposal_id.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
@@ -840,14 +912,14 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let mut local_state = state;
 
             if initial_jitter {
-                // Initial jitter to stagger threads (0-2s) — avoids thundering herd
+                // Initial jitter to stagger threads (0-2s) — wakes early on shutdown
                 let jitter = rand::thread_rng().gen_range(0..2000u64);
-                tokio::time::sleep(Duration::from_millis(jitter)).await;
+                shutdown.sleep(Duration::from_millis(jitter)).await;
             }
 
             loop {
                 // Check shutdown flag before each step
-                let is_shutting_down = shutting_down.load(Ordering::Relaxed);
+                let is_shutting_down = shutdown.is_shutting_down();
 
                 let result = tokio::time::timeout(Duration::from_secs(300), async {
                     advance_single(
@@ -942,11 +1014,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     break;
                 }
 
-                if advance_result.should_readvance() && !shutting_down.load(Ordering::Relaxed) {
+                if advance_result.should_readvance() && !shutdown.is_shutting_down() {
                     advance_result.apply_to_state(&mut local_state);
-                    // Jitter between steps (200-1000ms) to spread ledger load
+                    // Jitter between steps (200-1000ms) — wakes early on shutdown
                     let step_jitter = 200 + rand::thread_rng().gen_range(0..800u64);
-                    tokio::time::sleep(Duration::from_millis(step_jitter)).await;
+                    shutdown.sleep(Duration::from_millis(step_jitter)).await;
                 } else {
                     let _ = tx.send((advance_result, local_state));
                     break;
@@ -1104,21 +1176,30 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.needs_readvance.remove(&proposal_id);
             }
             AdvanceResult::Wait { proposal_id } => {
-                // Cooldown: don't re-poll for 30s. Without this, Wait settlements
-                // are re-polled every 2s, consuming semaphore permits and starving
-                // actionable settlements (CreateDvp, AcceptDvp) that are later in
-                // the iteration order. When counterparty acts, sync_on_chain_contracts
-                // adds to needs_readvance which clears the cooldown immediately.
+                // Exponential cooldown for consecutive Waits: 30, 60, 120, 240,
+                // 480, 600 (capped). Without this, Wait settlements are re-polled
+                // every 2s, consuming semaphore permits and starving actionable
+                // settlements. When counterparty acts, sync_on_chain_contracts
+                // / stream-driven advance_proposal / step completion all
+                // `.remove()` the entry — so `or_insert` creates a fresh one with
+                // wait_count=0, resetting the backoff naturally.
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
+                        wait_count: 0,
                         next_retry: Instant::now(),
                         first_transient_at: None,
                         cid_waiting: None,
                     });
                 entry.retry_count = 0; // Not a failure — don't accumulate
-                entry.next_retry = Instant::now() + Duration::from_secs(30);
+                entry.wait_count = entry.wait_count.saturating_add(1);
+                let delay = FailedSettlement::wait_delay(entry.wait_count);
+                entry.next_retry = Instant::now() + delay;
                 entry.cid_waiting = None;
+                debug!(
+                    "[{}] Wait #{}: cooldown {}s",
+                    proposal_id, entry.wait_count, delay.as_secs()
+                );
             }
             AdvanceResult::Error { proposal_id, error } => {
                 let is_permanent = error.contains("deadline-exceeded")
@@ -1132,6 +1213,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
+                        wait_count: 0,
                         next_retry: Instant::now(),
                         first_transient_at: None,
                         cid_waiting: None,
@@ -1212,6 +1294,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
+                        wait_count: 0,
                         next_retry: Instant::now(),
                         first_transient_at: None,
                         cid_waiting: None,
@@ -1744,8 +1827,10 @@ async fn advance_single<B: SettlementBackend>(
             // Trigger the off-chain processing-fee debit via PreparePayFee /
             // ExecutePayFee. The ledger looks up our role from the proposal
             // and debits our share of the DVP processing fee. The
-            // (source='pay_fee', external_id='dvp:<proposal_id>') UNIQUE
-            // constraint protects against double-debit on retry.
+            // (source='pay_fee', external_id='dvp:<role>:<proposal_id>')
+            // UNIQUE constraint dedupes per-role retries while letting
+            // buyer and seller each pay their own DVP fee on the same
+            // proposal.
             if let Err(e) = backend.pay_fee(&proposal_id, "dvp").await {
                 warn!("[{}] DVP processing fee debit failed: {:#}", proposal_id, e);
             }
@@ -1854,8 +1939,9 @@ async fn advance_single<B: SettlementBackend>(
             ).await;
             // Trigger the off-chain processing-fee debit via PreparePayFee /
             // ExecutePayFee. The (source='pay_fee',
-            // external_id='allocate:<proposal_id>') UNIQUE constraint
-            // protects against double-debit on retry.
+            // external_id='allocate:<role>:<proposal_id>') UNIQUE
+            // constraint dedupes per-role retries while letting buyer and
+            // seller each pay their own allocation fee on the same proposal.
             if let Err(e) = backend.pay_fee(&proposal_id, "allocate").await {
                 warn!("[{}] Allocation processing fee debit failed: {:#}", proposal_id, e);
             }

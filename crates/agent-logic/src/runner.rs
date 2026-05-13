@@ -7,11 +7,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -23,6 +23,7 @@ use crate::config::BaseConfig;
 use crate::order_manager::OrderManager;
 use crate::order_tracker::OrderTracker;
 use crate::settlement::{SettlementBackend, SettlementExecutor};
+use crate::shutdown::Shutdown;
 use crate::state::{
     SavedAcceptedRfqTrade, SavedFillState, SavedQuotedTrade, SavedState, delete_state, load_state,
     prune_state, save_backup, save_state,
@@ -63,8 +64,9 @@ pub struct AgentOptions {
     pub orders_only: bool,
     /// Optional shared counter for actionable settlements (used by fill loop)
     pub actionable_count: Option<Arc<AtomicUsize>>,
-    /// Optional external shutdown signal (used by fill loop to stop the background agent)
-    pub shutdown_notify: Option<Arc<Notify>>,
+    /// Optional external shutdown signal (used by fill loop to stop the background agent).
+    /// When set, signalling this `Shutdown` triggers the runner's main loop to exit.
+    pub shutdown: Option<Shutdown>,
     /// Buyer: accepted RFQ trades keyed by proposal_id (for settlement verification)
     pub accepted_rfq_trades: Option<Arc<Mutex<HashMap<String, AcceptedRfqTrade>>>>,
     /// Buyer: proposal_ids that the settlement executor has rejected.
@@ -74,8 +76,10 @@ pub struct AgentOptions {
     pub rejected_rfq_trades: Option<Arc<Mutex<HashSet<String>>>>,
     /// LP: trades we quoted on (for settlement verification by attribute matching)
     pub quoted_rfq_trades: Option<Arc<Mutex<Vec<QuotedTrade>>>>,
-    /// Signal to LP settlement stream to stop accepting new RFQs on shutdown
-    pub lp_shutdown: Option<Arc<AtomicBool>>,
+    /// Signal to LP settlement stream and other background tasks. The
+    /// runner's Ctrl-C handler will fire this on shutdown so every loop that
+    /// holds a clone wakes immediately.
+    pub lp_shutdown: Option<Shutdown>,
     /// Path to state file for save/restore on shutdown/restart
     pub state_file: Option<PathBuf>,
     /// Skip state restoration even if state file exists
@@ -327,21 +331,23 @@ where
     // even if the main loop is busy executing a long-running branch.
     // Handles BOTH first (graceful) and second (force exit) Ctrl-C signals
     // in the same spawned task to guarantee the force-exit always works.
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_notify = Arc::new(Notify::new());
+    //
+    // We use a single `Shutdown` (Arc<AtomicBool> + Arc<Notify>) — every
+    // background loop holds a clone, polls the flag at the top of each
+    // iteration, and `select!`s against `shutdown.wait()` so sleeps and
+    // recvs unblock the moment Ctrl-C fires.
+    let shutdown = Shutdown::new();
     let lp_shutdown = options.lp_shutdown.clone();
     {
-        let flag = shutdown_flag.clone();
-        let notify = shutdown_notify.clone();
+        let shutdown = shutdown.clone();
         let lp_shutdown = lp_shutdown.clone();
         tokio::spawn(async move {
             signal::ctrl_c().await.ok();
             warn!("Ctrl-C received, shutting down gracefully...");
-            flag.store(true, Ordering::SeqCst);
+            shutdown.signal();
             if let Some(ref lp) = lp_shutdown {
-                lp.store(true, Ordering::SeqCst);
+                lp.signal();
             }
-            notify.notify_one();
 
             // Wait for second Ctrl-C → force exit immediately
             signal::ctrl_c().await.ok();
@@ -351,20 +357,27 @@ where
     }
 
     // If an external shutdown signal was provided (e.g. from fill loop), forward it
-    if let Some(ext_notify) = options.shutdown_notify {
-        let flag = shutdown_flag.clone();
-        let notify = shutdown_notify.clone();
+    if let Some(ext_shutdown) = options.shutdown.clone() {
+        let shutdown = shutdown.clone();
+        let lp_shutdown = lp_shutdown.clone();
         tokio::spawn(async move {
-            ext_notify.notified().await;
+            ext_shutdown.wait().await;
             info!("External shutdown signal received");
-            flag.store(true, Ordering::SeqCst);
-            notify.notify_one();
+            shutdown.signal();
+            if let Some(ref lp) = lp_shutdown {
+                lp.signal();
+            }
         });
     }
 
-    // Share the runner's Ctrl-C flag with the settlement executor so spawned
-    // tasks observe shutdown immediately (not a stale bool copy).
-    settlement_executor.set_shutdown_flag(shutdown_flag.clone());
+    // Share the runner's `Shutdown` with the settlement executor so spawned
+    // tasks observe shutdown immediately (not a stale bool copy) AND so the
+    // jitter sleeps inside `spawn_settlement_task` wake instantly on Ctrl-C.
+    settlement_executor.set_shutdown(shutdown.clone());
+
+    // Backstop timeout for any single Canton-touching await — generous, but
+    // bounded so a stuck connection cannot trap the loop forever.
+    let canton_op_timeout = Duration::from_secs(config.canton_op_timeout_secs);
 
     // Track consecutive poll failures for connectivity detection
     let mut poll_failures: u32 = 0;
@@ -426,12 +439,18 @@ where
     // Main event loop
     if !options.orders_only {
         loop {
-            // Check shutdown flag directly — the Notify permit can be consumed
-            // by tokio::select! polling without the shutdown arm being selected
-            if shutdown_flag.load(Ordering::Relaxed) {
+            if shutdown.is_shutting_down() {
                 break;
             }
             tokio::select! {
+                // `biased` polls arms in declaration order so shutdown wins
+                // any tie with a ready timer arm — gives deterministic ~1s
+                // shutdown latency. Once a non-shutdown arm has been chosen,
+                // its body runs to completion (in-flight Canton tx finishes).
+                biased;
+                _ = shutdown.wait() => {
+                    break;
+                }
                 result = async {
                     match &mut settlement_stream {
                         Some(s) => s.next().await,
@@ -439,7 +458,7 @@ where
                     }
                 } => {
                     // Skip processing new settlement events during shutdown
-                    if shutdown_flag.load(Ordering::Relaxed) {
+                    if shutdown.is_shutting_down() {
                         continue;
                     }
 
@@ -455,18 +474,21 @@ where
                                 update.proposal.as_ref().map(|p| p.market_id.as_str()).unwrap_or("?"),
                             );
                             match tokio::time::timeout(
-                                Duration::from_secs(120),
+                                canton_op_timeout,
                                 settlement_executor.handle_settlement_update(update),
                             ).await {
                                 Ok(Ok(())) => {
                                     // Immediately advance the specific settlement that was updated
                                     // (bypasses poll timer delay, clears backoff)
                                     if let Some(ref pid) = update_proposal_id {
-                                        settlement_executor.advance_proposal(pid).await;
+                                        let _ = tokio::time::timeout(
+                                            canton_op_timeout,
+                                            settlement_executor.advance_proposal(pid),
+                                        ).await;
                                     }
                                     // Settlement event may have freed tokens or
                                     // caused partial fills — refresh orders.
-                                    if has_markets && !shutdown_flag.load(Ordering::Relaxed) {
+                                    if has_markets && !shutdown.is_shutting_down() {
                                         match tokio::time::timeout(
                                             Duration::from_secs(10),
                                             balance_provider.fetch_balances(),
@@ -475,15 +497,20 @@ where
                                             Ok(Err(e)) => warn!("Failed to fetch balances after settlement: {:#}", e),
                                             Err(_) => warn!("Balance fetch after settlement timed out"),
                                         }
-                                        if !shutdown_flag.load(Ordering::Relaxed) {
-                                            if let Err(e) = order_manager.update_cycle().await {
-                                                warn!("Order update after settlement failed: {:#}", e);
+                                        if !shutdown.is_shutting_down() {
+                                            match tokio::time::timeout(
+                                                canton_op_timeout,
+                                                order_manager.update_cycle(),
+                                            ).await {
+                                                Ok(Err(e)) => warn!("Order update after settlement failed: {:#}", e),
+                                                Err(_) => warn!("Order update after settlement timed out after {}s", canton_op_timeout.as_secs()),
+                                                Ok(Ok(())) => {}
                                             }
                                         }
                                     }
                                 }
                                 Ok(Err(e)) => error!("[{}] Error handling settlement update: {:#}", update_desc, e),
-                                Err(_) => warn!("[{}] Settlement update handling timed out after 120s", update_desc),
+                                Err(_) => warn!("[{}] Settlement update handling timed out after {}s", update_desc, canton_op_timeout.as_secs()),
                             }
                         }
                         Some(Err(e)) => {
@@ -498,7 +525,7 @@ where
 
                 _ = settlement_poll_timer.tick() => {
                     // Skip poll cycle during shutdown — let the notify branch fire
-                    if shutdown_flag.load(Ordering::Relaxed) {
+                    if shutdown.is_shutting_down() {
                         continue;
                     }
 
@@ -514,7 +541,7 @@ where
                         }
                     }
 
-                    match tokio::time::timeout(Duration::from_secs(120), async {
+                    match tokio::time::timeout(canton_op_timeout, async {
                         let poll_ok = settlement_executor.poll_pending_proposals(&mut orderbook_client).await;
                         settlement_executor.sync_on_chain_contracts().await;
                         settlement_executor.advance_all_settlements().await;
@@ -527,7 +554,7 @@ where
                             poll_failures = if poll_ok { 0 } else { poll_failures + 1 };
 
                             // Settlements may have completed — refresh orders.
-                            if has_markets && !shutdown_flag.load(Ordering::Relaxed) {
+                            if has_markets && !shutdown.is_shutting_down() {
                                 match tokio::time::timeout(
                                     Duration::from_secs(10),
                                     balance_provider.fetch_balances(),
@@ -536,21 +563,26 @@ where
                                     Ok(Err(e)) => warn!("Failed to fetch balances after settlement poll: {:#}", e),
                                     Err(_) => warn!("Balance fetch after settlement poll timed out"),
                                 }
-                                if !shutdown_flag.load(Ordering::Relaxed) {
-                                    if let Err(e) = order_manager.update_cycle().await {
-                                        warn!("Order update after settlement poll failed: {:#}", e);
+                                if !shutdown.is_shutting_down() {
+                                    match tokio::time::timeout(
+                                        canton_op_timeout,
+                                        order_manager.update_cycle(),
+                                    ).await {
+                                        Ok(Err(e)) => warn!("Order update after settlement poll failed: {:#}", e),
+                                        Err(_) => warn!("Order update after settlement poll timed out after {}s", canton_op_timeout.as_secs()),
+                                        Ok(Ok(())) => {}
                                     }
                                 }
                             }
                         }
                         Err(_) => {
                             poll_failures += 1;
-                            warn!("Settlement poll cycle timed out after 120s");
+                            warn!("Settlement poll cycle timed out after {}s", canton_op_timeout.as_secs());
                         }
                     }
                 }
 
-                _ = order_update_timer.tick(), if !shutdown_flag.load(Ordering::Relaxed) => {
+                _ = order_update_timer.tick() => {
                     // Always refresh balances — LiquidityManager needs non-CC balances
                     // for settlement allocation gating even when the agent isn't
                     // placing orders (buyer/seller / settlement_only mode).
@@ -577,14 +609,24 @@ where
                     // Order grid only runs when the agent has markets configured
                     // and isn't in settlement-only mode.
                     if has_markets {
-                        if let Err(e) = order_manager.update_cycle().await {
-                            warn!("Order update cycle failed: {:#}", e);
+                        match tokio::time::timeout(
+                            canton_op_timeout,
+                            order_manager.update_cycle(),
+                        ).await {
+                            Ok(Err(e)) => warn!("Order update cycle failed: {:#}", e),
+                            Err(_) => warn!("Order update cycle timed out after {}s", canton_op_timeout.as_secs()),
+                            Ok(Ok(())) => {}
                         }
                     }
                 }
 
                 _ = result_collect_timer.tick() => {
-                    settlement_executor.collect_and_readvance().await;
+                    if let Err(_) = tokio::time::timeout(
+                        canton_op_timeout,
+                        settlement_executor.collect_and_readvance(),
+                    ).await {
+                        warn!("collect_and_readvance timed out after {}s", canton_op_timeout.as_secs());
+                    }
                 }
 
                 _ = heartbeat_timer.tick() => {
@@ -687,20 +729,20 @@ where
                         info!("Active settlements: {}", ids.join(", "));
                     }
                 }
-
-                _ = shutdown_notify.notified() => {
-                    break;
-                }
             }
         }
     } else {
         // Orders-only mode
         loop {
-            if shutdown_flag.load(Ordering::Relaxed) {
+            if shutdown.is_shutting_down() {
                 break;
             }
             tokio::select! {
-                _ = order_update_timer.tick(), if has_markets && !shutdown_flag.load(Ordering::Relaxed) => {
+                biased;
+                _ = shutdown.wait() => {
+                    break;
+                }
+                _ = order_update_timer.tick(), if has_markets => {
                     match tokio::time::timeout(
                         Duration::from_secs(10),
                         balance_provider.fetch_balances(),
@@ -721,17 +763,18 @@ where
                         Ok(Err(e)) => warn!("Failed to fetch balances: {:#}", e),
                         Err(_) => warn!("Balance fetch timed out"),
                     }
-                    if let Err(e) = order_manager.update_cycle().await {
-                        warn!("Order update cycle failed: {:#}", e);
+                    match tokio::time::timeout(
+                        canton_op_timeout,
+                        order_manager.update_cycle(),
+                    ).await {
+                        Ok(Err(e)) => warn!("Order update cycle failed: {:#}", e),
+                        Err(_) => warn!("Order update cycle timed out after {}s", canton_op_timeout.as_secs()),
+                        Ok(Ok(())) => {}
                     }
                 }
 
                 _ = heartbeat_timer.tick() => {
                     info!("Heartbeat: orders-only mode");
-                }
-
-                _ = shutdown_notify.notified() => {
-                    break;
                 }
             }
         }
