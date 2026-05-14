@@ -29,6 +29,20 @@ use crate::state::{
     prune_state, save_backup, save_state,
 };
 
+fn fmt_sig4(d: rust_decimal::Decimal) -> String {
+    if d.is_zero() {
+        return "0".to_string();
+    }
+    use rust_decimal::prelude::ToPrimitive;
+    let abs = d.to_f64().unwrap_or(0.0).abs();
+    if abs == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = abs.log10().floor() as i32;
+    let dp = (3 - magnitude).max(0) as u32;
+    d.round_dp(dp).to_string()
+}
+
 /// Trade parameters recorded when buyer accepts an RFQ quote
 #[derive(Debug, Clone)]
 pub struct AcceptedRfqTrade {
@@ -701,21 +715,21 @@ where
                                 format!("{:.1}h", s.hours_to_depletion)
                             };
                             info!(
-                                "LIQUIDITY {}: {:.2} bal / {:.2} committed{}{} / {:.2} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({})",
+                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({})",
                                 s.token,
-                                s.balance,
-                                s.committed,
+                                fmt_sig4(s.balance),
+                                fmt_sig4(s.committed),
                                 if s.fee_committed > rust_decimal::Decimal::ZERO {
-                                    format!(" + {:.2} fees", s.fee_committed)
+                                    format!(" + {} fees", fmt_sig4(s.fee_committed))
                                 } else {
                                     String::new()
                                 },
                                 if s.fee_reserve > rust_decimal::Decimal::ZERO {
-                                    format!(" + {:.2} reserve", s.fee_reserve)
+                                    format!(" + {} reserve", fmt_sig4(s.fee_reserve))
                                 } else {
                                     String::new()
                                 },
-                                s.available,
+                                fmt_sig4(s.available),
                                 s.num_commitments,
                                 s.net_outflow_per_hour,
                                 s.depletion_coefficient,
