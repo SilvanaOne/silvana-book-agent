@@ -2579,22 +2579,50 @@ pub async fn complete_ledger_onboarding(
             )
             .expect("env vars validated above");
 
-            println!("\nSeeding prepaid traffic balance with first topup of {} CC...", topup_cc);
-            match runner.force_topup().await {
-                Ok(()) => match runner.get_balance().await {
+            if canton_chain == "devnet" {
+                // Devnet: faucet above funded the agent's CC amulet wallet, so an
+                // on-chain PrepayTraffic to seed the prepaid pool succeeds here.
+                println!("\nSeeding prepaid traffic balance with first topup of {} CC...", topup_cc);
+                match runner.force_topup().await {
+                    Ok(()) => match runner.get_balance().await {
+                        Ok(pt) => {
+                            println!("\n=== Initial Prepaid Traffic Balance ===");
+                            println!("  Balance:      {} CC", pt.balance_cc);
+                            println!("  Credit limit: {} CC", pt.credit_limit_cc);
+                            println!("  Available:    {} CC", pt.available_cc);
+                        }
+                        Err(e) => {
+                            println!("(unable to fetch post-topup prepaid balance: {})", e);
+                        }
+                    },
+                    Err(e) => {
+                        println!("First topup failed: {}", e);
+                    }
+                }
+            } else {
+                // Non-devnet (mainnet, etc.): no faucet ran, agent has 0 CC amulets,
+                // so an on-chain PrepayTraffic would fail. The server's
+                // ONBOARD_PREPAID_TRAFFIC_CC seed has already written a row to
+                // prepaid_traffic_balance, so the agent boots with a working seed.
+                // The runtime per-tx topup hook will refill once the operator
+                // funds the agent's amulet wallet.
+                println!(
+                    "\nSkipping first topup (chain={}): no auto-faucet, agent has no CC amulets yet.",
+                    canton_chain
+                );
+                println!(
+                    "  To enable self-topup: send CC amulets to {} — the runtime hook will refill \
+                     whenever balance drops below {} CC.",
+                    cfg.party_id, min_cc
+                );
+                match runner.get_balance().await {
                     Ok(pt) => {
-                        println!("\n=== Initial Prepaid Traffic Balance ===");
+                        println!("\n=== Initial Prepaid Traffic Balance (server-seeded) ===");
                         println!("  Balance:      {} CC", pt.balance_cc);
                         println!("  Credit limit: {} CC", pt.credit_limit_cc);
                         println!("  Available:    {} CC", pt.available_cc);
                     }
-                    Err(e) => {
-                        println!("(unable to fetch post-topup prepaid balance: {})", e);
-                    }
-                },
-                Err(e) => {
-                    println!("First topup failed: {}", e);
-                    println!("Agent will start without seed balance — first tx may fail at preflight.");
+                    Err(e) => println!("(unable to fetch prepaid balance: {})", e),
                 }
             }
         }
