@@ -1,0 +1,23 @@
+[package]
+name = "agent-signature"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-signature"
+path = "src/main.rs"
+
+[dependencies]
+orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+message-signing = { path = "../message-signing" }
+
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+
+anyhow = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+bs58 = "0.5"
+hex = { workspace = true }

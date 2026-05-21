@@ -1,0 +1,39 @@
+[package]
+name = "agent-watchlist"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-watchlist"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+orderbook-proto = { path = "../orderbook-proto" }
+
+# gRPC streaming
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
+tokio-stream = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+
+# CLI
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+
+# Logging and errors
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+anyhow = { workspace = true }
+
+# TLS provider (needed at process startup before BaseConfig::load triggers the channel)
+rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+
+# Timestamp formatting for proto google.protobuf.Timestamp values
+chrono = { workspace = true }
+prost-types = { workspace = true }
+

@@ -6,12 +6,19 @@
 
 use anyhow::{Context, Result};
 use orderbook_proto::{
-    pricing::{pricing_service_client::PricingServiceClient, GetPriceRequest, GetPriceResponse},
+    pricing::{
+        pricing_service_client::PricingServiceClient, GetPriceRequest, GetPriceResponse,
+        StreamPricesRequest, PriceUpdate,
+    },
     orderbook::{
         orderbook_service_client::OrderbookServiceClient, CancelOrderRequest, CancelOrderResponse,
         GetMarketsRequest, GetOrdersRequest, Market, Order, OrderStatus, OrderType,
         SubmitOrderRequest, SubmitOrderResponse, TimeInForce,
         SubscribeSettlementsRequest, SettlementUpdate,
+        SubscribeOrderbookRequest, OrderbookUpdate,
+        SubscribeOrdersRequest, OrderUpdate,
+        GetOrderbookDepthRequest, OrderbookDepth,
+        GetMarketDataRequest, MarketData,
         GetSettlementProposalsRequest, SettlementProposal, SettlementStatus,
         RequestQuotesRequest, RequestQuotesResponse,
         AcceptQuoteRequest, AcceptQuoteResponse,
@@ -44,8 +51,9 @@ struct ExternalAuthData {
 pub struct OrderbookClient {
     pricing_client: PricingServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
     orderbook_client: OrderbookServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
-    // Raw client for streaming (interceptors don't work well with streaming)
+    // Raw clients for streaming (interceptors don't work well with streaming)
     raw_orderbook_client: OrderbookServiceClient<Channel>,
+    raw_pricing_client: PricingServiceClient<Channel>,
     auth_data: ExternalAuthData,
 }
 
@@ -94,13 +102,17 @@ impl OrderbookClient {
         )
         .max_decoding_message_size(16 * 1024 * 1024);
 
-        let raw_orderbook_client = OrderbookServiceClient::new(channel)
+        let raw_orderbook_client = OrderbookServiceClient::new(channel.clone())
+            .max_decoding_message_size(16 * 1024 * 1024);
+
+        let raw_pricing_client = PricingServiceClient::new(channel)
             .max_decoding_message_size(16 * 1024 * 1024);
 
         Ok(Self {
             pricing_client,
             orderbook_client,
             raw_orderbook_client,
+            raw_pricing_client,
             auth_data,
         })
     }
@@ -152,6 +164,28 @@ impl OrderbookClient {
             .get_price(request)
             .await
             .map_err(|e| anyhow::anyhow!("get_price failed: {}", e.message()))?;
+
+        Ok(response.into_inner())
+    }
+
+    /// Get current price for a market from a specific source (e.g. `"binance_spot"`,
+    /// `"bybit"`, `"coingecko"`). Server may still return what it has if the requested
+    /// source isn't configured for this market.
+    pub async fn get_price_from_source(
+        &mut self,
+        market_id: &str,
+        source: &str,
+    ) -> Result<GetPriceResponse> {
+        let request = Request::new(GetPriceRequest {
+            market_id: market_id.to_string(),
+            source: Some(source.to_string()),
+        });
+
+        let response = self
+            .pricing_client
+            .get_price(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_price({}) failed: {}", source, e.message()))?;
 
         Ok(response.into_inner())
     }
@@ -346,6 +380,134 @@ impl OrderbookClient {
             .context("Failed to subscribe to settlements")?;
 
         Ok(Box::pin(response.into_inner()))
+    }
+
+    /// Subscribe to internal Silvana orderbook depth updates for a market
+    pub async fn subscribe_orderbook_depth(
+        &mut self,
+        market_id: &str,
+        depth: Option<u32>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<OrderbookUpdate, tonic::Status>> + Send>>> {
+        let mut request = Request::new(SubscribeOrderbookRequest {
+            market_id: market_id.to_string(),
+            depth,
+        });
+
+        let jwt = generate_jwt(
+            &self.auth_data.party_id,
+            &self.auth_data.role,
+            &self.auth_data.private_key_bytes,
+            self.auth_data.ttl_secs,
+            Some(self.auth_data.node_name.as_str()),
+        )?;
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", jwt).parse().context("Failed to parse JWT")?,
+        );
+
+        let response = self
+            .raw_orderbook_client
+            .subscribe_orderbook(request)
+            .await
+            .context("Failed to subscribe to orderbook depth")?;
+
+        Ok(Box::pin(response.into_inner()))
+    }
+
+    /// Subscribe to this party's own order updates (created/filled/cancelled/etc.)
+    pub async fn subscribe_orders(
+        &mut self,
+        market_id: Option<String>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<OrderUpdate, tonic::Status>> + Send>>> {
+        let mut request = Request::new(SubscribeOrdersRequest { market_id });
+
+        let jwt = generate_jwt(
+            &self.auth_data.party_id,
+            &self.auth_data.role,
+            &self.auth_data.private_key_bytes,
+            self.auth_data.ttl_secs,
+            Some(self.auth_data.node_name.as_str()),
+        )?;
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", jwt).parse().context("Failed to parse JWT")?,
+        );
+
+        let response = self
+            .raw_orderbook_client
+            .subscribe_orders(request)
+            .await
+            .context("Failed to subscribe to orders")?;
+
+        Ok(Box::pin(response.into_inner()))
+    }
+
+    /// Stream external price feed updates (Binance/ByBit/CoinGecko aggregated)
+    pub async fn stream_prices(
+        &mut self,
+        market_ids: Vec<String>,
+        include_orderbook: bool,
+        include_trades: bool,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<PriceUpdate, tonic::Status>> + Send>>> {
+        let mut request = Request::new(StreamPricesRequest {
+            market_ids,
+            include_orderbook: Some(include_orderbook),
+            include_trades: Some(include_trades),
+        });
+
+        let jwt = generate_jwt(
+            &self.auth_data.party_id,
+            &self.auth_data.role,
+            &self.auth_data.private_key_bytes,
+            self.auth_data.ttl_secs,
+            Some(self.auth_data.node_name.as_str()),
+        )?;
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", jwt).parse().context("Failed to parse JWT")?,
+        );
+
+        let response = self
+            .raw_pricing_client
+            .stream_prices(request)
+            .await
+            .context("Failed to subscribe to price stream")?;
+
+        Ok(Box::pin(response.into_inner()))
+    }
+
+    /// Get a single snapshot of internal orderbook depth for a market
+    pub async fn get_orderbook_depth(
+        &mut self,
+        market_id: &str,
+        depth: Option<u32>,
+    ) -> Result<Option<OrderbookDepth>> {
+        let request = Request::new(GetOrderbookDepthRequest {
+            market_id: market_id.to_string(),
+            depth,
+        });
+
+        let response = self
+            .orderbook_client
+            .get_orderbook_depth(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_orderbook_depth failed: {}", e.message()))?;
+
+        Ok(response.into_inner().orderbook)
+    }
+
+    /// Get current market data (best bid/ask, last price, 24h stats) for a set of markets.
+    /// Pass an empty vec for all accessible markets.
+    pub async fn get_market_data(&mut self, market_ids: Vec<String>) -> Result<Vec<MarketData>> {
+        let request = Request::new(GetMarketDataRequest { market_ids });
+
+        let response = self
+            .orderbook_client
+            .get_market_data(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_market_data failed: {}", e.message()))?;
+
+        Ok(response.into_inner().market_data)
     }
 
     /// Request quotes from connected liquidity providers

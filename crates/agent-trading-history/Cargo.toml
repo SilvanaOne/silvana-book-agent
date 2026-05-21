@@ -1,0 +1,33 @@
+[package]
+name = "agent-trading-history"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-trading-history"
+path = "src/main.rs"
+
+[dependencies]
+orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+orderbook-proto = { path = "../orderbook-proto" }
+message-signing = { path = "../message-signing" }
+
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
+tokio-stream = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "sync", "fs", "io-util"] }
+
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+anyhow = { workspace = true }
+
+rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
