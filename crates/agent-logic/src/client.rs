@@ -223,6 +223,10 @@ impl OrderbookClient {
             signature,
             signed_data,
             nonce,
+            // LP resting orders must fill retail flow: opt out of the LP-only
+            // counterparty filter (retail orders default it to true).
+            only_liquidity_providers: Some(false),
+            liquidity_provider_name: None,
         });
 
         let response = self
