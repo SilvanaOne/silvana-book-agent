@@ -474,6 +474,7 @@ mod tests {
                 matched_price: "100.50".to_string(),
                 created_at: None,
             }),
+            dvp_proposer_party: None,
         }
     }
 
