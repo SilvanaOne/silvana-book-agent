@@ -190,6 +190,52 @@ pub struct BaseConfig {
     pub prepaid_traffic_topup_cc: Option<rust_decimal::Decimal>,
 }
 
+#[cfg(test)]
+impl BaseConfig {
+    /// Minimal config for unit tests. Only the fields a test actually reads
+    /// matter; everything else is a zero/empty placeholder. Centralized here so
+    /// adding a `BaseConfig` field breaks one place, not every executor test.
+    pub(crate) fn test_minimal() -> Self {
+        Self {
+            orderbook_grpc_url: String::new(),
+            synchronizer_id: String::new(),
+            party_id: "test-party".to_string(),
+            private_key_bytes: [0u8; 32],
+            private_key_base58: String::new(),
+            public_key_hex: String::new(),
+            settlement_operator: String::new(),
+            fee_reserve_cc: 5.0,
+            merge_threshold: None,
+            merge_max_amulets: 0,
+            merge_poll_interval_sec: 0,
+            settlement_thread_count: 1,
+            dso_party: String::new(),
+            onboarded_registries: Vec::new(),
+            cc_token_id: None,
+            instrument_registries: HashMap::new(),
+            auto_settle: false,
+            poll_interval_secs: 0,
+            role: "agent".to_string(),
+            token_ttl_secs: 60,
+            connection_timeout_secs: 10,
+            request_timeout_secs: 10,
+            canton_op_timeout_secs: 60,
+            markets: Vec::new(),
+            node_name: String::new(),
+            ledger_service_public_key: [0u8; 32],
+            liquidity_provider: None,
+            max_active_settlements: 1000,
+            settle_before_secs: 7200,
+            liquidity_margin: 1.1,
+            flow_ema_window_hours: 4.0,
+            depletion_max_hours: 12.0,
+            depletion_min_hours: 1.0,
+            min_prepaid_traffic_balance_cc: None,
+            prepaid_traffic_topup_cc: None,
+        }
+    }
+}
+
 impl BaseConfig {
     /// Strict loader — fails if `agent.toml` is missing or unparseable.
     /// Use from commands that actually consume market/LP settings (i.e. `agent`).
