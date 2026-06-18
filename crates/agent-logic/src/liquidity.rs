@@ -10,7 +10,7 @@
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -343,6 +343,54 @@ impl LiquidityManager {
         s.fee_commitments.entries.remove(proposal_id);
 
         debug!("[{}] Released liquidity commitments", proposal_id);
+    }
+
+    /// Reconciliation safety net: drop any commitments whose proposal_id is no
+    /// longer in the live set.
+    ///
+    /// The authoritative set of in-flight settlements lives in the runner's
+    /// `active_settlements`. Reservations are normally released on each
+    /// settlement's terminal event, but if such an event is ever missed (e.g. a
+    /// stream gap on reconnect, or a future code path that forgets to release)
+    /// the per-proposal CC reservation would leak forever, decaying
+    /// `available_cc` to 0 and starving the RFQ handler. Calling this from the
+    /// runner heartbeat with the current live proposal_ids makes the reservation
+    /// set self-heal every cycle. Idempotent.
+    ///
+    /// Returns the number of orphaned reservations dropped (for logging).
+    pub async fn retain_commitments(&self, live_ids: &HashSet<String>) -> usize {
+        let mut s = self.state.write().await;
+        // Count the UNION of orphaned proposal_ids across both maps, so the
+        // returned count (and the runner's warn!) can't silently undercount if
+        // an allocation commitment ever lacks a matching fee entry or vice versa.
+        let mut orphaned: HashSet<&String> = HashSet::new();
+        for token_state in s.tokens.values() {
+            orphaned.extend(
+                token_state
+                    .allocation_commitments
+                    .keys()
+                    .filter(|pid| !live_ids.contains(*pid)),
+            );
+        }
+        orphaned.extend(
+            s.fee_commitments
+                .entries
+                .keys()
+                .filter(|pid| !live_ids.contains(*pid)),
+        );
+        let dropped = orphaned.len();
+        for token_state in s.tokens.values_mut() {
+            token_state
+                .allocation_commitments
+                .retain(|pid, _| live_ids.contains(pid));
+        }
+        s.fee_commitments
+            .entries
+            .retain(|pid, _| live_ids.contains(pid));
+        if dropped > 0 {
+            debug!("Reconciled liquidity commitments: dropped {} orphaned reservation(s)", dropped);
+        }
+        dropped
     }
 
     // -----------------------------------------------------------------------
@@ -712,5 +760,44 @@ mod tests {
         // Rate is 0 (never fetched)
         let fee = lm.estimate_fee_cc(Decimal::ONE).await;
         assert_eq!(fee, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_retain_commitments_drops_orphaned() {
+        // Reproduces the reservation leak: a proposal whose terminal event was
+        // missed (so `release` was never called) keeps its CC reservation
+        // forever, decaying available CC. `retain_commitments` reconciles the
+        // reservation set against the live set and reclaims the orphan.
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        assert!(fee_cc > Decimal::ZERO);
+
+        // Commit two proposals: p_live (still in flight) and p_orphan (its
+        // terminal event will be "missed").
+        lm.try_commit("p_live", "USDCx", Decimal::from(1000), fee_cc).await.unwrap();
+        lm.try_commit("p_orphan", "USDCx", Decimal::from(2000), fee_cc).await.unwrap();
+        assert_eq!(lm.available("USDCx").await, Decimal::from(2000)); // 5000 - 1000 - 2000
+        let cc_both = lm.available_cc().await;
+
+        // Reconcile against the live set (only p_live remains active).
+        let mut live = HashSet::new();
+        live.insert("p_live".to_string());
+        assert_eq!(lm.retain_commitments(&live).await, 1); // p_orphan reclaimed
+
+        // p_orphan's allocation + fee reservation freed; p_live's retained.
+        assert_eq!(lm.available("USDCx").await, Decimal::from(4000)); // 5000 - 1000
+        assert!(lm.available_cc().await > cc_both);
+
+        // Idempotent: re-running with the same live set drops nothing.
+        assert_eq!(lm.retain_commitments(&live).await, 0);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
+
+        // Empty live set → p_live is also reclaimed (full reset, as on reboot).
+        assert_eq!(lm.retain_commitments(&HashSet::new()).await, 1);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
     }
 }

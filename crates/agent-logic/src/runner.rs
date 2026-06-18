@@ -707,6 +707,19 @@ where
                     settlement_executor.log_cid_waiting_summary();
                     // Liquidity stats
                     if let Some(lm) = settlement_executor.liquidity_manager() {
+                        // Reconcile CC reservations against the authoritative
+                        // active set: a missed terminal event would otherwise
+                        // leak a per-proposal reservation forever, decaying
+                        // available CC to 0 over ~2 days. Self-heals each cycle.
+                        let live: std::collections::HashSet<String> =
+                            active_settlements.keys().cloned().collect();
+                        let dropped = lm.retain_commitments(&live).await;
+                        if dropped > 0 {
+                            warn!(
+                                "Liquidity reconcile: released {} orphaned CC reservation(s) (missed terminal event)",
+                                dropped
+                            );
+                        }
                         let stats = lm.stats().await;
                         for s in &stats {
                             let depl_str = if s.hours_to_depletion.is_infinite() {

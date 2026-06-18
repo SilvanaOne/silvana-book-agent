@@ -276,6 +276,39 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
     }
 
+    /// Record the inflow (token received from the counterparty) for a settling
+    /// proposal — exactly once.
+    ///
+    /// Reads the still-present `active_settlements` state, so callers MUST invoke
+    /// this BEFORE `shift_remove`. No-op if the proposal is no longer tracked
+    /// (the other terminal path already removed it). `record_inflow` is `+=` and
+    /// thus NOT idempotent, so this guard is what keeps the dominant stream
+    /// terminal path and the self-driven `Terminal` path from double-counting.
+    fn record_settlement_inflow(&self, proposal_id: &str) {
+        if let (Some(lm), Some(state)) =
+            (&self.liquidity_manager, self.active_settlements.get(proposal_id))
+        {
+            let received_token = if state.is_buyer {
+                &state.proposal.base_instrument
+            } else {
+                &state.proposal.quote_instrument
+            };
+            let received_amount = if state.is_buyer {
+                &state.proposal.base_quantity
+            } else {
+                &state.proposal.quote_quantity
+            };
+            let token_key = match &self.config.cc_token_id {
+                Some(cc_id) if received_token == cc_id => liquidity::CC_TOKEN.to_string(),
+                _ => received_token.clone(),
+            };
+            if let Ok(amount) = received_amount.parse::<f64>() {
+                let lm = lm.clone();
+                tokio::spawn(async move { lm.record_inflow(&token_key, amount).await });
+            }
+        }
+    }
+
     /// Get the liquidity manager from the backend (for initial injection)
     pub fn backend_liquidity_manager(&self) -> Option<Arc<LiquidityManager>> {
         self.backend.liquidity_manager()
@@ -404,7 +437,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             .collect();
 
         for proposal_id in unconfirmed {
-            // Release pending tracker quantity before rejecting
+            // Release the CC reservation + pending tracker quantity before rejecting
+            self.release_commitment(&proposal_id);
             {
                 let mut tracker = self.tracker.lock().await;
                 tracker.mark_failed(&proposal_id);
@@ -433,6 +467,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let success = rpc_client.cancel_settlement(proposal_id, reason).await?;
         if success {
             info!("[{}] Settlement cancelled: {}", proposal_id, reason);
+            self.release_commitment(proposal_id);
             self.active_settlements.shift_remove(proposal_id);
             self.in_progress.remove(proposal_id);
         }
@@ -462,6 +497,16 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         let mut tracker = self.tracker.lock().await;
                         tracker.mark_settled(&proposal.proposal_id);
                     }
+                    // Record the inflow and release the CC allocation + fee
+                    // reservation. This is the dominant terminal path (~90% of
+                    // settlements complete via the stream, not the self-driven
+                    // advance loop), so without these the reservation leaks and
+                    // `available_cc` decays to 0 over ~2 days (starving the RFQ
+                    // handler), and the depletion EMA is biased high (over-widening
+                    // spreads). Both helpers no-op if the self-driven path already
+                    // finalized this proposal, so there is no double-counting.
+                    self.record_settlement_inflow(&proposal.proposal_id);
+                    self.release_commitment(&proposal.proposal_id);
                     self.completed_proposals.insert(proposal.proposal_id.clone());
                     self.active_settlements.shift_remove(&proposal.proposal_id);
                     self.in_progress.remove(&proposal.proposal_id);
@@ -476,6 +521,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         let mut tracker = self.tracker.lock().await;
                         tracker.mark_failed(&proposal.proposal_id);
                     }
+                    // Release the CC reservation on the stream terminal path
+                    // (see EventType::Settled above — same leak applies).
+                    self.release_commitment(&proposal.proposal_id);
                     self.rejected_proposals.insert(proposal.proposal_id.clone());
                     self.active_settlements.shift_remove(&proposal.proposal_id);
                     self.in_progress.remove(&proposal.proposal_id);
@@ -1148,27 +1196,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.needs_readvance.remove(&proposal_id);
             }
             AdvanceResult::Terminal { proposal_id } => {
-                // Record inflow for the token we received from the counterparty
-                if let (Some(lm), Some(state)) = (&self.liquidity_manager, self.active_settlements.get(&proposal_id)) {
-                    let received_token = if state.is_buyer {
-                        &state.proposal.base_instrument
-                    } else {
-                        &state.proposal.quote_instrument
-                    };
-                    let received_amount = if state.is_buyer {
-                        &state.proposal.base_quantity
-                    } else {
-                        &state.proposal.quote_quantity
-                    };
-                    let token_key = match &self.config.cc_token_id {
-                        Some(cc_id) if received_token == cc_id => liquidity::CC_TOKEN.to_string(),
-                        _ => received_token.clone(),
-                    };
-                    if let Ok(amount) = received_amount.parse::<f64>() {
-                        let lm = lm.clone();
-                        tokio::spawn(async move { lm.record_inflow(&token_key, amount).await });
-                    }
-                }
+                // Record the inflow (token received from the counterparty) before
+                // removing the entry, then release the CC reservation.
+                self.record_settlement_inflow(&proposal_id);
                 self.release_commitment(&proposal_id);
                 self.completed_proposals.insert(proposal_id.clone());
                 self.active_settlements.shift_remove(&proposal_id);
@@ -1234,6 +1264,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         let mut t = self.tracker.lock().await;
                         t.mark_failed(&proposal_id);
                     }
+                    // Record as terminal so polling won't re-discover and re-add it
+                    // (and so a restart won't resume it). Mirrors the Rejected arm.
+                    // Without this, an expired/permanently-failed proposal that the
+                    // server still returns as pending loops forever.
+                    self.rejected_proposals.insert(proposal_id.clone());
                     self.active_settlements.shift_remove(&proposal_id);
                     self.failed_settlements.remove(&proposal_id);
                     self.needs_readvance.remove(&proposal_id);
@@ -1306,10 +1341,17 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         "[{}] Settlement permanently failed after {} timeouts",
                         proposal_id, entry.retry_count
                     );
+                    // Release the CC reservation, mirroring the sibling terminal
+                    // arms (Rejected/Terminal/Error-exhausted). Without this the
+                    // orphan leaks until the next heartbeat reconcile.
+                    self.release_commitment(&proposal_id);
                     {
                         let mut t = self.tracker.lock().await;
                         t.mark_failed(&proposal_id);
                     }
+                    // Record as terminal so polling won't re-discover and re-add it
+                    // (and so a restart won't resume it). Mirrors the Rejected arm.
+                    self.rejected_proposals.insert(proposal_id.clone());
                     self.active_settlements.shift_remove(&proposal_id);
                     self.failed_settlements.remove(&proposal_id);
                     self.needs_readvance.remove(&proposal_id);
@@ -1781,6 +1823,35 @@ async fn advance_single<B: SettlementBackend>(
         NextAction::try_from(status.seller_next_action).unwrap_or(NextAction::None)
     };
 
+    // Abandon any still-in-flight proposal that has blown past its settlement
+    // deadline, regardless of which action is pending. Without this, a proposal
+    // stuck in `Wait` (e.g. the counterparty abandoned the flow and the server
+    // emits no terminal event) is re-polled forever, never exhausts (the `Wait`
+    // handler keeps resetting `retry_count`), and its CC reservation leaks for
+    // the process lifetime — invisible to the heartbeat reconcile because the
+    // proposal stays in `active_settlements`. Routing it through the
+    // `deadline-exceeded` permanent-error path releases the reservation and
+    // removes the entry. `None` is excluded so an already-terminal proposal is
+    // handled by the terminal arm below instead of being marked failed.
+    if my_action != NextAction::None {
+        if let Some(created_at) = &state.proposal.created_at {
+            let deadline = created_at.seconds + config.settle_before_secs as i64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            if now > deadline {
+                return AdvanceResult::Error {
+                    proposal_id,
+                    error: format!(
+                        "Settlement expired: deadline-exceeded (created {}s ago, max {}s)",
+                        now - created_at.seconds, config.settle_before_secs
+                    ),
+                };
+            }
+        }
+    }
+
     match my_action {
         NextAction::Preconfirm => {
             if shutting_down {
@@ -1869,23 +1940,7 @@ async fn advance_single<B: SettlementBackend>(
             }
         }
         NextAction::AcceptDvp => {
-            // Check if proposal has expired before attempting on-chain transaction
-            if let Some(created_at) = &state.proposal.created_at {
-                let deadline = created_at.seconds + config.settle_before_secs as i64;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                if now > deadline {
-                    return AdvanceResult::Error {
-                        proposal_id,
-                        error: format!(
-                            "DvpProposal expired: deadline-exceeded (created {}s ago, max {}s)",
-                            now - created_at.seconds, config.settle_before_secs
-                        ),
-                    };
-                }
-            }
+            // (Deadline expiry is checked up-front for all in-flight actions.)
             action_log.lock().await.push((proposal_id.clone(), "AcceptDvp"));
             let dvp_proposal_cid = match state.dvp_proposal_cid {
                 Some(ref cid) => cid.clone(),
@@ -2041,5 +2096,158 @@ async fn advance_single<B: SettlementBackend>(
             }
             AdvanceResult::Terminal { proposal_id }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backend stub — none of its methods are exercised by the stream-update
+    /// terminal-path tests below (they only touch tracker + liquidity state).
+    struct MockBackend;
+
+    #[async_trait]
+    impl SettlementBackend for MockBackend {
+        async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
+            Err(anyhow::anyhow!("mock backend: pay_fee not used in test"))
+        }
+        async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+            Err(anyhow::anyhow!("mock backend: propose_dvp not used in test"))
+        }
+        async fn accept_dvp(
+            &self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str,
+        ) -> Result<StepResult> {
+            Err(anyhow::anyhow!("mock backend: accept_dvp not used in test"))
+        }
+        async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+            Err(anyhow::anyhow!("mock backend: allocate not used in test"))
+        }
+        async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
+            Ok(Vec::new())
+        }
+        fn queue_depth(&self) -> (u64, u64) {
+            (0, 0)
+        }
+    }
+
+    fn test_proposal(id: &str) -> SettlementProposal {
+        SettlementProposal {
+            proposal_id: id.to_string(),
+            base_instrument: "USDCx".to_string(),
+            base_quantity: "1000".to_string(),
+            quote_instrument: "CCY".to_string(),
+            quote_quantity: "500".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Executor with one committed proposal "p1": seller (is_buyer=false)
+    /// allocating 1000 USDCx + ~11 CC fees. CC available drops 95 -> 84.
+    async fn committed_executor() -> (SettlementExecutor<MockBackend>, Arc<LiquidityManager>) {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        assert!(fee_cc > Decimal::ZERO);
+        lm.try_commit("p1", "USDCx", Decimal::from(1000), fee_cc).await.unwrap();
+        // Reservation in effect: allocation + fee both held.
+        assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
+        assert!(lm.available_cc().await < Decimal::from(95));
+
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        exec.set_liquidity_manager(lm.clone());
+        exec.active_settlements
+            .insert("p1".to_string(), SettlementState::new(test_proposal("p1"), false));
+        (exec, lm)
+    }
+
+    /// Spawned release/inflow tasks need a chance to run before asserting.
+    async fn drain_spawned() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Regression for Fix 1: the dominant terminal path (stream EventType::Settled)
+    // must release the CC reservation. Before the fix this arm removed the entry
+    // from active_settlements but leaked the reservation, draining available_cc
+    // to 0 over ~2 days.
+    #[tokio::test]
+    async fn test_stream_settled_releases_commitment() {
+        let (mut exec, lm) = committed_executor().await;
+        exec.handle_settlement_update(SettlementUpdate {
+            event_type: EventType::Settled as i32,
+            proposal: Some(test_proposal("p1")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drain_spawned().await;
+
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+        assert_eq!(lm.available_cc().await, Decimal::from(95));
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.completed_proposals.contains("p1"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_cancelled_releases_commitment() {
+        let (mut exec, lm) = committed_executor().await;
+        exec.handle_settlement_update(SettlementUpdate {
+            event_type: EventType::Cancelled as i32,
+            proposal: Some(test_proposal("p1")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drain_spawned().await;
+
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+        assert_eq!(lm.available_cc().await, Decimal::from(95));
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.rejected_proposals.contains("p1"));
+    }
+
+    // Regression: a permanently-failed settlement (deadline-exceeded) must be
+    // recorded in rejected_proposals so polling does not re-discover and re-add
+    // it. Before the fix this arm removed the entry from active_settlements but
+    // skipped the dedup insert, so an expired proposal the server still returned
+    // as pending looped forever (re-failing every poll, across restarts).
+    #[tokio::test]
+    async fn test_deadline_exceeded_marks_rejected_and_removes_active() {
+        let (mut exec, _lm) = committed_executor().await;
+        assert!(exec.active_settlements.contains_key("p1"));
+
+        exec.apply_result(AdvanceResult::Error {
+            proposal_id: "p1".to_string(),
+            error: "Settlement expired: deadline-exceeded (created 13078s ago, max 7200s)".to_string(),
+        })
+        .await;
+        drain_spawned().await;
+
+        // Terminal: gone from the active set AND recorded so polling skips it.
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.rejected_proposals.contains("p1"));
+        assert!(!exec.failed_settlements.contains_key("p1"));
+    }
+
+    // Same guarantee for the Timeout-exhausted terminal arm.
+    #[tokio::test]
+    async fn test_timeout_exhausted_marks_rejected_and_removes_active() {
+        let (mut exec, _lm) = committed_executor().await;
+        // Drive Timeout until retries are exhausted (each Timeout increments by 1).
+        for _ in 0..FailedSettlement::max_retries() {
+            exec.apply_result(AdvanceResult::Timeout {
+                proposal_id: "p1".to_string(),
+            })
+            .await;
+        }
+        drain_spawned().await;
+
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.rejected_proposals.contains("p1"));
+        assert!(!exec.failed_settlements.contains_key("p1"));
     }
 }
