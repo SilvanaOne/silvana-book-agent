@@ -475,6 +475,7 @@ mod tests {
                 created_at: None,
             }),
             dvp_proposer_party: None,
+            origin: String::new(),
         }
     }
 

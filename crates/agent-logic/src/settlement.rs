@@ -1264,6 +1264,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         let mut t = self.tracker.lock().await;
                         t.mark_failed(&proposal_id);
                     }
+                    // Record as terminal so polling won't re-discover and re-add it
+                    // (and so a restart won't resume it). Mirrors the Rejected arm.
+                    // Without this, an expired/permanently-failed proposal that the
+                    // server still returns as pending loops forever.
+                    self.rejected_proposals.insert(proposal_id.clone());
                     self.active_settlements.shift_remove(&proposal_id);
                     self.failed_settlements.remove(&proposal_id);
                     self.needs_readvance.remove(&proposal_id);
@@ -1344,6 +1349,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         let mut t = self.tracker.lock().await;
                         t.mark_failed(&proposal_id);
                     }
+                    // Record as terminal so polling won't re-discover and re-add it
+                    // (and so a restart won't resume it). Mirrors the Rejected arm.
+                    self.rejected_proposals.insert(proposal_id.clone());
                     self.active_settlements.shift_remove(&proposal_id);
                     self.failed_settlements.remove(&proposal_id);
                     self.needs_readvance.remove(&proposal_id);
@@ -2200,5 +2208,46 @@ mod tests {
         assert_eq!(lm.available_cc().await, Decimal::from(95));
         assert!(!exec.active_settlements.contains_key("p1"));
         assert!(exec.rejected_proposals.contains("p1"));
+    }
+
+    // Regression: a permanently-failed settlement (deadline-exceeded) must be
+    // recorded in rejected_proposals so polling does not re-discover and re-add
+    // it. Before the fix this arm removed the entry from active_settlements but
+    // skipped the dedup insert, so an expired proposal the server still returned
+    // as pending looped forever (re-failing every poll, across restarts).
+    #[tokio::test]
+    async fn test_deadline_exceeded_marks_rejected_and_removes_active() {
+        let (mut exec, _lm) = committed_executor().await;
+        assert!(exec.active_settlements.contains_key("p1"));
+
+        exec.apply_result(AdvanceResult::Error {
+            proposal_id: "p1".to_string(),
+            error: "Settlement expired: deadline-exceeded (created 13078s ago, max 7200s)".to_string(),
+        })
+        .await;
+        drain_spawned().await;
+
+        // Terminal: gone from the active set AND recorded so polling skips it.
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.rejected_proposals.contains("p1"));
+        assert!(!exec.failed_settlements.contains_key("p1"));
+    }
+
+    // Same guarantee for the Timeout-exhausted terminal arm.
+    #[tokio::test]
+    async fn test_timeout_exhausted_marks_rejected_and_removes_active() {
+        let (mut exec, _lm) = committed_executor().await;
+        // Drive Timeout until retries are exhausted (each Timeout increments by 1).
+        for _ in 0..FailedSettlement::max_retries() {
+            exec.apply_result(AdvanceResult::Timeout {
+                proposal_id: "p1".to_string(),
+            })
+            .await;
+        }
+        drain_spawned().await;
+
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.rejected_proposals.contains("p1"));
+        assert!(!exec.failed_settlements.contains_key("p1"));
     }
 }
