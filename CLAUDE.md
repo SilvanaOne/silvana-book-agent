@@ -1,5 +1,6 @@
 # Silvana Book Agent
 
+
 Monorepo for Silvana orderbook agents — cloud-native Rust liquidity providers and trading bots on the Canton ledger.
 
 ## Architecture
