@@ -36,7 +36,12 @@ export function AppNav() {
             {ROUTES.map(({ href, label }) => {
               const active = pathname === href || (href !== "/" && pathname.startsWith(`${href}/`));
               return (
-                <Link key={href} href={href} className={`silv-nav__link${active ? " silv-nav__link--active" : ""}`}>
+                <Link
+                  key={href}
+                  href={href}
+                  prefetch
+                  className={`silv-nav__link${active ? " silv-nav__link--active" : ""}`}
+                >
                   {label}
                 </Link>
               );
