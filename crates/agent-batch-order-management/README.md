@@ -40,6 +40,12 @@ export UPLOAD_ENV_STACK=1
 ./deploy/deploy-to-server.sh --force --reseed   # plus rewrite seed targets/positions inside the api container
 ```
 
+Every `--force` deploy also takes an auto-backup of the live postgres state
+into `${REMOTE_WORK}/backups/auto-<UTC>.sql.gz` (last 5 kept) — see the
+"Database persistence and backups" section of `GUIDELINES.md` for the full
+workflow including the off-server `scripts/backup-postgres.sh` pull and the
+`--restore-from=` flag for migrating between servers.
+
 ## Quick start
 
 End-to-end local sequence «bring up Postgres/Redis → migrate → seed → build → `turbo dev` (api + web + worker)»:

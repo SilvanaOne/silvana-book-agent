@@ -218,6 +218,61 @@ movements rather than the imitator.
 
 ---
 
+## Database persistence and backups
+
+Postgres state — including the **Audit log**, every `RebalanceJob`,
+`OrderBatch`, and the user-edited `PortfolioTarget` rows — lives in a
+Docker named volume (`pgdata_batch_order_deploy`) on the VPS. The volume
+is preserved across `docker compose up --force-recreate`, so on the
+**same server** the audit log keeps accumulating across deploys; it is
+only at risk if you migrate to a **different server** or the disk dies.
+
+The deploy script ships with two safety nets:
+
+* **Auto-backup before recreate.** Every
+  `./deploy/deploy-to-server.sh --force` runs
+  `pg_dump --clean --if-exists -U postgres batch_agent | gzip` against
+  the running container and stores the result under
+  `${REMOTE_WORK}/backups/auto-<UTC>.sql.gz` before touching anything.
+  The last 5 dumps are kept; older ones are pruned. On a fresh server
+  (postgres not running yet) the step is silently skipped.
+* **Off-server pull.** `./scripts/backup-postgres.sh [output.sql.gz]`
+  streams the same `pg_dump --clean --if-exists` from the VPS to your
+  local `./backups/bam-postgres-<UTC>.sql.gz` (gitignored). Run it
+  whenever you want a portable copy on your workstation or right before
+  a planned migration.
+
+To move the database to another server:
+
+```bash
+# 1. on your laptop, with the current VPS still alive
+./scripts/backup-postgres.sh
+# → ./backups/bam-postgres-…sql.gz
+
+# 2. point the deploy at the new host and pass the dump as restore input
+DEPLOY_SERVER=root@<new-host> ./deploy/deploy-to-server.sh \
+  --force --restore-from=./backups/bam-postgres-<…>.sql.gz
+```
+
+`--restore-from=` rsyncs the dump to
+`${REMOTE_WORK}/backups/restore-input.sql.gz`, waits for postgres to
+accept connections after `docker compose up`, then loads it through
+`psql -v ON_ERROR_STOP=1`. The dump's own `DROP IF EXISTS … CREATE …`
+statements make the restore idempotent against either a freshly seeded
+or already-populated target database. After a successful load the input
+file is removed so the next routine deploy does not re-apply it.
+
+`--restore-from` and `--reseed` are mutually exclusive — a restore brings
+its own data and would clash with the seed script's `deleteMany +
+createMany`.
+
+For protection against hardware loss (the VPS disk dies and takes the
+backups with it) you'd want off-server storage (S3 / Backblaze) or a
+managed Postgres (Neon / Supabase). Not wired today; would be a separate
+evolution.
+
+---
+
 ## Related docs
 
 - `README.md` — how to develop the agent locally and
