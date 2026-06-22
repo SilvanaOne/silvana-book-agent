@@ -1,0 +1,26 @@
+{
+  "name": "@batch-order/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\"",
+    "dev": "tsx watch src/worker.ts",
+    "start": "node dist/worker.js"
+  },
+  "dependencies": {
+    "@batch-order/db": "*",
+    "@batch-order/execution-router": "*",
+    "@batch-order/portfolio-engine": "*",
+    "@batch-order/queue": "*",
+    "@batch-order/silvana-client": "*",
+    "@batch-order/venue-adapters": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.9",
+    "tsx": "^4.21.0",
+    "typescript": "~5.7.3"
+  }
+}

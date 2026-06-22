@@ -1,0 +1,30 @@
+# Гибрид «Вариант А» (Шаг 3). Накладывается ПОВЕРХ cloud-agent.compose.yml:
+#
+#   cd batch-order-agent/infra
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f cloud-agent.compose.yml \
+#     -f cloud-agent-variant-a.compose.yml \
+#     up -d --build cloud-agent
+#
+# Что делает этот файл:
+#   * переводит sidecar в long-running режим `cloud-agent agent --settlement-only`;
+#   * меняет policy перезапуска на unless-stopped (sidecar должен жить, пока
+#     поднят стек);
+#   * НЕ трогает TS-воркер: единственное изменение со стороны batch-order-agent —
+#     env-флаг WORKER_SILVANA_SETTLEMENT_SIDECAR=1 (только лог-баннер, см.
+#     apps/worker/src/silvana/exec-mode.ts).
+#
+# Откат:
+#   - убрать этот -f либо CLOUD_AGENT_CMD выставить обратно в "info party"
+#     и restart=no — sidecar снова станет пассивным;
+#   - в TS .env снять WORKER_SILVANA_SETTLEMENT_SIDECAR (либо =0). Воркер
+#     продолжит работать как раньше (rpc / plan_only по JWT).
+#
+# Документация: task/updated-scenario/hybrid-architecture.md §3 «Вариант А».
+services:
+  cloud-agent:
+    restart: unless-stopped
+    environment:
+      AGENT_DIR: /agent
+      CLOUD_AGENT_CMD: "agent --settlement-only"

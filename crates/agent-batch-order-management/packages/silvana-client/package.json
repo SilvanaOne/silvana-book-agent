@@ -1,0 +1,27 @@
+{
+  "name": "@batch-order/silvana-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@connectrpc/connect-node": "^2.1.1",
+    "@silvana-one/orderbook": "^1.1.44"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.9",
+    "typescript": "~5.7.3"
+  }
+}

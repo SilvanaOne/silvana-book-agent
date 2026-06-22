@@ -1,0 +1,27 @@
+{
+  "name": "@batch-order/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@batch-order/db": "*",
+    "@batch-order/execution-router": "*",
+    "@batch-order/portfolio-engine": "*",
+    "@batch-order/queue": "*",
+    "@batch-order/shared": "*",
+    "@batch-order/venue-adapters": "*",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.19.9",
+    "tsx": "^4.21.0",
+    "typescript": "~5.7.3"
+  }
+}

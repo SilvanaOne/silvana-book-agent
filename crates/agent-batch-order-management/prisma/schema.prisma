@@ -1,0 +1,191 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Portfolio {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  baseCurrency String   @map("base_currency")
+
+  targets       PortfolioTarget[]
+  snapshots     PositionSnapshot[]
+  rebalanceJobs RebalanceJob[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("portfolios")
+}
+
+model PortfolioTarget {
+  id          String @id @default(uuid()) @db.Uuid
+  portfolioId String @map("portfolio_id") @db.Uuid
+  portfolio   Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+
+  assetSymbol  String    @map("asset_symbol")
+  targetWeight Decimal   @map("target_weight") @db.Decimal(18, 8)
+  minWeight    Decimal?  @map("min_weight") @db.Decimal(18, 8)
+  maxWeight    Decimal?  @map("max_weight") @db.Decimal(18, 8)
+  enabled      Boolean
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([portfolioId, assetSymbol])
+  @@index([portfolioId])
+  @@map("portfolio_targets")
+}
+
+model PositionSnapshot {
+  id          String @id @default(uuid()) @db.Uuid
+  portfolioId String @map("portfolio_id") @db.Uuid
+  portfolio   Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+
+  assetSymbol String   @map("asset_symbol")
+  qty         Decimal  @db.Decimal(30, 12)
+  marketValue Decimal  @map("market_value") @db.Decimal(30, 12)
+  price       Decimal  @db.Decimal(30, 12)
+  asOf        DateTime @map("as_of")
+
+  @@index([portfolioId, asOf])
+  @@map("position_snapshots")
+}
+
+model RebalanceJob {
+  id          String @id @default(uuid()) @db.Uuid
+  portfolioId String @map("portfolio_id") @db.Uuid
+  portfolio   Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Restrict)
+
+  status      String
+  mode        String
+  requestedBy String?   @map("requested_by")
+  dryRun      Boolean   @default(false) @map("dry_run")
+  input       Json      @db.JsonB
+  output      Json?     @db.JsonB
+
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  orderBatches     OrderBatch[]
+  settlementEvents SettlementEvent[]
+
+  @@index([portfolioId, status])
+  @@index([status, createdAt])
+  @@map("rebalance_jobs")
+}
+
+model OrderBatch {
+  id             String       @id @default(uuid()) @db.Uuid
+  rebalanceJobId String       @map("rebalance_job_id") @db.Uuid
+  rebalanceJob   RebalanceJob @relation(fields: [rebalanceJobId], references: [id], onDelete: Cascade)
+
+  /** Площадка исполнения; см. hybrid ADR «venue на batch + один batch на `{venue, market}`». */
+  venue           String       @default("silvana") @map("venue")
+  status          String
+  market          String
+  totalOrders     Int @map("total_orders")
+  submittedOrders Int @default(0) @map("submitted_orders")
+  filledOrders    Int @default(0) @map("filled_orders")
+  cancelledOrders Int @default(0) @map("cancelled_orders")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  orders Order[]
+
+  @@index([rebalanceJobId])
+  @@index([rebalanceJobId, venue, market])
+  @@index([status])
+  @@map("order_batches")
+}
+
+model Order {
+  id           String @id @default(uuid()) @db.Uuid
+  orderBatchId String @map("order_batch_id") @db.Uuid
+  orderBatch   OrderBatch @relation(fields: [orderBatchId], references: [id], onDelete: Cascade)
+
+  /** Площадка строки после роутера; совпадает с batch-тиром `{venue, market}`. */
+  venue          String   @default("silvana") @map("venue")
+  venueOrderRef  String?  @map("venue_order_ref")
+  execProfile    String? @map("exec_profile")
+
+  silvanaOrderId String? @map("silvana_order_id")
+
+  side   String
+  type   String
+  market String
+  price  Decimal? @db.Decimal(30, 12)
+  qty    Decimal  @db.Decimal(30, 12)
+
+  status         String
+  clientOrderRef String? @map("client_order_ref")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  events OrderEvent[]
+
+  @@unique([silvanaOrderId])
+  @@unique([venue, venueOrderRef])
+  @@index([clientOrderRef])
+  @@index([orderBatchId])
+  @@map("orders")
+}
+
+/// Silvana order lifecycle (fill/cancel/update). При повторном чтении стрима вставляются новые строки; частичная идемпотентность — через silvanaEventKey (фаза 7).
+model OrderEvent {
+  id      String @id @default(uuid()) @db.Uuid
+  orderId String @map("order_id") @db.Uuid
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  eventType String @map("event_type")
+  payload   Json   @db.JsonB
+
+  /// Опциональный ключ события от Silvana/брокера для дедупликации (если есть в payload).
+  silvanaEventKey String? @unique @map("silvana_event_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([orderId])
+  @@index([eventType])
+  @@map("order_events")
+}
+
+model SettlementEvent {
+  id             String       @id @default(uuid()) @db.Uuid
+  rebalanceJobId String       @map("rebalance_job_id") @db.Uuid
+  rebalanceJob   RebalanceJob @relation(fields: [rebalanceJobId], references: [id], onDelete: Cascade)
+
+  payload Json @db.JsonB
+  status  String?
+
+  /// Идempotency для строк из subscribeSettlements (proposal_id + event_type или аналог).
+  silvanaStreamKey String? @unique @map("silvana_stream_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([rebalanceJobId])
+  @@map("settlement_events")
+}
+
+model AuditLog {
+  id         String @id @default(uuid()) @db.Uuid
+  actorId    String @map("actor_id")
+  action     String
+  entityType String @map("entity_type")
+  entityId   String @map("entity_id")
+  payload    Json   @db.JsonB
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

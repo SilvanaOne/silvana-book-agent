@@ -1,0 +1,41 @@
+{
+  "name": "batch-order-agent",
+  "private": true,
+  "packageManager": "npm@10.9.4",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "dev:api": "turbo run dev --filter=@batch-order/api",
+    "dev:web": "turbo run dev --filter=@batch-order/web",
+    "dev:worker": "turbo run dev --filter=@batch-order/worker",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "smoke:venues-status": "bash scripts/smoke-venues-status.sh",
+    "format": "prettier --write \"**/*.{ts,tsx,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,json,md}\"",
+    "db:generate": "prisma generate --schema prisma/schema.prisma",
+    "db:migrate:apply": "prisma migrate deploy --schema prisma/schema.prisma && npm run db:generate",
+    "db:seed": "prisma db seed --schema prisma/schema.prisma",
+    "db:reset:dev": "prisma migrate reset --schema prisma/schema.prisma --force"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "devDependencies": {
+    "prettier": "^3.7.4",
+    "prisma": "^6.19.2",
+    "tsx": "^4.21.0",
+    "turbo": "^2.8.8",
+    "typescript": "~5.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@silvana-one/orderbook": "^1.1.44"
+  }
+}

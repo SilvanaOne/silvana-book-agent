@@ -1,0 +1,18 @@
+# Все артефакты onboarding — секреты, не пускать в git.
+.env
+.env.*
+!.env.example
+agent.toml
+agent-state.json
+*.key
+*.key.b58
+keys/
+state/
+logs/
+
+# Локальная копия бинаря (собирается из task/vendor/silvana-book-agent)
+bin/cloud-agent
+bin/cloud-agent-*
+
+# Подсистема onboarding пишет рабочий каталог сюда
+runtime/

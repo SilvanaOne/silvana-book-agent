@@ -1,0 +1,37 @@
+# Оверлей docker-compose для sidecar cloud-agent.
+# Поднимается ВМЕСТЕ с infra/docker-compose.yml (Postgres + Redis):
+#
+#   cd batch-order-agent/infra
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f cloud-agent.compose.yml \
+#     up -d
+#
+# Что делает этот файл:
+#   * описывает сервис `cloud-agent` (см. silvana-agent/Dockerfile);
+#   * монтирует ./silvana-agent/runtime/ как /agent (там agent.toml + ключ);
+#   * по умолчанию запускает `info party` (Шаг 2 — пассивная проверка).
+#     В Шаге 3 переопределяется CLOUD_AGENT_CMD="agent --settlement-only".
+#
+# Перед `up`:
+#   1) cd silvana-agent && ./prepare.sh
+#   2) положить .env с инвайтом, ./onboard.sh
+#   3) убедиться, что runtime/agent.toml существует
+#
+# Документация: task/updated-scenario/hybrid-architecture.md §5.
+services:
+  cloud-agent:
+    image: batch-order-cloud-agent:dev
+    build:
+      context: ./silvana-agent
+      dockerfile: Dockerfile
+    container_name: bam-cloud-agent
+    init: true
+    restart: "no"             # в Шаге 3 переключим в unless-stopped
+    environment:
+      AGENT_DIR: /agent
+      CLOUD_AGENT_CMD: "info party"
+    volumes:
+      - ./silvana-agent/runtime:/agent:rw
+    # Сети не задаём специально — devnet ходит наружу, sidecar не нуждается
+    # в доступе к Postgres/Redis в Шаге 2.

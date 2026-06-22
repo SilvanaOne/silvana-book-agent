@@ -1,0 +1,13 @@
+# Сборки Docker (infra/deploy) — контекст корня репозитория.
+.git
+**/node_modules
+**/.turbo
+**/.next/cache
+**/dist
+**/*.log
+.env.local
+coverage
+**/tsconfig.tsbuildinfo
+
+# Секреты не копировать в образ; на сервере используйте .env.stack из шаблона.
+.env

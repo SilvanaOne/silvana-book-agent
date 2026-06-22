@@ -1,0 +1,20 @@
+{
+  "name": "smoke-orderbook",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "tsx src/smoke.ts"
+  },
+  "dependencies": {
+    "@connectrpc/connect-node": "^2.1.1",
+    "@silvana-one/orderbook": "^1.1.44"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
