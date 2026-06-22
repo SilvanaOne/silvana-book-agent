@@ -26,7 +26,7 @@ export default async function AuditPage(props: {
       ? Math.min(500, Math.max(1, Number(limitRaw)))
       : 120;
 
-  const fetched = await backendJson<{ logs: AuditLogRow[] }>(`/api/audit/logs?limit=${limitParsed}`);
+  const fetched = await backendJson<{ logs: AuditLogRow[] }>(`/api/audit/entries?limit=${limitParsed}`);
 
   if (!fetched.ok) {
     return (

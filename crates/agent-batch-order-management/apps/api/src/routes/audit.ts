@@ -3,7 +3,7 @@ import { listRecentAuditLogs } from "@batch-order/db";
 
 export const auditRouter = Router();
 
-auditRouter.get("/logs", async (req, res) => {
+auditRouter.get("/entries", async (req, res) => {
   const raw = Number(req.query.limit ?? 100);
   const limit = Number.isFinite(raw) ? Math.min(Math.max(raw, 1), 500) : 100;
 

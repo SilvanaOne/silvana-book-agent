@@ -94,7 +94,9 @@ export function DriftImitator(props: Readonly<{ portfolioId: string }>) {
         back to the targets you saved. Nothing is sent to the exchange.
       </p>
       <p className="muted">
-        Works for portfolios with exactly two enabled targets.
+        Works for portfolios with two or more enabled targets. When you shift one asset, the
+        remaining ones absorb the change proportionally to their own target weights — so the
+        ratios between counter-assets stay the same.
       </p>
 
       <div className="form-grid">

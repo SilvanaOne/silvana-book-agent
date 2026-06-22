@@ -13,6 +13,11 @@ const ROUTES = [
   { href: "/audit", label: "Audit" },
 ] as const;
 
+const GITHUB_URL =
+  "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-batch-order-management";
+const GUIDE_URL =
+  "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-batch-order-management/GUIDELINES.md";
+
 export function AppNav() {
   const pathname = usePathname();
 
@@ -38,15 +43,33 @@ export function AppNav() {
         </div>
       </div>
 
-      <a
-        className="silv-nav__silvana-mark"
-        href="https://silvana.one"
-        target="_blank"
-        rel="noopener noreferrer"
-        aria-label="Silvana — open website"
-      >
-        <Image src="/silvana-logo.svg" alt="Silvana" width={162} height={33} priority />
-      </a>
+      <div style={{ display: "flex", alignItems: "center", gap: "1.25rem" }}>
+        <a
+          className="silv-nav__link"
+          href={GITHUB_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          GitHub
+        </a>
+        <a
+          className="silv-nav__link"
+          href={GUIDE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Guide
+        </a>
+        <a
+          className="silv-nav__silvana-mark"
+          href="https://silvana.one"
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="Silvana — open website"
+        >
+          <Image src="/silvana-logo.svg" alt="Silvana" width={162} height={33} priority />
+        </a>
+      </div>
     </nav>
   );
 }

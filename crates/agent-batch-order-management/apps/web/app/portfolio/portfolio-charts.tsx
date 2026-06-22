@@ -14,34 +14,37 @@ import {
   YAxis,
 } from "recharts";
 
+// Diverse palette across hues so additional assets stay visually distinct from each other.
 const PALETTE = [
-  "#be98ff",
-  "#86b2ff",
-  "#a7a4f9",
-  "#7b6ef6",
-  "#9996ec",
-  "#c4b5fd",
-  "#93c5fd",
-  "#818cf8",
+  "#86b2ff", // sky blue
+  "#fb9b4b", // orange
+  "#b45309", // brown
+  "#ef4444", // red
+  "#facc15", // yellow
+  "#10b981", // green
+  "#be98ff", // light purple
+  "#7b6ef6", // deep purple
+  "#fb7185", // pink
+  "#0ea5e9", // cyan
 ];
 
 /** Bar chart: Target column (all) — light salad green */
 const BAR_TARGET_SALAD = "#c5eec5";
-/** Bar + pie: USDC — same blue as typical 2nd slice in palette */
-const ASSET_USDC_BLUE = "#86b2ff";
-/** Bar + pie: CC */
-const ASSET_CC_ORANGE = "#fb9b4b";
+
+// Per-asset overrides so the major tickers always render in a recognizable colour.
+const ASSET_COLOR: Record<string, string> = {
+  USDC: "#86b2ff", // sky blue
+  CC: "#fb9b4b", // orange (unchanged)
+  WBTC: "#b45309", // brown / bitcoin-gold
+  WETH: "#ef4444", // red
+};
 
 function pieSliceFill(assetSymbol: string, index: number): string {
-  if (assetSymbol === "USDC") return ASSET_USDC_BLUE;
-  if (assetSymbol === "CC") return ASSET_CC_ORANGE;
-  return PALETTE[index % PALETTE.length] ?? "#be98ff";
+  return ASSET_COLOR[assetSymbol] ?? PALETTE[index % PALETTE.length] ?? "#be98ff";
 }
 
 function actualBarFill(assetSymbol: string, index: number): string {
-  if (assetSymbol === "USDC") return ASSET_USDC_BLUE;
-  if (assetSymbol === "CC") return ASSET_CC_ORANGE;
-  return PALETTE[index % PALETTE.length] ?? "#be98ff";
+  return ASSET_COLOR[assetSymbol] ?? PALETTE[index % PALETTE.length] ?? "#be98ff";
 }
 
 function parseWt(s: string): number {

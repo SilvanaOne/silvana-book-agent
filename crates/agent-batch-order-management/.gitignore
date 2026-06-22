@@ -8,3 +8,10 @@ coverage
 .DS_Store
 .turbo
 *.tsbuildinfo
+
+# When this directory is published into SilvanaOne/silvana-book-agent as
+# crates/agent-batch-order-management/, the workspace-level .gitignore there
+# is broad (.env.*, etc.) and would drop our committed template files.
+# Re-include them so they survive the snapshot.
+!.env.example
+!.env.stack.example

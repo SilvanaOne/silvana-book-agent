@@ -271,10 +271,10 @@ portfolioRouter.post("/:id/imitate-drift", async (req, res) => {
   }
 
   const activeTargets = portfolio.targets.filter((t) => t.enabled);
-  if (activeTargets.length !== 2) {
+  if (activeTargets.length < 2) {
     res.status(400).json({
-      error: "two_assets_required",
-      message: `Drift imitator currently supports exactly 2 enabled targets (got ${activeTargets.length}).`,
+      error: "at_least_two_assets_required",
+      message: `Drift imitator needs at least 2 enabled targets (got ${activeTargets.length}).`,
     });
     return;
   }
@@ -284,9 +284,17 @@ portfolioRouter.post("/:id/imitate-drift", async (req, res) => {
     res.status(400).json({ error: "asset_not_in_targets", message: `${assetSymbol} is not an enabled target` });
     return;
   }
-  const other = activeTargets.find((t) => t.assetSymbol !== assetSymbol);
-  if (!other) {
-    res.status(500).json({ error: "internal_error", message: "could not find counter-asset" });
+  const others = activeTargets.filter((t) => t.assetSymbol !== assetSymbol);
+  if (others.length === 0) {
+    res.status(500).json({ error: "internal_error", message: "could not find counter-assets" });
+    return;
+  }
+  const othersTargetSum = others.reduce((acc, t) => acc + Number(t.targetWeight.toString()), 0);
+  if (!(othersTargetSum > 0)) {
+    res.status(400).json({
+      error: "counter_assets_zero_target",
+      message: "Cannot redistribute drift — all counter-assets have target weight 0.",
+    });
     return;
   }
 
@@ -312,34 +320,53 @@ portfolioRouter.post("/:id/imitate-drift", async (req, res) => {
     });
     return;
   }
-  const otherActualW = 1 - newActualW;
+  // Remaining weight (1 - newActualW) is split among counter-assets pro-rata to their target weights.
+  const remainder = 1 - newActualW;
 
-  const priceTgt = Number((snapByAsset.get(tgt.assetSymbol)?.price ?? firstSnap.price).toString());
-  const priceOther = Number((snapByAsset.get(other.assetSymbol)?.price ?? firstSnap.price).toString());
-  if (!Number.isFinite(priceTgt) || priceTgt <= 0 || !Number.isFinite(priceOther) || priceOther <= 0) {
-    res.status(400).json({ error: "price_not_positive" });
+  const fallbackPrice = firstSnap.price;
+  function priceFor(assetSym: string): number {
+    return Number((snapByAsset.get(assetSym)?.price ?? fallbackPrice).toString());
+  }
+
+  const priceTgt = priceFor(tgt.assetSymbol);
+  if (!Number.isFinite(priceTgt) || priceTgt <= 0) {
+    res.status(400).json({ error: "price_not_positive", message: `price for ${tgt.assetSymbol} is not positive` });
     return;
   }
 
-  const newMvTgt = newActualW * navTotal;
-  const newMvOther = otherActualW * navTotal;
-  const newQtyTgt = newMvTgt / priceTgt;
-  const newQtyOther = newMvOther / priceOther;
+  const newSnapshots: Array<{ assetSymbol: string; qty: string; marketValue: string; price: string }> = [];
+  const newWeights: Record<string, number> = { [tgt.assetSymbol]: newActualW };
 
-  const newSnapshots = [
-    {
-      assetSymbol: tgt.assetSymbol,
-      qty: newQtyTgt.toString(),
-      marketValue: newMvTgt.toString(),
-      price: priceTgt.toString(),
-    },
-    {
+  // Shifted asset
+  const newMvTgt = newActualW * navTotal;
+  newSnapshots.push({
+    assetSymbol: tgt.assetSymbol,
+    qty: (newMvTgt / priceTgt).toString(),
+    marketValue: newMvTgt.toString(),
+    price: priceTgt.toString(),
+  });
+
+  // Counter-assets, redistributed pro-rata to their own target weights.
+  for (const other of others) {
+    const otherTargetW = Number(other.targetWeight.toString());
+    const otherActualW = remainder * (otherTargetW / othersTargetSum);
+    const priceOther = priceFor(other.assetSymbol);
+    if (!Number.isFinite(priceOther) || priceOther <= 0) {
+      res.status(400).json({
+        error: "price_not_positive",
+        message: `price for ${other.assetSymbol} is not positive`,
+      });
+      return;
+    }
+    const mvOther = otherActualW * navTotal;
+    newSnapshots.push({
       assetSymbol: other.assetSymbol,
-      qty: newQtyOther.toString(),
-      marketValue: newMvOther.toString(),
+      qty: (mvOther / priceOther).toString(),
+      marketValue: mvOther.toString(),
       price: priceOther.toString(),
-    },
-  ];
+    });
+    newWeights[other.assetSymbol] = otherActualW;
+  }
 
   await replaceLatestPositionSnapshots(portfolioId, newSnapshots);
 
@@ -352,7 +379,7 @@ portfolioRouter.post("/:id/imitate-drift", async (req, res) => {
       assetSymbol,
       driftWeight,
       navTotal,
-      newWeights: { [tgt.assetSymbol]: newActualW, [other.assetSymbol]: otherActualW },
+      newWeights,
     },
   });
 
@@ -362,10 +389,10 @@ portfolioRouter.post("/:id/imitate-drift", async (req, res) => {
     applied: {
       assetSymbol,
       driftWeight,
-      newActualWeights: [
-        { assetSymbol: tgt.assetSymbol, weight: newActualW.toString() },
-        { assetSymbol: other.assetSymbol, weight: otherActualW.toString() },
-      ],
+      newActualWeights: Object.entries(newWeights).map(([s, w]) => ({
+        assetSymbol: s,
+        weight: w.toString(),
+      })),
     },
   });
 });

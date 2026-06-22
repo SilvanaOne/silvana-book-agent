@@ -3,7 +3,7 @@ import { Decimal } from "@prisma/client/runtime/library";
 
 const prisma = new PrismaClient();
 
-/** Устойчивый UUID для локального порта в dev-сидере (повторный seed делает upsert/update). */
+/** Stable UUID for the local dev portfolio. Re-running seed upserts/updates the same record. */
 const DEV_PORTFOLIO_ID = "00000000-0000-4000-a000-000000000001";
 
 async function seed() {
@@ -22,12 +22,30 @@ async function seed() {
 
   await prisma.portfolioTarget.deleteMany({ where: { portfolioId: DEV_PORTFOLIO_ID } });
 
+  // Four assets: two majors (WBTC, WETH), one minor (CC), and a quote-currency buffer (USDC).
+  // Sum of enabled weights = 1.0.
   await prisma.portfolioTarget.createMany({
     data: [
       {
         portfolioId: DEV_PORTFOLIO_ID,
+        assetSymbol: "WBTC",
+        targetWeight: new Decimal("0.25"),
+        minWeight: null,
+        maxWeight: null,
+        enabled: true,
+      },
+      {
+        portfolioId: DEV_PORTFOLIO_ID,
+        assetSymbol: "WETH",
+        targetWeight: new Decimal("0.25"),
+        minWeight: null,
+        maxWeight: null,
+        enabled: true,
+      },
+      {
+        portfolioId: DEV_PORTFOLIO_ID,
         assetSymbol: "CC",
-        targetWeight: new Decimal("0.4"),
+        targetWeight: new Decimal("0.1"),
         minWeight: null,
         maxWeight: null,
         enabled: true,
@@ -35,7 +53,7 @@ async function seed() {
       {
         portfolioId: DEV_PORTFOLIO_ID,
         assetSymbol: "USDC",
-        targetWeight: new Decimal("0.6"),
+        targetWeight: new Decimal("0.4"),
         minWeight: new Decimal("0.1"),
         maxWeight: new Decimal("0.9"),
         enabled: true,
@@ -45,9 +63,27 @@ async function seed() {
 
   await prisma.positionSnapshot.deleteMany({ where: { portfolioId: DEV_PORTFOLIO_ID } });
 
+  // Initial snapshot. Prices are demo-only placeholders; in production they come from the pricing stream.
+  // Total NAV ≈ 20406 USDC, drift vs targets is intentionally non-trivial so the dashboard is interesting on first load.
   const asOf = new Date();
   await prisma.positionSnapshot.createMany({
     data: [
+      {
+        portfolioId: DEV_PORTFOLIO_ID,
+        assetSymbol: "WBTC",
+        qty: new Decimal("0.05"),
+        marketValue: new Decimal("5000"),
+        price: new Decimal("100000"),
+        asOf,
+      },
+      {
+        portfolioId: DEV_PORTFOLIO_ID,
+        assetSymbol: "WETH",
+        qty: new Decimal("1.5"),
+        marketValue: new Decimal("5250"),
+        price: new Decimal("3500"),
+        asOf,
+      },
       {
         portfolioId: DEV_PORTFOLIO_ID,
         assetSymbol: "CC",
