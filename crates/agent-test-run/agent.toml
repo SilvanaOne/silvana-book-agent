@@ -11,6 +11,10 @@ description = "Read-only RPC smoke test — verifies connectivity, JWT, and basi
 icon        = "stethoscope"
 status      = "active"
 
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=test-run"

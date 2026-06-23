@@ -11,6 +11,10 @@ description = "Runs spot DCA in parallel across a basket of markets — same int
 icon        = "layers"
 status      = "active"
 
+required_balance   = "$100 min"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=dca-portfolio"

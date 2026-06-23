@@ -11,6 +11,10 @@ description = "Passive market-making grid — stacks bids and offers at fixed le
 icon        = "grid-3x3"
 status      = "active"
 
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=spot-grid"

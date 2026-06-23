@@ -11,6 +11,10 @@ description = "Human-readable snapshot — balances per instrument, open orders 
 icon        = "heart-pulse"
 status      = "active"
 
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=portfolio-health"

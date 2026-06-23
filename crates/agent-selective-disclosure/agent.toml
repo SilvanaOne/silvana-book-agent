@@ -11,6 +11,10 @@ description = "Post-processor over a Trading History log — filters by event ki
 icon        = "file-key"
 status      = "active"
 
+required_balance   = "None — offline"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=selective-disclosure"

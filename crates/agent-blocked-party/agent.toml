@@ -11,6 +11,10 @@ description = "Streams settlement events and flags any proposal whose buyer or s
 icon        = "user-x"
 status      = "active"
 
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=blocked-party"

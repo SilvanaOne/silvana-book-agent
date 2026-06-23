@@ -11,6 +11,10 @@ description = "Maintains target weights across instruments. Each cycle values th
 icon        = "scale"
 status      = "active"
 
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=portfolio-rebalancing"

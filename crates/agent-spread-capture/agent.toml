@@ -11,6 +11,10 @@ description = "Single-level two-sided market making — keeps one bid and one of
 icon        = "git-pull-request-arrow"
 status      = "active"
 
+required_balance   = "$200 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=spread-capture"

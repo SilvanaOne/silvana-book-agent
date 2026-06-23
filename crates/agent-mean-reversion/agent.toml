@@ -11,6 +11,10 @@ description = "Trades the snap-back when mid diverges from a rolling EMA by more
 icon        = "trending-down"
 status      = "active"
 
+required_balance   = "$100 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=mean-reversion"
