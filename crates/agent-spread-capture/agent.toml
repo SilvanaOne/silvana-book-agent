@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 6
+
+[agent]
+slug        = "spread-capture"
+name        = "Spread Capture"
+description = "Single-level two-sided market making — keeps one bid and one offer at mid ± half-spread, skipping a side when net inventory leaves the configured band."
+icon        = "git-pull-request-arrow"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=spread-capture"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Spread Capture v1"
+language = "rust"
+order    = 1
+tags     = ["marketmaker", "inventory-clamp"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/spread-capture/v1-rust"
+quickstart = "https://docs.silvana.one/agents/spread-capture/v1-rust/quickstart"

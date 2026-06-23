@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "data_analytics"
+order = 4
+
+[agent]
+slug        = "orderbook-streaming"
+name        = "Orderbook Streaming"
+description = "Fans live orderbook depth and external prices for the configured markets to any combination of stdout, append JSONL, and HTTP webhook. Read-only, no party-specific state."
+icon        = "waves"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=orderbook-streaming"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Orderbook Streaming v1"
+language = "rust"
+order    = 1
+tags     = ["market-data", "fanout"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/orderbook-streaming/v1-rust"
+quickstart = "https://docs.silvana.one/agents/orderbook-streaming/v1-rust/quickstart"

@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 3
+
+[agent]
+slug        = "tpsl"
+name        = "Automated TP/SL"
+description = "Watch a live position and trigger take-profit or stop-loss exits automatically, with optional trailing stops."
+icon        = "target"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=tpsl"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "TP/SL v1"
+language = "rust"
+order    = 1
+tags     = ["take-profit", "stop-loss", "trailing"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/tpsl/v1-rust"
+quickstart = "https://docs.silvana.one/agents/tpsl/v1-rust/quickstart"

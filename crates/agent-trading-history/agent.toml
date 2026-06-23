@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "auditing"
+order = 1
+
+[agent]
+slug        = "trading-history"
+name        = "Trading History"
+description = "Builds a tamper-evident audit log — every order and settlement event is appended to a JSONL file as a hash-chained, Ed25519-signed record that can later be verified."
+icon        = "file-lock"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=trading-history"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Trading History v1"
+language = "rust"
+order    = 1
+tags     = ["audit-log", "signed", "hash-chain"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/trading-history/v1-rust"
+quickstart = "https://docs.silvana.one/agents/trading-history/v1-rust/quickstart"

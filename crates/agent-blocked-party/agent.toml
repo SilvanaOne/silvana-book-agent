@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "compliance"
+order = 2
+
+[agent]
+slug        = "blocked-party"
+name        = "Blocked Party"
+description = "Streams settlement events and flags any proposal whose buyer or seller appears in a plain-text blocklist file. Reloads the blocklist on a configurable interval — no restart required."
+icon        = "user-x"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=blocked-party"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Blocked Party v1"
+language = "rust"
+order    = 1
+tags     = ["blocklist", "screening"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/blocked-party/v1-rust"
+quickstart = "https://docs.silvana.one/agents/blocked-party/v1-rust/quickstart"

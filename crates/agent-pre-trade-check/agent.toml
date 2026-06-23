@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "compliance"
+order = 1
+
+[agent]
+slug        = "pre-trade-check"
+name        = "Pre-Trade Check"
+description = "Offline rule engine — validates an order (or a stream of orders) against TOML compliance rules: notional, quantity, price band, market and side allow/blocklists. Exits non-zero on reject."
+icon        = "shield-check"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=pre-trade-check"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Pre-Trade Check v1"
+language = "rust"
+order    = 1
+tags     = ["rules", "offline", "validator"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/pre-trade-check/v1-rust"
+quickstart = "https://docs.silvana.one/agents/pre-trade-check/v1-rust/quickstart"

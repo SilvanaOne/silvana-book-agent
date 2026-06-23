@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "data_analytics"
+order = 3
+
+[agent]
+slug        = "oracle"
+name        = "Oracle"
+description = "Scheduled price publisher — polls GetPrice for every configured market on a fixed cadence and emits one record per market per poll to stdout, JSONL file, or webhook."
+icon        = "radio-tower"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=oracle"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Oracle v1"
+language = "rust"
+order    = 1
+tags     = ["price-feed", "scheduled"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/oracle/v1-rust"
+quickstart = "https://docs.silvana.one/agents/oracle/v1-rust/quickstart"

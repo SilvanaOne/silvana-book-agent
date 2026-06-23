@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "tx_flow"
+order = 3
+
+[agent]
+slug        = "readiness-check"
+name        = "Readiness Check"
+description = "Pre-trade gate — verifies required balances, absence of stuck settlements, and presence of TransferPreapproval contracts. Exits non-zero on any failure so deployment scripts can block on it."
+icon        = "circle-check-big"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=readiness-check"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Readiness Check v1"
+language = "rust"
+order    = 1
+tags     = ["gate", "pre-trade"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/readiness-check/v1-rust"
+quickstart = "https://docs.silvana.one/agents/readiness-check/v1-rust/quickstart"

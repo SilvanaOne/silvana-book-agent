@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "risk"
+order = 2
+
+[agent]
+slug        = "risk-alert"
+name        = "Risk Alert"
+description = "Passive risk monitor — polls orderbook state and fires alerts when thresholds (open orders, failed settlements, notional caps) are breached. Does not cancel anything."
+icon        = "bell-ring"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=risk-alert"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Risk Alert v1"
+language = "rust"
+order    = 1
+tags     = ["alerts", "monitoring"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/risk-alert/v1-rust"
+quickstart = "https://docs.silvana.one/agents/risk-alert/v1-rust/quickstart"

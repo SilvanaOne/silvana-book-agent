@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "portfolio_mgmt"
+order = 3
+
+[agent]
+slug        = "portfolio-rebalancing"
+name        = "Portfolio Rebalancing"
+description = "Maintains target weights across instruments. Each cycle values the portfolio in quote currency, compares against targets, and places one rebalance order per breach."
+icon        = "scale"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=portfolio-rebalancing"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Portfolio Rebalancing v1"
+language = "rust"
+order    = 1
+tags     = ["rebalance", "target-weights"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/portfolio-rebalancing/v1-rust"
+quickstart = "https://docs.silvana.one/agents/portfolio-rebalancing/v1-rust/quickstart"

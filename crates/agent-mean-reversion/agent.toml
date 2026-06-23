@@ -1,0 +1,30 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 5
+
+[agent]
+slug        = "mean-reversion"
+name        = "Mean Reversion"
+description = "Trades the snap-back when mid diverges from a rolling EMA by more than a configurable threshold. Places a single limit order at the EMA target and refuses to stack duplicates."
+icon        = "trending-down"
+status      = "active"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=mean-reversion"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Mean Reversion v1"
+language = "rust"
+order    = 1
+tags     = ["ema", "reversion"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/mean-reversion/v1-rust"
+quickstart = "https://docs.silvana.one/agents/mean-reversion/v1-rust/quickstart"
