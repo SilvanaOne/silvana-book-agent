@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/silvana-host" },
+    { "path": "../../packages/db" },
+    { "path": "../../packages/clients" },
+    { "path": "../../packages/strategy" },
+    { "path": "../../packages/risk" },
+    { "path": "../../packages/bybit-client" },
+    { "path": "../../packages/kucoin-client" },
+    { "path": "../../packages/oneswap-client" },
+    { "path": "../../packages/temple-client" },
+    { "path": "../../packages/cantex-client" },
+    { "path": "../../packages/silvana-client" }
+  ],
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

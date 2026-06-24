@@ -1,0 +1,36 @@
+# ── Next dashboard (@arbitrage-agent/web, output: standalone) ─────────────────
+FROM node:20-bookworm-slim AS builder
+WORKDIR /srv
+
+# NEXT_PUBLIC_* are baked into the client bundle at build time.
+ARG NEXT_PUBLIC_API_URL=
+ARG NEXT_PUBLIC_DISABLE_AUTH=1
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+ENV NEXT_PUBLIC_DISABLE_AUTH=${NEXT_PUBLIC_DISABLE_AUTH}
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+RUN find . -name '*.tsbuildinfo' -delete 2>/dev/null || true
+RUN npm ci
+RUN npx prisma generate --schema prisma/schema.prisma
+RUN npx turbo run build --filter=@arbitrage-agent/web
+
+FROM node:20-bookworm-slim AS runner
+WORKDIR /srv
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY --from=builder /srv/apps/web/.next/standalone ./
+COPY --from=builder /srv/apps/web/.next/static ./apps/web/.next/static
+# Standalone server does not bundle `public/` — copy explicitly for assets.
+COPY --from=builder /srv/apps/web/public ./apps/web/public
+
+EXPOSE 3000
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+CMD ["node", "apps/web/server.js"]

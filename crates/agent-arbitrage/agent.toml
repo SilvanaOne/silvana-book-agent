@@ -1,0 +1,35 @@
+schema_version = 1
+
+[category]
+slug = "trading"
+order = 7
+
+[agent]
+slug = "arbitrage"
+name = "Arbitrage Agent"
+description = "Cross-venue spread detection across CEX and Canton DEX venues — scanner, operator console, Balances, and optional live execution via Silvana Vault + proprietary engines."
+icon = "git-compare-arrows"
+status = "preview"
+
+required_balance = "CEX + Canton wallet keys via Silvana Vault"
+supported_assets = "CC, USDT, USDCx, CBTC"
+supported_projects = "Silvana, Canton"
+
+[[agent.cta]]
+label = "Order Agent"
+url = "https://silvana.one/order-agent?ref=arbitrage"
+
+[[agent.cta]]
+label = "Contact Us"
+url = "https://silvana.one/contact"
+
+[template]
+name = "Arbitrage Agent v1"
+language = "typescript"
+order = 1
+tags = ["arbitrage", "cross-venue", "scanner"]
+demo = "https://arbitrage.spcatcher.cfd"
+
+[template.resources]
+docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage"
+quickstart = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage#quick-start"

@@ -1,0 +1,42 @@
+# Local dev infrastructure: Postgres + Redis.
+#
+# Up:    docker compose -f infra/docker-compose.yml up -d
+# Down:  docker compose -f infra/docker-compose.yml down
+# Reset: docker compose -f infra/docker-compose.yml down -v
+#
+# Postgres listens on host port 5434 (not 5432) to avoid conflict with any
+# system Postgres and to coexist with BAM (5433) on the same machine.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: arb-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: arbitrage_agent
+    volumes:
+      - pgdata_arbitrage_agent:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d arbitrage_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: arb-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata_arbitrage_agent:

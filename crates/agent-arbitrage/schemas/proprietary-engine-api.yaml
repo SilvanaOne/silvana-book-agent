@@ -1,0 +1,587 @@
+openapi: 3.1.0
+info:
+  title: Arbitrage Agent — Proprietary Engine API
+  version: 0.1.0
+  description: >
+    Contract between the OPEN-CORE arbitrage agent and the three PROPRIETARY
+    components (executor, rebalancer, signing vault). This file is the single
+    source of truth for the HTTP surface — open-core typed clients
+    (`packages/clients/`) and the proprietary engines both conform to it.
+
+    Only the SPEC lives in open core (it describes the wire format, not the
+    implementation). Engine bodies live in separate private repos.
+    See md_docs/12-component-split-open-vs-proprietary.md and md_docs/upgrade-plan.md.
+
+    Auth: every request carries an HMAC-SHA256 signature derived from the
+    per-engine shared secret over `${timestamp}\n${METHOD}\n${path}\n${body}`,
+    sent as `X-Arb-Timestamp` + `X-Arb-Signature: sha256=<hex>`. Transport is
+    mTLS in production (out of scope for this contract).
+
+servers:
+  - url: http://localhost:4001
+    description: executor (dev mock)
+  - url: http://localhost:4002
+    description: rebalancer (dev mock)
+  - url: http://localhost:4003
+    description: signer (dev mock)
+
+tags:
+  - name: executor
+    description: Two-leg trade execution (TS). CEX legs run SEQUENTIALLY (buy→fill→sell).
+  - name: rebalancer
+    description: Cross-venue inventory routing + hedge (Python).
+  - name: signer
+    description: Secrets & signing vault. Key distribution model (B) — engines fetch scoped runtime bundles.
+  - name: common
+    description: Shared endpoints.
+
+paths:
+  # ───────────────────────────── EXECUTOR ─────────────────────────────
+  /execute-dual-trade:
+    post:
+      tags: [executor]
+      operationId: executeDualTrade
+      summary: Submit a two-leg arbitrage trade for execution.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DualTradeRequest' }
+      responses:
+        '202':
+          description: Accepted and queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DualTradeAccepted' }
+  /execute-dual-trade/{tradeId}:
+    get:
+      tags: [executor]
+      operationId: getDualTrade
+      summary: Poll the status + diagnostics of a submitted trade.
+      parameters: [{ $ref: '#/components/parameters/TradeId' }]
+      responses:
+        '200':
+          description: Current trade state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DualTradeStatus' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /execute-dual-trade/{tradeId}/abort:
+    post:
+      tags: [executor]
+      operationId: abortDualTrade
+      summary: Best-effort abort of an in-flight trade.
+      parameters: [{ $ref: '#/components/parameters/TradeId' }]
+      responses:
+        '200':
+          description: Abort outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AbortResult' }
+  /emergency-stop:
+    post:
+      tags: [executor]
+      operationId: emergencyStop
+      summary: Kill-switch — stop accepting new trades and abort all in-flight.
+      responses:
+        '200':
+          description: Stop outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmergencyStopResult' }
+
+  # ──────────────────────────── REBALANCER ────────────────────────────
+  /rebalance:
+    post:
+      tags: [rebalancer]
+      operationId: requestRebalance
+      summary: Request a cross-venue inventory move.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RebalanceRequest' }
+      responses:
+        '202':
+          description: Accepted and queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RebalanceAccepted' }
+  /rebalance/{jobId}:
+    get:
+      tags: [rebalancer]
+      operationId: getRebalanceJob
+      summary: Poll a rebalance job.
+      parameters: [{ $ref: '#/components/parameters/JobId' }]
+      responses:
+        '200':
+          description: Current job state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RebalanceJob' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /inventory:
+    get:
+      tags: [rebalancer]
+      operationId: getInventory
+      summary: Current inventory snapshots per venue/asset.
+      responses:
+        '200':
+          description: Inventory snapshots.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InventoryResponse' }
+  /skew:
+    get:
+      tags: [rebalancer]
+      operationId: getSkew
+      summary: Inventory skew per venue/asset vs target.
+      responses:
+        '200':
+          description: Skew report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SkewResponse' }
+  /hedge:
+    post:
+      tags: [rebalancer]
+      operationId: openHedge
+      summary: Open a perp hedge position.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HedgeRequest' }
+      responses:
+        '200':
+          description: Hedge opened.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HedgeResult' }
+  /hedge/close/{hedgeId}:
+    post:
+      tags: [rebalancer]
+      operationId: closeHedge
+      summary: Close a perp hedge position.
+      parameters:
+        - name: hedgeId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Hedge closed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [closed]
+                properties:
+                  closed: { type: boolean }
+                  realizedPnlUsd: { type: number }
+
+  # ────────────────────────────── SIGNER ──────────────────────────────
+  /pubkey:
+    get:
+      tags: [signer]
+      operationId: getPublicKey
+      summary: RSA public key (PEM) for browser-side secret encryption.
+      responses:
+        '200':
+          description: Public key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicKeyResponse' }
+  /secrets/cex:
+    post:
+      tags: [signer]
+      operationId: saveCexSecret
+      summary: Store an RSA-encrypted CEX API key set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveCexSecretRequest' }
+      responses:
+        '204': { description: Stored. }
+  /secrets/wallet:
+    post:
+      tags: [signer]
+      operationId: saveWalletSecret
+      summary: Store an RSA-encrypted wallet private key or BIP39 seed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveWalletSecretRequest' }
+      responses:
+        '204': { description: Stored. }
+  /secrets/status:
+    get:
+      tags: [signer]
+      operationId: getSecretsStatus
+      summary: Masked list of which secret slots are filled.
+      responses:
+        '200':
+          description: Masked status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SecretsStatusResponse' }
+  /runtime/bundle:
+    post:
+      tags: [signer]
+      operationId: getRuntimeBundle
+      summary: >
+        Model (B) key distribution — return the scoped decrypted secrets for a
+        given engine, loaded into engine memory at boot / on rotation. Signing
+        happens locally inside the engine; the vault is not in the per-order path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeBundleRequest' }
+      responses:
+        '200':
+          description: Scoped decrypted secrets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeBundleResponse' }
+
+  # ────────────────────────────── COMMON ──────────────────────────────
+  /health:
+    get:
+      tags: [common]
+      operationId: getHealth
+      summary: Liveness + readiness.
+      responses:
+        '200':
+          description: Health.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+components:
+  parameters:
+    TradeId:
+      name: tradeId
+      in: path
+      required: true
+      schema: { type: string }
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { type: string }
+        detail: { type: string }
+
+    # ── shared ──
+    LegStatus:
+      type: string
+      enum: [pending, success, failed]
+    TradeState:
+      type: string
+      enum: [queued, preflight, submitted, buy_filled, executed, partial, failed, skipped, aborted]
+    Side:
+      type: string
+      enum: [buy, sell]
+
+    SpreadOpportunityDTO:
+      type: object
+      additionalProperties: false
+      required: [baseSymbol, quoteSymbol, buyVenue, sellVenue, buyPrice, sellPrice, spreadPct, estimatedProfitUsd, detectedAt]
+      properties:
+        baseSymbol: { type: string, example: CC }
+        quoteSymbol: { type: string, example: USDT }
+        buyVenue: { type: string, example: bybit }
+        sellVenue: { type: string, example: kucoin }
+        buyPrice: { type: number }
+        sellPrice: { type: number }
+        spreadPct: { type: number }
+        estimatedProfitUsd: { type: number }
+        detectedAt: { type: integer, description: epoch ms }
+
+    # ── executor ──
+    DualTradeRequest:
+      type: object
+      additionalProperties: false
+      required: [opportunity, maxSlippageBps, safetyBufferBps, dryRun, idempotencyKey]
+      properties:
+        opportunity: { $ref: '#/components/schemas/SpreadOpportunityDTO' }
+        maxSlippageBps: { type: integer, minimum: 0 }
+        safetyBufferBps: { type: integer, minimum: 0 }
+        dryRun: { type: boolean }
+        idempotencyKey: { type: string }
+    DualTradeAccepted:
+      type: object
+      additionalProperties: false
+      required: [tradeId, status]
+      properties:
+        tradeId: { type: string }
+        status: { type: string, enum: [queued] }
+    LegDetail:
+      type: object
+      additionalProperties: false
+      required: [venue, side, status]
+      properties:
+        venue: { type: string }
+        side: { $ref: '#/components/schemas/Side' }
+        status: { $ref: '#/components/schemas/LegStatus' }
+        orderId: { type: string }
+        clientOrderId: { type: string }
+        qty: { type: number }
+        price: { type: number }
+        usdt: { type: number }
+        fee: { type: number }
+        error: { type: string }
+    DualTradeStatus:
+      type: object
+      additionalProperties: false
+      required: [tradeId, status, partialExecution]
+      properties:
+        tradeId: { type: string }
+        status: { $ref: '#/components/schemas/TradeState' }
+        partialExecution: { type: boolean }
+        legBuy: { $ref: '#/components/schemas/LegDetail' }
+        legSell: { $ref: '#/components/schemas/LegDetail' }
+        detected:
+          type: object
+          additionalProperties: false
+          properties:
+            buyPrice: { type: number }
+            sellPrice: { type: number }
+            spreadPct: { type: number }
+        actual:
+          type: object
+          additionalProperties: false
+          properties:
+            buyPrice: { type: number }
+            sellPrice: { type: number }
+            buySlippagePct: { type: number }
+            sellSlippagePct: { type: number }
+        profit:
+          type: object
+          additionalProperties: false
+          properties:
+            usdtDiff: { type: number }
+            tokenPct: { type: number }
+        timing:
+          type: object
+          additionalProperties: false
+          properties:
+            buyExecutedAt: { type: integer }
+            sellExecutedAt: { type: integer }
+            totalExecutionMs: { type: integer }
+        failReason: { type: string }
+    AbortResult:
+      type: object
+      additionalProperties: false
+      required: [aborted]
+      properties:
+        aborted: { type: boolean }
+        cleanupActions:
+          type: array
+          items: { type: string }
+    EmergencyStopResult:
+      type: object
+      additionalProperties: false
+      required: [stopped, inflightAborted]
+      properties:
+        stopped: { type: boolean }
+        inflightAborted:
+          type: array
+          items: { type: string }
+
+    # ── rebalancer ──
+    RebalanceRequest:
+      type: object
+      additionalProperties: false
+      required: [fromVenue, toVenue, asset, amountNative, idempotencyKey]
+      properties:
+        fromVenue: { type: string }
+        toVenue: { type: string }
+        asset: { type: string, example: CC }
+        amountNative: { type: string, description: decimal string }
+        maxRouteCostBps: { type: integer }
+        deadlineUnix: { type: integer }
+        idempotencyKey: { type: string }
+    RebalanceAccepted:
+      type: object
+      additionalProperties: false
+      required: [jobId]
+      properties:
+        jobId: { type: string }
+        estimatedArrivalTs: { type: integer }
+        estimatedCostBps: { type: integer }
+        routeSummary: { type: string }
+    RebalanceLeg:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string, example: withdraw }
+        venue: { type: string }
+        asset: { type: string }
+        amountNative: { type: string }
+        status: { type: string }
+        txRef: { type: string }
+    RebalanceJob:
+      type: object
+      additionalProperties: false
+      required: [jobId, status]
+      properties:
+        jobId: { type: string }
+        status: { type: string, enum: [queued, inflight, completed, failed] }
+        legs:
+          type: array
+          items: { $ref: '#/components/schemas/RebalanceLeg' }
+    InventorySnapshot:
+      type: object
+      additionalProperties: false
+      required: [venue, asset, free, locked]
+      properties:
+        venue: { type: string }
+        asset: { type: string }
+        free: { type: string }
+        locked: { type: string }
+        lastUpdatedTs: { type: integer }
+    InventoryResponse:
+      type: object
+      additionalProperties: false
+      required: [snapshots]
+      properties:
+        snapshots:
+          type: array
+          items: { $ref: '#/components/schemas/InventorySnapshot' }
+    SkewEntry:
+      type: object
+      additionalProperties: false
+      required: [venue, asset, skewPct]
+      properties:
+        venue: { type: string }
+        asset: { type: string }
+        currentUsd: { type: number }
+        targetUsd: { type: number }
+        skewPct: { type: number }
+        actionHint: { type: string }
+    SkewResponse:
+      type: object
+      additionalProperties: false
+      required: [skews]
+      properties:
+        skews:
+          type: array
+          items: { $ref: '#/components/schemas/SkewEntry' }
+    HedgeRequest:
+      type: object
+      additionalProperties: false
+      required: [side, venue, asset, notionalUsd]
+      properties:
+        side: { type: string, enum: [short, long] }
+        venue: { type: string, example: bybit }
+        asset: { type: string, example: CC }
+        notionalUsd: { type: number }
+    HedgeResult:
+      type: object
+      additionalProperties: false
+      required: [hedgeId]
+      properties:
+        hedgeId: { type: string }
+        positionSize: { type: number }
+        entryPrice: { type: number }
+
+    # ── signer ──
+    PublicKeyResponse:
+      type: object
+      additionalProperties: false
+      required: [pem, keyId]
+      properties:
+        pem: { type: string }
+        keyId: { type: string }
+    SaveCexSecretRequest:
+      type: object
+      additionalProperties: false
+      required: [venue, keyId, apiKeyCiphertext, secretCiphertext]
+      properties:
+        venue: { type: string }
+        keyId: { type: string, description: rsaKeyId the ciphertext was sealed with }
+        apiKeyCiphertext: { type: string }
+        secretCiphertext: { type: string }
+        passphraseCiphertext: { type: string }
+    SaveWalletSecretRequest:
+      type: object
+      additionalProperties: false
+      required: [label, chain, keyId]
+      properties:
+        label: { type: string }
+        chain: { type: string, example: evm }
+        keyId: { type: string }
+        privKeyCiphertext: { type: string }
+        seedCiphertext: { type: string }
+    SecretSlot:
+      type: object
+      additionalProperties: false
+      required: [id, kind, filled]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [cex, wallet] }
+        venue: { type: string }
+        label: { type: string }
+        filled: { type: boolean }
+        rsaKeyId: { type: string }
+    SecretsStatusResponse:
+      type: object
+      additionalProperties: false
+      required: [slots]
+      properties:
+        slots:
+          type: array
+          items: { $ref: '#/components/schemas/SecretSlot' }
+    RuntimeBundleRequest:
+      type: object
+      additionalProperties: false
+      required: [engine]
+      properties:
+        engine: { type: string, enum: [executor, rebalancer] }
+    DecryptedSecret:
+      type: object
+      additionalProperties: false
+      required: [id, kind]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [cex, wallet] }
+        venue: { type: string }
+        label: { type: string }
+        apiKey: { type: string }
+        apiSecret: { type: string }
+        passphrase: { type: string }
+        privKey: { type: string }
+    RuntimeBundleResponse:
+      type: object
+      additionalProperties: false
+      required: [engine, secrets]
+      properties:
+        engine: { type: string, enum: [executor, rebalancer] }
+        secrets:
+          type: array
+          items: { $ref: '#/components/schemas/DecryptedSecret' }
+
+    # ── common ──
+    Health:
+      type: object
+      additionalProperties: true
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, degraded, down] }

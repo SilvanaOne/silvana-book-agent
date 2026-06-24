@@ -1,0 +1,31 @@
+# ── API (@arbitrage-agent/api) ───────────────────────────────────────────────
+FROM node:20-bookworm-slim AS builder
+WORKDIR /srv
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+RUN find . -name '*.tsbuildinfo' -delete 2>/dev/null || true
+RUN npm ci
+RUN npx prisma generate --schema prisma/schema.prisma
+RUN npx turbo run build --filter=@arbitrage-agent/api
+
+FROM builder AS pruned
+WORKDIR /srv
+RUN npm prune --omit=dev
+
+FROM node:20-bookworm-slim AS runner
+WORKDIR /srv
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=pruned /srv /srv
+
+ENV NODE_ENV=production
+EXPOSE 3000
+
+CMD ["node", "apps/api/dist/main.js"]

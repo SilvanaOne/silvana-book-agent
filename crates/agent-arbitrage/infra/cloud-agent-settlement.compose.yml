@@ -1,0 +1,22 @@
+# Long-running settlement mode overlay (Sprint 6+ deliverable).
+#
+# Layers on top of cloud-agent.compose.yml:
+#
+#   docker compose \
+#     -f infra/docker-compose.yml \
+#     -f infra/cloud-agent.compose.yml \
+#     -f infra/cloud-agent-settlement.compose.yml \
+#     up -d --build cloud-agent
+#
+# Switches the sidecar from passive `info party` to long-running
+# `cloud-agent agent --settlement-only` mode. This is required for production
+# arbitrage execution with Canton-side legs.
+#
+# Reference: BAM's `cloud-agent-variant-a.compose.yml`.
+
+services:
+  cloud-agent:
+    restart: unless-stopped
+    environment:
+      AGENT_DIR: /agent
+      CLOUD_AGENT_CMD: "agent --settlement-only"

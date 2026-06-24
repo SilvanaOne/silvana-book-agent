@@ -1,0 +1,14 @@
+node_modules
+.git
+.turbo
+.next
+**/.next
+**/dist
+**/*.tsbuildinfo
+.run
+logs
+*.log
+.env
+.env.*
+!.env.example
+infra/deploy/.env.stack

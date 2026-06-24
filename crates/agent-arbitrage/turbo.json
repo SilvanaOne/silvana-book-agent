@@ -1,0 +1,69 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalPassThroughEnv": [
+    "PORT",
+    "WEB_PORT",
+    "HOST",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "TOKEN_SECRET",
+    "DISABLE_AUTH",
+    "OPERATOR_USERNAME",
+    "OPERATOR_PASSWORD_BOOTSTRAP",
+    "LOG_LEVEL",
+    "STRATEGY_MODE",
+    "SCANNER_PERSIST",
+    "SCAN_INTERVAL_MS",
+    "TARGET_SPREAD_PERCENT",
+    "MAX_SPREAD_PERCENT",
+    "TRADE_SIZE_USD",
+    "FEED_POLL_MS",
+    "EXECUTOR_API_URL",
+    "EXECUTOR_API_TOKEN",
+    "REBALANCER_API_URL",
+    "REBALANCER_API_TOKEN",
+    "SIGNER_API_URL",
+    "SIGNER_API_TOKEN",
+    "EXECUTOR_MAX_SLIPPAGE_BPS",
+    "EXECUTOR_SAFETY_BUFFER_BPS",
+    "SKEW_POLL_CYCLES",
+    "RISK_*",
+    "ONESWAP_*",
+    "TEMPLE_*",
+    "CANTEX_*",
+    "SILVANA_*",
+    "CROSS_CLUSTER_ENABLED",
+    "BITGET_ENABLED",
+    "HYPERLIQUID_ENABLED",
+    "BINANCE_ENABLED",
+    "TOOBIT_ENABLED",
+    "AI_ASSISTANT_*",
+    "AI_PROVIDER",
+    "NEXT_PUBLIC_*"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"],
+      "inputs": ["src/**", "tsconfig.json", "package.json"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": ["src/**", "test/**", "tsconfig.json", "package.json"]
+    },
+    "lint": {
+      "inputs": ["src/**", "test/**", ".eslintrc*", "eslint.config.*"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "inputs": ["src/**", "test/**", "tsconfig*.json"]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

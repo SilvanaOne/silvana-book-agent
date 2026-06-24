@@ -1,0 +1,43 @@
+# Silvana cloud-agent sidecar overlay (Sprint 3+ deliverable).
+#
+# Up together with main infra:
+#   docker compose -f infra/docker-compose.yml -f infra/cloud-agent.compose.yml up -d
+#
+# This file describes the `cloud-agent` Rust sidecar that provides Canton-side
+# operations (DvP, multicall, CIP-56, two-phase signing) for the entire stack:
+# open-core scanner, proprietary executor, proprietary rebalancer.
+#
+# All three TS processes talk to Canton ONLY through this sidecar — no direct
+# ledger connections. See md_docs/14-silvana-host-runtime.md.
+#
+# Sprint 0 status: placeholder. To activate:
+#   1) cd infra/silvana-agent && ./prepare.sh  (downloads cloud-agent binary)
+#   2) Configure .env with Silvana invite-code, then ./onboard.sh
+#   3) Verify runtime/agent.toml exists
+#   4) docker compose ... up -d
+#
+# Reference: BAM project at
+#   /home/mdb1/business/web3soft/canton/batch_orderbook_management_agent/
+#   batch-order-agent/infra/cloud-agent.compose.yml
+
+services:
+  cloud-agent:
+    image: arbitrage-cloud-agent:dev
+    build:
+      context: ./silvana-agent
+      dockerfile: Dockerfile
+    container_name: arb-cloud-agent
+    init: true
+    restart: "no" # Step 3 (settlement mode) switches to unless-stopped
+    environment:
+      AGENT_DIR: /agent
+      CLOUD_AGENT_CMD: "info party" # Step 2 — passive verification
+    volumes:
+      - ./silvana-agent/runtime:/agent:rw
+    networks:
+      - arb-backend
+
+networks:
+  arb-backend:
+    name: arb-backend
+    driver: bridge

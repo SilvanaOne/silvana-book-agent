@@ -1,0 +1,30 @@
+{
+  "name": "@arbitrage-agent/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate --schema=../../prisma/schema.prisma",
+    "db:migrate:dev": "prisma migrate dev --schema=../../prisma/schema.prisma",
+    "db:migrate:deploy": "prisma migrate deploy --schema=../../prisma/schema.prisma",
+    "db:studio": "prisma studio --schema=../../prisma/schema.prisma",
+    "clean": "rm -rf dist .turbo *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.0.0",
+    "typescript": "^5.7.0"
+  }
+}

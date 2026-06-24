@@ -1,0 +1,33 @@
+{
+  "name": "@arbitrage-agent/scanner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@arbitrage-agent/shared": "*",
+    "@arbitrage-agent/silvana-host": "*",
+    "@arbitrage-agent/db": "*",
+    "@arbitrage-agent/clients": "*",
+    "@arbitrage-agent/strategy": "*",
+    "@arbitrage-agent/risk": "*",
+    "@arbitrage-agent/bybit-client": "*",
+    "@arbitrage-agent/kucoin-client": "*",
+    "@arbitrage-agent/oneswap-client": "*",
+    "@arbitrage-agent/temple-client": "*",
+    "@arbitrage-agent/cantex-client": "*",
+    "@arbitrage-agent/silvana-client": "*",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,290 @@
+// Arbitrage Agent — initial Prisma schema (Sprint 0)
+//
+// This schema covers ONLY open-core state: detected spreads, opportunities, audit
+// trail from external engines. Proprietary executor and rebalancer have their own
+// independent databases — see md_docs/12-component-split-open-vs-proprietary.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Venues, instruments, markets — static configuration
+// ────────────────────────────────────────────────────────────────────────────
+
+model Venue {
+  id          String   @id // 'bybit' | 'kucoin' | 'temple' | 'oneswap' | 'cantex' | 'silvana' | 'bitget' | 'hyperliquid'
+  type        String // 'cex-spot' | 'cex-perp' | 'canton-clob' | 'canton-amm' | 'perp-dex'
+  displayName String
+  enabled     Boolean  @default(true)
+  config      Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  markets    Market[]
+  priceTicks PriceTick[]
+  spreadsBuy  Spread[] @relation("spreadBuyFrom")
+  spreadsSell Spread[] @relation("spreadSellTo")
+}
+
+model Instrument {
+  id        String @id // canonical symbol: 'CC', 'USDCx', 'USDT', 'CBTC'
+  symbol    String
+  decimals  Int
+  chainId   String // 'canton' | 'ethereum' | 'arbitrum' | 'bsc' | 'solana' | 'cex'
+  metadata  Json   @default("{}")
+  createdAt DateTime @default(now())
+
+  marketsAsBase  Market[] @relation("marketBase")
+  marketsAsQuote Market[] @relation("marketQuote")
+}
+
+model Market {
+  id      String @id @default(cuid())
+  venueId String
+  baseId  String
+  quoteId String
+
+  venue Venue      @relation(fields: [venueId], references: [id])
+  base  Instrument @relation("marketBase", fields: [baseId], references: [id])
+  quote Instrument @relation("marketQuote", fields: [quoteId], references: [id])
+
+  enabled   Boolean  @default(true)
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  priceTicks PriceTick[]
+
+  @@unique([venueId, baseId, quoteId])
+  @@index([venueId])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Live state — price ticks, spread detection log
+// ────────────────────────────────────────────────────────────────────────────
+
+model PriceTick {
+  id        BigInt   @id @default(autoincrement())
+  venueId   String
+  marketId  String
+  ts        DateTime @default(now())
+  bid       Decimal  @db.Decimal(36, 18)
+  ask       Decimal  @db.Decimal(36, 18)
+  mid       Decimal  @db.Decimal(36, 18)
+  metadata  Json     @default("{}")
+
+  venue  Venue  @relation(fields: [venueId], references: [id])
+  market Market @relation(fields: [marketId], references: [id])
+
+  @@index([marketId, ts])
+  @@index([ts])
+}
+
+model Spread {
+  id            BigInt   @id @default(autoincrement())
+  ts            DateTime @default(now())
+  basePairKey   String // canonical 'CC/USDT' etc.
+  buyVenueId    String
+  sellVenueId   String
+  buyPrice      Decimal  @db.Decimal(36, 18)
+  sellPrice     Decimal  @db.Decimal(36, 18)
+  spreadBps     Int
+  estProfitUsd  Decimal  @db.Decimal(36, 18)
+  acted         Boolean  @default(false) // did we send to executor?
+  opportunityId String?
+
+  buyVenue  Venue       @relation("spreadBuyFrom", fields: [buyVenueId], references: [id])
+  sellVenue Venue       @relation("spreadSellTo", fields: [sellVenueId], references: [id])
+  opportunity Opportunity? @relation(fields: [opportunityId], references: [id])
+
+  @@index([basePairKey, ts])
+  @@index([ts])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Opportunities sent to proprietary executor + audit from external engines
+// ────────────────────────────────────────────────────────────────────────────
+
+model Opportunity {
+  id              String   @id @default(cuid())
+  detectedAt      DateTime @default(now())
+  basePairKey     String
+  buyVenueId      String
+  sellVenueId     String
+  spreadBps       Int
+  estProfitUsd    Decimal  @db.Decimal(36, 18)
+  status          String   @default("queued") // queued | submitted | executed | partial | failed | skipped
+  executorTradeId String?  @unique
+  realizedProfitUsd Decimal? @db.Decimal(36, 18)
+  errorMessage    String?
+
+  spreads   Spread[]
+  audit     TradeAudit[]
+
+  @@index([detectedAt])
+  @@index([status])
+}
+
+model TradeAudit {
+  id              BigInt   @id @default(autoincrement())
+  opportunityId   String?
+  executorTradeId String?
+  ts              DateTime @default(now())
+  eventType       String // 'submitted' | 'leg_a_filled' | 'leg_b_filled' | 'failed' | etc.
+  legId           String?
+  venueId         String?
+  payload         Json     @default("{}")
+
+  opportunity Opportunity? @relation(fields: [opportunityId], references: [id])
+
+  @@index([opportunityId, ts])
+  @@index([ts])
+}
+
+// Per-trade execution summary — one row per dual-trade attempt. Fields mirror
+// the executor's diagnostics payload (per-leg model from cex-arbitrager-features
+// `tradeStatus`): per-leg status, detected-vs-actual prices, slippage, profit,
+// partial flag. Distinct from TradeAudit (append-only event log). The executor
+// reports these via GET /execute-dual-trade/:id. See md_docs/upgrade-plan.md §U0.
+model TradeExecution {
+  id               BigInt   @id @default(autoincrement())
+  executorTradeId  String?  @unique
+  opportunityId    String?
+  ts               DateTime @default(now())
+  ticker           String // e.g. "CC/USDT"
+  buyVenueId       String
+  sellVenueId      String
+  status           String // SUCCESS | PARTIAL | FAILED | SKIPPED
+  partialExecution Boolean  @default(false)
+
+  // Detected (at signal time)
+  detectedBuyPrice  Decimal? @db.Decimal(36, 18)
+  detectedSellPrice Decimal? @db.Decimal(36, 18)
+  spreadBps         Int?
+
+  // Leg: buy (executes first — market-by-quote)
+  legBuyStatus  String? // pending | success | failed
+  legBuyOrderId String?
+  legBuyQty     Decimal? @db.Decimal(36, 18)
+  legBuyUsdt    Decimal? @db.Decimal(36, 18)
+  legBuyError   String?
+
+  // Leg: sell (executes after buy fill is confirmed)
+  legSellStatus  String?
+  legSellOrderId String?
+  legSellQty     Decimal? @db.Decimal(36, 18)
+  legSellUsdt    Decimal? @db.Decimal(36, 18)
+  legSellError   String?
+
+  // Execution actuals
+  actualBuyPrice  Decimal?  @db.Decimal(36, 18)
+  actualSellPrice Decimal?  @db.Decimal(36, 18)
+  buySlippageBps  Int?
+  sellSlippageBps Int?
+  profitUsdtDiff  Decimal?  @db.Decimal(36, 18)
+  profitTokenPct  Decimal?  @db.Decimal(36, 18)
+  buyExecutedAt   DateTime?
+  sellExecutedAt  DateTime?
+  totalExecMs     Int?
+  failReason      String?
+
+  @@index([ts])
+  @@index([status])
+  @@index([opportunityId])
+}
+
+model RebalanceAudit {
+  id           BigInt   @id @default(autoincrement())
+  jobId        String? // from rebalancer engine
+  ts           DateTime @default(now())
+  fromVenueId  String?
+  toVenueId    String?
+  asset        String
+  amountNative Decimal? @db.Decimal(36, 18)
+  status       String // 'queued' | 'inflight' | 'completed' | 'failed'
+  payload      Json     @default("{}")
+
+  @@index([jobId])
+  @@index([ts])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Inventory snapshots (read from engines via their APIs)
+// ────────────────────────────────────────────────────────────────────────────
+
+model InventorySnapshot {
+  id        BigInt   @id @default(autoincrement())
+  venueId   String
+  asset     String
+  free      Decimal  @db.Decimal(36, 18)
+  locked    Decimal  @db.Decimal(36, 18)
+  ts        DateTime @default(now())
+
+  @@index([venueId, asset, ts])
+  @@index([ts])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Operator config + audit log
+// ────────────────────────────────────────────────────────────────────────────
+
+model Config {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String?
+}
+
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  ts        DateTime @default(now())
+  actor     String // 'system' | 'operator:<username>'
+  action    String
+  payload   Json     @default("{}")
+
+  @@index([ts])
+  @@index([actor, ts])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Operator auth (HMAC-signed tokens) + RSA keypair for UI session secrets
+// ────────────────────────────────────────────────────────────────────────────
+
+model Operator {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  enabled      Boolean  @default(true)
+  preferredLanguage String @default("en")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model RsaKeypair {
+  id            Int      @id @default(autoincrement())
+  publicKeyPem  String
+  privateKeyPem String
+  purpose       String // 'ui-session' (open core never stores CEX/Canton keys!)
+  createdAt     DateTime @default(now())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-venue connection health — one row per venue, upserted by the scanner
+// each cycle. Lets the operator UI show live per-venue status without the
+// scanner and API sharing in-memory state.
+// ────────────────────────────────────────────────────────────────────────────
+
+model VenueHealth {
+  venueId       String    @id
+  lastSuccessAt DateTime?
+  lastErrorAt   DateTime?
+  lastError     String?
+  successStreak Int       @default(0)
+  errorStreak   Int       @default(0)
+  updatedAt     DateTime  @updatedAt
+}

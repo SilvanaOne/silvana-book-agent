@@ -1,0 +1,71 @@
+# Local dev mock of the three PROPRIETARY engines (executor / rebalancer / signer).
+#
+# Up:   docker compose -f infra/dev/mock-engines-compose.yml up -d
+# Down: docker compose -f infra/dev/mock-engines-compose.yml down
+#
+# Each service is a Stoplight Prism mock driven by the OpenAPI contract
+# (schemas/proprietary-engine-api.yaml) — there is NO engine logic here, only the
+# spec served back as generated responses. This lets open core wire and test the
+# end-to-end path (scanner → executor, Wallet UI → signer) BEFORE the real
+# proprietary engines exist. Per md_docs/12, a dev mock of the engines is
+# explicitly allowed in the open-core repo (it is config, not engine code).
+#
+# Ports match .env.example: executor 4001, rebalancer 4002, signer 4003.
+#
+# Plus a separate Postgres (host port 5435) with one database per engine,
+# mirroring the "each engine owns its own isolated DB" rule. The Prism mocks do
+# not use it; it is here so the engine skeletons (U1–U3, in their own private
+# repos) can point at it during local dev.
+
+services:
+  mock-executor:
+    image: stoplight/prism:5
+    container_name: arb-mock-executor
+    restart: unless-stopped
+    command: mock -d -m false -h 0.0.0.0 -p 4010 /api/proprietary-engine-api.yaml
+    ports:
+      - "4001:4010"
+    volumes:
+      - ../../schemas:/api:ro
+
+  mock-rebalancer:
+    image: stoplight/prism:5
+    container_name: arb-mock-rebalancer
+    restart: unless-stopped
+    command: mock -d -m false -h 0.0.0.0 -p 4010 /api/proprietary-engine-api.yaml
+    ports:
+      - "4002:4010"
+    volumes:
+      - ../../schemas:/api:ro
+
+  mock-signer:
+    image: stoplight/prism:5
+    container_name: arb-mock-signer
+    restart: unless-stopped
+    command: mock -d -m false -h 0.0.0.0 -p 4010 /api/proprietary-engine-api.yaml
+    ports:
+      - "4003:4010"
+    volumes:
+      - ../../schemas:/api:ro
+
+  engines-postgres:
+    image: postgres:16-alpine
+    container_name: arb-engines-postgres
+    restart: unless-stopped
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata_arb_engines:/var/lib/postgresql/data
+      - ./init-engine-dbs.sql:/docker-entrypoint-initdb.d/init-engine-dbs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata_arb_engines:

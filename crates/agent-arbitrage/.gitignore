@@ -1,0 +1,148 @@
+# =====================================================================
+# PROPRIETARY COMPONENTS — НИКОГДА не commit'ить
+# (per md_docs/12-component-split-open-vs-proprietary.md)
+# =====================================================================
+# Three closed-source components that must live in separate private repos.
+# If they appear as subdirectories here (for local dev convenience),
+# this section prevents accidental commit to the open-source core.
+
+# Proprietary executor — two-leg trade execution engine
+/arbitrage-executor/
+/arbitrage-executor/**
+arbitrage-executor/
+**/arbitrage-executor/
+
+/silvana-executor/
+/silvana-executor/**
+silvana-executor/
+**/silvana-executor/
+
+/silvana-rebalancer/
+/silvana-rebalancer/**
+silvana-rebalancer/
+**/silvana-rebalancer/
+
+# Proprietary rebalancer — legacy local checkout (prefer canton/silvana-rebalancer/)
+/rebalancer/
+/rebalancer/**
+rebalancer/
+**/rebalancer/
+
+# Proprietary rebalancer — cross-venue inventory routing engine (legacy name)
+/arbitrage-rebalancer/
+/arbitrage-rebalancer/**
+arbitrage-rebalancer/
+**/arbitrage-rebalancer/
+
+# Proprietary signer — secrets & signing vault (4th component, per upgrade-plan.md)
+/arbitrage-signer/
+/arbitrage-signer/**
+arbitrage-signer/
+**/arbitrage-signer/
+
+# Generic safety net — anything tagged proprietary/private/closed-source
+/proprietary/
+/private/
+/closed-source/
+*.proprietary
+*.proprietary.*
+
+# Proprietary engine config / secrets / build artifacts
+**/executor-config*.json
+**/rebalancer-config*.json
+**/cex-api-secrets*.json
+**/canton-wallet*.json
+**/secret_rsa_keypair*.json
+**/proprietary-*.env
+
+# =====================================================================
+# Secrets and credentials
+# =====================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets/
+data/secrets/
+
+# Canton / Silvana onboarding artifacts (runtime — not catalog metadata)
+party-keys/
+silvana-onboard-state/
+infra/silvana-agent/runtime/
+**/runtime/agent.toml
+arbitrage-agent.toml
+
+# =====================================================================
+# Node.js / TypeScript
+# =====================================================================
+node_modules/
+dist/
+build/
+out/
+.turbo/
+.next/
+*.tsbuildinfo
+
+# pnpm/yarn lock variants (we use npm)
+yarn.lock
+pnpm-lock.yaml
+
+# =====================================================================
+# Database
+# =====================================================================
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+prisma/migrations/dev_*
+
+# =====================================================================
+# Runtime state (created by ./run.sh — PID + chosen ports)
+# =====================================================================
+.run/
+
+# =====================================================================
+# Logs
+# =====================================================================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =====================================================================
+# Coverage / test artifacts
+# =====================================================================
+coverage/
+.nyc_output/
+*.lcov
+
+# =====================================================================
+# IDE / editor
+# =====================================================================
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# =====================================================================
+# Temporary / scratch
+# =====================================================================
+tmp/
+.tmp/
+scratch/
+.cache/
+
+# =====================================================================
+# Deployment artifacts
+# =====================================================================
+.deploy/
+*.tar.gz
+*.zip

@@ -1,0 +1,35 @@
+# Overlay: arbitrage-gateway за host-Traefik (тот же паттерн, что у BAM).
+#   - HTTPS entrypoint "websecure" (host :443)
+#   - HTTP  entrypoint "web"       (host :80) — переадресуется на HTTPS
+#
+# Включить через infra/deploy/.env.stack:
+#   TRAEFIK_ENABLE=1
+#   TRAEFIK_EXTERNAL_NETWORK=spgas_net
+#   ARBITRAGE_DOMAIN=arbitrage.spcatcher.cfd
+#
+# Deploy:
+#   docker compose --env-file .env.stack \
+#     -f docker-compose.yml -f docker-compose.traefik.yml up -d
+
+networks:
+  traefik-edge:
+    external: true
+    name: ${TRAEFIK_EXTERNAL_NETWORK:-spgas_net}
+
+services:
+  gateway:
+    networks:
+      traefik-edge: {}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_EXTERNAL_NETWORK:-spgas_net}
+      # HTTPS
+      - traefik.http.routers.arbitrage.rule=Host(`${ARBITRAGE_DOMAIN}`)
+      - traefik.http.routers.arbitrage.entrypoints=websecure
+      - traefik.http.routers.arbitrage.tls.certresolver=tls
+      - traefik.http.routers.arbitrage.service=arbitrage
+      # Plain HTTP (та же служба; Traefik должен иметь entrypoint "web" на :80)
+      - traefik.http.routers.arbitrage-web.rule=Host(`${ARBITRAGE_DOMAIN}`)
+      - traefik.http.routers.arbitrage-web.entrypoints=web
+      - traefik.http.routers.arbitrage-web.service=arbitrage
+      - traefik.http.services.arbitrage.loadbalancer.server.port=80
