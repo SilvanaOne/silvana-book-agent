@@ -7,9 +7,11 @@
 //! serialized through a PaymentQueue to avoid LOCKED_CONTRACTS race conditions.
 //! Operations that don't use amulets (propose_dvp, accept_dvp) run concurrently.
 
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use tracing::{debug, info};
@@ -17,6 +19,7 @@ use tracing::{debug, info};
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::ConfirmLock;
 use agent_logic::liquidity::LiquidityManager;
+use agent_logic::rpc_client::OrderbookRpcClient;
 use agent_logic::settlement::{DiscoveredContract, SettlementBackend, StepResult};
 use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
@@ -26,6 +29,7 @@ use orderbook_proto::ledger::{
 
 use tx_verifier::OperationExpectation;
 
+use crate::accept_settle::MulticallSettler;
 use crate::amulet_cache::AmuletCache;
 use crate::acs_worker::spawn_acs_worker;
 use crate::ledger_client::DAppProviderClient;
@@ -225,6 +229,115 @@ impl SettlementBackend for CloudSettlementBackend {
 
     async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult> {
         self.payment_queue.submit_allocate(proposal_id, dvp_cid, allocation_cc).await
+    }
+
+    async fn multicall_accept_settle(
+        &self,
+        proposal_id: &str,
+        dvp_proposal_cid: &str,
+        is_buyer: bool,
+        base_quantity: &str,
+        quote_quantity: &str,
+        base_instrument: &str,
+        quote_instrument: &str,
+    ) -> Result<StepResult> {
+        // 1. Fetch per-role processing fees (stored in USD on the settlement proposal).
+        //    Retry briefly: the proposal row may take a moment to surface after match.
+        let mut rpc = OrderbookRpcClient::connect(
+            &self.config.orderbook_grpc_url,
+            Some(agent_logic::auth::generate_jwt(
+                &self.config.party_id, &self.config.role, &self.config.private_key_bytes,
+                self.config.token_ttl_secs, Some(self.config.node_name.as_str()),
+            )?),
+        ).await.context("multicall: connect orderbook RPC")?;
+
+        let (dvp_usd_str, alloc_usd_str) = {
+            let mut attempt = 0u8;
+            loop {
+                match rpc.get_settlement_proposal_by_id(proposal_id).await? {
+                    Some(p) => {
+                        let (dvp, alloc) = if is_buyer {
+                            (p.dvp_processing_fee_buyer.clone(), p.allocation_processing_fee_buyer.clone())
+                        } else {
+                            (p.dvp_processing_fee_seller.clone(), p.allocation_processing_fee_seller.clone())
+                        };
+                        let dvp = if dvp.trim().is_empty() { "0.0".to_string() } else { dvp };
+                        let alloc = if alloc.trim().is_empty() { "0.0".to_string() } else { alloc };
+                        break (dvp, alloc);
+                    }
+                    None => {
+                        attempt += 1;
+                        if attempt > 10 {
+                            anyhow::bail!("multicall: settlement proposal {} not found after 10 attempts", proposal_id);
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        };
+
+        // 2. Convert USD → CC via the current amulet price. A zero rate is a hard
+        //    error: we'd rather fail than publish a USD-shaped fee on-chain.
+        let mut client = self.create_client().await.context("multicall: create ledger client")?;
+        let rates = client.get_dso_rates().await
+            .context("multicall: fetch DSO rates for USD→CC fee conversion")?;
+        let rate = Decimal::from_str(&rates.cc_usd_rate)
+            .with_context(|| format!("multicall: invalid cc_usd_rate '{}'", rates.cc_usd_rate))?;
+        if rate <= Decimal::ZERO {
+            anyhow::bail!("multicall: cc_usd_rate is {} — cannot convert fees", rate);
+        }
+        let dvp_usd = Decimal::from_str(&dvp_usd_str)
+            .with_context(|| format!("multicall: invalid dvp fee decimal '{}'", dvp_usd_str))?;
+        let alloc_usd = Decimal::from_str(&alloc_usd_str)
+            .with_context(|| format!("multicall: invalid alloc fee decimal '{}'", alloc_usd_str))?;
+        let dvp_cc = (dvp_usd / rate).round_dp(10);
+        let alloc_cc = (alloc_usd / rate).round_dp(10);
+
+        // 3. Determine what to allocate: buyer allocates quote (payment leg),
+        //    seller allocates base (delivery leg).
+        let (allocation_instrument_id, allocation_qty_str) = if is_buyer {
+            (quote_instrument, quote_quantity)
+        } else {
+            (base_instrument, base_quantity)
+        };
+
+        let cc_token = self.config.cc_token_id.as_deref().unwrap_or("CC");
+        let allocation_cc = if allocation_instrument_id.eq_ignore_ascii_case(cc_token)
+            || allocation_instrument_id.eq_ignore_ascii_case("Amulet")
+        {
+            Some(
+                Decimal::from_str(allocation_qty_str)
+                    .with_context(|| format!("multicall: invalid allocation qty '{}'", allocation_qty_str))?,
+            )
+        } else {
+            None
+        };
+
+        debug!(
+            "multicall_accept_settle proposal={} cid={} is_buyer={} alloc_instrument={} alloc_cc={:?} dvp_cc={} alloc_fee_cc={}",
+            proposal_id, dvp_proposal_cid, is_buyer, allocation_instrument_id, allocation_cc, dvp_cc, alloc_cc,
+        );
+
+        // 4. Build a one-shot MulticallSettler and run the atomic accept+allocate+fees tx.
+        let settler = MulticallSettler {
+            config: self.config.clone(),
+            amulet_cache: self.amulet_cache.clone(),
+            verbose: self.verbose,
+            dry_run: self.dry_run,
+            force: self.force,
+            confirm: self.confirm,
+            confirm_lock: self.confirm_lock.clone(),
+        };
+        settler.accept_and_settle(
+            proposal_id,
+            dvp_proposal_cid,
+            &dvp_cc.to_string(),
+            &alloc_cc.to_string(),
+            &dvp_usd_str,
+            &alloc_usd_str,
+            allocation_instrument_id,
+            allocation_cc,
+        ).await
     }
 
     fn queue_depth(&self) -> (u64, u64) {

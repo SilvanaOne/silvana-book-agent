@@ -120,6 +120,33 @@ pub trait SettlementBackend: Send + Sync {
     /// None if allocating CIP-56 tokens.
     async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult>;
 
+    /// Single-tx taker settlement (AcceptDvp + Allocate + processing fees + traffic fee).
+    /// Server returns NEXT_ACTION_MULTICALL_ACCEPT for orderbook takers as a preferred
+    /// path over the per-step (AcceptDvp / PayFee / Allocate) sequence.
+    ///
+    /// The backend internally fetches the per-role processing fees and the CC/USD rate,
+    /// converts USD→CC for on-chain transfers, selects amulets, and submits the
+    /// `Execute_MultiCall` transaction in one shot.
+    ///
+    /// Default implementation bails — backends that don't support multicall accept
+    /// (e.g. mocks in tests) should fall through to the per-step path.
+    async fn multicall_accept_settle(
+        &self,
+        proposal_id: &str,
+        dvp_proposal_cid: &str,
+        is_buyer: bool,
+        base_quantity: &str,
+        quote_quantity: &str,
+        base_instrument: &str,
+        quote_instrument: &str,
+    ) -> Result<StepResult> {
+        let _ = (
+            proposal_id, dvp_proposal_cid, is_buyer,
+            base_quantity, quote_quantity, base_instrument, quote_instrument,
+        );
+        anyhow::bail!("multicall_accept_settle not implemented by this backend")
+    }
+
     /// Sync on-chain contracts for given settlement IDs
     async fn sync_contracts(&self, settlement_ids: &[String]) -> Result<Vec<DiscoveredContract>>;
 
@@ -2079,9 +2106,61 @@ async fn advance_single<B: SettlementBackend>(
                 is_buyer: state.is_buyer,
             }
         }
-        NextAction::Wait | NextAction::MulticallAccept => {
-            debug!("[{}] NextAction: Wait (counterparty's turn or multicall)", proposal_id);
+        NextAction::Wait => {
+            debug!("[{}] NextAction: Wait (counterparty's turn)", proposal_id);
             AdvanceResult::Wait { proposal_id }
+        }
+        NextAction::MulticallAccept => {
+            // Server-preferred path for the taker (buyer for orderbook): pack
+            // AcceptDvp + Allocate + both processing fees + traffic fee into
+            // one atomic Execute_MultiCall transaction. Required because the
+            // server's state machine does NOT issue the per-step actions
+            // (AcceptDvp / PayDvpFee / PayAllocFee / Allocate) for orderbook
+            // takers — it only emits MulticallAccept. Handling this as Wait
+            // (pre-fix behaviour) deadlocks the buyer side indefinitely.
+            action_log.lock().await.push((proposal_id.clone(), "MulticallAccept"));
+
+            let dvp_proposal_cid = match state.dvp_proposal_cid {
+                Some(ref cid) => cid.clone(),
+                None => {
+                    debug!(
+                        "[{}] MulticallAccept deferred: DvpProposal CID not yet on chain",
+                        proposal_id
+                    );
+                    return AdvanceResult::Wait { proposal_id };
+                }
+            };
+            debug!("[{}] MulticallAccept dispatching (cid={})", proposal_id, dvp_proposal_cid);
+
+            match backend.multicall_accept_settle(
+                &proposal_id,
+                &dvp_proposal_cid,
+                state.is_buyer,
+                &state.proposal.base_quantity,
+                &state.proposal.quote_quantity,
+                &state.proposal.base_instrument,
+                &state.proposal.quote_instrument,
+            ).await {
+                Ok(result) => {
+                    record_step_completed(
+                        &mut rpc_client, &proposal_id, &config.party_id,
+                        state.is_buyer, SettlementEventType::DvpAcceptCompleted,
+                        &result.update_id, &result.contract_id,
+                    ).await;
+                    AdvanceResult::StepCompleted {
+                        proposal_id,
+                        stage: SettlementStage::Allocated,
+                        dvp_proposal_cid: None,
+                        dvp_cid: Some(result.contract_id),
+                        allocation_cid: None,
+                        pending_traffic: 0,
+                    }
+                }
+                Err(e) => AdvanceResult::Error {
+                    proposal_id,
+                    error: format!("MulticallAccept failed: {:#}", e),
+                },
+            }
         }
         NextAction::None => {
             let is_settled = status.stage == orderbook_proto::SettlementStage::Settled as i32;
