@@ -10,7 +10,7 @@ name = "agent-trading-history"
 path = "src/main.rs"
 
 [dependencies]
-orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+agent-logic = { path = "../agent-logic" }
 orderbook-proto = { path = "../orderbook-proto" }
 message-signing = { path = "../message-signing" }
 

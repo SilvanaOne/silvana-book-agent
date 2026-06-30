@@ -56,21 +56,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::order_tracker::OrderTracker;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
+use agent_logic::order_tracker::OrderTracker;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::TokenBalance;
 use orderbook_proto::orderbook::{OrderStatus, OrderType, OrderbookLevel};
 
-mod acs_worker;
-mod amulet_cache;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+use cloud_agent::CloudSettlementBackend;
+use cloud_agent::DAppProviderClient;
 
 #[derive(Parser)]
 #[command(name = "agent-algo-order")]
@@ -161,9 +156,9 @@ fn default_depth() -> u32 { 20 }
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_algo_order", "orderbook_agent_logic", "tx_verifier"],
+        &["agent_algo_order", "agent_logic", "tx_verifier"],
         "agent-algo-order",
     );
 
@@ -223,7 +218,7 @@ async fn run_plan(
     info!("Party: {}", config.party_id);
     info!("Plan: {} steps", plan.steps.len());
 
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -242,9 +237,11 @@ async fn run_plan(
             }
         }
     }
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let runner_shutdown = agent_logic::shutdown::Shutdown::new();
     let backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock, liquidity_manager,
+        runner_shutdown.clone(),
     );
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
@@ -279,10 +276,11 @@ async fn run_plan(
             settlement_only: true,
             orders_only: false,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: Some(runner_shutdown.clone()),
+            rejected_rfq_trades: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
-            lp_shutdown: Some(shutdown),
+            lp_shutdown: Some(agent_logic::shutdown::Shutdown::from_flag(shutdown.clone())),
             state_file: Some(PathBuf::from("algo-order-state.json")),
             no_restore,
             fill_state: None,

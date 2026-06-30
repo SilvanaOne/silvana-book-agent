@@ -14,7 +14,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 
-use orderbook_agent_logic::auth::{
+use agent_logic::auth::{
     decode_base58_private_key, extract_user_id_from_jwt, generate_jwt, get_public_key_hex,
 };
 

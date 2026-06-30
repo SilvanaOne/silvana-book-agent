@@ -15,20 +15,15 @@ use std::path::PathBuf;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::TokenBalance;
 use orderbook_proto::orderbook::OrderType;
 
-mod acs_worker;
-mod amulet_cache;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+use cloud_agent::CloudSettlementBackend;
+use cloud_agent::DAppProviderClient;
 
 #[derive(Parser)]
 #[command(name = "agent-spot-grid")]
@@ -69,9 +64,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_spot_grid", "orderbook_agent_logic", "tx_verifier"],
+        &["agent_spot_grid", "agent_logic", "tx_verifier"],
         "agent-spot-grid",
     );
 
@@ -118,7 +113,7 @@ async fn run_grid(
     info!("Party: {}", config.party_id);
     info!("Enabled markets: {}", enabled_markets.join(", "));
 
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -138,7 +133,8 @@ async fn run_grid(
         }
     }
 
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let shutdown = agent_logic::shutdown::Shutdown::new();
     let backend = CloudSettlementBackend::new(
         config.clone(),
         verbose,
@@ -147,6 +143,7 @@ async fn run_grid(
         confirm,
         confirm_lock,
         liquidity_manager,
+        shutdown.clone(),
     );
 
     let ledger_client = DAppProviderClient::new(
@@ -177,7 +174,8 @@ async fn run_grid(
             settlement_only: false,
             orders_only: false,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: Some(shutdown.clone()),
+            rejected_rfq_trades: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
             lp_shutdown: None,

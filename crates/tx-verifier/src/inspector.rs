@@ -943,12 +943,14 @@ fn inspect_request_preapproval(
         }
     };
 
-    // --- Template must be TransferPreapprovalProposal ---
+    // --- Template must be TransferPreapproval (CIP-56 or Splice) ---
     let tid = create
         .template_id
         .as_ref()
         .context("Create node missing template_id")?;
-    if !template_matches(tid, "Splice.Wallet.TransferPreapproval", "TransferPreapprovalProposal") {
+    let is_cip56 = template_matches(tid, "Utility.Registry.App.V0.Model.TransferPreapproval", "TransferPreapproval");
+    let is_splice = template_matches(tid, "Splice.Wallet.TransferPreapproval", "TransferPreapprovalProposal");
+    if !is_cip56 && !is_splice {
         return Ok(InspectionResult {
             accepted: false,
             summary: format!(
@@ -957,7 +959,7 @@ fn inspect_request_preapproval(
             ),
             warnings,
             rejection_reason: Some(format!(
-                "Expected TransferPreapprovalProposal template, got {}.{}",
+                "Expected TransferPreapproval template, got {}.{}",
                 tid.module_name, tid.entity_name
             )),
         });
@@ -999,14 +1001,16 @@ fn inspect_request_preapproval(
         });
     }
 
-    // --- Extract provider for summary ---
+    // --- Extract provider/operator for summary ---
     let provider = get_record_field(record, "provider")
+        .or_else(|| get_record_field(record, "operator"))
         .and_then(get_party)
         .unwrap_or("<unknown>");
 
+    let template_type = if is_cip56 { "CIP-56" } else { "Splice" };
     let summary = format!(
-        "RequestPreapproval VERIFIED: receiver {} requests preapproval from provider {} | 1 Create node",
-        party, provider,
+        "RequestPreapproval VERIFIED ({}): receiver {} preapproval with {} | 1 Create node",
+        template_type, party, provider,
     );
 
     debug!("TX INSPECT: {}", summary);
@@ -2213,6 +2217,7 @@ pub fn inspect(
         OperationExpectation::AcceptDvp { .. } => "AcceptDvp".to_string(),
         OperationExpectation::Allocate { .. } => "Allocate".to_string(),
         OperationExpectation::TransferCc { amount, .. } => format!("TransferCc({})", amount),
+        OperationExpectation::PrepayTraffic { amount, .. } => format!("PrepayTraffic({})", amount),
         OperationExpectation::RequestPreapproval { .. } => "RequestPreapproval".to_string(),
         OperationExpectation::RequestRecurringPrepaid { .. } => {
             "RequestRecurringPrepaid".to_string()
@@ -2240,6 +2245,16 @@ pub fn inspect(
         OperationExpectation::ExecuteMulticall { op_count, .. } => {
             format!("ExecuteMulticall({} ops)", op_count)
         }
+        OperationExpectation::LockHoldings { amount, instrument_id, .. } => {
+            format!("LockHoldings({} {})", amount, instrument_id)
+        }
+        OperationExpectation::ProcessLockUnlockRequests { request_count, .. } => {
+            format!("ProcessLockUnlockRequests({} reqs)", request_count)
+        }
+        OperationExpectation::ResizeLock { new_amount, .. } => {
+            format!("ResizeLock({})", new_amount)
+        }
+        OperationExpectation::TerminateLock { .. } => "TerminateLock".to_string(),
     };
 
     // Verbose: dump full JSON

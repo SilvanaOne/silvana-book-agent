@@ -41,6 +41,14 @@ pub enum OperationExpectation {
         amount: String,
         command_id: String,
     },
+    /// Off-chain prepaid traffic top-up — server-resolved receiver
+    /// (PARTY_PREPAID_TRAFFIC). Inspected as a stub today since the
+    /// cloud-agent doesn't carry the receiver party id locally.
+    PrepayTraffic {
+        sender_party: String,
+        amount: String,
+        command_id: String,
+    },
     RequestPreapproval {
         party: String,
     },
@@ -75,6 +83,23 @@ pub enum OperationExpectation {
     ExecuteMulticall {
         party: String,
         op_count: usize,
+    },
+    LockHoldings {
+        party: String,
+        amount: String,
+        instrument_id: String,
+        context: String,
+    },
+    ProcessLockUnlockRequests {
+        party: String,
+        request_count: usize,
+    },
+    ResizeLock {
+        party: String,
+        new_amount: String,
+    },
+    TerminateLock {
+        party: String,
     },
 }
 

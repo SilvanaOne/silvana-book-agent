@@ -10,7 +10,7 @@ name = "agent-contractual-compliance"
 path = "src/main.rs"
 
 [dependencies]
-orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+agent-logic = { path = "../agent-logic" }
 orderbook-proto = { path = "../orderbook-proto" }
 
 tonic = { workspace = true, features = ["tls-webpki-roots"] }

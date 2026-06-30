@@ -12,8 +12,8 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
 use orderbook_proto::orderbook::Order;
 
 #[derive(Parser)]
@@ -64,9 +64,9 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_order_expiry", "orderbook_agent_logic"],
+        &["agent_order_expiry", "agent_logic"],
         "agent-order-expiry",
     );
 

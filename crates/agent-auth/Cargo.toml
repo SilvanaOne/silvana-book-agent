@@ -10,7 +10,7 @@ name = "agent-auth"
 path = "src/main.rs"
 
 [dependencies]
-orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+agent-logic = { path = "../agent-logic" }
 
 clap = { workspace = true, features = ["derive", "env"] }
 dotenvy = { workspace = true }

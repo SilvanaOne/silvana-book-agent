@@ -15,8 +15,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let orderbook_proto = "../../proto/silvana/orderbook/v1/orderbook.proto";
     let settlement_proto = "../../proto/silvana/settlement/v1/settlement.proto";
     let pricing_proto = "../../proto/silvana/pricing/v1/pricing.proto";
-    let ledger_proto = "../../proto/silvana/ledger/v1/ledger.proto";
     let proto_includes = vec!["../../proto"];
+
+    // ledger.proto has been split into per-domain files; all share the
+    // silvana.ledger.v1 package and compile into a single descriptor pool.
+    let ledger_proto_dir = "../../proto/silvana/ledger/v1";
+    let ledger_protos: Vec<String> = [
+        "common.proto",
+        "queries.proto",
+        "onboarding.proto",
+        "transfer.proto",
+        "preapproval.proto",
+        "dvp.proto",
+        "cip56.proto",
+        "recurring.proto",
+        "multicall.proto",
+        "fees.proto",
+        "pay_fee.proto",
+        "transactions.proto",
+        "service.proto",
+        "bridge.proto",
+    ]
+    .iter()
+    .map(|f| format!("{}/{}", ledger_proto_dir, f))
+    .collect();
+    // tonic-prost-build's compile_with_config requires both `protos` and
+    // `includes` slices to use the same generic type — so for the ledger
+    // call (which uses Vec<String>) we need a String-typed include list.
+    let ledger_proto_includes: Vec<String> = proto_includes.iter().map(|s| s.to_string()).collect();
 
     // Configure for orderbook.proto
     let mut config_orderbook = Config::new();
@@ -93,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &proto_includes
         )?;
 
-    // Configure for ledger.proto
+    // Configure for ledger protos (split into multiple files in same package)
     let mut config_ledger = Config::new();
     config_ledger.protoc_arg("--experimental_allow_proto3_optional");
 
@@ -102,8 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .descriptor_pool("crate::LEDGER_DESCRIPTOR_POOL")
         .configure(
             &mut config_ledger,
-            &[ledger_proto],
-            &proto_includes
+            &ledger_protos,
+            &ledger_proto_includes
         )
         .expect("Failed to configure reflection for ledger proto");
 
@@ -114,8 +140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(&ledger_descriptor_path)
         .compile_with_config(
             config_ledger,
-            &[ledger_proto],
-            &proto_includes
+            &ledger_protos,
+            &ledger_proto_includes
         )?;
 
     // Tell cargo to recompile if any .proto files change

@@ -10,7 +10,7 @@ name = "agent-selective-disclosure"
 path = "src/main.rs"
 
 [dependencies]
-orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+agent-logic = { path = "../agent-logic" }
 message-signing = { path = "../message-signing" }
 
 clap = { workspace = true, features = ["derive", "env"] }

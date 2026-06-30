@@ -33,8 +33,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
 
 #[derive(Parser)]
 #[command(name = "agent-yield-rotation")]
@@ -102,9 +102,9 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_yield_rotation", "orderbook_agent_logic"],
+        &["agent_yield_rotation", "agent_logic"],
         "agent-yield-rotation",
     );
 

@@ -41,8 +41,8 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
 use orderbook_proto::orderbook::{settlement_update::EventType as SettlementEvent, SettlementUpdate};
 
 #[derive(Parser)]
@@ -117,9 +117,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_scam_screening", "orderbook_agent_logic"],
+        &["agent_scam_screening", "agent_logic"],
         "agent-scam-screening",
     );
 

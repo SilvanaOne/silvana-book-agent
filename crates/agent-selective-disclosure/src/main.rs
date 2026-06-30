@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use orderbook_agent_logic::auth::decode_base58_private_key;
+use agent_logic::auth::decode_base58_private_key;
 
 #[derive(Parser)]
 #[command(name = "agent-selective-disclosure")]

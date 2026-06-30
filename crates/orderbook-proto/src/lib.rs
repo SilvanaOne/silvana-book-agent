@@ -38,6 +38,12 @@ pub mod ledger {
 
     /// File descriptor set for DApp Provider service
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("ledger_descriptor");
+
+    impl message_signing::AsCanonicalFee for Fee {
+        fn entry_type(&self) -> &str { &self.entry_type }
+        fn description(&self) -> &str { &self.description }
+        fn amount_cc(&self) -> &str { &self.amount_cc }
+    }
 }
 
 /// Descriptor pool for orderbook service reflection

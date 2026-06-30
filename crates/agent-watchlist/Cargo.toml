@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal crates
-orderbook-agent-logic = { path = "../orderbook-agent-logic" }
+agent-logic = { path = "../agent-logic" }
 orderbook-proto = { path = "../orderbook-proto" }
 
 # gRPC streaming

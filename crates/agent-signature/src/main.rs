@@ -13,7 +13,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-use orderbook_agent_logic::auth::decode_base58_private_key;
+use agent_logic::auth::decode_base58_private_key;
 
 #[derive(Parser)]
 #[command(name = "agent-signature")]

@@ -15,21 +15,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn, error};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::order_tracker::OrderTracker;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
+use agent_logic::order_tracker::OrderTracker;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::TokenBalance;
 use orderbook_proto::orderbook::OrderType;
 
-mod amulet_cache;
-mod acs_worker;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+use cloud_agent::CloudSettlementBackend;
+use cloud_agent::DAppProviderClient;
 
 // ============================================================================
 // CLI
@@ -108,13 +103,13 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_dca_portfolio", "orderbook_agent_logic", "tx_verifier"],
+        &["agent_dca_portfolio", "agent_logic", "tx_verifier"],
         "agent-dca-portfolio",
     );
 
-    let base_config = orderbook_agent_logic::config::BaseConfig::load(&cli.config)
+    let base_config = agent_logic::config::BaseConfig::load(&cli.config)
         .with_context(|| format!("Failed to load config from {:?}", cli.config))?;
 
     match cli.command {
@@ -209,7 +204,7 @@ async fn run_dca(
     }
 
     // Create liquidity manager
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -232,9 +227,11 @@ async fn run_dca(
     }
 
     // Create settlement backend
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let shutdown = agent_logic::shutdown::Shutdown::new();
     let backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock, liquidity_manager,
+        shutdown.clone(),
     );
 
     // Create balance provider
@@ -291,10 +288,11 @@ async fn run_dca(
             settlement_only: true, // don't use OrderManager for grid orders
             orders_only: false,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: Some(shutdown.clone()),
+            rejected_rfq_trades: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
-            lp_shutdown: Some(dca_shutdown),
+            lp_shutdown: Some(agent_logic::shutdown::Shutdown::from_flag(dca_shutdown.clone())),
             state_file: Some(PathBuf::from("dca-portfolio-state.json")),
             no_restore,
             fill_state: None,

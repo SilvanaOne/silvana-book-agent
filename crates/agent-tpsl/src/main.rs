@@ -17,20 +17,15 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn, error};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::order_tracker::OrderTracker;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::client::OrderbookClient;
+use agent_logic::order_tracker::OrderTracker;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::TokenBalance;
 use orderbook_proto::orderbook::OrderType;
 
-mod amulet_cache;
-mod acs_worker;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+use cloud_agent::CloudSettlementBackend;
+use cloud_agent::DAppProviderClient;
 
 // ============================================================================
 // CLI
@@ -120,13 +115,13 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_tpsl", "orderbook_agent_logic", "tx_verifier"],
+        &["agent_tpsl", "agent_logic", "tx_verifier"],
         "agent-tpsl",
     );
 
-    let base_config = orderbook_agent_logic::config::BaseConfig::load(&cli.config)
+    let base_config = agent_logic::config::BaseConfig::load(&cli.config)
         .with_context(|| format!("Failed to load config from {:?}", cli.config))?;
 
     match cli.command {
@@ -159,7 +154,7 @@ impl BalanceProvider for CloudBalanceProvider {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_tpsl(
-    config: orderbook_agent_logic::config::BaseConfig,
+    config: agent_logic::config::BaseConfig,
     verbose: bool,
     dry_run: bool,
     force: bool,
@@ -192,7 +187,7 @@ async fn run_tpsl(
     info!("Poll interval: {}s", poll_secs);
 
     // Create liquidity manager
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc, config.liquidity_margin,
         config.flow_ema_window_hours, config.depletion_max_hours, config.depletion_min_hours,
     );
@@ -210,9 +205,11 @@ async fn run_tpsl(
     }
 
     // Settlement backend
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let shutdown = agent_logic::shutdown::Shutdown::new();
     let backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock, liquidity_manager,
+        shutdown.clone(),
     );
 
     // Balance provider
@@ -248,10 +245,11 @@ async fn run_tpsl(
             settlement_only: true,
             orders_only: false,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: Some(shutdown.clone()),
+            rejected_rfq_trades: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
-            lp_shutdown: Some(tpsl_shutdown),
+            lp_shutdown: Some(agent_logic::shutdown::Shutdown::from_flag(tpsl_shutdown.clone())),
             state_file: Some(PathBuf::from("tpsl-state.json")),
             no_restore,
             fill_state: None,
@@ -266,7 +264,7 @@ async fn run_tpsl(
 
 #[allow(clippy::too_many_arguments)]
 async fn tpsl_loop(
-    config: orderbook_agent_logic::config::BaseConfig,
+    config: agent_logic::config::BaseConfig,
     market_id: String,
     side: PositionSide,
     quantity: Decimal,
@@ -458,7 +456,7 @@ async fn tpsl_loop(
 // Status command
 // ============================================================================
 
-async fn run_status(config: orderbook_agent_logic::config::BaseConfig) -> Result<()> {
+async fn run_status(config: agent_logic::config::BaseConfig) -> Result<()> {
     let mut client = OrderbookClient::new(&config).await?;
     let mut ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url, &config.party_id, &config.role,

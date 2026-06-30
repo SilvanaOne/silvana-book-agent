@@ -16,17 +16,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
 use orderbook_proto::orderbook::{OrderType, SettlementStatus};
 
-mod acs_worker;
-mod amulet_cache;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use ledger_client::DAppProviderClient;
+use cloud_agent::DAppProviderClient;
 
 #[derive(Parser)]
 #[command(name = "agent-portfolio-health")]
@@ -56,9 +51,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_portfolio_health", "orderbook_agent_logic"],
+        &["agent_portfolio_health", "agent_logic"],
         "agent-portfolio-health",
     );
 

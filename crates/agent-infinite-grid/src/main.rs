@@ -23,21 +23,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::order_tracker::OrderTracker;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
+use agent_logic::order_tracker::OrderTracker;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::TokenBalance;
 use orderbook_proto::orderbook::OrderType;
 
-mod acs_worker;
-mod amulet_cache;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+use cloud_agent::CloudSettlementBackend;
+use cloud_agent::DAppProviderClient;
 
 #[derive(Parser)]
 #[command(name = "agent-infinite-grid")]
@@ -98,9 +93,9 @@ enum Commands {
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_infinite_grid", "orderbook_agent_logic", "tx_verifier"],
+        &["agent_infinite_grid", "agent_logic", "tx_verifier"],
         "agent-infinite-grid",
     );
 
@@ -180,7 +175,7 @@ async fn run_grid(
         market, step_pct, levels, qty, refresh_secs, drift_threshold_pct
     );
 
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -199,7 +194,8 @@ async fn run_grid(
             }
         }
     }
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let runner_shutdown = agent_logic::shutdown::Shutdown::new();
     let backend = CloudSettlementBackend::new(
         config.clone(),
         verbose,
@@ -208,6 +204,7 @@ async fn run_grid(
         confirm,
         confirm_lock,
         liquidity_manager,
+        runner_shutdown.clone(),
     );
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
@@ -253,10 +250,11 @@ async fn run_grid(
             settlement_only: true,
             orders_only: false,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: Some(runner_shutdown.clone()),
+            rejected_rfq_trades: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
-            lp_shutdown: Some(shutdown),
+            lp_shutdown: Some(agent_logic::shutdown::Shutdown::from_flag(shutdown.clone())),
             state_file: Some(PathBuf::from("infinite-grid-state.json")),
             no_restore,
             fill_state: None,

@@ -1,0 +1,6 @@
+max_notional_per_order = "5000"
+max_quantity_per_order = "100"
+min_price = "0.05"
+max_price = "5.0"
+allowed_markets = ["CC-USDC", "cETH-CC", "cETH-USDC"]
+allowed_sides = ["buy", "sell"]

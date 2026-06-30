@@ -24,21 +24,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
-use orderbook_agent_logic::client::OrderbookClient;
-use orderbook_agent_logic::config::BaseConfig;
-use orderbook_agent_logic::order_tracker::OrderTracker;
-use orderbook_agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::client::OrderbookClient;
+use agent_logic::config::BaseConfig;
+use agent_logic::order_tracker::OrderTracker;
+use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
 use orderbook_proto::ledger::TokenBalance;
 use orderbook_proto::orderbook::{OrderStatus, OrderType};
 
-mod acs_worker;
-mod amulet_cache;
-mod backend;
-mod ledger_client;
-mod payment_queue;
 
-use backend::CloudSettlementBackend;
-use ledger_client::DAppProviderClient;
+use cloud_agent::CloudSettlementBackend;
+use cloud_agent::DAppProviderClient;
 
 #[derive(Parser)]
 #[command(name = "agent-mean-reversion")]
@@ -100,9 +95,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
-    orderbook_agent_logic::logging::init_logging(
+    agent_logic::logging::init_logging(
         cli.verbose,
-        &["agent_mean_reversion", "orderbook_agent_logic", "tx_verifier"],
+        &["agent_mean_reversion", "agent_logic", "tx_verifier"],
         "agent-mean-reversion",
     );
 
@@ -177,7 +172,7 @@ async fn run_mr(
         market, ema_window, deviation_pct, qty, poll_secs, warmup_samples
     );
 
-    let liquidity_manager = orderbook_agent_logic::liquidity::LiquidityManager::new(
+    let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
         config.liquidity_margin,
         config.flow_ema_window_hours,
@@ -197,7 +192,8 @@ async fn run_mr(
         }
     }
 
-    let confirm_lock = orderbook_agent_logic::confirm::new_confirm_lock();
+    let confirm_lock = agent_logic::confirm::new_confirm_lock();
+    let shutdown = agent_logic::shutdown::Shutdown::new();
     let backend = CloudSettlementBackend::new(
         config.clone(),
         verbose,
@@ -206,6 +202,7 @@ async fn run_mr(
         confirm,
         confirm_lock,
         liquidity_manager,
+        shutdown.clone(),
     );
 
     let ledger_client = DAppProviderClient::new(
@@ -253,10 +250,11 @@ async fn run_mr(
             settlement_only: true,
             orders_only: false,
             actionable_count: None,
-            shutdown_notify: None,
+            shutdown: Some(shutdown.clone()),
+            rejected_rfq_trades: None,
             accepted_rfq_trades: None,
             quoted_rfq_trades: None,
-            lp_shutdown: Some(mr_shutdown),
+            lp_shutdown: Some(agent_logic::shutdown::Shutdown::from_flag(mr_shutdown.clone())),
             state_file: Some(PathBuf::from("mean-reversion-state.json")),
             no_restore,
             fill_state: None,
