@@ -371,11 +371,13 @@ async fn dca_loop(
             continue;
         }
 
-        // Apply price offset
+        // Apply price offset, then round to tick precision (8 decimals = 1e-8)
+        // to avoid "Price X must be a multiple of tick size" rejections caused
+        // by Decimal multiplication producing more decimals than the tick allows.
         let offset_multiplier = Decimal::ONE + Decimal::from_str(
             &format!("{}", price_offset_pct / 100.0)
         ).unwrap_or(Decimal::ZERO);
-        let order_price = mid_price * offset_multiplier;
+        let order_price = (mid_price * offset_multiplier).round_dp(8);
 
         // Cap amount if it would exceed max_total
         let this_amount = if let Some(max) = max_total {
