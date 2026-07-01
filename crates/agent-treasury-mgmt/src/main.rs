@@ -415,7 +415,8 @@ async fn treasury_sweep(
             info!("  [dry-run] would submit_order");
             continue;
         }
-        let price = mid.round_dp(8);
+        let tick_size = ob.get_tick_size(&t.market).await;
+        let price = agent_logic::tick::round_to_tick(mid, tick_size);
         let (signature, signed_data, nonce) =
             tracker.sign_order(&t.market, label, &price.to_string(), &qty.to_string());
         match ob

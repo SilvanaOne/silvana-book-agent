@@ -325,8 +325,11 @@ async fn dca_loop(
     let mut total_placed = Decimal::ZERO;
     let mut order_count: u64 = 0;
 
+    let tick_size = client.get_tick_size(&market_id).await;
+
     // Wait a few seconds for run_agent to initialize settlement stream
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    info!("DCA loop for {} started (tick={})", market_id, tick_size);
 
     info!("DCA loop started — placing orders every {}s", interval_secs);
 
@@ -375,11 +378,11 @@ async fn dca_loop(
             continue;
         }
 
-        // Apply price offset
+        // Apply price offset, round to market's tick_size
         let offset_multiplier = Decimal::ONE + Decimal::from_str(
             &format!("{}", price_offset_pct / 100.0)
         ).unwrap_or(Decimal::ZERO);
-        let order_price = (mid_price * offset_multiplier).round_dp(8);
+        let order_price = agent_logic::tick::round_to_tick(mid_price * offset_multiplier, tick_size);
 
         // Cap amount if it would exceed max_total
         let this_amount = if let Some(max) = max_total {

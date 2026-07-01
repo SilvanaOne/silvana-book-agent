@@ -329,8 +329,9 @@ async fn alloc_loop(
             } else {
                 (OrderType::Bid, "BID")
             };
-            let price = mid.round_dp(8);
-            info!("REBAL {} {} on {}: qty={} @ {}", label, t.instrument, t.market, qty, price);
+            let tick_size = ob.get_tick_size(&t.market).await;
+            let price = agent_logic::tick::round_to_tick(mid, tick_size);
+            info!("REBAL {} {} on {}: qty={} @ {} (tick={})", label, t.instrument, t.market, qty, price, tick_size);
             if dry_run {
                 info!("  [dry-run] would submit {} {} @ {}", label, qty, price);
             } else {

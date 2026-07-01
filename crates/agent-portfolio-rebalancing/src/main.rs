@@ -423,9 +423,10 @@ async fn balance_loop(
                 "REBAL {} {} on {}: qty={} @ mid={}",
                 label, t.instrument, t.market, qty, mid
             );
-            let price = mid.round_dp(8);
+            let tick_size = ob.get_tick_size(&t.market).await;
+            let price = agent_logic::tick::round_to_tick(mid, tick_size);
             if dry_run {
-                info!("  [dry-run] would submit {} {} on {} @ {}", label, qty, t.market, price);
+                info!("  [dry-run] would submit {} {} on {} @ {} (tick={})", label, qty, t.market, price, tick_size);
             } else {
                 place(&mut ob, &tracker, &t.market, order_type, label, &price, &qty).await;
             }

@@ -348,7 +348,8 @@ async fn run_twap(
     let limit_d = limit_price.map(Decimal::from_str).transpose().context("twap.limit_price")?;
     let label = if order_type == OrderType::Bid { "BID" } else { "OFFER" };
 
-    info!("twap: total={} slices={} interval={}s", total_d, slices, interval);
+    let tick_size = client.get_tick_size(market).await;
+    info!("twap: total={} slices={} interval={}s tick={}", total_d, slices, interval, tick_size);
     for i in 1..=slices {
         if shutdown.load(Ordering::Relaxed) { return Ok(()); }
         let price = match client.get_price(market).await {
@@ -360,9 +361,9 @@ async fn run_twap(
             sleep_or_break(interval, shutdown).await;
             continue;
         }
-        let order_price = (mid * (Decimal::ONE
-            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO)))
-        .round_dp(8);
+        let raw = mid * (Decimal::ONE
+            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO));
+        let order_price = agent_logic::tick::round_to_tick(raw, tick_size);
         if let Some(limit) = limit_d {
             let bad = match order_type {
                 OrderType::Bid => order_price > limit,
