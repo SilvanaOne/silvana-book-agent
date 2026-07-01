@@ -321,6 +321,12 @@ async fn dca_loop(
     let mut total_placed = Decimal::ZERO;
     let mut order_count: u64 = 0;
 
+    // Fetch tick_size once from GetMarkets — the server rejects any price
+    // that isn't an exact multiple. On CC-USDC and cETH-USDC this is 1e-8;
+    // on cETH-CC it's 1e-10.
+    let tick_size = client.get_tick_size(&market_id).await;
+    info!("Market {} tick_size = {}", market_id, tick_size);
+
     // Wait a few seconds for run_agent to initialize settlement stream
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
@@ -371,13 +377,14 @@ async fn dca_loop(
             continue;
         }
 
-        // Apply price offset, then round to tick precision (8 decimals = 1e-8)
-        // to avoid "Price X must be a multiple of tick size" rejections caused
-        // by Decimal multiplication producing more decimals than the tick allows.
+        // Apply price offset, then round to the market's actual tick size
+        // (fetched once at startup). Prevents "Price X must be a multiple of
+        // tick size" rejections from server. Works for any market including
+        // cETH-CC where tick is 1e-10 rather than the 1e-8 default.
         let offset_multiplier = Decimal::ONE + Decimal::from_str(
             &format!("{}", price_offset_pct / 100.0)
         ).unwrap_or(Decimal::ZERO);
-        let order_price = (mid_price * offset_multiplier).round_dp(8);
+        let order_price = agent_logic::tick::round_to_tick(mid_price * offset_multiplier, tick_size);
 
         // Cap amount if it would exceed max_total
         let this_amount = if let Some(max) = max_total {

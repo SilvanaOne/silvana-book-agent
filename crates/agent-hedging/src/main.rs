@@ -290,8 +290,9 @@ async fn hedge_loop(
         config.private_key_bytes,
     );
 
+    let tick_size = ob.get_tick_size(&hedge_market).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    info!("Hedge loop started");
+    info!("Hedge loop started (tick={})", tick_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -354,7 +355,7 @@ async fn hedge_loop(
         }
         let offset = Decimal::from_str(&format!("{}", price_offset_pct / 100.0))
             .unwrap_or(Decimal::ZERO);
-        let order_price = (mid * (Decimal::ONE + offset)).round_dp(8);
+        let order_price = agent_logic::tick::round_to_tick(mid * (Decimal::ONE + offset), tick_size);
 
         info!(
             "HEDGE {}: {} {} @ {} (mid={}, fraction={})",

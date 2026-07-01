@@ -320,9 +320,10 @@ async fn twap_loop(
         chrono::Utc::now().timestamp_millis() as u64,
         config.private_key_bytes,
     );
+    let tick_size = client.get_tick_size(&market_id).await;
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    info!("TWAP loop started: {} slices @ {}s apart", slices, slice_interval_secs);
+    info!("TWAP loop started: {} slices @ {}s apart (tick={})", slices, slice_interval_secs, tick_size);
 
     for i in 1..=slices {
         if shutdown.load(Ordering::Relaxed) {
@@ -345,11 +346,11 @@ async fn twap_loop(
             continue;
         }
 
-        let order_price = (mid
+        let raw_price = mid
             * (Decimal::ONE
                 + Decimal::from_str(&format!("{}", price_offset_pct / 100.0))
-                    .unwrap_or(Decimal::ZERO)))
-        .round_dp(8);
+                    .unwrap_or(Decimal::ZERO));
+        let order_price = agent_logic::tick::round_to_tick(raw_price, tick_size);
 
         if let Some(limit) = limit_price {
             let bad = match order_type {

@@ -287,8 +287,9 @@ async fn mr_loop(
     let mut samples: u32 = 0;
     let dev = deviation_pct / 100.0;
 
+    let tick_size = client.get_tick_size(&market_id).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    info!("Mean reversion loop started (α={:.4})", alpha);
+    info!("Mean reversion loop started (α={:.4}, tick={})", alpha, tick_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -355,9 +356,8 @@ async fn mr_loop(
             continue;
         }
 
-        let order_price = Decimal::from_str(&format!("{}", ema_val))
-            .unwrap_or(Decimal::ZERO)
-            .round_dp(8);
+        let raw_price = Decimal::from_str(&format!("{}", ema_val)).unwrap_or(Decimal::ZERO);
+        let order_price = agent_logic::tick::round_to_tick(raw_price, tick_size);
         if order_price <= Decimal::ZERO {
             sleep_or_break(poll_secs, &shutdown).await;
             continue;

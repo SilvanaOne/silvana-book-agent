@@ -299,8 +299,9 @@ async fn inv_loop(
         config.private_key_bytes,
     );
 
+    let tick_size = ob.get_tick_size(&market).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    info!("Inventory loop started");
+    info!("Inventory loop started (tick={})", tick_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -335,6 +336,7 @@ async fn inv_loop(
                 "OFFER",
                 chunk,
                 price_offset_pct,
+                tick_size,
             )
             .await
             {
@@ -350,6 +352,7 @@ async fn inv_loop(
                 "BID",
                 chunk,
                 price_offset_pct,
+                tick_size,
             )
             .await
             {
@@ -371,6 +374,7 @@ async fn rebalance(
     label: &'static str,
     qty: Decimal,
     price_offset_pct: f64,
+    tick_size: Decimal,
 ) -> Result<()> {
     let price = ob.get_price(market).await?;
     let mid = mid_value(&price);
@@ -378,10 +382,10 @@ async fn rebalance(
         anyhow::bail!("no valid mid price for {}", market);
     }
     let mid_dec = Decimal::from_str(&format!("{}", mid)).unwrap_or(Decimal::ZERO);
-    let order_price = (mid_dec
+    let raw = mid_dec
         * (Decimal::ONE
-            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO)))
-    .round_dp(8);
+            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO));
+    let order_price = agent_logic::tick::round_to_tick(raw, tick_size);
 
     let (signature, signed_data, nonce) =
         tracker.sign_order(market, label, &order_price.to_string(), &qty.to_string());

@@ -265,8 +265,9 @@ async fn sc_loop(
 
     let half = Decimal::from(spread_bps as i64) / Decimal::from(20000);
 
+    let tick_size = client.get_tick_size(&market).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    info!("Spread capture loop started: half_spread={}", half);
+    info!("Spread capture loop started: half_spread={} (tick={})", half, tick_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -301,8 +302,8 @@ async fn sc_loop(
         let inv = filled_buy_qty - filled_sell_qty;
         let place_bid = inv < max_inventory;
         let place_offer = inv > -max_inventory;
-        let bid_price = (mid_dec * (Decimal::ONE - half)).round_dp(8);
-        let offer_price = (mid_dec * (Decimal::ONE + half)).round_dp(8);
+        let bid_price = agent_logic::tick::round_to_tick(mid_dec * (Decimal::ONE - half), tick_size);
+        let offer_price = agent_logic::tick::round_to_tick(mid_dec * (Decimal::ONE + half), tick_size);
 
         info!(
             "cycle: mid={:.6} inv={} place_bid={} place_offer={} bid={} offer={}",

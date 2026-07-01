@@ -283,8 +283,9 @@ async fn grid_loop(
 
     let mut last_pivot: Option<f64> = None;
 
+    let tick_size = client.get_tick_size(&market).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    info!("Infinite grid loop started");
+    info!("Infinite grid loop started (tick={})", tick_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -333,8 +334,8 @@ async fn grid_loop(
         for i in 1..=levels {
             let offset = Decimal::from_str(&format!("{}", step_pct * i as f64 / 100.0))
                 .unwrap_or(Decimal::ZERO);
-            let bid_price = (mid_dec * (Decimal::ONE - offset)).round_dp(8);
-            let offer_price = (mid_dec * (Decimal::ONE + offset)).round_dp(8);
+            let bid_price = agent_logic::tick::round_to_tick(mid_dec * (Decimal::ONE - offset), tick_size);
+            let offer_price = agent_logic::tick::round_to_tick(mid_dec * (Decimal::ONE + offset), tick_size);
 
             place(&mut client, &tracker, &market, OrderType::Bid, "BID", &bid_price, &quantity, i).await;
             place(&mut client, &tracker, &market, OrderType::Offer, "OFFER", &offer_price, &quantity, i).await;
