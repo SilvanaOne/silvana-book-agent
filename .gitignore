@@ -36,3 +36,10 @@ logs
 
 # Docker build artifacts
 docker/release/
+
+# Runtime working directories (contain .env with private key + local fixtures)
+runtime/
+runtime2/
+
+# Claude Code session data
+.claude/

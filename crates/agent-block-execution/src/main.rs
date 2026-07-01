@@ -360,7 +360,7 @@ async fn block_loop(
             info!("  → order_id={} placed; waiting for it to clear", order_id);
 
             let actual_filled =
-                wait_clear(&mut client, &market, order_id, poll_secs, &shutdown).await;
+                wait_clear(&mut client, &market, order_id, chunk_qty, poll_secs, &shutdown).await;
             slice_filled += actual_filled;
             total_filled += actual_filled;
             info!(
@@ -378,6 +378,7 @@ async fn wait_clear(
     client: &mut OrderbookClient,
     market: &str,
     order_id: u64,
+    expected_qty: Decimal,
     poll_secs: u64,
     shutdown: &Arc<AtomicBool>,
 ) -> Decimal {
@@ -398,8 +399,9 @@ async fn wait_clear(
                 }
             }
             None => {
-                // No longer in active set — treat as cleared with full visible quantity.
-                return Decimal::ZERO;
+                // No longer in active set — chunk fully consumed. Return expected qty
+                // so the parent slice/total fill counters advance.
+                return expected_qty;
             }
         }
     }

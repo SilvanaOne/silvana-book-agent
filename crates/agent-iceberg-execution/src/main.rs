@@ -349,7 +349,7 @@ async fn iceberg_loop(
         info!("  → order id={} placed; waiting for fill", order_id);
 
         // Poll until the order is no longer active
-        let chunk_filled = wait_for_completion(&mut client, &market, order_id, poll_secs, &shutdown).await;
+        let chunk_filled = wait_for_completion(&mut client, &market, order_id, this_qty, poll_secs, &shutdown).await;
         filled += chunk_filled;
         info!(
             "chunk #{} done: chunk_filled={} parent_filled={}/{}",
@@ -369,6 +369,7 @@ async fn wait_for_completion(
     client: &mut OrderbookClient,
     market: &str,
     order_id: u64,
+    expected_qty: Decimal,
     poll_secs: u64,
     shutdown: &Arc<AtomicBool>,
 ) -> Decimal {
@@ -395,18 +396,12 @@ async fn wait_for_completion(
                 // still working
             }
             None => {
-                // disappeared from active set — fetch one more time to read final filled quantity
-                // via the "all orders" endpoint isn't available read-side here, so treat as fully filled
-                // up to the visible cap. Caller knows the cap (visible) and we approximate by it.
-                // Safer behaviour: treat as fully filled.
-                info!("order_id={} no longer active — assuming chunk fully consumed", order_id);
-                return Decimal::ZERO; // caller will recover via parent loop's remaining check
-                                       // (set to ZERO so we re-issue the same chunk; but to keep progress
-                                       // we instead break with `visible`.)
-                                       // Actually, return visible would over-count. Better return ZERO and
-                                       // rely on the next chunk to retry — but that would loop. Compromise:
-                                       // return ZERO with one log message; caller will re-issue and the
-                                       // first wait_for_completion above will give a definitive answer.
+                // Disappeared from active set — order fully consumed by the matcher and
+                // DvP already settled (or was cancelled externally). Return the chunk's
+                // expected quantity so the parent-order fill count advances instead of
+                // looping forever.
+                info!("order_id={} no longer active — chunk of {} treated as fully filled", order_id, expected_qty);
+                return expected_qty;
             }
         }
     }
