@@ -50,9 +50,8 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 
 | # | Агент | Что | Влияние |
 | --- | --- | --- | --- |
-| 1 | Тick-size hardcoded `.round_dp(8)` в 14 агент-крейтах | Не универсально для non-CC-USDC маркетов (cETH-* может иметь иной tick) | На CC-USDC работает; для cETH-USDC наблюдаемые цены совместимы с 8-decimal. Централизованный helper уже добавлен в `agent_logic::tick` (commit `3082d64`), но 14 call-sites ещё используют inline `.round_dp(8)`. Миграция — crate-by-crate. |
-| 2 | `agent-cash-buffer` transient balance mismatch | В одном прогоне вернуло `cc_unlocked=5025` при 9955 CC в info balance. Актуально не воспроизвелось (2549 vs 2550 совпадают). Гипотеза: eventual-consistency Amulet-контрактов во время in-flight settlements. | Endpoint работает; в момент consistency-gap TransferCc мог перебросить больше чем ожидалось (наблюдался фактический transfer 7404 CC при request'е 2475). Добавлен `debug!`-level dump всех TokenBalance для будущего исследования (commit `e924e6b`). |
-| 3 | `agent-iceberg-execution` medium runtime | При `total=3 visible=1 price=0.13` — каждый chunk settle'ится ~70 сек. 3 chunks = ~3.5 мин. `--max-runtime-secs` нужно задавать соответственно. | Не bug, а characterstic — DvP через `MulticallAccept` небыстрый на devnet. |
+| 1 | `agent-cash-buffer` transient balance mismatch | В одном прогоне вернуло `cc_unlocked=5025` при 9955 CC в info balance. Актуально не воспроизвелось (2549 vs 2550 совпадают). Гипотеза: eventual-consistency Amulet-контрактов во время in-flight settlements. | Endpoint работает; в момент consistency-gap TransferCc мог перебросить больше чем ожидалось (наблюдался фактический transfer 7404 CC при request'е 2475). Добавлен `debug!`-level dump всех TokenBalance для будущего исследования (commit `e924e6b`). |
+| 2 | `agent-iceberg-execution` medium runtime | При `total=3 visible=1 price=0.13` — каждый chunk settle'ится ~70 сек. 3 chunks = ~3.5 мин. `--max-runtime-secs` нужно задавать соответственно. | Не bug, а characterstic — DvP через `MulticallAccept` небыстрый на devnet. |
 
 **Всё пофикшено в этой сессии (9 багов + 1 race + 1 counter):**
 - ~~`agent-cash-buffer` cc_token_id~~ → `74dcb7d`
@@ -87,6 +86,13 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 | Коммит | Тип | Файл |
 | --- | --- | --- |
 | `d0e03c5` | witnesses shell hook: `sh -c` вместо `cmd /C` для env var expansion | `agent-witnesses` |
+| `77f13ca` | **`supported_assets` в 42 agent.toml исправлено** ("CBTC, CETH" → "CC, USDC, cETH"): реальные instruments на devnet. Плюс: `OrderbookClient::get_tick_size(market)` с кешем | 42 agent.toml + `agent-logic/client.rs` |
+| `d70244f` | Мигрированы **7 single-market агентов** на tick-aware rounding (`round_to_tick(price, tick_size)` вместо hardcoded `.round_dp(8)`) | spot-dca, twap, hedging, mean-reversion, spread-capture, infinite-grid, inventory-mgmt |
+| `8241e14` | Мигрированы **5 multi-market агентов** (per-target tick_size lookup, cache O(1)) | portfolio-rebalancing, target-allocation, treasury-mgmt, dca-portfolio, algo-order |
+
+**Итого 12 крейтов** переведены на tick-aware. `grep '\.round_dp(8)' crates/agent-*/src/` возвращает ноль — только `agent-logic/tick.rs` содержит helper (как fallback).
+
+**Impact:** до fix ANY order на `cETH-CC` (tick=1e-10) отбивался бы сервером. После fix любой tick_size поддерживается автоматически.
 
 ### Commit chain — все fix'ы и добавления
 
