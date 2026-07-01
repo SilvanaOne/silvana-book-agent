@@ -25,6 +25,9 @@ use orderbook_proto::{
         GetRoundsDataRequest, GetRoundsDataResponse,
     },
 };
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -55,6 +58,8 @@ pub struct OrderbookClient {
     raw_orderbook_client: OrderbookServiceClient<Channel>,
     raw_pricing_client: PricingServiceClient<Channel>,
     auth_data: ExternalAuthData,
+    /// Per-market tick_size cache, populated on first lookup
+    tick_size_cache: HashMap<String, Decimal>,
 }
 
 impl OrderbookClient {
@@ -114,7 +119,36 @@ impl OrderbookClient {
             raw_orderbook_client,
             raw_pricing_client,
             auth_data,
+            tick_size_cache: HashMap::new(),
         })
+    }
+
+    /// Get the `tick_size` for a market, populating the cache from
+    /// `get_markets()` on the first miss. Returns the crate-wide default
+    /// (`crate::tick::default_tick_size()`) if the market can't be resolved.
+    /// Combine with `crate::tick::round_to_tick` to align a raw price:
+    ///
+    /// ```ignore
+    /// let tick = client.get_tick_size("CC-USDC").await;
+    /// let price = crate::tick::round_to_tick(raw_price, tick);
+    /// ```
+    pub async fn get_tick_size(&mut self, market_id: &str) -> Decimal {
+        if let Some(t) = self.tick_size_cache.get(market_id) {
+            return *t;
+        }
+        if let Ok(markets) = self.get_markets().await {
+            for m in markets {
+                if let Ok(ts) = Decimal::from_str(&m.tick_size) {
+                    if ts > Decimal::ZERO {
+                        self.tick_size_cache.insert(m.market_id, ts);
+                    }
+                }
+            }
+        }
+        self.tick_size_cache
+            .get(market_id)
+            .copied()
+            .unwrap_or_else(crate::tick::default_tick_size)
     }
 
     /// Create gRPC channel with TLS

@@ -12,7 +12,7 @@ icon        = "arrow-left-right"
 status      = "active"
 
 required_balance   = "$500 min"
-supported_assets   = "CC, USDC, CBTC, CETH"
+supported_assets   = "CC, USDC, cETH"
 supported_projects = "Silvana"
 
 [[agent.cta]]

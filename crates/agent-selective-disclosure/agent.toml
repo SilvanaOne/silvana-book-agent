@@ -12,7 +12,7 @@ icon        = "file-key"
 status      = "active"
 
 required_balance   = "None — offline"
-supported_assets   = "CC, USDC, CBTC, CETH"
+supported_assets   = "CC, USDC, cETH"
 supported_projects = "Silvana"
 
 [[agent.cta]]

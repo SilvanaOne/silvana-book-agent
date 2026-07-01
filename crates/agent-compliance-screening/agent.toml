@@ -12,7 +12,7 @@ icon        = "shield"
 status      = "active"
 
 required_balance   = "None — read-only"
-supported_assets   = "CC, USDC, CBTC, CETH"
+supported_assets   = "CC, USDC, cETH"
 supported_projects = "Silvana"
 
 [[agent.cta]]

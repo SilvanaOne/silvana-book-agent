@@ -12,7 +12,7 @@ icon        = "building-2"
 status      = "active"
 
 required_balance   = "$1000 min"
-supported_assets   = "CC, USDC, CBTC, CETH"
+supported_assets   = "CC, USDC, cETH"
 supported_projects = "Silvana"
 
 [[agent.cta]]
