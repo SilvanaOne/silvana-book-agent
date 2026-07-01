@@ -415,13 +415,14 @@ async fn treasury_sweep(
             info!("  [dry-run] would submit_order");
             continue;
         }
+        let price = mid.round_dp(8);
         let (signature, signed_data, nonce) =
-            tracker.sign_order(&t.market, label, &mid.to_string(), &qty.to_string());
+            tracker.sign_order(&t.market, label, &price.to_string(), &qty.to_string());
         match ob
             .submit_order(
                 &t.market,
                 order_type,
-                mid.to_string(),
+                price.to_string(),
                 qty.to_string(),
                 Some(format!("treas-{}-{}", label, chrono::Utc::now().timestamp_millis())),
                 Some(signature),

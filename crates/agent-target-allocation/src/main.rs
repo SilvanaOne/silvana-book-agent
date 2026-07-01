@@ -328,13 +328,14 @@ async fn alloc_loop(
             } else {
                 (OrderType::Bid, "BID")
             };
-            let (signature, signed_data, nonce) = tracker.sign_order(&t.market, label, &mid.to_string(), &qty.to_string());
-            info!("REBAL {} {} on {}: qty={} @ {}", label, t.instrument, t.market, qty, mid);
+            let price = mid.round_dp(8);
+            let (signature, signed_data, nonce) = tracker.sign_order(&t.market, label, &price.to_string(), &qty.to_string());
+            info!("REBAL {} {} on {}: qty={} @ {}", label, t.instrument, t.market, qty, price);
             match ob
                 .submit_order(
                     &t.market,
                     order_type,
-                    mid.to_string(),
+                    price.to_string(),
                     qty.to_string(),
                     Some(format!("alloc-{}-{}", label, chrono::Utc::now().timestamp_millis())),
                     Some(signature),

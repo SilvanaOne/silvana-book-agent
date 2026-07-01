@@ -391,7 +391,7 @@ async fn balance_loop(
                 "REBAL {} {} on {}: qty={} @ mid={}",
                 label, t.instrument, t.market, qty, mid
             );
-            place(&mut ob, &tracker, &t.market, order_type, label, &mid, &qty).await;
+            place(&mut ob, &tracker, &t.market, order_type, label, &mid.round_dp(8), &qty).await;
         }
 
         sleep_or_break(check_interval, &shutdown).await;
