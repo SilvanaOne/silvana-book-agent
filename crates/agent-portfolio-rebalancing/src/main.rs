@@ -338,13 +338,32 @@ async fn balance_loop(
             mids.insert(t.market.clone(), m);
         }
 
-        // Portfolio value in quote currency, summed across all targeted instruments
+        // Portfolio value in quote currency, summed across all targeted instruments.
+        //
+        // A market `BASE-QUOTE` has `mid` in units of QUOTE per BASE. So for a target
+        // `(instrument, market)`:
+        //   - if instrument == BASE of market → value = balance × mid (base × price)
+        //   - if instrument == QUOTE of market → value = balance directly (already in
+        //     quote units — multiplying by mid would give a nonsense number)
+        // Prior code multiplied unconditionally, producing e.g. 1006 USDC × 0.149 = 150
+        // for a USDC leg on CC-USDC, blowing up the weight calculation.
         let mut portfolio_value = Decimal::ZERO;
         let mut values: HashMap<&str, Decimal> = HashMap::new();
         for t in &targets {
             let bal = by_inst.get(t.instrument.as_str()).copied().unwrap_or(Decimal::ZERO);
             let mid = mids.get(&t.market).copied().unwrap_or(Decimal::ZERO);
-            let val = bal * mid;
+            let (base, quote) = match t.market.split_once('-') {
+                Some((b, q)) => (b, q),
+                None => ("", ""),
+            };
+            let val = if t.instrument == base {
+                bal * mid
+            } else if t.instrument == quote {
+                bal
+            } else {
+                warn!("{}@{}: instrument matches neither base nor quote of market — using bal * mid", t.instrument, t.market);
+                bal * mid
+            };
             values.insert(t.instrument.as_str(), val);
             portfolio_value += val;
         }
@@ -375,15 +394,27 @@ async fn balance_loop(
                 continue;
             }
 
-            // Notional to push: fraction of deviation * portfolio_value
+            // Notional to push: fraction of deviation * portfolio_value (in quote units)
             let notional = (delta_weight * frac).abs() * portfolio_value;
             let qty = notional / mid;
             if qty <= Decimal::ZERO {
                 continue;
             }
 
-            // Over-weight (delta > 0) → SELL. Under-weight → BUY.
-            let (order_type, label) = if delta_weight > Decimal::ZERO {
+            // Order direction depends on whether the target instrument is the BASE
+            // or QUOTE of the market:
+            //   BASE overweight  → OFFER (sell base)              reduces base
+            //   BASE underweight → BID   (buy base)               increases base
+            //   QUOTE overweight → BID   (buy base, spend quote)  reduces quote  ← inverted!
+            //   QUOTE underweight → OFFER (sell base, gain quote) increases quote ← inverted!
+            let (base, _quote) = t.market.split_once('-').unwrap_or(("", ""));
+            let is_base = t.instrument == base;
+            let sell_base = if is_base {
+                delta_weight > Decimal::ZERO
+            } else {
+                delta_weight < Decimal::ZERO
+            };
+            let (order_type, label) = if sell_base {
                 (OrderType::Offer, "OFFER")
             } else {
                 (OrderType::Bid, "BID")

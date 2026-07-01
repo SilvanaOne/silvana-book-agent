@@ -125,30 +125,36 @@ impl OrderTracker {
             return; // Already tracked
         }
 
-        // Initialize `pending_quantity` to ZERO locally, NOT to server's value.
+        // Initialize BOTH `settled_quantity` and `pending_quantity` to ZERO
+        // locally, NOT to server's values.
         //
-        // Why: when the matching engine commits N parallel fills against this
-        // order, the server atomically marks the full matched volume as
-        // `pending_quantity` BEFORE emitting the per-fill settlement proposals.
-        // If we import the server's pending value as-is, the very first
-        // proposal we verify will see
-        //     remaining = quantity − settled − pending = 0
-        // and reject — even though we have NOT yet accepted any of the
-        // proposals locally. All subsequent proposals fail the same way and
-        // the order ends up with zero completed settlements (race condition
-        // observed on devnet 2026-06-30 with multi-fill aggressive bids).
+        // Why: when the matching engine commits N fills against this order,
+        // the server atomically marks matched volume across `filled_quantity`
+        // and `pending_quantity` BEFORE (or during) emission of the per-fill
+        // settlement proposals. Two observed manifestations on devnet:
+        //
+        //   1. Multi-fill race (2026-06-30, aggressive bid → 3 proposals):
+        //      server.pending_quantity = 30 immediately, so importing pending
+        //      as-is makes the first proposal see remaining = 0 and reject.
+        //
+        //   2. Instant-match single-fill race (2026-07-01, iceberg /
+        //      block-execution OFFER @ 0.13 vs mid 0.148 → matched instantly
+        //      by market-maker c2cde443): server.filled_quantity = 1 by the
+        //      time we import, so remaining = quantity − 1 − 0 = 0 and the
+        //      single proposal rejects.
         //
         // Local accounting starts fresh: each proposal we choose to accept
         // calls `mark_pending(base_quantity)`, which grows pending_quantity
-        // proposal-by-proposal. The capacity check then correctly debits
-        // each new proposal against the remaining un-claimed volume.
+        // proposal-by-proposal. On settlement completion the amount moves
+        // pending → settled. The capacity check then correctly debits each
+        // new proposal against the remaining un-claimed local volume.
         let tracked = TrackedOrder {
             order_id,
             market_id: order.market_id.clone(),
             order_type: order.order_type,
             price: Decimal::from_str(&order.price).unwrap_or_default(),
             quantity: Decimal::from_str(&order.quantity).unwrap_or_default(),
-            settled_quantity: Decimal::from_str(&order.filled_quantity).unwrap_or_default(),
+            settled_quantity: Decimal::ZERO,
             pending_quantity: Decimal::ZERO,
             nonce: order.nonce,
             signature: order.signature.clone().unwrap_or_default(),
