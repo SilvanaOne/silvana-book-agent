@@ -94,6 +94,24 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 
 **Impact:** до fix ANY order на `cETH-CC` (tick=1e-10) отбивался бы сервером. После fix любой tick_size поддерживается автоматически.
 
+### End-to-end verifications (последняя волна)
+
+**Trading history + Selective disclosure** (реальная цепочка вместо empty):
+- 4 записи в hash-chained JSONL (2× `order.created` + 2× `order.cancelled`)
+- Каждая: SHA256 payload + prev_hash chain + Ed25519 signature
+- `agent-trading-history verify --history-file th-real.jsonl` → **"OK: verified 4 record(s)"** ✅
+- `agent-selective-disclosure filter --kinds order.cancelled` → 2 kept, 2 skipped; свежая цепочка + signatures
+- `agent-selective-disclosure verify` → **"OK: verified 2 disclosure record(s)"** ✅
+
+**Witnesses с реальными событиями:**
+- `witness-real.log` содержит `CANCEL_27286684` + `CANCEL_27286683` — оба env-var expansion корректно ✅
+
+**Liquidity-seeking на cETH-CC** (тестировали ранее только CC-USDC no-depth):
+- Placed BID 0.0005 cETH @ **10742.0828851522** (order_id=27286688) ✅
+- 10-decimal precision совместимо с cETH-CC tick=1e-10
+- Preconfirmation submitted, killswitch отменил до fill
+- **Adaptive execution работает на реальном depth**
+
 ### End-to-end verification tick-aware на cETH-CC
 
 Финальная проверка что миграция реально работает:
