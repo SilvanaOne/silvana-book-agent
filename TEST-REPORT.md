@@ -71,12 +71,22 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 - 🎯 **agent-block-execution** — slice 1 settled, `filled=1 slice_filled=1/1 parent_filled=1/2` (было 0/2)
 - 🎯 **agent-mean-reversion** — SIGNAL OFFER триггернулся и продал 1 CC → +0.15 USDC
 - 🎯 **agent-order-matching** — SNIPE OFFER triggered (не заполнился т.к. bid=0.18 phantom)
+- 🎯 **agent-witnesses shell hook** — реально spawn'ится команда, env vars подставляются после `d0e03c5`: `witnesses.log` содержит `CANCELLED_27286564 market_CC-USDC` (было бы `$SILVANA_ORDER_ID` литерально)
+- 🎯 **agent-batch-orders `cancel-batch --side buy/sell`** — фильтр работает: 1 buy cancelled, 1 sell cancelled (не оба вместе)
+- 🎯 **agent-signal-bot `--from-end`** — стартует от offset EOF (пропустил 2 старых сигнала), обработал только новый добавленный (`NEW-c`) → order 27292726
+- 🎯 **agent-human-approval approve** — full workflow: `enqueue` → `list --status pending` → `approve --id X --by Y --reason Z` → order реально submitted (id=27286579) → `list --status approved` показывает decided timestamp
 
 ---
 
 ## Все агенты — детальная таблица
 
 Легенда: **✅** протестирован и работает • **✅+** протестирован end-to-end с реальной сделкой и изменением баланса • **⚠** работает частично, есть баг • **⛔** не тестировался (out of scope)
+
+### Дополнительные багфиксы после первого отчёта
+
+| Коммит | Тип | Файл |
+| --- | --- | --- |
+| `d0e03c5` | witnesses shell hook: `sh -c` вместо `cmd /C` для env var expansion | `agent-witnesses` |
 
 ### Commit chain — все fix'ы и добавления
 
