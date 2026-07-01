@@ -98,8 +98,12 @@ async fn main() -> Result<()> {
         "agent-cash-buffer",
     );
 
-    let config = BaseConfig::load(&cli.config)
+    let mut config = BaseConfig::load(&cli.config)
         .with_context(|| format!("Failed to load config from {:?}", cli.config))?;
+    if let Err(e) = cloud_agent::populate_instruments(&mut config).await {
+        warn!("Failed to populate instrument registry: {:#}", e);
+    }
+    let config = config;
 
     match cli.command {
         Commands::Run {

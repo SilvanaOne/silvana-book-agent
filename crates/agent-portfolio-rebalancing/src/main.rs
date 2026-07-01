@@ -247,7 +247,7 @@ async fn run_balance(
     let loop_sd = shutdown.clone();
     tokio::spawn(async move {
         if let Err(e) = balance_loop(
-            loop_cfg, targets_norm, threshold_pct, rebalance_fraction, check_interval, loop_sd,
+            loop_cfg, targets_norm, threshold_pct, rebalance_fraction, check_interval, dry_run, loop_sd,
         )
         .await
         {
@@ -283,6 +283,7 @@ async fn balance_loop(
     threshold_pct: f64,
     rebalance_fraction: f64,
     check_interval: u64,
+    dry_run: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut ob = OrderbookClient::new(&config).await?;
@@ -391,7 +392,12 @@ async fn balance_loop(
                 "REBAL {} {} on {}: qty={} @ mid={}",
                 label, t.instrument, t.market, qty, mid
             );
-            place(&mut ob, &tracker, &t.market, order_type, label, &mid.round_dp(8), &qty).await;
+            let price = mid.round_dp(8);
+            if dry_run {
+                info!("  [dry-run] would submit {} {} on {} @ {}", label, qty, t.market, price);
+            } else {
+                place(&mut ob, &tracker, &t.market, order_type, label, &price, &qty).await;
+            }
         }
 
         sleep_or_break(check_interval, &shutdown).await;

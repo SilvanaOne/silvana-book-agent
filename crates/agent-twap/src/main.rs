@@ -262,6 +262,7 @@ async fn run_twap(
             price_offset_pct,
             limit_dec,
             order_type_label(order_type),
+            dry_run,
             loop_shutdown,
         )
         .await
@@ -311,6 +312,7 @@ async fn twap_loop(
     price_offset_pct: f64,
     limit_price: Option<Decimal>,
     side_label: &'static str,
+    dry_run: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut client = OrderbookClient::new(&config).await?;
@@ -377,24 +379,28 @@ async fn twap_loop(
             i, slices, side_label, slice_size, market_id, order_price, mid
         );
 
-        match client
-            .submit_order(
-                &market_id,
-                order_type,
-                order_price.to_string(),
-                slice_size.to_string(),
-                Some(format!("twap-{}-{}", i, chrono::Utc::now().timestamp_millis())),
-                Some(signature),
-                signed_data,
-                nonce,
-            )
-            .await
-        {
-            Ok(resp) => info!(
-                "  → order placed id={}",
-                resp.order.as_ref().map(|o| o.order_id).unwrap_or(0)
-            ),
-            Err(e) => warn!("slice {} submit failed: {:#}", i, e),
+        if dry_run {
+            info!("  [dry-run] would submit {} {} @ {}", side_label, slice_size, order_price);
+        } else {
+            match client
+                .submit_order(
+                    &market_id,
+                    order_type,
+                    order_price.to_string(),
+                    slice_size.to_string(),
+                    Some(format!("twap-{}-{}", i, chrono::Utc::now().timestamp_millis())),
+                    Some(signature),
+                    signed_data,
+                    nonce,
+                )
+                .await
+            {
+                Ok(resp) => info!(
+                    "  → order placed id={}",
+                    resp.order.as_ref().map(|o| o.order_id).unwrap_or(0)
+                ),
+                Err(e) => warn!("slice {} submit failed: {:#}", i, e),
+            }
         }
 
         if i < slices {

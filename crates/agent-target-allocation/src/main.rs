@@ -223,7 +223,7 @@ async fn run_alloc(
         if let Err(e) = alloc_loop(
             loop_cfg, targets, threshold_quote,
             Decimal::from_str(&format!("{}", rebalance_fraction)).unwrap_or(Decimal::ONE),
-            check_interval, loop_sd,
+            check_interval, dry_run, loop_sd,
         ).await {
             error!("alloc loop failed: {:#}", e);
         }
@@ -257,6 +257,7 @@ async fn alloc_loop(
     threshold_quote: Decimal,
     fraction: Decimal,
     check_interval: u64,
+    dry_run: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut ob = OrderbookClient::new(&config).await?;
@@ -329,26 +330,30 @@ async fn alloc_loop(
                 (OrderType::Bid, "BID")
             };
             let price = mid.round_dp(8);
-            let (signature, signed_data, nonce) = tracker.sign_order(&t.market, label, &price.to_string(), &qty.to_string());
             info!("REBAL {} {} on {}: qty={} @ {}", label, t.instrument, t.market, qty, price);
-            match ob
-                .submit_order(
-                    &t.market,
-                    order_type,
-                    price.to_string(),
-                    qty.to_string(),
-                    Some(format!("alloc-{}-{}", label, chrono::Utc::now().timestamp_millis())),
-                    Some(signature),
-                    signed_data,
-                    nonce,
-                )
-                .await
-            {
-                Ok(resp) => info!(
-                    "  → order id={}",
-                    resp.order.as_ref().map(|o| o.order_id).unwrap_or(0)
-                ),
-                Err(e) => warn!("  submit failed: {:#}", e),
+            if dry_run {
+                info!("  [dry-run] would submit {} {} @ {}", label, qty, price);
+            } else {
+                let (signature, signed_data, nonce) = tracker.sign_order(&t.market, label, &price.to_string(), &qty.to_string());
+                match ob
+                    .submit_order(
+                        &t.market,
+                        order_type,
+                        price.to_string(),
+                        qty.to_string(),
+                        Some(format!("alloc-{}-{}", label, chrono::Utc::now().timestamp_millis())),
+                        Some(signature),
+                        signed_data,
+                        nonce,
+                    )
+                    .await
+                {
+                    Ok(resp) => info!(
+                        "  → order id={}",
+                        resp.order.as_ref().map(|o| o.order_id).unwrap_or(0)
+                    ),
+                    Err(e) => warn!("  submit failed: {:#}", e),
+                }
             }
         }
 
