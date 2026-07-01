@@ -32,23 +32,25 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 | `2a69336` | tick-size fix (8 агентов) | `agent-twap`, `agent-inventory-mgmt`, `agent-infinite-grid`, `agent-hedging`, `agent-algo-order`, `agent-spread-capture`, `agent-dca-portfolio`, `agent-mean-reversion` |
 | `ea91e56` | tick-size fix (ещё 3 агента) | `agent-portfolio-rebalancing`, `agent-target-allocation`, `agent-treasury-mgmt` |
 | `74dcb7d` | 4 bug fix: `populate_instruments_from_rpc` в cash-buffer + `--dry-run` gating в 3 агентах | `agent-cash-buffer`, `agent-twap`, `agent-target-allocation`, `agent-portfolio-rebalancing` |
+| `3e68b8a` | iceberg/block race (zero-out settled+pending на import) + portfolio-rebalancing base/quote accounting | `agent-logic/order_tracker.rs`, `agent-portfolio-rebalancing` |
 
 **Всего 11 крейтов** с tick-size патчем `.round_dp(8)`. Природа бага — server отбивает цены с > 8 знаков: `Price X must be a multiple of tick size 0.0000000100`.
 
 ### Не пофикшено (стоит отдельного PR)
 
-| # | Агент | Что | Как воспроизвести | Влияние |
-| --- | --- | --- | --- | --- |
-| 1 | `agent-portfolio-rebalancing` | Multi-instrument на одном маркете размещает взаимоисключающие OFFER+BID | `--target CC@CC-USDC=0.6 --target USDC@CC-USDC=0.4` → ставит OFFER 34 CC + BID 34 CC на CC-USDC | Логика: overweight → sell + underweight → buy оба идут через один market → взаимокомпенсация. Design issue. |
-| 2 | `agent-portfolio-rebalancing` | `portfolio_value` считает не полный USDC (150 вместо 1006) | В логе `portfolio_value=1637` при `9958 CC × 0.149 + 1006 USDC = 2490` | Неверный расчёт весов → возможно завышенный REBAL delta. Accounting bug. |
-| 3 | Tick-size fix использует hard-coded `.round_dp(8)` | Не универсально для non-CC-USDC маркетов | На cETH-USDC tick может быть другим | На CC-USDC работает |
-| 4 | `agent-iceberg-execution` + `agent-block-execution` | Race при мгновенном матче: OFFER @ 0.13 (сильно под mid) → `Order X insufficient capacity: remaining=0.0000000000, requested=1.0000000000` при верификации proposal → chunk застревает без settle, order остаётся на книге | Запустить `agent-iceberg-execution run --side sell --total 3 --visible 1 --price 0.13` → chunk #1 placed → race, wait forever | Instant fills не могут заcетлиться. Похоже на race из `510ee82` но проявляется в другой стадии. Иначе агенты работают при некрасивых fills. |
+| # | Агент | Что | Влияние |
+| --- | --- | --- | --- |
+| 1 | Tick-size fix использует hard-coded `.round_dp(8)` | Не универсально для non-CC-USDC маркетов (cETH-* может иметь другой tick) | На CC-USDC работает. Долгосрочное решение — читать tick_size из `get_markets` per market. |
+| 2 | `agent-iceberg-execution` | `chunk_filled` counter не инкрементируется при `Settlement completed` — логи показывают `parent_filled=0/3` даже после успешных settle | Minor UX issue — реальный DvP проходит и балансы меняются, но progress reporting не показывает fill count. |
 
-**Пофикшено ранее в этой сессии:**
-- ~~`agent-cash-buffer` cc_token_id~~ → fixed in `74dcb7d`
-- ~~`agent-twap` `--dry-run` gate~~ → fixed in `74dcb7d`
-- ~~`agent-target-allocation` `--dry-run` gate~~ → fixed in `74dcb7d`
-- ~~`agent-portfolio-rebalancing` `--dry-run` gate~~ → fixed in `74dcb7d`
+**Всё пофикшено в этой сессии (7 багов + 1 race):**
+- ~~`agent-cash-buffer` cc_token_id~~ → `74dcb7d`
+- ~~`agent-twap` `--dry-run` gate~~ → `74dcb7d`
+- ~~`agent-target-allocation` `--dry-run` gate~~ → `74dcb7d`
+- ~~`agent-portfolio-rebalancing` `--dry-run` gate~~ → `74dcb7d`
+- ~~`agent-iceberg-execution` + `agent-block-execution` race~~ → `3e68b8a` (order_tracker: zero settled+pending on import)
+- ~~`agent-portfolio-rebalancing` accounting~~ → `3e68b8a` (portfolio_value теперь корректно 2479 вместо 1637)
+- ~~`agent-portfolio-rebalancing` design~~ → `3e68b8a` (base/quote-aware direction: больше нет взаимоисключающих OFFER+BID)
 
 ---
 
