@@ -378,9 +378,10 @@ async fn rebalance(
         anyhow::bail!("no valid mid price for {}", market);
     }
     let mid_dec = Decimal::from_str(&format!("{}", mid)).unwrap_or(Decimal::ZERO);
-    let order_price = mid_dec
+    let order_price = (mid_dec
         * (Decimal::ONE
-            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO));
+            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO)))
+    .round_dp(8);
 
     let (signature, signed_data, nonce) =
         tracker.sign_order(market, label, &order_price.to_string(), &qty.to_string());

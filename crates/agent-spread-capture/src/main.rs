@@ -301,8 +301,8 @@ async fn sc_loop(
         let inv = filled_buy_qty - filled_sell_qty;
         let place_bid = inv < max_inventory;
         let place_offer = inv > -max_inventory;
-        let bid_price = mid_dec * (Decimal::ONE - half);
-        let offer_price = mid_dec * (Decimal::ONE + half);
+        let bid_price = (mid_dec * (Decimal::ONE - half)).round_dp(8);
+        let offer_price = (mid_dec * (Decimal::ONE + half)).round_dp(8);
 
         info!(
             "cycle: mid={:.6} inv={} place_bid={} place_offer={} bid={} offer={}",

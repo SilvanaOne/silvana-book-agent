@@ -343,10 +343,11 @@ async fn twap_loop(
             continue;
         }
 
-        let order_price = mid
+        let order_price = (mid
             * (Decimal::ONE
                 + Decimal::from_str(&format!("{}", price_offset_pct / 100.0))
-                    .unwrap_or(Decimal::ZERO));
+                    .unwrap_or(Decimal::ZERO)))
+        .round_dp(8);
 
         if let Some(limit) = limit_price {
             let bad = match order_type {

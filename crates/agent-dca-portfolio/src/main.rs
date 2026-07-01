@@ -379,7 +379,7 @@ async fn dca_loop(
         let offset_multiplier = Decimal::ONE + Decimal::from_str(
             &format!("{}", price_offset_pct / 100.0)
         ).unwrap_or(Decimal::ZERO);
-        let order_price = mid_price * offset_multiplier;
+        let order_price = (mid_price * offset_multiplier).round_dp(8);
 
         // Cap amount if it would exceed max_total
         let this_amount = if let Some(max) = max_total {

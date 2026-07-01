@@ -355,7 +355,9 @@ async fn mr_loop(
             continue;
         }
 
-        let order_price = Decimal::from_str(&format!("{}", ema_val)).unwrap_or(Decimal::ZERO);
+        let order_price = Decimal::from_str(&format!("{}", ema_val))
+            .unwrap_or(Decimal::ZERO)
+            .round_dp(8);
         if order_price <= Decimal::ZERO {
             sleep_or_break(poll_secs, &shutdown).await;
             continue;

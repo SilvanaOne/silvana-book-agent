@@ -354,7 +354,7 @@ async fn hedge_loop(
         }
         let offset = Decimal::from_str(&format!("{}", price_offset_pct / 100.0))
             .unwrap_or(Decimal::ZERO);
-        let order_price = mid * (Decimal::ONE + offset);
+        let order_price = (mid * (Decimal::ONE + offset)).round_dp(8);
 
         info!(
             "HEDGE {}: {} {} @ {} (mid={}, fraction={})",

@@ -360,8 +360,9 @@ async fn run_twap(
             sleep_or_break(interval, shutdown).await;
             continue;
         }
-        let order_price = mid * (Decimal::ONE
-            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO));
+        let order_price = (mid * (Decimal::ONE
+            + Decimal::from_str(&format!("{}", price_offset_pct / 100.0)).unwrap_or(Decimal::ZERO)))
+        .round_dp(8);
         if let Some(limit) = limit_d {
             let bad = match order_type {
                 OrderType::Bid => order_price > limit,

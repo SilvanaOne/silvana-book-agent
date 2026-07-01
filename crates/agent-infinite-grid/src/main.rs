@@ -333,8 +333,8 @@ async fn grid_loop(
         for i in 1..=levels {
             let offset = Decimal::from_str(&format!("{}", step_pct * i as f64 / 100.0))
                 .unwrap_or(Decimal::ZERO);
-            let bid_price = mid_dec * (Decimal::ONE - offset);
-            let offer_price = mid_dec * (Decimal::ONE + offset);
+            let bid_price = (mid_dec * (Decimal::ONE - offset)).round_dp(8);
+            let offer_price = (mid_dec * (Decimal::ONE + offset)).round_dp(8);
 
             place(&mut client, &tracker, &market, OrderType::Bid, "BID", &bid_price, &quantity, i).await;
             place(&mut client, &tracker, &market, OrderType::Offer, "OFFER", &offer_price, &quantity, i).await;
