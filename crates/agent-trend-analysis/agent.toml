@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "data_analytics"
+order = 5
+
+[agent]
+slug        = "trend-analysis"
+name        = "Trend Analysis"
+description = "Publishes SMA, EMA, Bollinger bands, RSI, and MACD per market on a fixed cadence — the technical-analysis feed for downstream strategies."
+icon        = "line-chart"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=trend-analysis"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Trend Analysis v1"
+language = "rust"
+order    = 1
+tags     = ["ta", "indicators", "publisher"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/trend-analysis/v1-rust"
+quickstart = "https://docs.silvana.one/agents/trend-analysis/v1-rust/quickstart"

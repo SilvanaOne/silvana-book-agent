@@ -11,6 +11,10 @@ description = "Observe your own orders and settlement proposals in real time —
 icon        = "activity"
 status      = "active"
 
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=state-monitor"

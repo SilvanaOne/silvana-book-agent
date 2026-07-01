@@ -11,6 +11,10 @@ description = "Keep your unlocked Canton Coin balance inside a band — excess i
 icon        = "wallet"
 status      = "active"
 
+required_balance   = "$50 min"
+supported_assets   = "CC"
+supported_projects = "Silvana"
+
 [[agent.cta]]
 label = "Order Agent"
 url   = "https://silvana.one/order-agent?ref=cash-buffer"

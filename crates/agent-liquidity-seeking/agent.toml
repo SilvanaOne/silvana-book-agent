@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 15
+
+[agent]
+slug        = "liquidity-seeking"
+name        = "Liquidity Seeking"
+description = "Adaptive execution — child order sizes are chosen to keep VWAP-vs-mid slippage under a configured budget while walking the available depth."
+icon        = "search"
+status      = "active"
+
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=liquidity-seeking"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Liquidity Seeking v1"
+language = "rust"
+order    = 1
+tags     = ["adaptive", "slippage", "execution"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/liquidity-seeking/v1-rust"
+quickstart = "https://docs.silvana.one/agents/liquidity-seeking/v1-rust/quickstart"

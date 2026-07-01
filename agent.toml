@@ -1,0 +1,124 @@
+# agent.toml — full reference example.
+#
+# Lives in: silvana-book-agent/crates/agent-<name>/agent.toml (next to Cargo.toml).
+# Crates without this file are EXCLUDED from /api/agents/catalog.
+#
+# Required vs optional fields are marked in the comments below. Backend logs any
+# parse/validation issue to /api/agents/_validation (it does NOT crash startup —
+# bad crates are just dropped from the catalog).
+
+schema_version = 1                  # required. Integer. Bumped when the format
+                                    # changes in a backward-incompatible way.
+
+# ──────────────────────────────────────────────────────────────────────────
+# [category] — where the agent appears in the catalog tree
+# ──────────────────────────────────────────────────────────────────────────
+[category]
+# Declare EITHER `slug = "..."` (single-category — the common case) OR
+# `slugs = ["...", "..."]` (multi-category — when one agent conceptually
+# fits several columns; the card is rendered in each of them). The two
+# forms are mutually exclusive; declaring both is a parse error.
+slug  = "trading"                   # required (single form). One of the
+                                    # fixed enum values:
+                                    #   "trading"          — Trading
+                                    #   "portfolio_mgmt"   — Asset/Portfolio Management
+                                    #   "tx_flow"          — Tx Flow
+                                    #   "data_analytics"   — Data and Analytics
+                                    #   "compliance"       — Compliance
+                                    #   "risk"             — Risk
+                                    #   "auditing"         — Auditing
+                                    #   "zk_proving"       — Zk Proving
+                                    # Unknown slug → crate is skipped and
+                                    # reported in /_validation.
+# slugs = ["risk", "data_analytics"]  # required (multi form, instead of slug).
+                                      # Order in the array is preserved in
+                                      # /api/agents/{slug}.categories[].
+                                      # Duplicates / unknown entries → parse error.
+order = 1                           # required. Position within the category
+                                    # (lower = higher in the column). Applied
+                                    # to EVERY category the agent appears in
+                                    # under the multi form. Should match
+                                    # across templates of one agent; if they
+                                    # disagree, smallest wins and the rest
+                                    # are reported as warnings.
+
+# ──────────────────────────────────────────────────────────────────────────
+# [agent] — concept-level metadata, SHARED across every template of this agent.
+# Duplicated across crates that share the same agent.slug. Backend dedupes:
+# the first crate by (category.order, template.order) becomes canonical; any
+# mismatching field in sibling crates is logged as a warning (not a failure).
+# ──────────────────────────────────────────────────────────────────────────
+[agent]
+slug        = "spot-grid"           # required. Joins multiple crates into one
+                                    # card on the catalog. Lowercase, kebab-case.
+name        = "Spot Grid"           # required. Card title in the catalog.
+description = "Automate buy-low, sell-high execution across every market swing."
+                                    # required. One or two sentences. Shown on
+                                    # both the tile and the detail page.
+icon        = "candles"             # required. Free-text identifier. The
+                                    # frontend will eventually constrain this
+                                    # to a preset list; for now any non-empty
+                                    # string is accepted and passed through.
+status      = "active"              # required. One of:
+                                    #   "active"     — visible in catalog
+                                    #   "preview"    — visible with a badge
+                                    #   "deprecated" — returned everywhere with
+                                    #                  `deprecated = true`;
+                                    #                  frontend decides how to
+                                    #                  render
+
+# Three free-text descriptive fields shown on the detail card. All optional;
+# blank strings are normalised to absent. Stored verbatim — the backend does
+# NOT parse "$100 min" or split "BTC, ETH" into an array. Drift across
+# sibling crates surfaces as a warning in /api/agents/_validation.
+required_balance   = "$100 min"
+supported_assets   = "BTC, ETH, SOL, USDC"
+supported_projects = "Silvana"
+
+# Optional. Per-agent custom CTAs shown in the "Need a custom agent?" block on
+# the detail page (e.g. "Order Agent", "Contact Us"). Render order follows the
+# declaration order in this file. Across crates of one agent, only the
+# canonical crate's list is used.
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=spot-grid"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+# ──────────────────────────────────────────────────────────────────────────
+# [template] — per-crate metadata. UNIQUE to this crate; identifies this
+# particular implementation in the "Agent Templates" list on the detail page.
+# ──────────────────────────────────────────────────────────────────────────
+[template]
+name      = "Spot Grid v1 Marketmaker"
+                                    # required. Display name in the templates
+                                    # list. Must be unique within an agent.slug.
+language  = "rust"                  # required. One of: "rust", "typescript",
+                                    # "python", "go". Frontend picks the
+                                    # coloured language badge from this.
+order     = 1                       # required. Position in the templates list
+                                    # for this agent (lower = higher).
+tags      = ["marketmaker"]         # optional. Extra free-text badges shown
+                                    # alongside the language badge. Keep short —
+                                    # these render as pills.
+demo      = "https://demo.silvana.one/agents/spot-grid/v1"
+                                    # optional. URL to a live demonstration.
+                                    # When present, the frontend renders a
+                                    # clickable DEMO badge next to the
+                                    # template name; when omitted, no badge.
+                                    # There is no separate maturity field —
+                                    # the badge IS the maturity signal.
+# NOTE: repo_path is NOT a field here. The backend auto-derives it from the
+# location of this file (the parent directory of agent.toml) so the value can
+# never drift from reality. The API exposes it as `repo_path` to the frontend.
+
+# Optional. Per-template documentation links rendered in the "Resources"
+# section of the detail page. Any subset of {docs, quickstart, faq} is allowed;
+# missing keys are simply not shown. If [template.resources] is absent entirely,
+# the section is empty for this template.
+[template.resources]
+docs       = "https://docs.silvana.one/agents/spot-grid/v1-rust"
+quickstart = "https://docs.silvana.one/agents/spot-grid/v1-rust/quickstart"
+faq        = "https://docs.silvana.one/agents/spot-grid/v1-rust/faq"

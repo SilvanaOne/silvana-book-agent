@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 8
+
+[agent]
+slug        = "signal-bot"
+name        = "Signal Bot"
+description = "Tails a JSONL signals file and executes one limit order per line — persists byte offset in a sidecar file so it survives restarts without replay."
+icon        = "radio"
+status      = "active"
+
+required_balance   = "$100 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=signal-bot"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Signal Bot v1"
+language = "rust"
+order    = 1
+tags     = ["signals", "jsonl", "executor"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/signal-bot/v1-rust"
+quickstart = "https://docs.silvana.one/agents/signal-bot/v1-rust/quickstart"

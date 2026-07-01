@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "risk"
+order = 8
+
+[agent]
+slug        = "risk-exposure"
+name        = "Risk Exposure"
+description = "Aggregated dashboard of portfolio value, open notional per market, pending settlement notional, and per-instrument concentration. Emits a snapshot on a schedule."
+icon        = "layout-dashboard"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=risk-exposure"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Risk Exposure v1"
+language = "rust"
+order    = 1
+tags     = ["exposure", "dashboard"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/risk-exposure/v1-rust"
+quickstart = "https://docs.silvana.one/agents/risk-exposure/v1-rust/quickstart"

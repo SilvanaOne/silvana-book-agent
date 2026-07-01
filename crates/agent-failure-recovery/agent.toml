@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "tx_flow"
+order = 5
+
+[agent]
+slug        = "failure-recovery"
+name        = "Failure Recovery"
+description = "Watchdog for stale or failed settlement proposals — sweeps pending flows on a schedule and optionally cancels the related orders."
+icon        = "life-buoy"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, CBTC, CETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=failure-recovery"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Failure Recovery v1"
+language = "rust"
+order    = 1
+tags     = ["watchdog", "settlement", "recovery"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/failure-recovery/v1-rust"
+quickstart = "https://docs.silvana.one/agents/failure-recovery/v1-rust/quickstart"
