@@ -258,8 +258,13 @@ async fn handle_order(u: &OrderUpdate, handlers: &HashMap<&'static str, String>)
 fn spawn_command(cmd: String, env: Vec<(String, String)>, kind: &'static str) {
     tokio::spawn(async move {
         info!("fire {} -> {}", kind, cmd);
-        // Use the shell so users can pass pipelines and quoted strings.
-        let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+        // Always try POSIX `sh -c` so `$VAR` env expansion works uniformly
+        // across Unix and Windows (Git Bash / MSYS / WSL provide `sh`). If `sh`
+        // isn't in PATH the spawn will fail with a clear warning below and the
+        // user should install Git for Windows or WSL. This is preferable to
+        // silently switching to `cmd /C` which uses `%VAR%` syntax and would
+        // make `$VAR` scripts written for the Unix docs break with no error.
+        let (shell, flag) = ("sh", "-c");
         let mut command = tokio::process::Command::new(shell);
         command
             .arg(flag)
