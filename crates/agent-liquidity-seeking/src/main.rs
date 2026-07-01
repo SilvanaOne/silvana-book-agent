@@ -407,8 +407,8 @@ fn max_safe_qty(
         let cand_cost = accum_cost + lvl_qty * lvl_px;
         let vwap = cand_cost / cand_qty;
         let dev = match side {
-            OrderType::Bid => (vwap - mid),  // walking offers ↑
-            OrderType::Offer => (mid - vwap), // walking bids ↓
+            OrderType::Bid => vwap - mid,   // walking offers ↑
+            OrderType::Offer => mid - vwap, // walking bids ↓
             _ => Decimal::ZERO,
         };
         let bps = dev.abs() / mid * bps_unit;

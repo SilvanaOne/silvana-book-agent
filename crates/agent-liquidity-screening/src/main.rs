@@ -300,7 +300,6 @@ fn walk(levels: &[OrderbookLevel], target: Decimal, mid: Option<Decimal>) -> Pro
         if remaining <= lvl_qty {
             weighted_cost += remaining * lvl_px;
             filled += remaining;
-            remaining = Decimal::ZERO;
             break;
         } else {
             weighted_cost += lvl_qty * lvl_px;
