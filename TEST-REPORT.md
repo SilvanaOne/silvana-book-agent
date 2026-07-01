@@ -94,6 +94,33 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 
 **Impact:** до fix ANY order на `cETH-CC` (tick=1e-10) отбивался бы сервером. После fix любой tick_size поддерживается автоматически.
 
+### End-to-end verification tick-aware на cETH-CC
+
+Финальная проверка что миграция реально работает:
+
+```
+$ agent-spot-dca run --market cETH-CC --side buy --amount 0.001 --price-offset-pct=-99
+Market cETH-CC tick_size = 0.0000000001
+DCA #1: BID 0.001 cETH-CC @ 106.9920137290 (mid=10699.201372900388, offset=-99%)
+Order id=27286633 placed
+```
+
+- ✅ `tick_size = 1e-10` прочитан с `GetMarkets` RPC
+- ✅ Order размещён с **10 знаками после запятой** (`106.9920137290`)
+- ✅ Server принял ордер
+- ✅ Cancel succeeded
+
+Все 7 single-market и 5 multi-market агентов теперь умеют работать на ЛЮБОМ маркете devnet.
+
+### Test suite
+
+```
+$ cargo test --release -p agent-logic --lib
+test result: ok. 37 passed; 0 failed; 0 ignored
+```
+
+Юнит-тесты покрывают: auth JWT, liquidity manager, order_tracker (сигнатура, race conditions, capacity), shutdown signaling, settlement state transitions, config parsing, state persistence, **tick rounding (4 tests: 1e-8 tick, 5e-8 odd tick, zero-tick passthrough, 8-decimal helper)**.
+
 ### Commit chain — все fix'ы и добавления
 
 ```
