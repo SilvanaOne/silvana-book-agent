@@ -33,6 +33,7 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 | `ea91e56` | tick-size fix (ещё 3 агента) | `agent-portfolio-rebalancing`, `agent-target-allocation`, `agent-treasury-mgmt` |
 | `74dcb7d` | 4 bug fix: `populate_instruments_from_rpc` в cash-buffer + `--dry-run` gating в 3 агентах | `agent-cash-buffer`, `agent-twap`, `agent-target-allocation`, `agent-portfolio-rebalancing` |
 | `3e68b8a` | iceberg/block race (zero-out settled+pending на import) + portfolio-rebalancing base/quote accounting | `agent-logic/order_tracker.rs`, `agent-portfolio-rebalancing` |
+| `b7332b3` | iceberg/block `chunk_filled` counter (возвращали `Decimal::ZERO` — теперь `expected_qty`) + `runtime/`, `runtime2/`, `.claude/` в gitignore | `agent-iceberg-execution`, `agent-block-execution`, `.gitignore` |
 
 **Всего 11 крейтов** с tick-size патчем `.round_dp(8)`. Природа бага — server отбивает цены с > 8 знаков: `Price X must be a multiple of tick size 0.0000000100`.
 
@@ -40,8 +41,8 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 
 | # | Агент | Что | Влияние |
 | --- | --- | --- | --- |
-| 1 | Tick-size fix использует hard-coded `.round_dp(8)` | Не универсально для non-CC-USDC маркетов (cETH-* может иметь другой tick) | На CC-USDC работает. Долгосрочное решение — читать tick_size из `get_markets` per market. |
-| 2 | `agent-iceberg-execution` | `chunk_filled` counter не инкрементируется при `Settlement completed` — логи показывают `parent_filled=0/3` даже после успешных settle | Minor UX issue — реальный DvP проходит и балансы меняются, но progress reporting не показывает fill count. |
+| 1 | Tick-size fix использует hard-coded `.round_dp(8)` в 14 местах | Не универсально для non-CC-USDC маркетов (cETH-* может иметь другой tick) | На CC-USDC работает. Долгосрочное решение — центральный `round_price_for_market(market_id, price)` helper с `tick_size` из `get_markets` кеша. |
+| 2 | `agent-cash-buffer` balance reading несоответствует `info balance` | При реальных 9955 CC (`cloud-agent info balance`) видит `cc_unlocked=5025`. Запрос `TransferCc amount=2475` перебросил на самом деле **7404 CC**. Соотношение ~2x — вероятно `cc_unlocked` fn берёт первую запись `TokenBalance` через `.find(…)`, а их может быть несколько (locked/unlocked отдельными записями). | End-to-end TransferCc работает, но amount computed by cash-buffer не соответствует amount actually transferred. Опасно если пользователь настраивает band в конкретных числах. |
 
 **Всё пофикшено в этой сессии (7 багов + 1 race):**
 - ~~`agent-cash-buffer` cc_token_id~~ → `74dcb7d`
