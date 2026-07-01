@@ -298,6 +298,12 @@ async fn buffer_loop(
 
         match client.get_balances().await {
             Ok(balances) => {
+                for b in &balances {
+                    tracing::debug!(
+                        "balance dump: instrument_id={} is_canton_coin={} total={} locked={} unlocked={}",
+                        b.instrument_id, b.is_canton_coin, b.total_amount, b.locked_amount, b.unlocked_amount
+                    );
+                }
                 let cc = cc_unlocked(&balances, config.cc_token_id.as_deref());
                 info!("cc_unlocked={} (target band {} ≤ x ≤ {})", cc, min, max);
                 if cc < min {
