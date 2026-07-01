@@ -24,8 +24,8 @@ export function TopBar({ active = "dashboard", onChange, live }: Props) {
     <>
       <div className="topbar">
         <div className="brand">
-          <span className="brand-mark">T</span>
-          <span className="brand-title">TP/SL</span>
+          <span className="brand-mark">D</span>
+          <span className="brand-title">Spot DCA</span>
           <span className="brand-agent">Agent</span>
           <span className="chip">CANTON</span>
         </div>

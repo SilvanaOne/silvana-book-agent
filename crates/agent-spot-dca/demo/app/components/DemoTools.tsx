@@ -1,27 +1,23 @@
 "use client";
 
 import { useState } from "react";
-import type { PositionState } from "@/lib/tpsl-engine";
+import type { DcaState } from "@/lib/dca-engine";
 
 type Props = Readonly<{
-  position: PositionState | null;
+  dca: DcaState | null;
   onJump: (to: number) => Promise<void>;
   onWalk: (patch: { driftPerTick?: number; volPerTick?: number }) => Promise<void>;
 }>;
 
-export function DemoTools({ position, onJump, onWalk }: Props) {
+export function DemoTools({ dca, onJump, onWalk }: Props) {
   const [manual, setManual] = useState("");
   const [drift, setDrift] = useState("0");
-  const [vol, setVol] = useState("0.8");
+  const [vol, setVol] = useState("0.5");
 
-  if (!position || position.status !== "monitoring") {
-    return <div className="muted">Start a position to enable demo tools.</div>;
-  }
+  if (!dca || dca.status !== "monitoring") return <div className="muted">Start a DCA to enable demo tools.</div>;
 
-  const price = position.currentPrice;
+  const price = dca.currentPrice;
   const nudge = (mult: number) => Number((price * mult).toFixed(8));
-  const tp = position.config.tp;
-  const sl = position.currentSl;
 
   return (
     <div className="stack">
@@ -34,16 +30,6 @@ export function DemoTools({ position, onJump, onWalk }: Props) {
         <button className="ghost" onClick={() => onJump(nudge(0.98))}>−2%</button>
         <button className="ghost" onClick={() => onJump(nudge(0.95))}>−5%</button>
       </div>
-      {tp !== null && (
-        <button className="ghost" onClick={() => onJump(Number((tp * 1.0001).toFixed(8)))}>
-          Jump to TP ({tp})
-        </button>
-      )}
-      {sl !== null && (
-        <button className="ghost" onClick={() => onJump(Number((sl * 0.9999).toFixed(8)))}>
-          Jump to SL ({sl.toFixed(6)})
-        </button>
-      )}
       <div className="row" style={{ gap: 6 }}>
         <input type="number" step="any" placeholder="Manual price" value={manual} onChange={(e) => setManual(e.target.value)} />
         <button disabled={!manual || !Number.isFinite(Number(manual))} onClick={() => onJump(Number(manual))}>Set</button>
