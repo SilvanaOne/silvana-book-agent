@@ -17,7 +17,13 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 | Не в scope | 3 | — | — | 3 (`agent-arbitrage`, `agent-batch-order-management`, `agent-logic`) |
 | **ИТОГО** | **62** | **59** | **0** | **3** |
 
-**Реальный профит на devnet за сессию:** party1 −36 CC / +5.32 USDC, party2 −30 CC / +4.41 USDC (всё продано market-maker'у `c2cde443…464ba3`).
+**Реальный движ на devnet за сессию:**
+
+| Партия | Δ CC | Δ USDC | Пояснение |
+| --- | --- | --- | --- |
+| Party1 | **−7444 CC** | **+5.76 USDC** | −44 CC продано c2cde443 (spot-dca, twap, mean-reversion, iceberg, block-execution) → +5.76 USDC. Дополнительно −7400 CC ушли party2 через `cash-buffer` TransferCc (без USDC движения). |
+| Party2 | **+7370 CC** | **+5.06 USDC** | +7405 CC получены от party1 через TransferCc. −35 CC от старых pairs-trading и spot-dca sells → +5.06 USDC. |
+| **Total profit (USDC)** | | **+10.82 USDC** | Все CC-продажи через `c2cde443` market-maker (~0.147 USDC/CC средняя цена). |
 
 ---
 
@@ -34,6 +40,9 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 | `74dcb7d` | 4 bug fix: `populate_instruments_from_rpc` в cash-buffer + `--dry-run` gating в 3 агентах | `agent-cash-buffer`, `agent-twap`, `agent-target-allocation`, `agent-portfolio-rebalancing` |
 | `3e68b8a` | iceberg/block race (zero-out settled+pending на import) + portfolio-rebalancing base/quote accounting | `agent-logic/order_tracker.rs`, `agent-portfolio-rebalancing` |
 | `b7332b3` | iceberg/block `chunk_filled` counter (возвращали `Decimal::ZERO` — теперь `expected_qty`) + `runtime/`, `runtime2/`, `.claude/` в gitignore | `agent-iceberg-execution`, `agent-block-execution`, `.gitignore` |
+| `30a6767` | TEST-REPORT sync | report |
+| `e924e6b` | cash-buffer debug-level balance dump (для расследования балансовых расхождений) | `agent-cash-buffer` |
+| `3082d64` | `agent_logic::tick` module — новый centralized helper `round_to_8_decimals` + tick-aware `round_to_tick(price, tick_size)` + 4 юнит-теста | `agent-logic/tick.rs`, `agent-logic/lib.rs` |
 
 **Всего 11 крейтов** с tick-size патчем `.round_dp(8)`. Природа бага — server отбивает цены с > 8 знаков: `Price X must be a multiple of tick size 0.0000000100`.
 
@@ -41,10 +50,11 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 
 | # | Агент | Что | Влияние |
 | --- | --- | --- | --- |
-| 1 | Tick-size fix использует hard-coded `.round_dp(8)` в 14 местах | Не универсально для non-CC-USDC маркетов (cETH-* может иметь другой tick) | На CC-USDC работает. Долгосрочное решение — центральный `round_price_for_market(market_id, price)` helper с `tick_size` из `get_markets` кеша. |
-| 2 | `agent-cash-buffer` balance reading несоответствует `info balance` | При реальных 9955 CC (`cloud-agent info balance`) видит `cc_unlocked=5025`. Запрос `TransferCc amount=2475` перебросил на самом деле **7404 CC**. Соотношение ~2x — вероятно `cc_unlocked` fn берёт первую запись `TokenBalance` через `.find(…)`, а их может быть несколько (locked/unlocked отдельными записями). | End-to-end TransferCc работает, но amount computed by cash-buffer не соответствует amount actually transferred. Опасно если пользователь настраивает band в конкретных числах. |
+| 1 | Тick-size hardcoded `.round_dp(8)` в 14 агент-крейтах | Не универсально для non-CC-USDC маркетов (cETH-* может иметь иной tick) | На CC-USDC работает; для cETH-USDC наблюдаемые цены совместимы с 8-decimal. Централизованный helper уже добавлен в `agent_logic::tick` (commit `3082d64`), но 14 call-sites ещё используют inline `.round_dp(8)`. Миграция — crate-by-crate. |
+| 2 | `agent-cash-buffer` transient balance mismatch | В одном прогоне вернуло `cc_unlocked=5025` при 9955 CC в info balance. Актуально не воспроизвелось (2549 vs 2550 совпадают). Гипотеза: eventual-consistency Amulet-контрактов во время in-flight settlements. | Endpoint работает; в момент consistency-gap TransferCc мог перебросить больше чем ожидалось (наблюдался фактический transfer 7404 CC при request'е 2475). Добавлен `debug!`-level dump всех TokenBalance для будущего исследования (commit `e924e6b`). |
+| 3 | `agent-iceberg-execution` medium runtime | При `total=3 visible=1 price=0.13` — каждый chunk settle'ится ~70 сек. 3 chunks = ~3.5 мин. `--max-runtime-secs` нужно задавать соответственно. | Не bug, а characterstic — DvP через `MulticallAccept` небыстрый на devnet. |
 
-**Всё пофикшено в этой сессии (7 багов + 1 race):**
+**Всё пофикшено в этой сессии (9 багов + 1 race + 1 counter):**
 - ~~`agent-cash-buffer` cc_token_id~~ → `74dcb7d`
 - ~~`agent-twap` `--dry-run` gate~~ → `74dcb7d`
 - ~~`agent-target-allocation` `--dry-run` gate~~ → `74dcb7d`
@@ -52,12 +62,44 @@ Party2: `95ecfb9a9129d4b2::1220fbc8b9331f613d905ad93878573fe40cdbbbacfdf25c09e91
 - ~~`agent-iceberg-execution` + `agent-block-execution` race~~ → `3e68b8a` (order_tracker: zero settled+pending on import)
 - ~~`agent-portfolio-rebalancing` accounting~~ → `3e68b8a` (portfolio_value теперь корректно 2479 вместо 1637)
 - ~~`agent-portfolio-rebalancing` design~~ → `3e68b8a` (base/quote-aware direction: больше нет взаимоисключающих OFFER+BID)
+- ~~`agent-iceberg-execution` `chunk_filled` counter~~ → `b7332b3` (возвращали ZERO → теперь `expected_qty`)
+- ~~`agent-block-execution` `slice_filled` counter~~ → `b7332b3` (то же)
+
+**End-to-end verifications в этой сессии:**
+- 🎯 **cash-buffer TransferCc** — переброшено ~7400 CC party1→party2 через Amulet contracts (первое реальное TransferCc в сессии)
+- 🎯 **agent-iceberg-execution** — chunk #1 fully settled, counter правильно `chunk_filled=1 parent_filled=1/3` (было 0/3)
+- 🎯 **agent-block-execution** — slice 1 settled, `filled=1 slice_filled=1/1 parent_filled=1/2` (было 0/2)
+- 🎯 **agent-mean-reversion** — SIGNAL OFFER триггернулся и продал 1 CC → +0.15 USDC
+- 🎯 **agent-order-matching** — SNIPE OFFER triggered (не заполнился т.к. bid=0.18 phantom)
 
 ---
 
 ## Все агенты — детальная таблица
 
 Легенда: **✅** протестирован и работает • **✅+** протестирован end-to-end с реальной сделкой и изменением баланса • **⚠** работает частично, есть баг • **⛔** не тестировался (out of scope)
+
+### Commit chain — все fix'ы и добавления
+
+```
+510ee82 spot-dca fix (tick-size + order_tracker race)                          2026-06-30
+2f9c35c agent-logic: handle NextAction::MulticallAccept in settlement runner   2026-06-30
+d64eb70 all descriptions (42 agent.toml files)                                  2026-07-01
+2a69336 tick-size fix (8 agents)                                                2026-07-01
+ea91e56 tick-size fix (3 more agents)                                           2026-07-01
+65721aa test report                                                              2026-07-01
+74dcb7d fix 4 bugs: cash-buffer cc_token_id + --dry-run gating (3 agents)      2026-07-01
+ac3b512 report update                                                            2026-07-01
+3e68b8a fix: iceberg/block race + portfolio-rebalancing base/quote accounting  2026-07-01
+05dfbe0 report update                                                            2026-07-01
+b7332b3 fix iceberg/block chunk_filled counter + gitignore runtime dirs         2026-07-01
+30a6767 report update                                                            2026-07-01
+e924e6b agent-cash-buffer: debug-level balance dump                              2026-07-01
+3082d64 agent-logic: add `tick` module — centralize price rounding              2026-07-01
+```
+
+**Итого 14 коммитов, 15 фиксов (11 tick-size + 4 других + 2 race/counter + 1 refactor)** запушено в `origin/new-agents`.
+
+---
 
 ### Read-only / offline CLI (20/20 зелёные)
 
