@@ -72,3 +72,35 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Roll the freshly-built images onto the host. Runs only after both images
+  # built + pushed successfully (needs: build), and only on a real push to
+  # new-agents — never on PRs (which don't push images) or forks.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/new-agents'
+    concurrency:
+      group: deploy-demos
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          GIT_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          envs: GIT_SHA
+          script: |
+            set -euo pipefail
+            cd /opt/silvana-book-agent
+            git fetch --all --prune
+            git checkout new-agents
+            git pull --ff-only
+            # metadata-action's type=sha tag is the 7-char short SHA — match it
+            # exactly so we deploy precisely the image this run built.
+            TAG="sha-$(echo "$GIT_SHA" | cut -c1-7)"
+            bash scripts/deploy-demos.sh "$TAG"

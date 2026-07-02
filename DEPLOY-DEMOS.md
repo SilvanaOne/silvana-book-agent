@@ -54,47 +54,113 @@ bash scripts/deploy-demos.sh          # latest
 bash scripts/deploy-demos.sh sha-abc  # pin a specific commit
 ```
 
-That script does:
+At its core the script runs:
 
 ```
 docker compose -f docker-compose.demos.yml pull
-docker compose -f docker-compose.demos.yml up -d --remove-orphans
+docker compose -f docker-compose.demos.yml up -d --pull always --remove-orphans
 docker image prune -f
 ```
 
-Idempotent. Only recreates containers whose image tag changed.
+Universal start-or-restart, applied per demo service:
+
+- **not running** → started
+- **running an old version** → recreated on the new image
+- **already up to date** → left alone (no needless restart)
+
+The script snapshots each service's running image before and after the roll
+and prints which of the three outcomes happened. Idempotent — re-running with
+the same tag is a no-op.
 
 ## Ports
 
 | Service          | Host port | Suggested domain         |
 | ---------------- | --------- | ------------------------ |
-| `tpsl-demo`      | 3002      | tpsl.spcatcher.cfd       |
-| `spot-dca-demo`  | 3003      | spot-dca.spcatcher.cfd   |
+| `tpsl-demo`      | 3002      | tpsl.example.com         |
+| `spot-dca-demo`  | 3003      | spot-dca.example.com     |
 
 ## Reverse proxy (Caddy)
 
 Add to `/etc/caddy/Caddyfile`:
 
 ```caddyfile
-tpsl.spcatcher.cfd {
+tpsl.example.com {
   reverse_proxy 127.0.0.1:3002
 }
 
-spot-dca.spcatcher.cfd {
+spot-dca.example.com {
   reverse_proxy 127.0.0.1:3003
 }
 ```
 
 Reload: `sudo systemctl reload caddy`. Let's Encrypt is automatic.
 
-## Auto-deploy on push
+## Auto-deploy on push (live)
 
-Two flavors, pick one.
+The `deploy` job in `.github/workflows/demos.yml` is already wired up. After
+the `build` matrix pushes both images to GHCR, `deploy` SSHes into the host and
+rolls the containers — but **only on a real push to `new-agents`** (never on PRs,
+which don't push images). It pins to this commit's short SHA
+(`sha-<7-char>`, matching metadata-action's `type=sha` tag) so the server runs
+exactly the image the same run just built:
 
-### 1) GitHub webhook → tiny hook on the server
+```yaml
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/new-agents'
+    concurrency:
+      group: deploy-demos
+      cancel-in-progress: false
+    steps:
+      - uses: appleboy/ssh-action@v1
+        env:
+          GIT_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          envs: GIT_SHA
+          script: |
+            set -euo pipefail
+            cd /opt/silvana-book-agent
+            git fetch --all --prune
+            git checkout new-agents
+            git pull --ff-only
+            TAG="sha-$(echo "$GIT_SHA" | cut -c1-7)"
+            bash scripts/deploy-demos.sh "$TAG"
+```
 
-Install [webhook](https://github.com/adnanh/webhook), point a GitHub
-webhook at it, run this on receipt:
+### Required repo secrets
+
+Set these under GitHub → repo Settings → Secrets and variables → Actions:
+
+| Secret     | Notes                                          |
+| ---------- | ---------------------------------------------- |
+| `SSH_HOST` | host running the demos (IP or hostname)        |
+| `SSH_USER` | SSH user                                       |
+| `SSH_KEY`  | private key with access to the host            |
+| `SSH_PORT` | optional (defaults to 22)                      |
+
+### One-time host prerequisites
+
+On the deploy host:
+
+1. Clone the repo at `/opt/silvana-book-agent` on branch `new-agents`
+   (only the compose file + `scripts/deploy-demos.sh` are used — no source build).
+2. Docker + compose v2 plugin installed.
+3. GHCR pull access — either make the two `*-demo` packages **Public**, or run a
+   persistent `docker login ghcr.io` with a `read:packages` PAT (see above).
+4. Optional reverse-proxy entries: `tpsl.example.com → 127.0.0.1:3002` and
+   `spot-dca.example.com → 127.0.0.1:3003`. Containers are reachable on the host
+   ports regardless of the proxy.
+
+### Alternative: server-side webhook
+
+If you'd rather not give CI SSH access, install
+[webhook](https://github.com/adnanh/webhook), point a GitHub push webhook at it,
+and run on receipt:
 
 ```bash
 #!/usr/bin/env bash
@@ -103,30 +169,6 @@ cd /opt/silvana-book-agent
 git pull --ff-only
 bash scripts/deploy-demos.sh latest
 ```
-
-### 2) GitHub Actions SSH deploy
-
-Add a `deploy` job to `.github/workflows/demos.yml` that runs after the
-image build succeeds:
-
-```yaml
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/new-agents'
-    steps:
-      - uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            cd /opt/silvana-book-agent
-            git pull --ff-only
-            bash scripts/deploy-demos.sh sha-${{ github.sha }}
-```
-
-Requires `SSH_HOST`, `SSH_USER`, `SSH_KEY` set in repo Secrets.
 
 ## Local dev (build without pulling)
 
