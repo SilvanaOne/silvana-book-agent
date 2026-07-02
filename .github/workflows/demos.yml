@@ -118,6 +118,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/new-agents'
+    permissions:
+      contents: read
+      packages: read
     concurrency:
       group: deploy-demos
       cancel-in-progress: false
@@ -142,6 +145,9 @@ jobs:
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN_RP }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -151,10 +157,15 @@ jobs:
           proxy_username: ${{ secrets.SSH_PROXY_USER }}
           proxy_key: ${{ secrets.SSH_KEY }}
           proxy_port: ${{ secrets.SSH_PROXY_PORT }}
+          envs: GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
+            # The demo images are private on GHCR — log the host in with the
+            # workflow token (same token that pushed them; scoped + ephemeral).
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             cd /opt/silvana-book-agent
             # Deploy the mutable `latest` tag: only the demo that was actually
             # rebuilt this run has a new `latest`, so `deploy-demos.sh` restarts
             # just that container and leaves the unchanged one running.
             bash scripts/deploy-demos.sh latest
+            docker logout ghcr.io || true
