@@ -26,18 +26,49 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      tpsl: ${{ steps.filter.outputs.tpsl }}
-      dca: ${{ steps.filter.outputs.dca }}
+      tpsl: ${{ steps.detect.outputs.tpsl }}
+      dca: ${{ steps.detect.outputs.dca }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            tpsl:
-              - 'crates/agent-tpsl/demo/**'
-            dca:
-              - 'crates/agent-spot-dca/demo/**'
+          fetch-depth: 0   # need history so we can diff the push range
+      - name: Detect changed demos in this push
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          emit() { echo "tpsl=$1" >> "$GITHUB_OUTPUT"; echo "dca=$2" >> "$GITHUB_OUTPUT"; \
+                   echo "→ tpsl=$1 dca=$2"; }
+
+          # Manual runs: rebuild both on purpose.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "workflow_dispatch → force both"; emit true true; exit 0
+          fi
+
+          # Work out the diff range for this event.
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="${PR_BASE}...${PR_HEAD}"          # only what the PR introduces
+          else
+            # push. First push of a branch has an all-zero "before" → can't diff.
+            if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              echo "new branch (no before commit) → build both"; emit true true; exit 0
+            fi
+            RANGE="${BEFORE} ${SHA}"                 # exactly the commits pushed
+          fi
+
+          echo "Diff range: $RANGE"
+          CHANGED="$(git diff --name-only $RANGE)"
+          echo "Changed files:"; echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -q '^crates/agent-tpsl/demo/';     then T=true; else T=false; fi
+          if echo "$CHANGED" | grep -q '^crates/agent-spot-dca/demo/'; then D=true; else D=false; fi
+          emit "$T" "$D"
 
   build:
     needs: changes
