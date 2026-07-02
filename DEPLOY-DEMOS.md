@@ -24,14 +24,29 @@ or `main` and publishes to `ghcr.io/<owner>/<name>-demo:<tag>`. Tags:
 public: GitHub → repo Settings → Packages → each package → change to
 Public. Or leave private and use `docker login ghcr.io` on the server.
 
+### Auto-discovery (zero hand-maintained lists)
+
+Demos are **never listed by hand**. `scripts/discover-demos.sh` finds every
+`crates/*/demo/` folder that has a `Dockerfile`, derives its image name
+(`<agent-without-agent-prefix>-demo`) and reads its port from the Dockerfile
+(`ENV PORT=` / `EXPOSE`). This one source of truth drives:
+
+- the **build matrix** (dynamic, via `fromJSON`), and
+- the **compose file** (`scripts/gen-demos-compose.sh` regenerates it at deploy
+  time from all discovered demos).
+
+Drop in a new `crates/agent-<name>/demo/` with a Dockerfile and it is built,
+published and deployed automatically — no edits to the workflow or compose file.
+
 ### Selective build & caching
 
 Two layers keep builds cheap:
 
-1. **Per-demo change detection** (`dorny/paths-filter`): a `changes` job decides
-   which demo(s) actually changed. Only the changed demo is rebuilt+pushed; the
-   other is skipped and keeps its existing image. A change to the workflow or
-   `docker-compose.demos.yml` rebuilds both. `workflow_dispatch` forces both.
+1. **Per-demo change detection** (`discover` job): a `git diff` over exactly the
+   commits this push introduced (`github.event.before..github.sha`; the PR range
+   for PRs) selects which discovered demos changed. Only those are rebuilt+pushed;
+   unchanged demos are skipped and keep their images. `workflow_dispatch` (and the
+   first push of a fresh branch) forces all.
 2. **Layer cache** (`type=gha`): even when a demo does rebuild, unchanged Docker
    layers are restored from the GitHub Actions cache, so a rebuild is fast.
 
@@ -193,28 +208,24 @@ build. The `image:` reference is used as the tag.
 
 ## Adding a new demo
 
+Only **two** things, both inside the new demo folder:
+
 1. Scaffold under `crates/agent-<name>/demo/` (mirror the TPSL layout).
-2. Copy the Dockerfile — change **two** `PORT` / `EXPOSE` values to the
-   next free port.
-3. Add a service block to `docker-compose.demos.yml`:
+2. Give it a `Dockerfile` that declares a **unique** port via `ENV PORT=<n>` and
+   `EXPOSE <n>` (pick the next free port — see the Ports table).
 
-   ```yaml
-     <name>-demo:
-       image: ${<NAME>_IMAGE:-ghcr.io/silvanaone/<name>-demo:${DEMO_TAG:-latest}}
-       build:
-         context: ./crates/agent-<name>/demo
-       container_name: <name>-demo
-       restart: unless-stopped
-       ports:
-         - "<PORT>:<PORT>"
-   ```
+Then push. That's it — no workflow, matrix, or compose edits:
 
-4. Add a matrix entry to `.github/workflows/demos.yml`:
+- CI auto-discovers `crates/<name>/demo/Dockerfile`, builds + pushes
+  `ghcr.io/<owner>/<name>-demo`, and the `deploy` job regenerates the compose
+  file and rolls it onto the host (removing orphans, starting the new one).
 
-   ```yaml
-             - name: <name>-demo
-               context: crates/agent-<name>/demo
-   ```
+To preview locally what will be generated:
 
-5. Push. GHA builds + pushes the image. On the server:
-   `bash scripts/deploy-demos.sh` picks it up.
+```bash
+bash scripts/discover-demos.sh          # JSON list of discovered demos
+bash scripts/gen-demos-compose.sh       # the compose that will be deployed
+```
+
+> `docker-compose.demos.yml` in the repo is **generated** — don't hand-edit it.
+> Regenerate with `bash scripts/gen-demos-compose.sh > docker-compose.demos.yml`.

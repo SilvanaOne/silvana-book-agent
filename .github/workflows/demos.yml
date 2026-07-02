@@ -4,14 +4,14 @@ on:
   push:
     branches: [new-agents, main]
     paths:
-      - "crates/agent-tpsl/demo/**"
-      - "crates/agent-spot-dca/demo/**"
+      - "crates/*/demo/**"
       - ".github/workflows/demos.yml"
-      - "docker-compose.demos.yml"
+      - "scripts/discover-demos.sh"
+      - "scripts/gen-demos-compose.sh"
+      - "scripts/deploy-demos.sh"
   pull_request:
     paths:
-      - "crates/agent-tpsl/demo/**"
-      - "crates/agent-spot-dca/demo/**"
+      - "crates/*/demo/**"
   workflow_dispatch:
 
 env:
@@ -19,20 +19,19 @@ env:
   IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
-  # Detect which demo actually changed so we only rebuild that one. A demo is
-  # rebuilt ONLY when its own files change (its demo/** dir, Dockerfile included)
-  # — never because of unrelated commits, workflow edits, or compose changes.
-  # workflow_dispatch forces both (handled by the `if` on the build steps below).
-  changes:
+  # Auto-discover every demo (crates/*/demo/Dockerfile) and decide which ones
+  # this push actually changed. Output is a dynamic build matrix — no demo is
+  # ever listed by hand here or in the compose file.
+  discover:
     runs-on: ubuntu-latest
     outputs:
-      tpsl: ${{ steps.detect.outputs.tpsl }}
-      dca: ${{ steps.detect.outputs.dca }}
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any: ${{ steps.detect.outputs.any }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # need history so we can diff the push range
-      - name: Detect changed demos in this push
+          fetch-depth: 0   # need history to diff the push range
+      - name: Discover demos and select changed
         id: detect
         env:
           EVENT: ${{ github.event_name }}
@@ -42,65 +41,60 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          ALL="$(bash scripts/discover-demos.sh)"
+          echo "All demos: $ALL"
 
-          emit() { echo "tpsl=$1" >> "$GITHUB_OUTPUT"; echo "dca=$2" >> "$GITHUB_OUTPUT"; \
-                   echo "→ tpsl=$1 dca=$2"; }
-
-          # Manual runs: rebuild both on purpose.
+          # Force-build-all cases: manual run, or a first push with no "before".
+          FORCE=0
+          RANGE=""
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            echo "workflow_dispatch → force both"; emit true true; exit 0
-          fi
-
-          # Work out the diff range for this event.
-          if [ "$EVENT" = "pull_request" ]; then
-            RANGE="${PR_BASE}...${PR_HEAD}"          # only what the PR introduces
+            FORCE=1
+          elif [ "$EVENT" = "pull_request" ]; then
+            RANGE="${PR_BASE}...${PR_HEAD}"
           else
-            # push. First push of a branch has an all-zero "before" → can't diff.
             if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              echo "new branch (no before commit) → build both"; emit true true; exit 0
+              FORCE=1
+            else
+              RANGE="${BEFORE} ${SHA}"
             fi
-            RANGE="${BEFORE} ${SHA}"                 # exactly the commits pushed
           fi
 
-          echo "Diff range: $RANGE"
-          CHANGED="$(git diff --name-only $RANGE)"
-          echo "Changed files:"; echo "$CHANGED"
+          if [ "$FORCE" = "1" ]; then
+            echo "Force-building all demos."
+            SEL="$ALL"
+          else
+            CHANGED="$(git diff --name-only $RANGE || true)"
+            echo "Changed files:"; echo "$CHANGED"
+            SEL="$(echo "$ALL" | jq -c --arg files "$CHANGED" '
+              ($files | split("\n") | map(select(length > 0))) as $f
+              | map(select(.context as $c | ($f | any(startswith($c + "/")))))')"
+          fi
 
-          if echo "$CHANGED" | grep -q '^crates/agent-tpsl/demo/';     then T=true; else T=false; fi
-          if echo "$CHANGED" | grep -q '^crates/agent-spot-dca/demo/'; then D=true; else D=false; fi
-          emit "$T" "$D"
+          COUNT="$(echo "$SEL" | jq 'length')"
+          echo "Selected $COUNT demo(s): $SEL"
+          echo "matrix={\"include\":$SEL}" >> "$GITHUB_OUTPUT"
+          [ "$COUNT" -gt 0 ] && echo "any=true" >> "$GITHUB_OUTPUT" || echo "any=false" >> "$GITHUB_OUTPUT"
 
+  # Build + push only the demos the discover job selected. Matrix is dynamic.
   build:
-    needs: changes
+    needs: discover
+    if: needs.discover.outputs.any == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: tpsl-demo
-            context: crates/agent-tpsl/demo
-            changed: ${{ needs.changes.outputs.tpsl }}
-          - name: spot-dca-demo
-            context: crates/agent-spot-dca/demo
-            changed: ${{ needs.changes.outputs.dca }}
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Skip note
-        if: matrix.changed != 'true' && github.event_name != 'workflow_dispatch'
-        run: echo "No changes for ${{ matrix.name }} — skipping build (cached image kept)."
-
       - name: Checkout
-        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: (matrix.changed == 'true' || github.event_name == 'workflow_dispatch') && github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -108,12 +102,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lowercase repo owner
-        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         id: owner
         run: echo "value=$(echo '${{ env.IMAGE_OWNER }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Docker meta
-        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -125,10 +117,9 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/new-agents' }}
 
-      # Layer cache lives in GitHub Actions cache (type=gha): unchanged layers are
-      # reused, so even a forced rebuild is fast. push only on branch pushes.
+      # Layer cache lives in the GitHub Actions cache (type=gha): unchanged
+      # layers are reused, so rebuilds are fast. push only on branch pushes.
       - name: Build (validate on PR, push otherwise)
-        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -138,14 +129,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Roll the freshly-built images onto the host. Runs only after the build job
-  # finishes, and only on a real push to new-agents — never on PRs (which don't
-  # push images) or forks. Copies the compose file + deploy script to the host
-  # via scp (no git-on-server needed), then runs the roll through the bastion.
+  # Roll onto the host. Regenerates the compose file from ALL discovered demos
+  # (so newly added demos appear and deleted ones are removed via
+  # --remove-orphans), copies it + the deploy script over scp through the
+  # bastion, and pulls/rolls. Runs on every new-agents push (unless a build
+  # failed) so the host always reflects the current demo set.
   deploy:
-    needs: build
+    needs: [discover, build]
+    if: >-
+      always()
+      && github.event_name == 'push'
+      && github.ref == 'refs/heads/new-agents'
+      && needs.build.result != 'failure'
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/new-agents'
     permissions:
       contents: read
       packages: read
@@ -155,6 +151,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Generate compose from discovered demos
+        env:
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner_lc="$(echo "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_OWNER="$owner_lc" bash scripts/gen-demos-compose.sh > docker-compose.demos.yml
+          echo "Generated docker-compose.demos.yml:"; cat docker-compose.demos.yml
 
       - name: Copy compose file + deploy script to host
         uses: appleboy/scp-action@v1
@@ -188,12 +193,14 @@ jobs:
           envs: GHCR_USER,GHCR_TOKEN
           script: |
             set -euo pipefail
-            # The demo images are private on GHCR — log the host in with the
-            # workflow token (same token that pushed them; scoped + ephemeral).
+            if [ -z "${GHCR_TOKEN:-}" ]; then
+              echo "ERROR: GHCR token is empty. Set the GIT_TOKEN_RP repo secret" >&2
+              echo "       to a PAT with 'read:packages', then re-run." >&2
+              exit 1
+            fi
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             cd /opt/silvana-book-agent
-            # Deploy the mutable `latest` tag: only the demo that was actually
-            # rebuilt this run has a new `latest`, so `deploy-demos.sh` restarts
-            # just that container and leaves the unchanged one running.
+            # `latest` roll: only demos rebuilt this run moved their latest, so
+            # deploy-demos.sh restarts just those and leaves the rest running.
             bash scripts/deploy-demos.sh latest
             docker logout ghcr.io || true
