@@ -19,9 +19,10 @@ env:
   IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
-  # Detect which demo actually changed so we only rebuild that one. A change to
-  # the workflow or the compose file rebuilds both. workflow_dispatch forces both
-  # (handled by the `if` on the build steps below).
+  # Detect which demo actually changed so we only rebuild that one. A demo is
+  # rebuilt ONLY when its own files change (its demo/** dir, Dockerfile included)
+  # — never because of unrelated commits, workflow edits, or compose changes.
+  # workflow_dispatch forces both (handled by the `if` on the build steps below).
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -35,12 +36,8 @@ jobs:
           filters: |
             tpsl:
               - 'crates/agent-tpsl/demo/**'
-              - '.github/workflows/demos.yml'
-              - 'docker-compose.demos.yml'
             dca:
               - 'crates/agent-spot-dca/demo/**'
-              - '.github/workflows/demos.yml'
-              - 'docker-compose.demos.yml'
 
   build:
     needs: changes
