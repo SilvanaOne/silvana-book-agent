@@ -50,8 +50,7 @@ export function TopBar({ active = "dashboard", onChange, live }: Props) {
           <a href="https://silvana.one" target="_blank" rel="noopener" className="hosted-logo">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="/silvana-mark.svg" alt="" width={18} height={18} />
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/silvana-logo.svg" alt="silvana" height={16} />
+            <span>silvana</span>
           </a>
         </span>
       </div>
