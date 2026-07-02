@@ -147,7 +147,7 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN_RP }}
+          GHCR_TOKEN: ${{ secrets.GIT_TOKEN_RP }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
