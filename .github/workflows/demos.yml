@@ -93,6 +93,10 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          proxy_host: ${{ secrets.SSH_PROXY_HOST }}
+          proxy_username: ${{ secrets.SSH_PROXY_USER }}
+          proxy_key: ${{ secrets.SSH_KEY }}
+          proxy_port: ${{ secrets.SSH_PROXY_PORT }}
           envs: GIT_SHA
           script: |
             set -euo pipefail
