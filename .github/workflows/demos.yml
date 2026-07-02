@@ -19,28 +19,60 @@ env:
   IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
+  # Detect which demo actually changed so we only rebuild that one. A change to
+  # the workflow or the compose file rebuilds both. workflow_dispatch forces both
+  # (handled by the `if` on the build steps below).
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      tpsl: ${{ steps.filter.outputs.tpsl }}
+      dca: ${{ steps.filter.outputs.dca }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            tpsl:
+              - 'crates/agent-tpsl/demo/**'
+              - '.github/workflows/demos.yml'
+              - 'docker-compose.demos.yml'
+            dca:
+              - 'crates/agent-spot-dca/demo/**'
+              - '.github/workflows/demos.yml'
+              - 'docker-compose.demos.yml'
+
   build:
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: tpsl-demo
             context: crates/agent-tpsl/demo
+            changed: ${{ needs.changes.outputs.tpsl }}
           - name: spot-dca-demo
             context: crates/agent-spot-dca/demo
+            changed: ${{ needs.changes.outputs.dca }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Skip note
+        if: matrix.changed != 'true' && github.event_name != 'workflow_dispatch'
+        run: echo "No changes for ${{ matrix.name }} — skipping build (cached image kept)."
+
       - name: Checkout
+        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: (matrix.changed == 'true' || github.event_name == 'workflow_dispatch') && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -48,10 +80,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lowercase repo owner
+        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         id: owner
         run: echo "value=$(echo '${{ env.IMAGE_OWNER }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Docker meta
+        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -63,7 +97,10 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/new-agents' }}
 
+      # Layer cache lives in GitHub Actions cache (type=gha): unchanged layers are
+      # reused, so even a forced rebuild is fast. push only on branch pushes.
       - name: Build (validate on PR, push otherwise)
+        if: matrix.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -73,9 +110,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Roll the freshly-built images onto the host. Runs only after both images
-  # built + pushed successfully (needs: build), and only on a real push to
-  # new-agents — never on PRs (which don't push images) or forks.
+  # Roll the freshly-built images onto the host. Runs only after the build job
+  # finishes, and only on a real push to new-agents — never on PRs (which don't
+  # push images) or forks. Copies the compose file + deploy script to the host
+  # via scp (no git-on-server needed), then runs the roll through the bastion.
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -84,10 +122,11 @@ jobs:
       group: deploy-demos
       cancel-in-progress: false
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
-        env:
-          GIT_SHA: ${{ github.sha }}
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy compose file + deploy script to host
+        uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -97,14 +136,25 @@ jobs:
           proxy_username: ${{ secrets.SSH_PROXY_USER }}
           proxy_key: ${{ secrets.SSH_KEY }}
           proxy_port: ${{ secrets.SSH_PROXY_PORT }}
-          envs: GIT_SHA
+          source: "docker-compose.demos.yml,scripts/deploy-demos.sh"
+          target: /opt/silvana-book-agent
+          overwrite: true
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          proxy_host: ${{ secrets.SSH_PROXY_HOST }}
+          proxy_username: ${{ secrets.SSH_PROXY_USER }}
+          proxy_key: ${{ secrets.SSH_KEY }}
+          proxy_port: ${{ secrets.SSH_PROXY_PORT }}
           script: |
             set -euo pipefail
             cd /opt/silvana-book-agent
-            git fetch --all --prune
-            git checkout new-agents
-            git pull --ff-only
-            # metadata-action's type=sha tag is the 7-char short SHA — match it
-            # exactly so we deploy precisely the image this run built.
-            TAG="sha-$(echo "$GIT_SHA" | cut -c1-7)"
-            bash scripts/deploy-demos.sh "$TAG"
+            # Deploy the mutable `latest` tag: only the demo that was actually
+            # rebuilt this run has a new `latest`, so `deploy-demos.sh` restarts
+            # just that container and leaves the unchanged one running.
+            bash scripts/deploy-demos.sh latest

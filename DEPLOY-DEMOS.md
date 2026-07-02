@@ -24,6 +24,17 @@ or `main` and publishes to `ghcr.io/<owner>/<name>-demo:<tag>`. Tags:
 public: GitHub → repo Settings → Packages → each package → change to
 Public. Or leave private and use `docker login ghcr.io` on the server.
 
+### Selective build & caching
+
+Two layers keep builds cheap:
+
+1. **Per-demo change detection** (`dorny/paths-filter`): a `changes` job decides
+   which demo(s) actually changed. Only the changed demo is rebuilt+pushed; the
+   other is skipped and keeps its existing image. A change to the workflow or
+   `docker-compose.demos.yml` rebuilds both. `workflow_dispatch` forces both.
+2. **Layer cache** (`type=gha`): even when a demo does rebuild, unchanged Docker
+   layers are restored from the GitHub Actions cache, so a rebuild is fast.
+
 ## Server setup (once per host)
 
 Install Docker + compose plugin:
@@ -97,64 +108,62 @@ Reload: `sudo systemctl reload caddy`. Let's Encrypt is automatic.
 
 ## Auto-deploy on push (live)
 
-The `deploy` job in `.github/workflows/demos.yml` is already wired up. After
-the `build` matrix pushes both images to GHCR, `deploy` SSHes into the host and
-rolls the containers — but **only on a real push to `new-agents`** (never on PRs,
-which don't push images). It pins to this commit's short SHA
-(`sha-<7-char>`, matching metadata-action's `type=sha` tag) so the server runs
-exactly the image the same run just built:
+The `deploy` job in `.github/workflows/demos.yml` is already wired up. After the
+`build` job finishes, `deploy` copies the compose file + deploy script to the
+host via `scp` (through the bastion) and rolls the containers — but **only on a
+real push to `new-agents`** (never on PRs, which don't push images).
+
+It deploys the mutable **`latest`** tag. Because only the demo that actually
+changed is rebuilt (see [Selective build](#selective-build--caching)), only that
+demo's `latest` moves — so `deploy-demos.sh` restarts just that container and
+leaves the unchanged one running.
+
+No git is needed on the host: `scp` recreates `/opt/silvana-book-agent` with the
+two files the roll needs, so a fresh/empty host works out of the box.
 
 ```yaml
   deploy:
     needs: build
-    runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/new-agents'
-    concurrency:
-      group: deploy-demos
-      cancel-in-progress: false
     steps:
-      - uses: appleboy/ssh-action@v1
-        env:
-          GIT_SHA: ${{ github.sha }}
+      - uses: actions/checkout@v4
+      - uses: appleboy/scp-action@v1        # copy compose + script to the host
+        with: { host, username, key, port, proxy_*, source, target, overwrite }
+      - uses: appleboy/ssh-action@v1        # run the roll through the bastion
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
-          envs: GIT_SHA
+          # host / bastion secrets …
           script: |
-            set -euo pipefail
             cd /opt/silvana-book-agent
-            git fetch --all --prune
-            git checkout new-agents
-            git pull --ff-only
-            TAG="sha-$(echo "$GIT_SHA" | cut -c1-7)"
-            bash scripts/deploy-demos.sh "$TAG"
+            bash scripts/deploy-demos.sh latest
 ```
 
 ### Required repo secrets
 
 Set these under GitHub → repo Settings → Secrets and variables → Actions:
 
-| Secret     | Notes                                          |
-| ---------- | ---------------------------------------------- |
-| `SSH_HOST` | host running the demos (IP or hostname)        |
-| `SSH_USER` | SSH user                                       |
-| `SSH_KEY`  | private key with access to the host            |
-| `SSH_PORT` | optional (defaults to 22)                      |
+| Secret            | Notes                                             |
+| ----------------- | ------------------------------------------------- |
+| `SSH_HOST`        | target host running the demos (IP or hostname)    |
+| `SSH_USER`        | SSH user on the target host                        |
+| `SSH_KEY`         | private key (used for both target and bastion)     |
+| `SSH_PORT`        | target SSH port (optional, defaults to 22)         |
+| `SSH_PROXY_HOST`  | bastion host to jump through                        |
+| `SSH_PROXY_USER`  | bastion SSH user                                    |
+| `SSH_PROXY_PORT`  | bastion SSH port (optional, defaults to 22)         |
 
 ### One-time host prerequisites
 
 On the deploy host:
 
-1. Clone the repo at `/opt/silvana-book-agent` on branch `new-agents`
-   (only the compose file + `scripts/deploy-demos.sh` are used — no source build).
-2. Docker + compose v2 plugin installed.
-3. GHCR pull access — either make the two `*-demo` packages **Public**, or run a
+1. Docker + compose v2 plugin installed.
+2. GHCR pull access — either make the two `*-demo` packages **Public**, or run a
    persistent `docker login ghcr.io` with a `read:packages` PAT (see above).
-4. Optional reverse-proxy entries: `tpsl.example.com → 127.0.0.1:3002` and
+3. Optional reverse-proxy entries: `tpsl.example.com → 127.0.0.1:3002` and
    `spot-dca.example.com → 127.0.0.1:3003`. Containers are reachable on the host
    ports regardless of the proxy.
+
+The repo does **not** need to be pre-cloned — the `deploy` job `scp`s the compose
+file and `scripts/deploy-demos.sh` into `/opt/silvana-book-agent` on every run.
 
 ### Alternative: server-side webhook
 
