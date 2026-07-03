@@ -664,6 +664,10 @@ pub struct RfqMarketConfig {
     /// DVP settlement deadline in seconds from DVP creation (default 2 hours)
     #[serde(default = "default_rfq_settle_before_secs")]
     pub settle_before_secs: u32,
+    /// Per-market override of the LP's global `min_notional_usd` (USD).
+    /// When set, takes precedence over `[liquidity_provider].min_notional_usd`.
+    #[serde(default)]
+    pub min_notional_usd: Option<f64>,
 }
 
 /// Liquidity provider configuration (LP agents only)
@@ -674,6 +678,11 @@ pub struct LiquidityProviderConfig {
     pub max_concurrent_rfqs: usize,
     #[serde(default = "default_quote_valid_secs")]
     pub default_quote_valid_secs: u32,
+    /// Global minimum RFQ value in USD. RFQs whose USD notional is below this
+    /// are rejected (AmountTooSmall). 0 = disabled. Overridden per-market by
+    /// `[markets.rfq].min_notional_usd`.
+    #[serde(default)]
+    pub min_notional_usd: f64,
 }
 
 // ============================================================================
@@ -761,5 +770,47 @@ mod tests {
         assert_eq!(agent.request_timeout_secs, 120);
         assert_eq!(agent.canton_op_timeout_secs, 600);
         assert!(agent.markets.is_empty());
+    }
+
+    #[test]
+    fn test_min_notional_usd_config() {
+        // Omitted → global default 0.0 (disabled) and per-market None (no override).
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[[markets]]
+market_id = "CC-USDCx"
+
+[markets.rfq]
+min_quantity = "5"
+max_quantity = "1000"
+"#,
+        )
+        .unwrap();
+        assert_eq!(agent.liquidity_provider.as_ref().unwrap().min_notional_usd, 0.0);
+        assert_eq!(agent.markets[0].rfq.as_ref().unwrap().min_notional_usd, None);
+
+        // Global set with an integer literal (as written in the deployed tomls)
+        // must coerce to f64; the per-market value overrides the global.
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+min_notional_usd = 10
+
+[[markets]]
+market_id = "CC-USDCx"
+
+[markets.rfq]
+min_quantity = "5"
+max_quantity = "1000"
+min_notional_usd = 25.0
+"#,
+        )
+        .unwrap();
+        assert_eq!(agent.liquidity_provider.as_ref().unwrap().min_notional_usd, 10.0);
+        assert_eq!(agent.markets[0].rfq.as_ref().unwrap().min_notional_usd, Some(25.0));
     }
 }
