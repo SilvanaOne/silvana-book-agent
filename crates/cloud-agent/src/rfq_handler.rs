@@ -69,6 +69,24 @@ impl RfqHandler {
         self.quoted_trades.clone()
     }
 
+    /// USD price of a token from mid_prices. USDC/USDCx ≈ $1; others resolve
+    /// from a `{token}-USDCx` or `{token}-USDC` market (mainnet/devnet naming).
+    /// Returns None if no USD reference is available.
+    async fn token_usd_price(&self, token: &str) -> Option<f64> {
+        if token.starts_with("USDC") {
+            return Some(1.0);
+        }
+        let mids = self.mid_prices.read().await;
+        for stable in ["USDCx", "USDC"] {
+            if let Some(&p) = mids.get(&format!("{token}-{stable}")) {
+                if p > 0.0 {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
     /// Handle an incoming RFQ request
     pub async fn handle_rfq_request(&self, request: RfqRequest) -> RfqResponse {
         let rfq_id = request.rfq_id.clone();
@@ -276,6 +294,43 @@ impl RfqHandler {
                 min_quantity: None,
                 max_quantity: None,
             });
+        }
+
+        // USD minimum-value floor (global LP default, per-market override).
+        // Refuse to quote RFQs whose USD value falls below the configured minimum.
+        let min_notional_usd = rfq_config
+            .min_notional_usd
+            .unwrap_or(self.lp_config.min_notional_usd);
+        if min_notional_usd > 0.0 {
+            match self.token_usd_price(quote_token).await {
+                Some(usd_per_quote) => {
+                    let notional_usd = quote_quantity * usd_per_quote;
+                    if notional_usd < min_notional_usd {
+                        info!(
+                            "RFQ {}: value ${:.2} < min ${:.2} — rejecting",
+                            rfq_id, notional_usd, min_notional_usd
+                        );
+                        return RfqResponse::Reject(RfqReject {
+                            rfq_id,
+                            lp_party_id: self.party_id.clone(),
+                            lp_name: self.lp_config.name.clone(),
+                            reason: RfqRejectionReason::AmountTooSmall as i32,
+                            reason_detail: Some(format!("Min notional: ${:.2}", min_notional_usd)),
+                            rejected_at: Some(prost_types::Timestamp {
+                                seconds: chrono::Utc::now().timestamp(),
+                                nanos: 0,
+                            }),
+                            min_quantity: None,
+                            max_quantity: None,
+                        });
+                    }
+                }
+                // Missing cross price → fail open (don't block trading on a transient gap).
+                None => warn!(
+                    "RFQ {}: no USD price for quote asset {} — skipping min-notional check",
+                    rfq_id, quote_token
+                ),
+            }
         }
 
         // Liquidity gate: reject if LP lacks sufficient balance for the allocation + estimated fees
