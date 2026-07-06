@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "agent-ai-signal"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-algo-order"
 version = "0.3.4"
 dependencies = [
@@ -34,6 +47,19 @@ dependencies = [
  "tracing-subscriber",
  "tx-verifier",
  "uuid",
+]
+
+[[package]]
+name = "agent-anomaly-classifier"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -787,6 +813,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-news-sentiment"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-notifier"
 version = "0.3.4"
 dependencies = [
@@ -1378,6 +1417,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-strategy-genesis"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-target-allocation"
 version = "0.3.4"
 dependencies = [
@@ -1457,6 +1509,19 @@ dependencies = [
  "tracing-subscriber",
  "tx-verifier",
  "uuid",
+]
+
+[[package]]
+name = "agent-trade-explain"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -73,6 +73,11 @@ members = [
     "crates/agent-audit-retention",
     "crates/agent-audit-anomaly",
     "crates/agent-copy-trading",
+    "crates/agent-ai-signal",
+    "crates/agent-news-sentiment",
+    "crates/agent-strategy-genesis",
+    "crates/agent-trade-explain",
+    "crates/agent-anomaly-classifier",
 ]
 default-members = [
     "crates/cloud-agent",
@@ -146,6 +151,11 @@ default-members = [
     "crates/agent-audit-retention",
     "crates/agent-audit-anomaly",
     "crates/agent-copy-trading",
+    "crates/agent-ai-signal",
+    "crates/agent-news-sentiment",
+    "crates/agent-strategy-genesis",
+    "crates/agent-trade-explain",
+    "crates/agent-anomaly-classifier",
 ]
 
 [workspace.package]

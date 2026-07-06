@@ -1,0 +1,19 @@
+[package]
+name = "agent-ai-signal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-ai-signal"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util", "time"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
