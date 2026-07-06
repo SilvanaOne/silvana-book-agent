@@ -31,4 +31,4 @@ tags     = ["hedging", "exposure"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/hedging/v1-rust"
-quickstart = "https://docs.silvana.one/agents/hedging/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/hedging/"

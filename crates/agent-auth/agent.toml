@@ -31,4 +31,4 @@ tags     = ["jwt", "auth", "cli"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/auth/v1-rust"
-quickstart = "https://docs.silvana.one/agents/auth/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/auth/"

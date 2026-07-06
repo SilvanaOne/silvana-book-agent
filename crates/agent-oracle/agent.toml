@@ -31,4 +31,4 @@ tags     = ["price-feed", "scheduled"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/oracle/v1-rust"
-quickstart = "https://docs.silvana.one/agents/oracle/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/oracle/"

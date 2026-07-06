@@ -31,4 +31,4 @@ tags     = ["pnl", "position", "cost-basis"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/pnl-screening/v1-rust"
-quickstart = "https://docs.silvana.one/agents/pnl-screening/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/pnl-screening/"

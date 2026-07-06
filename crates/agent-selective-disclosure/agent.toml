@@ -31,4 +31,4 @@ tags     = ["audit", "redaction", "signed"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/selective-disclosure/v1-rust"
-quickstart = "https://docs.silvana.one/agents/selective-disclosure/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/selective-disclosure/"

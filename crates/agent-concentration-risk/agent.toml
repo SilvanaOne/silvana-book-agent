@@ -31,4 +31,4 @@ tags     = ["concentration", "enforcement"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/concentration-risk/v1-rust"
-quickstart = "https://docs.silvana.one/agents/concentration-risk/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/concentration-risk/"

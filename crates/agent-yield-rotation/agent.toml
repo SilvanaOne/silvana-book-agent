@@ -31,4 +31,4 @@ tags     = ["yield", "carry", "rotation"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/yield-rotation/v1-rust"
-quickstart = "https://docs.silvana.one/agents/yield-rotation/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/yield-rotation/"

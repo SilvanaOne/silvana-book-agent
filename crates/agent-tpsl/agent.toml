@@ -31,4 +31,4 @@ tags     = ["take-profit", "stop-loss", "trailing"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/tpsl/v1-rust"
-quickstart = "https://docs.silvana.one/agents/tpsl/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/tpsl/"

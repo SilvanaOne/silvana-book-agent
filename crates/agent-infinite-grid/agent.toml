@@ -31,4 +31,4 @@ tags     = ["grid", "dynamic", "market-making"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/infinite-grid/v1-rust"
-quickstart = "https://docs.silvana.one/agents/infinite-grid/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/infinite-grid/"

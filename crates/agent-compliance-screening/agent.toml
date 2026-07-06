@@ -31,4 +31,4 @@ tags     = ["compliance", "policy", "settlements"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/compliance-screening/v1-rust"
-quickstart = "https://docs.silvana.one/agents/compliance-screening/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/compliance-screening/"

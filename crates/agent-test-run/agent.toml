@@ -31,4 +31,4 @@ tags     = ["healthcheck", "pre-flight"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/test-run/v1-rust"
-quickstart = "https://docs.silvana.one/agents/test-run/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/test-run/"

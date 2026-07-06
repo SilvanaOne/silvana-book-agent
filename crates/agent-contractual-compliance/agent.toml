@@ -31,4 +31,4 @@ tags     = ["contracts", "obligations"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/contractual-compliance/v1-rust"
-quickstart = "https://docs.silvana.one/agents/contractual-compliance/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/contractual-compliance/"

@@ -31,4 +31,4 @@ tags     = ["execution", "time-sliced"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/twap/v1-rust"
-quickstart = "https://docs.silvana.one/agents/twap/v1-rust/quickstart"
+quickstart = "https://silvana.one/agents/demo/twap/"
