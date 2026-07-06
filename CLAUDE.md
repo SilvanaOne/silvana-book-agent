@@ -86,7 +86,11 @@ silvana-book-agent/
     ├── agent-risk-management/      # Composite live-state limits + enforce (Tier 3)
     ├── agent-inventory-risk/       # Soft/hard band signal + auto-hedge (Tier 3)
     ├── agent-smart-allocation/     # Two-level bucket portfolio (Tier 3)
-    └── agent-algo-order/           # Pluggable execution dispatcher (Tier 3)
+    ├── agent-algo-order/           # Pluggable execution dispatcher (Tier 3)
+    ├── agent-audit-attestation/    # Signed chain-head checkpoints (Tier 3)
+    ├── agent-audit-replay/         # Offline policy back-test on trading-history (Tier 3)
+    ├── agent-audit-retention/      # Chained per-day/week log rotation (Tier 3)
+    └── agent-audit-anomaly/        # Post-hoc statistical anomaly scan (Tier 3)
 ```
 
 ### Crate Dependency Graph
@@ -159,7 +163,11 @@ tx-verifier              (Canton tx verification)
 ├── agent-risk-management  (Tier 3: composite limits + enforce)
 ├── agent-inventory-risk   (Tier 3: soft/hard band hedge)
 ├── agent-smart-allocation (Tier 3: bucket portfolio)
-└── agent-algo-order       (Tier 3: execution dispatcher)
+├── agent-algo-order       (Tier 3: execution dispatcher)
+├── agent-audit-attestation (Tier 3: signed chain-head checkpoints)
+├── agent-audit-replay      (Tier 3: offline policy back-test on trading-history)
+├── agent-audit-retention   (Tier 3: chained per-day/week log rotation)
+└── agent-audit-anomaly     (Tier 3: post-hoc anomaly scan)
 ```
 
 ### gRPC Services
@@ -829,6 +837,47 @@ agent-treasury-mgmt run \
     --approval-queue approval-queue.jsonl
 ```
 
+### agent-audit-attestation (Tier 3 Auditing — checkpoint publisher)
+
+Reads the current head of an `agent-trading-history` JSONL file (last record's `seq`, `ts`, line-hash), wraps it in a signed `{ts, head_seq, head_hash, party, signature}` checkpoint, and emits to any combination of stdout / append JSONL file / HTTP webhook. Auditors can later use any single checkpoint to prove that earlier records existed at that time — without needing the full log. `snapshot` is one-shot; `run --interval-secs N` publishes on a schedule until SIGINT.
+
+```bash
+agent-audit-attestation snapshot --history history.jsonl --stdout --party party::alice
+agent-audit-attestation run --history history.jsonl --interval-secs 300 \
+                             --log-file checkpoints.jsonl \
+                             --webhook https://hooks.example.com/attest
+```
+
+### agent-audit-replay (Tier 3 Auditing — offline policy back-test)
+
+Reads a signed `agent-trading-history` JSONL and replays every `order.created` / `settlement.settled` record through a TOML rule set (same shape as `agent-pre-trade-check` + `agent-compliance-screening` per-market caps). Emits per-event verdicts + a summary with hits-by-rule. Answer "how many trades would have been blocked if this new policy had been active since date X?" before rolling it out live.
+
+```bash
+agent-audit-replay replay --history history.jsonl --rules rules.toml
+agent-audit-replay replay --history history.jsonl --rules rules.toml --emit-accepts --output verdicts.jsonl
+agent-audit-replay check --rules rules.toml
+```
+
+### agent-audit-retention (Tier 3 Auditing — chained log rotation)
+
+Splits a large `agent-trading-history` JSONL into per-day (or per-week with `--weekly`) slice files. Each slice starts with a signed header that embeds the `prev_slice_hash` of the previous slice — the audit chain remains provable across rotations. With `--retention-days N`, records older than the window are dropped; the surviving slice headers still chain through. `verify` walks the slice directory in chronological order and checks the header chain.
+
+```bash
+agent-audit-retention rotate --history history.jsonl --out-dir slices/
+agent-audit-retention rotate --history history.jsonl --out-dir slices/ --weekly --retention-days 90
+agent-audit-retention verify --dir slices/
+```
+
+### agent-audit-anomaly (Tier 3 Auditing — post-hoc statistical scan)
+
+Offline scan over any `agent-trading-history` JSONL. Applies heuristics that catch patterns worth reviewing after the fact — `stuck_settlement` (fill without a matching settled/failed inside the window), `rapid_cancel` (create+cancel within ms → spoofing indicator), `layer_cluster` (many same-side orders on one market inside a tight price band), `fill_before_cancel_burst` (cancel burst right after a fill → churn indicator). Distinct from live `agent-market-abuse`: works on any historical log, no stream connection.
+
+```bash
+agent-audit-anomaly --history history.jsonl
+agent-audit-anomaly --history history.jsonl --layer-threshold 8 --layer-band-pct 0.5 --output anomalies.jsonl
+agent-audit-anomaly --history history.jsonl --settlement-window-secs 1800 --burst-count 10
+```
+
 ## Agent Roadmap
 
 All agents reuse `orderbook-agent-logic` (settlement, orders, auth, config, liquidity, state) + `tx-verifier` + `message-signing`.
@@ -941,6 +990,10 @@ Agents requiring significant new business logic, analytics, or external integrat
 | **Inventory Risk Prevention** ✅            | Risk             | Cut or hedge positions when a market maker's inventory becomes too directional    | Inventory analysis + automated hedging triggers                       |
 | **Trading History** ✅                      | Auditing         | Build a provable history of decisions, trades, and settlement outcomes            | Event sourcing, immutable log, query interface                        |
 | **Selective Disclosure** ✅                 | Auditing         | Share only the minimum provable facts needed for auditors or regulators           | Data filtering, access control, proof generation                      |
+| **Audit Attestation** ✅                    | Auditing         | Publish signed checkpoints of the trading-history chain head                      | Chain-head sha256, Ed25519 signing, periodic publisher                |
+| **Audit Replay** ✅                         | Auditing         | Back-test a rule policy against a signed trading-history log                      | JSONL streamer + TOML rule engine reused from pre-trade-check         |
+| **Audit Retention** ✅                      | Auditing         | Split trading-history into signed, chained per-day/week slices with retention     | Bucket-by-day, signed slice header, prev_slice_hash cross-file chain  |
+| **Audit Anomaly** ✅                        | Auditing         | Offline scan for stuck settlements, rapid cancels, layer clusters, cancel bursts  | Heuristic pattern matcher over historical JSONL                       |
 | **Simulation Agent**                       | Testing          | Test a strategy against live-like market conditions before capital is deployed    | Market simulation engine, virtual order matching                      |
 | **Backtesting Agent**                      | Testing          | Evaluate a strategy on historical data before it is allowed to production         | Historical data replay, performance metrics                           |
 | **Custom Bot**                             | Trading          | Build and run your own trading strategies                                         | Generic strategy framework, plugin system                             |

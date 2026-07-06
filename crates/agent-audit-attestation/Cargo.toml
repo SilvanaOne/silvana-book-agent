@@ -1,0 +1,27 @@
+[package]
+name = "agent-audit-attestation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-audit-attestation"
+path = "src/main.rs"
+
+[dependencies]
+message-signing = { path = "../message-signing" }
+agent-logic = { path = "../agent-logic" }
+
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
+
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = { workspace = true }

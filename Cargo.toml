@@ -68,6 +68,10 @@ members = [
     "crates/agent-inventory-risk",
     "crates/agent-smart-allocation",
     "crates/agent-algo-order",
+    "crates/agent-audit-attestation",
+    "crates/agent-audit-replay",
+    "crates/agent-audit-retention",
+    "crates/agent-audit-anomaly",
 ]
 default-members = [
     "crates/cloud-agent",
@@ -136,6 +140,10 @@ default-members = [
     "crates/agent-inventory-risk",
     "crates/agent-smart-allocation",
     "crates/agent-algo-order",
+    "crates/agent-audit-attestation",
+    "crates/agent-audit-replay",
+    "crates/agent-audit-retention",
+    "crates/agent-audit-anomaly",
 ]
 
 [workspace.package]

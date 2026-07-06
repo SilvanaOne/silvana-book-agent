@@ -37,6 +37,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-audit-anomaly"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agent-audit-attestation"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "hex",
+ "message-signing",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agent-audit-replay"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "agent-audit-retention"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "hex",
+ "message-signing",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-auth"
 version = "0.3.4"
 dependencies = [
