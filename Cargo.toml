@@ -72,6 +72,7 @@ members = [
     "crates/agent-audit-replay",
     "crates/agent-audit-retention",
     "crates/agent-audit-anomaly",
+    "crates/agent-copy-trading",
 ]
 default-members = [
     "crates/cloud-agent",
@@ -144,6 +145,7 @@ default-members = [
     "crates/agent-audit-replay",
     "crates/agent-audit-retention",
     "crates/agent-audit-anomaly",
+    "crates/agent-copy-trading",
 ]
 
 [workspace.package]

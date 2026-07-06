@@ -329,6 +329,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-copy-trading"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-dca-portfolio"
 version = "0.3.4"
 dependencies = [
