@@ -37,6 +37,12 @@ logs
 # Docker build artifacts
 docker/release/
 
+# Demo scaffolds — Next.js build/deps live per-demo (covered by each demo's
+# own .gitignore too, but this catches empty scaffolds that don't have one yet).
+**/demo/node_modules/
+**/demo/.next/
+**/demo/*.tsbuildinfo
+
 # Runtime working directories (contain .env with private key + local fixtures)
 runtime/
 runtime2/
