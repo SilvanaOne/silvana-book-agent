@@ -31,4 +31,4 @@ tags     = ["marketmaker", "inventory-clamp"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/spread-capture/v1-rust"
-quickstart = "https://silvana.one/agents/demo/spread-capture/"
+demo       = "https://silvana.one/agents/demo/spread-capture/"

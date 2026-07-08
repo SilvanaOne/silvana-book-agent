@@ -12,7 +12,6 @@ logs/
 .env
 .env.*
 configuration.toml
-agent.toml
 agent-state.json
 tpsl-state.json
 dca-state.json

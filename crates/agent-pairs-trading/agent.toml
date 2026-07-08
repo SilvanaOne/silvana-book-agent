@@ -31,4 +31,4 @@ tags     = ["pairs", "stat-arb", "dual-leg"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/pairs-trading/v1-rust"
-quickstart = "https://silvana.one/agents/demo/pairs-trading/"
+demo       = "https://silvana.one/agents/demo/pairs-trading/"

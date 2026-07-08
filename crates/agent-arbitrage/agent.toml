@@ -32,4 +32,4 @@ demo = "https://arbitrage.spcatcher.cfd"
 
 [template.resources]
 docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage"
-quickstart = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage#quick-start"
+demo       = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage#quick-start"

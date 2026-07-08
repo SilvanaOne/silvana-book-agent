@@ -31,4 +31,4 @@ tags     = ["batch", "bulk", "cli"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/batch-orders/v1-rust"
-quickstart = "https://silvana.one/agents/demo/batch-orders/"
+demo       = "https://silvana.one/agents/demo/batch-orders/"

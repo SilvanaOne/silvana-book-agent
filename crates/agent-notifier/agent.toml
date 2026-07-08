@@ -31,4 +31,4 @@ tags     = ["events", "webhook", "notify"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/notifier/v1-rust"
-quickstart = "https://silvana.one/agents/demo/notifier/"
+demo       = "https://silvana.one/agents/demo/notifier/"

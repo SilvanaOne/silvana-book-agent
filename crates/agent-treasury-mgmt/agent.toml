@@ -31,4 +31,4 @@ tags     = ["treasury", "policy", "approval"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/treasury-mgmt/v1-rust"
-quickstart = "https://silvana.one/agents/demo/treasury-mgmt/"
+demo       = "https://silvana.one/agents/demo/treasury-mgmt/"

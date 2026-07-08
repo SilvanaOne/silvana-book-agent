@@ -31,4 +31,4 @@ tags     = ["algo", "execution", "dispatcher"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/algo-order/v1-rust"
-quickstart = "https://silvana.one/agents/demo/algo-order/"
+demo       = "https://silvana.one/agents/demo/algo-order/"

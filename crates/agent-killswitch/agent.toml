@@ -31,4 +31,4 @@ tags     = ["emergency-stop", "cancel-all"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/killswitch/v1-rust"
-quickstart = "https://silvana.one/agents/demo/killswitch/"
+demo       = "https://silvana.one/agents/demo/killswitch/"

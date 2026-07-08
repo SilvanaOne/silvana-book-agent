@@ -31,4 +31,4 @@ tags     = ["spoofing", "layering", "self-audit"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/market-abuse/v1-rust"
-quickstart = "https://silvana.one/agents/demo/market-abuse/"
+demo       = "https://silvana.one/agents/demo/market-abuse/"

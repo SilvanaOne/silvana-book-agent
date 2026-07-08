@@ -31,4 +31,4 @@ tags     = ["read-only", "market-data"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/watchlist/v1-rust"
-quickstart = "https://silvana.one/agents/demo/watchlist/"
+demo       = "https://silvana.one/agents/demo/watchlist/"

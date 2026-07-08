@@ -31,4 +31,4 @@ tags     = ["audit-log", "signed", "hash-chain"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/trading-history/v1-rust"
-quickstart = "https://silvana.one/agents/demo/trading-history/"
+demo       = "https://silvana.one/agents/demo/trading-history/"

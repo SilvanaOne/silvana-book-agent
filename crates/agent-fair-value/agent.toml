@@ -31,4 +31,4 @@ tags     = ["aggregation", "reference-price"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/fair-value/v1-rust"
-quickstart = "https://silvana.one/agents/demo/fair-value/"
+demo       = "https://silvana.one/agents/demo/fair-value/"

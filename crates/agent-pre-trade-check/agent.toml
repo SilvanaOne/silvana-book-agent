@@ -31,4 +31,4 @@ tags     = ["rules", "offline", "validator"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/pre-trade-check/v1-rust"
-quickstart = "https://silvana.one/agents/demo/pre-trade-check/"
+demo       = "https://silvana.one/agents/demo/pre-trade-check/"

@@ -31,4 +31,4 @@ tags     = ["realized-vol", "rolling-window"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/volatility-screening/v1-rust"
-quickstart = "https://silvana.one/agents/demo/volatility-screening/"
+demo       = "https://silvana.one/agents/demo/volatility-screening/"

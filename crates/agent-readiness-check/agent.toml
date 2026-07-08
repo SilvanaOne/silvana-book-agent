@@ -31,4 +31,4 @@ tags     = ["gate", "pre-trade"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/readiness-check/v1-rust"
-quickstart = "https://silvana.one/agents/demo/readiness-check/"
+demo       = "https://silvana.one/agents/demo/readiness-check/"

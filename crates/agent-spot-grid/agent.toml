@@ -31,4 +31,4 @@ tags     = ["marketmaker", "grid"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/spot-grid/v1-rust"
-quickstart = "https://silvana.one/agents/demo/spot-grid/"
+demo       = "https://silvana.one/agents/demo/spot-grid/"

@@ -31,4 +31,4 @@ tags     = ["circuit-breaker", "auto-pause"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/circuit-breaker/v1-rust"
-quickstart = "https://silvana.one/agents/demo/circuit-breaker/"
+demo       = "https://silvana.one/agents/demo/circuit-breaker/"

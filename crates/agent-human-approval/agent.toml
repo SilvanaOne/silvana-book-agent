@@ -31,4 +31,4 @@ tags     = ["approval", "queue", "manual"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/human-approval/v1-rust"
-quickstart = "https://silvana.one/agents/demo/human-approval/"
+demo       = "https://silvana.one/agents/demo/human-approval/"

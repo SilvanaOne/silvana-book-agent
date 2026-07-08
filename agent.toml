@@ -115,10 +115,10 @@ demo      = "https://demo.silvana.one/agents/spot-grid/v1"
 # never drift from reality. The API exposes it as `repo_path` to the frontend.
 
 # Optional. Per-template documentation links rendered in the "Resources"
-# section of the detail page. Any subset of {docs, quickstart, faq} is allowed;
+# section of the detail page. Any subset of {docs, demo, faq} is allowed;
 # missing keys are simply not shown. If [template.resources] is absent entirely,
 # the section is empty for this template.
 [template.resources]
 docs       = "https://docs.silvana.one/agents/spot-grid/v1-rust"
-quickstart = "https://docs.silvana.one/agents/spot-grid/v1-rust/quickstart"
+demo       = "https://docs.silvana.one/agents/spot-grid/v1-rust/quickstart"
 faq        = "https://docs.silvana.one/agents/spot-grid/v1-rust/faq"

@@ -31,4 +31,4 @@ tags     = ["treasury", "transfer-cc"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/cash-buffer/v1-rust"
-quickstart = "https://silvana.one/agents/demo/cash-buffer/"
+demo       = "https://silvana.one/agents/demo/cash-buffer/"

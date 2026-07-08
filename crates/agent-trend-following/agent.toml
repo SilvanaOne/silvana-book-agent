@@ -31,4 +31,4 @@ tags     = ["momentum", "ema", "crossover"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/trend-following/v1-rust"
-quickstart = "https://silvana.one/agents/demo/trend-following/"
+demo       = "https://silvana.one/agents/demo/trend-following/"

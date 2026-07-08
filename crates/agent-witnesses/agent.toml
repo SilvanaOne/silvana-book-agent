@@ -31,4 +31,4 @@ tags     = ["events", "shell", "witness"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/witnesses/v1-rust"
-quickstart = "https://silvana.one/agents/demo/witnesses/"
+demo       = "https://silvana.one/agents/demo/witnesses/"

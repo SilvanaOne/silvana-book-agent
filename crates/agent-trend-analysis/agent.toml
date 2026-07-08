@@ -31,4 +31,4 @@ tags     = ["ta", "indicators", "publisher"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/trend-analysis/v1-rust"
-quickstart = "https://silvana.one/agents/demo/trend-analysis/"
+demo       = "https://silvana.one/agents/demo/trend-analysis/"

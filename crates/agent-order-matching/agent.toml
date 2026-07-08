@@ -31,4 +31,4 @@ tags     = ["trigger", "snipe"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/order-matching/v1-rust"
-quickstart = "https://silvana.one/agents/demo/order-matching/"
+demo       = "https://silvana.one/agents/demo/order-matching/"

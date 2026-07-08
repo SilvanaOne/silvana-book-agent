@@ -31,4 +31,4 @@ tags     = ["allocation", "buckets", "themes"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/smart-allocation/v1-rust"
-quickstart = "https://silvana.one/agents/demo/smart-allocation/"
+demo       = "https://silvana.one/agents/demo/smart-allocation/"

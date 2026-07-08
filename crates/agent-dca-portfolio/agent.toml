@@ -31,4 +31,4 @@ tags     = ["dca", "multi-market"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/dca-portfolio/v1-rust"
-quickstart = "https://silvana.one/agents/demo/dca-portfolio/"
+demo       = "https://silvana.one/agents/demo/dca-portfolio/"

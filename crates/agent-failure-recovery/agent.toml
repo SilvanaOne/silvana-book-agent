@@ -31,4 +31,4 @@ tags     = ["watchdog", "settlement", "recovery"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/failure-recovery/v1-rust"
-quickstart = "https://silvana.one/agents/demo/failure-recovery/"
+demo       = "https://silvana.one/agents/demo/failure-recovery/"

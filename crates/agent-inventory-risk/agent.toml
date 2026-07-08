@@ -31,4 +31,4 @@ tags     = ["inventory", "risk", "auto-hedge"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/inventory-risk/v1-rust"
-quickstart = "https://silvana.one/agents/demo/inventory-risk/"
+demo       = "https://silvana.one/agents/demo/inventory-risk/"

@@ -31,4 +31,4 @@ tags     = ["legal", "jurisdiction"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/legal-compliance/v1-rust"
-quickstart = "https://silvana.one/agents/demo/legal-compliance/"
+demo       = "https://silvana.one/agents/demo/legal-compliance/"

@@ -31,4 +31,4 @@ tags     = ["ema", "reversion"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/mean-reversion/v1-rust"
-quickstart = "https://silvana.one/agents/demo/mean-reversion/"
+demo       = "https://silvana.one/agents/demo/mean-reversion/"

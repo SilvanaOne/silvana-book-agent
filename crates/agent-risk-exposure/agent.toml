@@ -31,4 +31,4 @@ tags     = ["exposure", "dashboard"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/risk-exposure/v1-rust"
-quickstart = "https://silvana.one/agents/demo/risk-exposure/"
+demo       = "https://silvana.one/agents/demo/risk-exposure/"

@@ -31,4 +31,4 @@ tags     = ["adaptive", "slippage", "execution"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/liquidity-seeking/v1-rust"
-quickstart = "https://silvana.one/agents/demo/liquidity-seeking/"
+demo       = "https://silvana.one/agents/demo/liquidity-seeking/"

@@ -31,4 +31,4 @@ tags     = ["blocklist", "screening"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/blocked-party/v1-rust"
-quickstart = "https://silvana.one/agents/demo/blocked-party/"
+demo       = "https://silvana.one/agents/demo/blocked-party/"

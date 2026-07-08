@@ -31,4 +31,4 @@ tags     = ["allocation", "targets"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/target-allocation/v1-rust"
-quickstart = "https://silvana.one/agents/demo/target-allocation/"
+demo       = "https://silvana.one/agents/demo/target-allocation/"

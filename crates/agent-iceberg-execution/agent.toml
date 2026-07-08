@@ -31,4 +31,4 @@ tags     = ["iceberg", "hidden-size", "execution"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/iceberg-execution/v1-rust"
-quickstart = "https://silvana.one/agents/demo/iceberg-execution/"
+demo       = "https://silvana.one/agents/demo/iceberg-execution/"

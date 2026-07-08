@@ -31,4 +31,4 @@ tags     = ["alerts", "monitoring"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/risk-alert/v1-rust"
-quickstart = "https://silvana.one/agents/demo/risk-alert/"
+demo       = "https://silvana.one/agents/demo/risk-alert/"

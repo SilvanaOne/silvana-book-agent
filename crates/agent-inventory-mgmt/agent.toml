@@ -31,4 +31,4 @@ tags     = ["inventory", "rebalance"]
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/inventory-mgmt/v1-rust"
-quickstart = "https://silvana.one/agents/demo/inventory-mgmt/"
+demo       = "https://silvana.one/agents/demo/inventory-mgmt/"
