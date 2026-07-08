@@ -39,6 +39,9 @@ jobs:
           SHA: ${{ github.sha }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          OWNER: ${{ github.repository_owner }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GIT_TOKEN_RP }}
         run: |
           set -euo pipefail
           ALL="$(bash scripts/discover-demos.sh)"
@@ -61,14 +64,37 @@ jobs:
 
           if [ "$FORCE" = "1" ]; then
             echo "Force-building all demos."
-            SEL="$ALL"
+            KEEP="$(echo "$ALL" | jq -r '.[].name')"
           else
+            # (a) demos whose files changed in this push
             CHANGED="$(git diff --name-only $RANGE || true)"
             echo "Changed files:"; echo "$CHANGED"
-            SEL="$(echo "$ALL" | jq -c --arg files "$CHANGED" '
+            KEEP="$(echo "$ALL" | jq -r --arg files "$CHANGED" '
               ($files | split("\n") | map(select(length > 0))) as $f
-              | map(select(.context as $c | ($f | any(startswith($c + "/")))))')"
+              | .[] | select(.context as $c | ($f | any(startswith($c + "/")))) | .name')"
+
+            # (b) PLUS demos whose :latest image is missing in GHCR — i.e. newly
+            # added or renamed demos that were never published under this name.
+            # Without this, a rename that isn't touched again never gets built.
+            owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null 2>&1 || true
+              while read -r name; do
+                if ! docker manifest inspect "ghcr.io/${owner_lc}/${name}:latest" >/dev/null 2>&1; then
+                  echo "  not in registry → will build: ${name}"
+                  KEEP="${KEEP}"$'\n'"${name}"
+                fi
+              done < <(echo "$ALL" | jq -r '.[].name')
+              docker logout ghcr.io >/dev/null 2>&1 || true
+            else
+              echo "WARN: GIT_TOKEN_RP not set — skipping registry existence check."
+            fi
           fi
+
+          # Unique names → filter ALL down to the selected demo objects.
+          KEEP_JSON="$(printf '%s\n' "$KEEP" | sed '/^$/d' | sort -u | jq -R . | jq -s -c .)"
+          SEL="$(echo "$ALL" | jq -c --argjson keep "$KEEP_JSON" \
+            'map(select(.name as $n | $keep | index($n)))')"
 
           COUNT="$(echo "$SEL" | jq 'length')"
           echo "Selected $COUNT demo(s): $SEL"
@@ -132,15 +158,19 @@ jobs:
   # Roll onto the host. Regenerates the compose file from ALL discovered demos
   # (so newly added demos appear and deleted ones are removed via
   # --remove-orphans), copies it + the deploy script over scp through the
-  # bastion, and pulls/rolls. Runs on every new-agents push (unless a build
-  # failed) so the host always reflects the current demo set.
+  # bastion, and pulls/rolls.
+  #
+  # Gate: never deploy if ANY previous phase errored or the run was cancelled.
+  # `!failure() && !cancelled()` blocks on discover/build failure (incl. a single
+  # failed build leg, since fail-fast:false still marks the job failed) but still
+  # allows the "build was skipped — nothing to build" case through, so the host
+  # is reconciled on a clean run.
   deploy:
     needs: [discover, build]
     if: >-
-      always()
+      !failure() && !cancelled()
       && github.event_name == 'push'
       && github.ref == 'refs/heads/new-agents'
-      && needs.build.result != 'failure'
     runs-on: ubuntu-latest
     permissions:
       contents: read

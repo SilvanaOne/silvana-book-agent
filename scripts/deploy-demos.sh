@@ -6,13 +6,18 @@
 #   - not running        → start it
 #   - running old version → recreate it on the new image
 #   - already up to date  → leave it alone (no needless restart)
+#   - image missing in registry → skip it (don't fail the whole roll)
 #
-# All three are handled by `docker compose up -d --pull always`: compose
-# diffs the desired image against each running container and only recreates
-# the ones whose image actually changed, while starting any that are missing.
-# `--pull always` guarantees we detect a new build even when the tag string
-# is reused (e.g. `latest`); a pinned `sha-<short>` tag changes the reference
-# anyway, so the recreate is doubly certain.
+# The first three are handled by `docker compose up -d`: compose diffs the
+# desired image against each running container and only recreates the ones
+# whose image actually changed, while starting any that are missing.
+#
+# The last point matters when the demo set changes (a demo was renamed or newly
+# added but its image hasn't been built+pushed yet): `docker compose up` on ALL
+# services would abort with "manifest not found" for the missing ones. So we
+# pull with --ignore-pull-failures and then bring up ONLY the services whose
+# image is actually available locally. Missing ones are logged and skipped;
+# they roll in automatically once the build job publishes them.
 #
 # Assumes:
 #   - Docker + docker compose plugin installed on the host
@@ -50,12 +55,36 @@ for svc in $(compose config --services); do
   fi
 done
 
-# Fetch the requested tag, then start-or-recreate. `up -d` starts missing
-# containers and recreates only those whose image changed; `--pull always`
-# forces a fresh image check; `--remove-orphans` is scoped to this compose
-# project ("silvana-book-agent"), so neighbour stacks on the host are untouched.
-compose pull
-compose up -d --pull always --remove-orphans
+# Fetch every image, tolerating ones that don't exist yet in the registry.
+compose pull --ignore-pull-failures || true
+
+# Select only the services whose image is now present locally. Services whose
+# image is missing (never built / just renamed) are skipped, not fatal.
+avail=()
+skipped=()
+for svc in $(compose config --services); do
+  img="$(compose config --images "$svc" 2>/dev/null | head -n1 || true)"
+  if [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1; then
+    avail+=("$svc")
+  else
+    skipped+=("$svc")
+  fi
+done
+
+if [[ "${#skipped[@]}" -gt 0 ]]; then
+  echo "⚠ Skipping ${#skipped[@]} demo(s) with no image in the registry yet:"
+  printf '   - %s\n' "${skipped[@]}"
+fi
+
+if [[ "${#avail[@]}" -eq 0 ]]; then
+  echo "✖ No demo images available to deploy — nothing to do." >&2
+  exit 0
+fi
+
+# Start-or-recreate only the available services. `--remove-orphans` drops
+# containers for services no longer in the compose file (e.g. renamed-away),
+# scoped to this compose project so neighbour stacks are untouched.
+compose up -d --remove-orphans "${avail[@]}"
 
 # Report per-service outcome.
 echo "→ Result:"
@@ -63,7 +92,9 @@ for svc in $(compose config --services); do
   cid="$(compose ps -q "$svc" 2>/dev/null || true)"
   after=""
   [[ -n "$cid" ]] && after="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || echo '')"
-  if [[ -z "${before[$svc]:-}" && -n "$after" ]]; then
+  if [[ " ${skipped[*]} " == *" $svc "* ]]; then
+    echo "   • ${svc}: skipped (no image)"
+  elif [[ -z "${before[$svc]:-}" && -n "$after" ]]; then
     echo "   • ${svc}: started (was not running)"
   elif [[ -n "${before[$svc]:-}" && "${before[$svc]}" != "$after" ]]; then
     echo "   • ${svc}: restarted on new version"
@@ -74,5 +105,5 @@ done
 
 docker image prune -f
 
-echo "✔ Deployed"
+echo "✔ Deployed ${#avail[@]} demo(s)"
 compose ps
