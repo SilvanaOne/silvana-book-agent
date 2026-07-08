@@ -41,6 +41,12 @@ echo "→ Deploying demos with tag='${TAG}' from ${COMPOSE_FILE}"
 
 export DEMO_TAG="${TAG}"
 
+# Cap how many images Compose pulls/creates concurrently (default 4). Without
+# this, `docker compose pull` fetches all ~70 images at once, saturating the
+# host and risking GHCR rate limits. Override via COMPOSE_PARALLEL_LIMIT.
+export COMPOSE_PARALLEL_LIMIT="${COMPOSE_PARALLEL_LIMIT:-4}"
+echo "→ COMPOSE_PARALLEL_LIMIT=${COMPOSE_PARALLEL_LIMIT}"
+
 compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 # Snapshot the currently-running container image per service so we can report
