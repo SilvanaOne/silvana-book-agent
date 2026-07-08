@@ -28,7 +28,7 @@ name     = "Threat Feed"
 language = "rust"
 order    = 1
 tags     = ["scam", "threat-feed"]
+demo     = "https://silvana.one/agents/demo/scam-screening-threat-feed/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/scam-screening/threat-feed-rust"
-demo       = "https://silvana.one/agents/demo/scam-screening-threat-feed/"

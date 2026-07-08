@@ -28,7 +28,7 @@ name     = "Auto-Hedge"
 language = "rust"
 order    = 1
 tags     = ["inventory", "risk", "auto-hedge"]
+demo     = "https://silvana.one/agents/demo/inventory-risk-auto-hedge/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/inventory-risk/auto-hedge-rust"
-demo       = "https://silvana.one/agents/demo/inventory-risk-auto-hedge/"

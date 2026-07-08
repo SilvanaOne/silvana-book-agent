@@ -28,7 +28,7 @@ name     = "Pre-Trade"
 language = "rust"
 order    = 1
 tags     = ["gate", "pre-trade"]
+demo     = "https://silvana.one/agents/demo/readiness-check-pre-trade/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/readiness-check/pre-trade-rust"
-demo       = "https://silvana.one/agents/demo/readiness-check-pre-trade/"

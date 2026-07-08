@@ -28,7 +28,7 @@ name     = "TTL"
 language = "rust"
 order    = 1
 tags     = ["ttl", "cleanup"]
+demo     = "https://silvana.one/agents/demo/order-expiry-ttl/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/order-expiry/ttl-rust"
-demo       = "https://silvana.one/agents/demo/order-expiry-ttl/"

@@ -28,7 +28,7 @@ name     = "Offline Rules"
 language = "rust"
 order    = 1
 tags     = ["rules", "offline", "validator"]
+demo     = "https://silvana.one/agents/demo/pre-trade-check-offline-rules/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/pre-trade-check/offline-rules-rust"
-demo       = "https://silvana.one/agents/demo/pre-trade-check-offline-rules/"

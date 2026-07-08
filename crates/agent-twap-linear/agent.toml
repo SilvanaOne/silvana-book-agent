@@ -28,7 +28,7 @@ name     = "Linear"
 language = "rust"
 order    = 1
 tags     = ["execution", "time-sliced"]
+demo     = "https://silvana.one/agents/demo/twap-linear/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/twap/linear-rust"
-demo       = "https://silvana.one/agents/demo/twap-linear/"

@@ -28,7 +28,7 @@ name     = "Trigger"
 language = "rust"
 order    = 1
 tags     = ["trigger", "snipe"]
+demo     = "https://silvana.one/agents/demo/order-matching-trigger/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/order-matching/trigger-rust"
-demo       = "https://silvana.one/agents/demo/order-matching-trigger/"

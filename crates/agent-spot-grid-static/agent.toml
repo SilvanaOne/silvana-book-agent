@@ -28,7 +28,7 @@ name     = "Static"
 language = "rust"
 order    = 1
 tags     = ["marketmaker", "grid"]
+demo     = "https://silvana.one/agents/demo/spot-grid-static/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/spot-grid/static-rust"
-demo       = "https://silvana.one/agents/demo/spot-grid-static/"

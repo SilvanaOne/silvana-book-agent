@@ -28,7 +28,7 @@ name     = "Snapshot"
 language = "rust"
 order    = 1
 tags     = ["report", "exposure"]
+demo     = "https://silvana.one/agents/demo/portfolio-health-snapshot/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/portfolio-health/snapshot-rust"
-demo       = "https://silvana.one/agents/demo/portfolio-health-snapshot/"

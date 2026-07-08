@@ -28,7 +28,7 @@ name     = "Heuristic"
 language = "rust"
 order    = 1
 tags     = ["audit", "anomaly", "post-hoc"]
+demo     = "https://silvana.one/agents/demo/audit-anomaly-heuristic/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/audit-anomaly/heuristic-rust"
-demo       = "https://silvana.one/agents/demo/audit-anomaly-heuristic/"

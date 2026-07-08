@@ -28,7 +28,7 @@ name     = "Dispatcher"
 language = "rust"
 order    = 1
 tags     = ["algo", "execution", "dispatcher"]
+demo     = "https://silvana.one/agents/demo/algo-order-dispatcher/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/algo-order/dispatcher-rust"
-demo       = "https://silvana.one/agents/demo/algo-order-dispatcher/"

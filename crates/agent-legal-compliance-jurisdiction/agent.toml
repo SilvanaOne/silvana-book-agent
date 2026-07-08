@@ -28,7 +28,7 @@ name     = "Jurisdiction"
 language = "rust"
 order    = 1
 tags     = ["legal", "jurisdiction"]
+demo     = "https://silvana.one/agents/demo/legal-compliance-jurisdiction/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/legal-compliance/jurisdiction-rust"
-demo       = "https://silvana.one/agents/demo/legal-compliance-jurisdiction/"

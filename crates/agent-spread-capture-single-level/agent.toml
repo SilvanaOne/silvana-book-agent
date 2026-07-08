@@ -28,7 +28,7 @@ name     = "Single-Level"
 language = "rust"
 order    = 1
 tags     = ["marketmaker", "inventory-clamp"]
+demo     = "https://silvana.one/agents/demo/spread-capture-single-level/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/spread-capture/single-level-rust"
-demo       = "https://silvana.one/agents/demo/spread-capture-single-level/"

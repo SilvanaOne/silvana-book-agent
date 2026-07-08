@@ -28,7 +28,7 @@ name     = "Passive"
 language = "rust"
 order    = 1
 tags     = ["alerts", "monitoring"]
+demo     = "https://silvana.one/agents/demo/risk-alert-passive/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/risk-alert/passive-rust"
-demo       = "https://silvana.one/agents/demo/risk-alert-passive/"

@@ -28,7 +28,7 @@ name     = "Ed25519"
 language = "rust"
 order    = 1
 tags     = ["ed25519", "signing", "cli"]
+demo     = "https://silvana.one/agents/demo/signature-ed25519/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/signature/ed25519-rust"
-demo       = "https://silvana.one/agents/demo/signature-ed25519/"

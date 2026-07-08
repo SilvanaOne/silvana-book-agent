@@ -28,7 +28,7 @@ name     = "Mirror"
 language = "rust"
 order    = 1
 tags     = ["copy-trading", "mirror", "leader-follower"]
+demo     = "https://silvana.one/agents/demo/copy-trading-mirror/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/copy-trading/mirror-rust"
-demo       = "https://silvana.one/agents/demo/copy-trading-mirror/"

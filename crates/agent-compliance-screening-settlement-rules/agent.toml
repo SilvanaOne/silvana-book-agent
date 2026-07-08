@@ -28,7 +28,7 @@ name     = "Settlement Rules"
 language = "rust"
 order    = 1
 tags     = ["compliance", "policy", "settlements"]
+demo     = "https://silvana.one/agents/demo/compliance-screening-settlement-rules/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/compliance-screening/settlement-rules-rust"
-demo       = "https://silvana.one/agents/demo/compliance-screening-settlement-rules/"

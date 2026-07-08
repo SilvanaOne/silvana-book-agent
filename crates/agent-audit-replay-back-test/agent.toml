@@ -28,7 +28,7 @@ name     = "Back-Test"
 language = "rust"
 order    = 1
 tags     = ["audit", "policy", "back-test"]
+demo     = "https://silvana.one/agents/demo/audit-replay-back-test/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/audit-replay/back-test-rust"
-demo       = "https://silvana.one/agents/demo/audit-replay-back-test/"

@@ -28,7 +28,7 @@ name     = "Enforcer"
 language = "rust"
 order    = 1
 tags     = ["concentration", "enforcement"]
+demo     = "https://silvana.one/agents/demo/concentration-risk-enforcer/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/concentration-risk/enforcer-rust"
-demo       = "https://silvana.one/agents/demo/concentration-risk-enforcer/"

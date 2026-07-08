@@ -28,7 +28,7 @@ name     = "Checkpoints"
 language = "rust"
 order    = 1
 tags     = ["audit", "checkpoint", "signed"]
+demo     = "https://silvana.one/agents/demo/audit-attestation-checkpoints/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/audit-attestation/checkpoints-rust"
-demo       = "https://silvana.one/agents/demo/audit-attestation-checkpoints/"

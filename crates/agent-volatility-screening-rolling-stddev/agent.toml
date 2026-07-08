@@ -28,7 +28,7 @@ name     = "Rolling Std-Dev"
 language = "rust"
 order    = 1
 tags     = ["realized-vol", "rolling-window"]
+demo     = "https://silvana.one/agents/demo/volatility-screening-rolling-stddev/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/volatility-screening/rolling-stddev-rust"
-demo       = "https://silvana.one/agents/demo/volatility-screening-rolling-stddev/"

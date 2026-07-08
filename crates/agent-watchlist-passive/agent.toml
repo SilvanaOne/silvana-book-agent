@@ -28,7 +28,7 @@ name     = "Passive"
 language = "rust"
 order    = 1
 tags     = ["read-only", "market-data"]
+demo     = "https://silvana.one/agents/demo/watchlist-passive/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/watchlist/passive-rust"
-demo       = "https://silvana.one/agents/demo/watchlist-passive/"

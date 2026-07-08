@@ -28,7 +28,7 @@ name     = "Hidden Parent"
 language = "rust"
 order    = 1
 tags     = ["iceberg", "hidden-size", "execution"]
+demo     = "https://silvana.one/agents/demo/iceberg-execution-hidden-parent/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/iceberg-execution/hidden-parent-rust"
-demo       = "https://silvana.one/agents/demo/iceberg-execution-hidden-parent/"

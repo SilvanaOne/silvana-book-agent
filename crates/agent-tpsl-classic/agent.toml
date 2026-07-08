@@ -28,7 +28,7 @@ name     = "Classic"
 language = "rust"
 order    = 1
 tags     = ["take-profit", "stop-loss", "trailing"]
+demo     = "https://silvana.one/agents/demo/tpsl-classic/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/tpsl/classic-rust"
-demo       = "https://silvana.one/agents/demo/tpsl-classic/"

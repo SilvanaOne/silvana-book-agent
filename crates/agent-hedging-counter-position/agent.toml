@@ -28,7 +28,7 @@ name     = "Counter-Position"
 language = "rust"
 order    = 1
 tags     = ["hedging", "exposure"]
+demo     = "https://silvana.one/agents/demo/hedging-counter-position/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/hedging/counter-position-rust"
-demo       = "https://silvana.one/agents/demo/hedging-counter-position/"

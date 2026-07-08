@@ -28,7 +28,7 @@ name     = "Depth Probe"
 language = "rust"
 order    = 1
 tags     = ["depth", "slippage", "screening"]
+demo     = "https://silvana.one/agents/demo/liquidity-screening-depth-probe/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/liquidity-screening/depth-probe-rust"
-demo       = "https://silvana.one/agents/demo/liquidity-screening-depth-probe/"

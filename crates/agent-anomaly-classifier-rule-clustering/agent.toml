@@ -28,7 +28,7 @@ name     = "Rule-Clustering"
 language = "rust"
 order    = 1
 tags     = ["ml", "clustering", "audit"]
+demo     = "https://silvana.one/agents/demo/anomaly-classifier-rule-clustering/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/anomaly-classifier/rule-clustering-rust"
-demo       = "https://silvana.one/agents/demo/anomaly-classifier-rule-clustering/"

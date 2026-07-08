@@ -28,7 +28,7 @@ name     = "Blocklist"
 language = "rust"
 order    = 1
 tags     = ["blocklist", "screening"]
+demo     = "https://silvana.one/agents/demo/blocked-party-blocklist/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/blocked-party/blocklist-rust"
-demo       = "https://silvana.one/agents/demo/blocked-party-blocklist/"

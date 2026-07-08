@@ -28,7 +28,7 @@ name     = "TA Indicators"
 language = "rust"
 order    = 1
 tags     = ["ta", "indicators", "publisher"]
+demo     = "https://silvana.one/agents/demo/trend-analysis-ta-indicators/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/trend-analysis/ta-indicators-rust"
-demo       = "https://silvana.one/agents/demo/trend-analysis-ta-indicators/"

@@ -28,7 +28,7 @@ name     = "Bulk CLI"
 language = "rust"
 order    = 1
 tags     = ["batch", "bulk", "cli"]
+demo     = "https://silvana.one/agents/demo/batch-orders-bulk-cli/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/batch-orders/bulk-cli-rust"
-demo       = "https://silvana.one/agents/demo/batch-orders-bulk-cli/"

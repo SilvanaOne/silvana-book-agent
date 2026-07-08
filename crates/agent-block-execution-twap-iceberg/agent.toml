@@ -28,7 +28,7 @@ name     = "TWAP x Iceberg"
 language = "rust"
 order    = 1
 tags     = ["twap", "iceberg", "block"]
+demo     = "https://silvana.one/agents/demo/block-execution-twap-iceberg/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/block-execution/twap-iceberg-rust"
-demo       = "https://silvana.one/agents/demo/block-execution-twap-iceberg/"

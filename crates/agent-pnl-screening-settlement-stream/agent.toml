@@ -28,7 +28,7 @@ name     = "Settlement-Stream"
 language = "rust"
 order    = 1
 tags     = ["pnl", "position", "cost-basis"]
+demo     = "https://silvana.one/agents/demo/pnl-screening-settlement-stream/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/pnl-screening/settlement-stream-rust"
-demo       = "https://silvana.one/agents/demo/pnl-screening-settlement-stream/"

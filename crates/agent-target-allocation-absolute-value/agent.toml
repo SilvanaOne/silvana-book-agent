@@ -28,7 +28,7 @@ name     = "Absolute Value"
 language = "rust"
 order    = 1
 tags     = ["allocation", "targets"]
+demo     = "https://silvana.one/agents/demo/target-allocation-absolute-value/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/target-allocation/absolute-value-rust"
-demo       = "https://silvana.one/agents/demo/target-allocation-absolute-value/"
