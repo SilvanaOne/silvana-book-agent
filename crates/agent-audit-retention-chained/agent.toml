@@ -28,7 +28,7 @@ name     = "Chained"
 language = "rust"
 order    = 1
 tags     = ["audit", "retention", "rotation", "signed"]
+demo     = "https://silvana.one/agents/demo/audit-retention-chained/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/audit-retention/chained-rust"
-demo       = "https://silvana.one/agents/demo/audit-retention-chained/"

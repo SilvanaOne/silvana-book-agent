@@ -28,7 +28,7 @@ name     = "EMA Crossover"
 language = "rust"
 order    = 1
 tags     = ["momentum", "ema", "crossover"]
+demo     = "https://silvana.one/agents/demo/trend-following-ema-crossover/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/trend-following/ema-crossover-rust"
-demo       = "https://silvana.one/agents/demo/trend-following-ema-crossover/"

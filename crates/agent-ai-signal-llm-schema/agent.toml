@@ -28,7 +28,7 @@ name     = "LLM Schema"
 language = "rust"
 order    = 1
 tags     = ["ai", "llm", "signal-generation"]
+demo     = "https://silvana.one/agents/demo/ai-signal-llm-schema/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/ai-signal/llm-schema-rust"
-demo       = "https://silvana.one/agents/demo/ai-signal-llm-schema/"

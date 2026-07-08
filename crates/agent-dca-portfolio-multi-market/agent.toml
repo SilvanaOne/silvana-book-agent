@@ -28,7 +28,7 @@ name     = "Multi-Market"
 language = "rust"
 order    = 1
 tags     = ["dca", "multi-market"]
+demo     = "https://silvana.one/agents/demo/dca-portfolio-multi-market/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/dca-portfolio/multi-market-rust"
-demo       = "https://silvana.one/agents/demo/dca-portfolio-multi-market/"

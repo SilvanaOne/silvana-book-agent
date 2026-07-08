@@ -28,7 +28,7 @@ name     = "Buckets"
 language = "rust"
 order    = 1
 tags     = ["allocation", "buckets", "themes"]
+demo     = "https://silvana.one/agents/demo/smart-allocation-buckets/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/smart-allocation/buckets-rust"
-demo       = "https://silvana.one/agents/demo/smart-allocation-buckets/"

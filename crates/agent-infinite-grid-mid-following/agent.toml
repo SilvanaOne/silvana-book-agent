@@ -28,7 +28,7 @@ name     = "Mid-Following"
 language = "rust"
 order    = 1
 tags     = ["grid", "dynamic", "market-making"]
+demo     = "https://silvana.one/agents/demo/infinite-grid-mid-following/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/infinite-grid/mid-following-rust"
-demo       = "https://silvana.one/agents/demo/infinite-grid-mid-following/"

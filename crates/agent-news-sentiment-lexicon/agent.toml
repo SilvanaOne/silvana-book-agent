@@ -28,7 +28,7 @@ name     = "Lexicon"
 language = "rust"
 order    = 1
 tags     = ["news", "sentiment", "nlp"]
+demo     = "https://silvana.one/agents/demo/news-sentiment-lexicon/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/news-sentiment/lexicon-rust"
-demo       = "https://silvana.one/agents/demo/news-sentiment-lexicon/"

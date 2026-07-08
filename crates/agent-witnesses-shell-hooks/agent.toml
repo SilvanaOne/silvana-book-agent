@@ -28,7 +28,7 @@ name     = "Shell Hooks"
 language = "rust"
 order    = 1
 tags     = ["events", "shell", "witness"]
+demo     = "https://silvana.one/agents/demo/witnesses-shell-hooks/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/witnesses/shell-hooks-rust"
-demo       = "https://silvana.one/agents/demo/witnesses-shell-hooks/"

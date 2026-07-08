@@ -28,7 +28,7 @@ name     = "Band"
 language = "rust"
 order    = 1
 tags     = ["inventory", "rebalance"]
+demo     = "https://silvana.one/agents/demo/inventory-mgmt-band/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/inventory-mgmt/band-rust"
-demo       = "https://silvana.one/agents/demo/inventory-mgmt-band/"

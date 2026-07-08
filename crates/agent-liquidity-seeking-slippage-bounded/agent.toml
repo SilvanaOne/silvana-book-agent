@@ -28,7 +28,7 @@ name     = "Slippage-Bounded"
 language = "rust"
 order    = 1
 tags     = ["adaptive", "slippage", "execution"]
+demo     = "https://silvana.one/agents/demo/liquidity-seeking-slippage-bounded/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/liquidity-seeking/slippage-bounded-rust"
-demo       = "https://silvana.one/agents/demo/liquidity-seeking-slippage-bounded/"

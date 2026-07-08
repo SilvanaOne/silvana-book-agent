@@ -28,7 +28,7 @@ name     = "Carry Ranking"
 language = "rust"
 order    = 1
 tags     = ["yield", "carry", "rotation"]
+demo     = "https://silvana.one/agents/demo/yield-rotation-carry-ranking/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/yield-rotation/carry-ranking-rust"
-demo       = "https://silvana.one/agents/demo/yield-rotation-carry-ranking/"

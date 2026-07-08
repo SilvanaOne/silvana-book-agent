@@ -28,7 +28,7 @@ name     = "Ratio Divergence"
 language = "rust"
 order    = 1
 tags     = ["pairs", "stat-arb", "dual-leg"]
+demo     = "https://silvana.one/agents/demo/pairs-trading-ratio-divergence/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/pairs-trading/ratio-divergence-rust"
-demo       = "https://silvana.one/agents/demo/pairs-trading-ratio-divergence/"

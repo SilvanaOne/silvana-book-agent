@@ -28,7 +28,7 @@ name     = "Target Weights"
 language = "rust"
 order    = 1
 tags     = ["rebalance", "target-weights"]
+demo     = "https://silvana.one/agents/demo/portfolio-rebalancing-target-weights/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/portfolio-rebalancing/target-weights-rust"
-demo       = "https://silvana.one/agents/demo/portfolio-rebalancing-target-weights/"

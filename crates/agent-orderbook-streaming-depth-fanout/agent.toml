@@ -28,7 +28,7 @@ name     = "Depth Fanout"
 language = "rust"
 order    = 1
 tags     = ["market-data", "fanout"]
+demo     = "https://silvana.one/agents/demo/orderbook-streaming-depth-fanout/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/orderbook-streaming/depth-fanout-rust"
-demo       = "https://silvana.one/agents/demo/orderbook-streaming-depth-fanout/"

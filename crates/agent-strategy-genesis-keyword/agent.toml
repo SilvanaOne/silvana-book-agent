@@ -28,7 +28,7 @@ name     = "Keyword"
 language = "rust"
 order    = 1
 tags     = ["chat-to-strategy", "nlp", "codegen"]
+demo     = "https://silvana.one/agents/demo/strategy-genesis-keyword/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/strategy-genesis/keyword-rust"
-demo       = "https://silvana.one/agents/demo/strategy-genesis-keyword/"

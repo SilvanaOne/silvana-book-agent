@@ -28,7 +28,7 @@ name     = "Queue"
 language = "rust"
 order    = 1
 tags     = ["approval", "queue", "manual"]
+demo     = "https://silvana.one/agents/demo/human-approval-queue/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/human-approval/queue-rust"
-demo       = "https://silvana.one/agents/demo/human-approval-queue/"

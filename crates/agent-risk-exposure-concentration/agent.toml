@@ -28,7 +28,7 @@ name     = "Concentration"
 language = "rust"
 order    = 1
 tags     = ["exposure", "dashboard"]
+demo     = "https://silvana.one/agents/demo/risk-exposure-concentration/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/risk-exposure/concentration-rust"
-demo       = "https://silvana.one/agents/demo/risk-exposure-concentration/"

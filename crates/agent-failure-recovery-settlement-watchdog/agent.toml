@@ -28,7 +28,7 @@ name     = "Settlement Watchdog"
 language = "rust"
 order    = 1
 tags     = ["watchdog", "settlement", "recovery"]
+demo     = "https://silvana.one/agents/demo/failure-recovery-settlement-watchdog/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/failure-recovery/settlement-watchdog-rust"
-demo       = "https://silvana.one/agents/demo/failure-recovery-settlement-watchdog/"

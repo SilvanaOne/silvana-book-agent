@@ -28,7 +28,7 @@ name     = "JSONL"
 language = "rust"
 order    = 1
 tags     = ["signals", "jsonl", "executor"]
+demo     = "https://silvana.one/agents/demo/signal-bot-jsonl/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/signal-bot/jsonl-rust"
-demo       = "https://silvana.one/agents/demo/signal-bot-jsonl/"

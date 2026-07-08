@@ -28,7 +28,7 @@ name     = "Composite"
 language = "rust"
 order    = 1
 tags     = ["risk", "limits", "enforcement"]
+demo     = "https://silvana.one/agents/demo/risk-management-composite/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/risk-management/composite-rust"
-demo       = "https://silvana.one/agents/demo/risk-management-composite/"

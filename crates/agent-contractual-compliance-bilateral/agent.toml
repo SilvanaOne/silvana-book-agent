@@ -28,7 +28,7 @@ name     = "Bilateral"
 language = "rust"
 order    = 1
 tags     = ["contracts", "obligations"]
+demo     = "https://silvana.one/agents/demo/contractual-compliance-bilateral/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/contractual-compliance/bilateral-rust"
-demo       = "https://silvana.one/agents/demo/contractual-compliance-bilateral/"

@@ -28,7 +28,7 @@ name     = "Rationale"
 language = "rust"
 order    = 1
 tags     = ["ai", "explain", "counterfactual", "audit"]
+demo     = "https://silvana.one/agents/demo/trade-explain-rationale/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/trade-explain/rationale-rust"
-demo       = "https://silvana.one/agents/demo/trade-explain-rationale/"

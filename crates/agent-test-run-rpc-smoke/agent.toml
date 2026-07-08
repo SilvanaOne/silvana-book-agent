@@ -28,7 +28,7 @@ name     = "RPC Smoke"
 language = "rust"
 order    = 1
 tags     = ["healthcheck", "pre-flight"]
+demo     = "https://silvana.one/agents/demo/test-run-rpc-smoke/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/test-run/rpc-smoke-rust"
-demo       = "https://silvana.one/agents/demo/test-run-rpc-smoke/"

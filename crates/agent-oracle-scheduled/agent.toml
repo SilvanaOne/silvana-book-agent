@@ -28,7 +28,7 @@ name     = "Scheduled"
 language = "rust"
 order    = 1
 tags     = ["price-feed", "scheduled"]
+demo     = "https://silvana.one/agents/demo/oracle-scheduled/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/oracle/scheduled-rust"
-demo       = "https://silvana.one/agents/demo/oracle-scheduled/"

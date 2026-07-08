@@ -28,7 +28,7 @@ name     = "Push-Only"
 language = "rust"
 order    = 1
 tags     = ["treasury", "transfer-cc"]
+demo     = "https://silvana.one/agents/demo/cash-buffer-push-only/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/cash-buffer/push-only-rust"
-demo       = "https://silvana.one/agents/demo/cash-buffer-push-only/"

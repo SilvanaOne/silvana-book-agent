@@ -28,7 +28,7 @@ name     = "Filtered"
 language = "rust"
 order    = 1
 tags     = ["audit", "redaction", "signed"]
+demo     = "https://silvana.one/agents/demo/selective-disclosure-filtered/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/selective-disclosure/filtered-rust"
-demo       = "https://silvana.one/agents/demo/selective-disclosure-filtered/"

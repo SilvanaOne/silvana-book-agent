@@ -28,7 +28,7 @@ name     = "EMA"
 language = "rust"
 order    = 1
 tags     = ["ema", "reversion"]
+demo     = "https://silvana.one/agents/demo/mean-reversion-ema/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/mean-reversion/ema-rust"
-demo       = "https://silvana.one/agents/demo/mean-reversion-ema/"

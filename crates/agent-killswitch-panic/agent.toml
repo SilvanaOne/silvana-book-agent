@@ -28,7 +28,7 @@ name     = "Panic"
 language = "rust"
 order    = 1
 tags     = ["emergency-stop", "cancel-all"]
+demo     = "https://silvana.one/agents/demo/killswitch-panic/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/killswitch/panic-rust"
-demo       = "https://silvana.one/agents/demo/killswitch-panic/"

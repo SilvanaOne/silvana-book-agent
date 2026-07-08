@@ -28,7 +28,7 @@ name     = "JWT"
 language = "rust"
 order    = 1
 tags     = ["jwt", "auth", "cli"]
+demo     = "https://silvana.one/agents/demo/auth-jwt/"
 
 [template.resources]
 docs       = "https://docs.silvana.one/agents/auth/jwt-rust"
-demo       = "https://silvana.one/agents/demo/auth-jwt/"
