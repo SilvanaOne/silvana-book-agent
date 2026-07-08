@@ -66,6 +66,14 @@ pub struct StepResult {
 /// `collect_and_readvance` tick.
 const MAX_ADVANCE_SPAWNS_PER_CYCLE: usize = 50;
 
+/// Advance cadence for proposals already past their deadline. Their retry/Wait
+/// cooldowns are capped to this in `apply_result`, and the backoff bypass in
+/// `advance_all_settlements` only cuts short cooldowns LONGER than this — so an
+/// expired proposal is advanced (and its reservation released by the deadline
+/// watchdog) within ~30s, without the 2s-tick hammering a full bypass would
+/// cause, and without burning through retries in seconds during an RPC outage.
+const EXPIRED_RETRY_SECS: u64 = 30;
+
 /// Extract the 48-bit ms-since-epoch timestamp from a UUID-v7 string.
 /// Used to sort the spawn queue freshest-first so a brand-new RFQ-driven
 /// proposal is never starved behind stale buyer-abandoned ones.
@@ -274,6 +282,43 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let pid = proposal_id.to_string();
             tokio::spawn(async move { lm.release(&pid).await });
         }
+    }
+
+    /// True when a tracked settlement has outlived its settlement window — or its
+    /// allocation window while allocation is still pending per the locally-tracked
+    /// stage. Used to bypass the retry backoff so the deadline watchdog in
+    /// `advance_single` (which decides on fresh server data) runs promptly and the
+    /// liquidity reservation is released at the deadline, not up to a full Wait
+    /// cooldown later.
+    fn past_deadline(&self, proposal_id: &str) -> bool {
+        let Some(state) = self.active_settlements.get(proposal_id) else {
+            return false;
+        };
+        let Some(created_at) = &state.proposal.created_at else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let age = now - created_at.seconds;
+        let (allocate_window, settle_window) = expiry_windows(
+            &state.proposal.origin,
+            self.config.allocate_before_secs,
+            self.config.settle_before_secs,
+        );
+        if age > settle_window as i64 {
+            return true;
+        }
+        let pre_allocation = matches!(
+            state.stage,
+            SettlementStage::ProposalReceived
+                | SettlementStage::DvpFeePaid
+                | SettlementStage::DvpProposed
+                | SettlementStage::DvpAccepted
+                | SettlementStage::AllocationFeePaid
+        );
+        pre_allocation && age > allocate_window as i64
     }
 
     /// Record the inflow (token received from the counterparty) for a settling
@@ -855,11 +900,21 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 continue;
             }
 
-            // Skip if in backoff from a previous failure
+            // Skip if in backoff from a previous failure. A proposal already past
+            // its deadline cuts short a long PRE-expiry cooldown once (so the
+            // deadline watchdog can release the reservation promptly instead of
+            // after up to 10 min of Wait cooldown); cooldowns set AFTER expiry are
+            // already capped at EXPIRED_RETRY_SECS in apply_result, bounding the
+            // advance cadence rather than re-polling on every 2s tick.
             if let Some(f) = self.failed_settlements.get(&proposal_id) {
                 if Instant::now() < f.next_retry {
-                    skipped_backoff += 1;
-                    continue;
+                    let cut_short = f.next_retry
+                        > Instant::now() + Duration::from_secs(EXPIRED_RETRY_SECS)
+                        && self.past_deadline(&proposal_id);
+                    if !cut_short {
+                        skipped_backoff += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -1213,6 +1268,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 // / stream-driven advance_proposal / step completion all
                 // `.remove()` the entry — so `or_insert` creates a fresh one with
                 // wait_count=0, resetting the backoff naturally.
+                let expired = self.past_deadline(&proposal_id);
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
@@ -1223,7 +1279,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     });
                 entry.retry_count = 0; // Not a failure — don't accumulate
                 entry.wait_count = entry.wait_count.saturating_add(1);
-                let delay = FailedSettlement::wait_delay(entry.wait_count);
+                let mut delay = FailedSettlement::wait_delay(entry.wait_count);
+                if expired {
+                    // Past-deadline: keep advancing at a bounded cadence so the
+                    // deadline watchdog can conclude and release the reservation.
+                    delay = delay.min(Duration::from_secs(EXPIRED_RETRY_SECS));
+                }
                 entry.next_retry = Instant::now() + delay;
                 entry.cid_waiting = None;
                 debug!(
@@ -1240,6 +1301,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let is_transient = !is_permanent && (is_inactive
                     || error.contains("No Dvp contract ID found")
                     || error.contains("No DvpProposal CID found"));
+                let expired = self.past_deadline(&proposal_id);
                 let entry = self.failed_settlements.entry(proposal_id.clone())
                     .or_insert(FailedSettlement {
                         retry_count: 0,
@@ -1276,11 +1338,17 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     return;
                 }
 
-                let delay = if is_transient {
+                let mut delay = if is_transient {
                     Duration::from_secs(10)
                 } else {
                     FailedSettlement::retry_delay(entry.retry_count)
                 };
+                if expired {
+                    // Past-deadline: bounded cadence (see EXPIRED_RETRY_SECS) —
+                    // fast enough for prompt release, slow enough that an RPC
+                    // outage doesn't burn through retries in seconds.
+                    delay = delay.min(Duration::from_secs(EXPIRED_RETRY_SECS));
+                }
                 entry.next_retry = Instant::now() + delay;
                 if is_transient {
                     let is_cid_waiting = error.contains("No Dvp contract ID found")
@@ -1761,6 +1829,73 @@ async fn record_step_submitted(
 // Free function: advance a single settlement (runs in spawned task)
 // ============================================================================
 
+/// Deadline windows for orderbook-origin settlements. These proposals carry no
+/// LP-quoted windows — the server's env defaults (ALLOCATE_DEADLINE_SECS /
+/// SETTLE_DEADLINE_SECS, 6h/12h) are stamped into their on-chain DVP terms —
+/// so the agent must NOT judge them by its own much tighter RFQ windows:
+/// a human counterparty may legitimately take hours (frontend may be closed).
+const ORDERBOOK_ALLOCATE_BEFORE_SECS: u64 = 21_600; // 6 hours
+const ORDERBOOK_SETTLE_BEFORE_SECS: u64 = 43_200; // 12 hours
+
+/// Resolve the (allocate, settle) expiry windows for a proposal by origin:
+/// RFQ settlements use the agent's own quoted windows; orderbook (or unknown/
+/// legacy origin) settlements use the server's 6h/12h defaults.
+fn expiry_windows(origin: &str, rfq_allocate_secs: u64, rfq_settle_secs: u64) -> (u64, u64) {
+    if origin == "rfq" {
+        (rfq_allocate_secs, rfq_settle_secs)
+    } else {
+        (ORDERBOOK_ALLOCATE_BEFORE_SECS, ORDERBOOK_SETTLE_BEFORE_SECS)
+    }
+}
+
+/// Deadline watchdog verdict for an in-flight settlement.
+///
+/// Returns the permanent `deadline-exceeded` error message when the proposal has
+/// outlived its settlement window — or its allocation window while the server
+/// still expects a pre-allocation action from us. Past `allocateBefore` the DVP
+/// contract rejects further allocation steps on-chain, so such a settlement is
+/// doomed even though the settle window is still open; abandoning it right away
+/// releases the liquidity reservation instead of holding it until the (later)
+/// settle deadline or a server-sent terminal event. `Wait` is excluded from the
+/// allocation gate: it can mean "allocated, waiting for the operator", which
+/// only the settle window covers. `None` never expires — an already-terminal
+/// proposal is handled by the terminal arm of the state machine.
+fn deadline_expiry_error(
+    created_at_secs: i64,
+    now_secs: i64,
+    my_action: NextAction,
+    allocate_before_secs: u64,
+    settle_before_secs: u64,
+) -> Option<String> {
+    if my_action == NextAction::None {
+        return None;
+    }
+    let age = now_secs - created_at_secs;
+    if age > settle_before_secs as i64 {
+        return Some(format!(
+            "Settlement expired: deadline-exceeded (created {}s ago, max {}s)",
+            age, settle_before_secs
+        ));
+    }
+    let pre_allocation = matches!(
+        my_action,
+        NextAction::Preconfirm
+            | NextAction::PayDvpFee
+            | NextAction::CreateDvp
+            | NextAction::AcceptDvp
+            | NextAction::PayAllocFee
+            | NextAction::Allocate
+            | NextAction::MulticallAccept
+    );
+    if pre_allocation && age > allocate_before_secs as i64 {
+        return Some(format!(
+            "Settlement expired: deadline-exceeded (allocation window: created {}s ago, max {}s, pending action {:?})",
+            age, allocate_before_secs, my_action
+        ));
+    }
+    None
+}
+
 /// Advance a single settlement by checking NextAction from the server.
 ///
 /// This is the core settlement state machine, extracted as a free function
@@ -1824,7 +1959,8 @@ async fn advance_single<B: SettlementBackend>(
     };
 
     // Abandon any still-in-flight proposal that has blown past its settlement
-    // deadline, regardless of which action is pending. Without this, a proposal
+    // deadline (or its allocation deadline while allocation is still pending),
+    // regardless of which action is pending. Without this, a proposal
     // stuck in `Wait` (e.g. the counterparty abandoned the flow and the server
     // emits no terminal event) is re-polled forever, never exhausts (the `Wait`
     // handler keeps resetting `retry_count`), and its CC reservation leaks for
@@ -1833,22 +1969,24 @@ async fn advance_single<B: SettlementBackend>(
     // `deadline-exceeded` permanent-error path releases the reservation and
     // removes the entry. `None` is excluded so an already-terminal proposal is
     // handled by the terminal arm below instead of being marked failed.
-    if my_action != NextAction::None {
-        if let Some(created_at) = &state.proposal.created_at {
-            let deadline = created_at.seconds + config.settle_before_secs as i64;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            if now > deadline {
-                return AdvanceResult::Error {
-                    proposal_id,
-                    error: format!(
-                        "Settlement expired: deadline-exceeded (created {}s ago, max {}s)",
-                        now - created_at.seconds, config.settle_before_secs
-                    ),
-                };
-            }
+    if let Some(created_at) = &state.proposal.created_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (allocate_window, settle_window) = expiry_windows(
+            &state.proposal.origin,
+            config.allocate_before_secs,
+            config.settle_before_secs,
+        );
+        if let Some(error) = deadline_expiry_error(
+            created_at.seconds,
+            now,
+            my_action,
+            allocate_window,
+            settle_window,
+        ) {
+            return AdvanceResult::Error { proposal_id, error };
         }
     }
 
@@ -2249,5 +2387,124 @@ mod tests {
         assert!(!exec.active_settlements.contains_key("p1"));
         assert!(exec.rejected_proposals.contains("p1"));
         assert!(!exec.failed_settlements.contains_key("p1"));
+    }
+
+    // --- deadline_expiry_error: the watchdog verdict (pure) ---
+    // Windows: allocate 900s, settle 1800s.
+
+    #[test]
+    fn test_expiry_settle_window_fires_for_any_pending_action() {
+        for action in [NextAction::Wait, NextAction::Allocate, NextAction::Preconfirm] {
+            let err = deadline_expiry_error(0, 1861, action, 900, 1800)
+                .expect("settle window expired");
+            assert!(err.contains("deadline-exceeded"), "got: {err}");
+        }
+        // Inside the settle window, Wait does not expire
+        assert!(deadline_expiry_error(0, 1799, NextAction::Wait, 900, 1800).is_none());
+    }
+
+    #[test]
+    fn test_expiry_allocation_window_fires_only_for_pre_allocation_actions() {
+        // Past allocateBefore, still inside settleBefore
+        let err = deadline_expiry_error(0, 901, NextAction::Allocate, 900, 1800)
+            .expect("allocation window expired for pending Allocate");
+        assert!(err.contains("allocation window"), "got: {err}");
+        for action in [
+            NextAction::Preconfirm,
+            NextAction::PayDvpFee,
+            NextAction::CreateDvp,
+            NextAction::AcceptDvp,
+            NextAction::PayAllocFee,
+            NextAction::MulticallAccept,
+        ] {
+            assert!(
+                deadline_expiry_error(0, 901, action, 900, 1800).is_some(),
+                "expected allocation-window expiry for {action:?}"
+            );
+        }
+        // Wait may mean "allocated, waiting for the operator" — only the settle
+        // window applies to it.
+        assert!(deadline_expiry_error(0, 901, NextAction::Wait, 900, 1800).is_none());
+        // Inside the allocation window nothing expires
+        assert!(deadline_expiry_error(0, 899, NextAction::Allocate, 900, 1800).is_none());
+    }
+
+    #[test]
+    fn test_expiry_none_action_never_expires() {
+        assert!(deadline_expiry_error(0, 1_000_000, NextAction::None, 900, 1800).is_none());
+    }
+
+    // past_deadline (backoff bypass): settle window applies to any stage; the
+    // allocation window only to pre-allocation stages; windows are origin-aware.
+    #[tokio::test]
+    async fn test_past_deadline_bypasses_backoff_by_stage() {
+        let (mut exec, _lm) = committed_executor().await;
+        exec.config.allocate_before_secs = 900;
+        exec.config.settle_before_secs = 1800;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Fresh RFQ proposal: not past any deadline
+        {
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.proposal.origin = "rfq".to_string();
+            state.proposal.created_at = Some(prost_types::Timestamp { seconds: now, nanos: 0 });
+            state.stage = SettlementStage::ProposalReceived;
+        }
+        assert!(!exec.past_deadline("p1"));
+
+        // Un-allocated past the allocation window
+        {
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.proposal.created_at = Some(prost_types::Timestamp { seconds: now - 1000, nanos: 0 });
+        }
+        assert!(exec.past_deadline("p1"));
+
+        // Allocated: allocation window no longer applies, settle window not hit
+        {
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.stage = SettlementStage::Allocated;
+        }
+        assert!(!exec.past_deadline("p1"));
+
+        // Allocated but past the settle window
+        {
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.proposal.created_at = Some(prost_types::Timestamp { seconds: now - 2000, nanos: 0 });
+        }
+        assert!(exec.past_deadline("p1"));
+
+        // Orderbook-origin proposal (empty/legacy origin too): agent RFQ windows
+        // do NOT apply — the server's 6h/12h windows govern.
+        {
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.proposal.origin = "orderbook".to_string();
+            state.stage = SettlementStage::ProposalReceived;
+        }
+        assert!(!exec.past_deadline("p1")); // 2000s: inside 6h allocate window
+        {
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.proposal.created_at = Some(prost_types::Timestamp { seconds: now - 21_700, nanos: 0 });
+        }
+        assert!(exec.past_deadline("p1")); // past 6h allocate window, unallocated
+
+        // Unknown proposal: never bypass
+        assert!(!exec.past_deadline("unknown"));
+    }
+
+    #[test]
+    fn test_expiry_windows_by_origin() {
+        assert_eq!(expiry_windows("rfq", 900, 1800), (900, 1800));
+        assert_eq!(
+            expiry_windows("orderbook", 900, 1800),
+            (ORDERBOOK_ALLOCATE_BEFORE_SECS, ORDERBOOK_SETTLE_BEFORE_SECS)
+        );
+        // Legacy servers send no origin — treat as orderbook (lenient)
+        assert_eq!(
+            expiry_windows("", 900, 1800),
+            (ORDERBOOK_ALLOCATE_BEFORE_SECS, ORDERBOOK_SETTLE_BEFORE_SECS)
+        );
     }
 }

@@ -315,8 +315,8 @@ max_quantity = "1000"
 bid_spread_percent = 0.5
 offer_spread_percent = 0.5
 quote_valid_secs = 60
-allocate_before_secs = 3600
-settle_before_secs = 7200
+allocate_before_secs = 900
+settle_before_secs = 1800
 ```
 
 ### Grid Orders
@@ -348,8 +348,8 @@ Rejection reasons: market disabled, RFQ disabled for market, quantity out of ran
 
 Each quote includes:
 
-- **`allocate_before_secs`** — seconds from DVP creation to allocate tokens (default: 3600)
-- **`settle_before_secs`** — seconds from DVP creation to complete settlement (default: 7200)
+- **`allocate_before_secs`** — seconds from DVP creation to allocate tokens (default: 900)
+- **`settle_before_secs`** — seconds from DVP creation to complete settlement (default: 1800)
 
 ### Taker Fill Loops (`buy` / `sell`)
 
