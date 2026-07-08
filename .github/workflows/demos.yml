@@ -107,6 +107,9 @@ jobs:
     if: needs.discover.outputs.any == 'true'
     strategy:
       fail-fast: false
+      # Cap concurrent pushes: 70 demos pushing at once blows past GHCR's
+      # 2000 req/min limit (toomanyrequests). Throttling smooths the bursts.
+      max-parallel: 6
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     runs-on: ubuntu-latest
     permissions:
@@ -136,9 +139,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ steps.owner.outputs.value }}/${{ matrix.name }}
+          # Keep tags minimal — every extra tag is another manifest push against
+          # GHCR's rate limit. sha-<short> for immutability, latest for deploy.
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/new-agents' }}
