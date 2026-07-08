@@ -237,3 +237,23 @@ jobs:
             # deploy-demos.sh restarts just those and leaves the rest running.
             bash scripts/deploy-demos.sh latest
             docker logout ghcr.io || true
+
+  # Delete GHCR demo images whose demo no longer exists in git (renamed away /
+  # removed). Scoped to THIS repo's packages only — never the whole org. Runs
+  # after a clean deploy so we don't prune on a broken run.
+  prune:
+    needs: [deploy]
+    if: >-
+      !failure() && !cancelled()
+      && github.event_name == 'push'
+      && github.ref == 'refs/heads/new-agents'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Prune stale demo images from GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN_RP }}   # needs delete:packages scope
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: bash scripts/prune-demo-images.sh

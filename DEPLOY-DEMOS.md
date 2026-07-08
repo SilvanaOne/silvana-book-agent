@@ -40,6 +40,14 @@ Demos are **never listed by hand**. `scripts/discover-demos.sh` finds every
 Drop in a new `crates/agent-<name>/demo/` with a Dockerfile and it is built,
 published and deployed automatically — no edits to the workflow or compose file.
 
+The pipeline is four jobs: `discover → build → deploy → prune`. The `prune` job
+(`scripts/prune-demo-images.sh`) deletes GHCR `*-demo` images whose demo no
+longer exists in git (renamed away / removed), so the registry stays in sync.
+It is **scoped to this repo's packages only** (filtered by the package's linked
+repository) — never the whole org. It needs `GIT_TOKEN_RP` to carry the
+**`delete:packages`** scope in addition to `read:packages` (the `GITHUB_TOKEN`
+cannot delete packages).
+
 ### Selective build & caching
 
 Two layers keep builds cheap:
