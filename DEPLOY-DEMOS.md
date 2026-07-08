@@ -1,8 +1,10 @@
 # Deploying demos via Docker
 
 Every agent demo ships with its own `Dockerfile` in
-`crates/agent-<name>/demo/`. A root-level `docker-compose.demos.yml`
-orchestrates all of them.
+`crates/agent-<name>/demo/`. The demos are discovered automatically and a
+`docker-compose.demos.yml` that orchestrates all of them is **generated on
+demand** by `scripts/gen-demos-compose.sh` — it is not committed to git (the
+deploy job and local dev both regenerate it).
 
 **Two deployment modes:**
 - **Prod** — GitHub Actions builds + pushes images to GHCR on every push;
@@ -97,6 +99,34 @@ Universal start-or-restart, applied per demo service:
 The script snapshots each service's running image before and after the roll
 and prints which of the three outcomes happened. Idempotent — re-running with
 the same tag is a no-op.
+
+## Networking & scale
+
+All demo containers share **one explicitly-sized Docker network** (`silvana-demos`,
+default subnet `172.31.240.0/20` ≈ 4094 addresses). This is deliberate: with many
+demos, Docker's *default* per-compose subnet can be too small on a busy shared
+host, which fails with:
+
+```
+no available IPv4 addresses on this network's address pools
+```
+
+The explicit subnet is taken directly (not from Docker's pool), so it scales to
+hundreds of demos. Override with `DEMOS_SUBNET=10.90.0.0/20` (env at generate
+time) if it collides with another stack on the host.
+
+If a host already hit the error above (half-started containers, old network),
+clean up once:
+
+```bash
+cd /opt/silvana-book-agent
+docker compose -f docker-compose.demos.yml down --remove-orphans
+docker network prune -f
+bash scripts/deploy-demos.sh latest     # recreates on the sized network
+```
+
+> Each demo also needs a **unique host port** — 70 demos means 70 ports (and the
+> RAM to run 70 Node servers). Keep an eye on host resources as the set grows.
 
 ## Ports
 
@@ -199,12 +229,15 @@ bash scripts/deploy-demos.sh latest
 Windows / Mac need Docker Desktop with WSL2 or Hyper-V enabled in BIOS.
 Linux — just Docker.
 
+Generate the compose file first (it's not committed), then build locally:
+
 ```bash
+bash scripts/gen-demos-compose.sh > docker-compose.demos.yml
 docker compose -f docker-compose.demos.yml up -d --build
 ```
 
-The `build:` section in `docker-compose.demos.yml` triggers a local
-build. The `image:` reference is used as the tag.
+The `build:` section in each service triggers a local build; the `image:`
+reference is used as the tag. Requires `jq`.
 
 ## Adding a new demo
 
@@ -227,5 +260,6 @@ bash scripts/discover-demos.sh          # JSON list of discovered demos
 bash scripts/gen-demos-compose.sh       # the compose that will be deployed
 ```
 
-> `docker-compose.demos.yml` in the repo is **generated** — don't hand-edit it.
-> Regenerate with `bash scripts/gen-demos-compose.sh > docker-compose.demos.yml`.
+> `docker-compose.demos.yml` is **generated and git-ignored** — never hand-edit
+> or commit it. Regenerate any time with
+> `bash scripts/gen-demos-compose.sh > docker-compose.demos.yml`.

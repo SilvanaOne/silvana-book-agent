@@ -5,9 +5,13 @@
 # come from scripts/discover-demos.sh (which reads each demo's Dockerfile).
 #
 # Output goes to stdout. Env overrides:
-#   IMAGE_OWNER   GHCR owner (default: silvanaone)
-#   DEMO_TAG      image tag at deploy time (default: latest) — left as a compose
-#                 variable so `deploy-demos.sh <tag>` still controls it.
+#   IMAGE_OWNER    GHCR owner (default: silvanaone)
+#   DEMO_TAG       image tag at deploy time (default: latest) — left as a compose
+#                  variable so `deploy-demos.sh <tag>` still controls it.
+#   DEMOS_SUBNET   IPv4 subnet for the shared demos network (default 172.31.240.0/20,
+#                  ~4094 addresses). All demos share ONE explicitly-sized network so
+#                  Docker never hands out a subnet too small for the demo count.
+#                  Override if it collides with another stack on the host.
 #
 # Per-demo image can also be overridden with <SHORT_UPPER>_IMAGE, e.g.
 # SPOT_DCA_IMAGE=... for the spot-dca demo.
@@ -19,6 +23,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 owner="${IMAGE_OWNER:-silvanaone}"
+subnet="${DEMOS_SUBNET:-172.31.240.0/20}"
 
 demos="$(bash "$here/discover-demos.sh")"
 
@@ -36,6 +41,20 @@ echo "$demos" | jq -r --arg owner "$owner" '
   "      context: ./\(.context)",
   "    container_name: \(.name)",
   "    restart: unless-stopped",
+  "    networks: [demos]",
   "    ports:",
   "      - \"\(.port):\(.port)\""
 '
+
+# One explicitly-sized network for all demos — avoids Docker allocating a
+# too-small default subnet on a busy shared host (the cause of
+# "no available IPv4 addresses on this network's address pools").
+cat <<EOF
+
+networks:
+  demos:
+    name: silvana-demos
+    ipam:
+      config:
+        - subnet: ${subnet}
+EOF
