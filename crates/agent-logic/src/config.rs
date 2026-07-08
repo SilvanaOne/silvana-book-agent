@@ -170,6 +170,10 @@ pub struct BaseConfig {
     // Settlement expiry (max lifetime before considering expired)
     pub settle_before_secs: u64,
 
+    // Allocation expiry (max age before an un-allocated settlement is considered
+    // expired and its liquidity reservation released)
+    pub allocate_before_secs: u64,
+
     // Liquidity management
     /// Safety margin multiplier for fee estimates (e.g. 1.1 = 10%)
     pub liquidity_margin: f64,
@@ -225,7 +229,8 @@ impl BaseConfig {
             ledger_service_public_key: [0u8; 32],
             liquidity_provider: None,
             max_active_settlements: 1000,
-            settle_before_secs: 7200,
+            settle_before_secs: 1800,
+            allocate_before_secs: 900,
             liquidity_margin: 1.1,
             flow_ema_window_hours: 4.0,
             depletion_max_hours: 12.0,
@@ -338,11 +343,36 @@ impl BaseConfig {
             .map_err(|_| anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
         let ledger_service_public_key = decode_public_key(&ledger_service_public_key_b58)?;
 
+        // The quoted windows are stamped into the on-chain DVP terms, where the
+        // DAML model requires 0 < allocateBefore < settleBefore — a misordered
+        // market would permanently fail every DVP propose on that pair, so
+        // refuse to start instead.
+        for market in &agent.markets {
+            if let Some(rfq) = &market.rfq {
+                if rfq.allocate_before_secs == 0
+                    || rfq.allocate_before_secs >= rfq.settle_before_secs
+                {
+                    return Err(anyhow!(
+                        "Market {}: invalid [markets.rfq] deadline windows: \
+                         allocate_before_secs={} settle_before_secs={} \
+                         (need 0 < allocate_before_secs < settle_before_secs)",
+                        market.market_id, rfq.allocate_before_secs, rfq.settle_before_secs
+                    ));
+                }
+            }
+        }
+
         let settle_before_secs = agent.markets.iter()
             .filter_map(|m| m.rfq.as_ref())
             .map(|r| r.settle_before_secs as u64)
             .max()
             .unwrap_or(default_rfq_settle_before_secs() as u64);
+
+        let allocate_before_secs = agent.markets.iter()
+            .filter_map(|m| m.rfq.as_ref())
+            .map(|r| r.allocate_before_secs as u64)
+            .max()
+            .unwrap_or(default_rfq_allocate_before_secs() as u64);
 
         let liquidity_margin = std::env::var("LIQUIDITY_MARGIN")
             .ok()
@@ -423,6 +453,7 @@ impl BaseConfig {
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
             settle_before_secs,
+            allocate_before_secs,
             liquidity_margin,
             flow_ema_window_hours,
             depletion_max_hours,
@@ -658,10 +689,10 @@ pub struct RfqMarketConfig {
     pub offer_spread_percent: f64,
     #[serde(default)]
     pub quote_valid_secs: Option<u32>,
-    /// DVP allocation deadline in seconds from DVP creation (default 1 hour)
+    /// DVP allocation deadline in seconds from DVP creation (default 15 minutes)
     #[serde(default = "default_rfq_allocate_before_secs")]
     pub allocate_before_secs: u32,
-    /// DVP settlement deadline in seconds from DVP creation (default 2 hours)
+    /// DVP settlement deadline in seconds from DVP creation (default 30 minutes)
     #[serde(default = "default_rfq_settle_before_secs")]
     pub settle_before_secs: u32,
     /// Per-market override of the LP's global `min_notional_usd` (USD).
@@ -740,11 +771,11 @@ fn default_quote_valid_secs() -> u32 {
 }
 
 fn default_rfq_allocate_before_secs() -> u32 {
-    3600 // 1 hour
+    900 // 15 minutes
 }
 
 fn default_rfq_settle_before_secs() -> u32 {
-    7200 // 2 hours
+    1800 // 30 minutes
 }
 
 #[cfg(test)]
