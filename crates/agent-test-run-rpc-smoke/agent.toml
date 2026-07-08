@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "tx_flow"
+order = 2
+
+[agent]
+slug        = "test-run"
+name        = "Test Run"
+description = "Read-only RPC smoke test — verifies connectivity, JWT, and basic queries before launching any ledger-writing agent. Add a market flag to also probe price and depth."
+icon        = "stethoscope"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=test-run"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "RPC Smoke"
+language = "rust"
+order    = 1
+tags     = ["healthcheck", "pre-flight"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/test-run/rpc-smoke-rust"
+demo       = "https://silvana.one/agents/demo/test-run-rpc-smoke/"

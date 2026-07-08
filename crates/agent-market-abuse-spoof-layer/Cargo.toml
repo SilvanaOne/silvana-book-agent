@@ -1,0 +1,31 @@
+[package]
+name = "agent-market-abuse-spoof-layer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-market-abuse-spoof-layer"
+path = "src/main.rs"
+
+[dependencies]
+agent-logic = { path = "../agent-logic" }
+orderbook-proto = { path = "../orderbook-proto" }
+
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
+tokio-stream = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "sync", "fs"] }
+
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+anyhow = { workspace = true }
+
+rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { version = "1.36" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }

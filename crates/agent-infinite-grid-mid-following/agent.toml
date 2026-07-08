@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 6
+
+[agent]
+slug        = "infinite-grid"
+name        = "Infinite Grid"
+description = "Grid market-maker with no fixed price range — regenerates a bid/offer ladder around the live mid on every refresh, so the strategy follows the market indefinitely."
+icon        = "grid-3x3"
+status      = "active"
+
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=infinite-grid"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Mid-Following"
+language = "rust"
+order    = 1
+tags     = ["grid", "dynamic", "market-making"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/infinite-grid/mid-following-rust"
+demo       = "https://silvana.one/agents/demo/infinite-grid-mid-following/"

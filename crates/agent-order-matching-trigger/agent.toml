@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 10
+
+[agent]
+slug        = "order-matching"
+name        = "Order Matching"
+description = "Trigger sniper — places a bid the moment best-offer drops through a level, or an offer the moment best-bid climbs through one. One open snipe per side."
+icon        = "crosshair"
+status      = "active"
+
+required_balance   = "$200 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=order-matching"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Trigger"
+language = "rust"
+order    = 1
+tags     = ["trigger", "snipe"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/order-matching/trigger-rust"
+demo       = "https://silvana.one/agents/demo/order-matching-trigger/"

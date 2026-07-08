@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "intelligence"
+order = 1
+
+[agent]
+slug        = "ai-signal"
+name        = "AI Signal"
+description = "Wraps an LLM in a strict output schema — natural-language prompt + market context → structured trading signal (market, side, price, quantity, confidence, rationale). Feeds directly into agent-signal-bot."
+icon        = "sparkles"
+status      = "active"
+
+required_balance   = "None — signal-generation only"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=ai-signal"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "LLM Schema"
+language = "rust"
+order    = 1
+tags     = ["ai", "llm", "signal-generation"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/ai-signal/llm-schema-rust"
+demo       = "https://silvana.one/agents/demo/ai-signal-llm-schema/"

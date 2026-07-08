@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "risk"
+order = 7
+
+[agent]
+slug        = "inventory-risk"
+name        = "Inventory Risk"
+description = "Watches directional inventory build-up in market-making books — emits soft/hard band signals and optionally auto-hedges the excess exposure."
+icon        = "gauge"
+status      = "active"
+
+required_balance   = "$100 min"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=inventory-risk"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Auto-Hedge"
+language = "rust"
+order    = 1
+tags     = ["inventory", "risk", "auto-hedge"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/inventory-risk/auto-hedge-rust"
+demo       = "https://silvana.one/agents/demo/inventory-risk-auto-hedge/"

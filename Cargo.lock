@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "agent-ai-signal"
+name = "agent-ai-signal-llm-schema"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-algo-order"
+name = "agent-algo-order-dispatcher"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -50,7 +50,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-anomaly-classifier"
+name = "agent-anomaly-classifier-rule-clustering"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -63,7 +63,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-audit-anomaly"
+name = "agent-audit-anomaly-heuristic"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -76,7 +76,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-audit-attestation"
+name = "agent-audit-attestation-checkpoints"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -94,7 +94,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-audit-replay"
+name = "agent-audit-replay-back-test"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -108,7 +108,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-audit-retention"
+name = "agent-audit-retention-chained"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -125,7 +125,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-auth"
+name = "agent-auth-jwt"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -141,40 +141,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-batch-orders"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-block-execution"
+name = "agent-batch-orders-bulk-cli"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -207,7 +174,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-blocked-party"
+name = "agent-block-execution-twap-iceberg"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-blocked-party-blocklist"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -227,7 +227,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-cash-buffer"
+name = "agent-cash-buffer-push-only"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -260,7 +260,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-circuit-breaker"
+name = "agent-circuit-breaker-deviation"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -276,63 +276,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-compliance-screening"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "chrono",
- "clap",
- "dotenvy",
- "orderbook-proto",
- "reqwest",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agent-concentration-risk"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-contractual-compliance"
+name = "agent-compliance-screening-settlement-rules"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -355,21 +299,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-copy-trading"
-version = "0.3.4"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "dotenvy",
- "reqwest",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "agent-dca-portfolio"
+name = "agent-concentration-risk-enforcer"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -402,258 +332,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-failure-recovery"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "chrono",
- "clap",
- "dotenvy",
- "orderbook-proto",
- "rustls",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agent-fair-value"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "chrono",
- "clap",
- "dotenvy",
- "orderbook-proto",
- "reqwest",
- "rustls",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agent-hedging"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-human-approval"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-iceberg-execution"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-infinite-grid"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-inventory-mgmt"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-inventory-risk"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "reqwest",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-killswitch"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "clap",
- "dotenvy",
- "orderbook-proto",
- "rustls",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "agent-legal-compliance"
+name = "agent-contractual-compliance-bilateral"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -676,7 +355,328 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-liquidity-screening"
+name = "agent-copy-trading-mirror"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agent-dca-portfolio-multi-market"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-failure-recovery-settlement-watchdog"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "rustls",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-fair-value-multi-source"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-hedging-counter-position"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-human-approval-queue"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-iceberg-execution-hidden-parent"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-infinite-grid-mid-following"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-inventory-mgmt-band"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-inventory-risk-auto-hedge"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "reqwest",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-killswitch-panic"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "rustls",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-legal-compliance-jurisdiction"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "reqwest",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-liquidity-screening-depth-probe"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -696,7 +696,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-liquidity-seeking"
+name = "agent-liquidity-seeking-slippage-bounded"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -759,7 +759,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-market-abuse"
+name = "agent-market-abuse-spoof-layer"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -780,7 +780,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-mean-reversion"
+name = "agent-mean-reversion-ema"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -813,7 +813,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-news-sentiment"
+name = "agent-news-sentiment-lexicon"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -826,7 +826,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-notifier"
+name = "agent-notifier-multi-sink"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -848,7 +848,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-oracle"
+name = "agent-oracle-scheduled"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -867,7 +867,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-order-expiry"
+name = "agent-order-expiry-ttl"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -885,7 +885,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-order-matching"
+name = "agent-order-matching-trigger"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -918,7 +918,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-orderbook-streaming"
+name = "agent-orderbook-streaming-depth-fanout"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -938,7 +938,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-pairs-trading"
+name = "agent-pairs-trading-ratio-divergence"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -971,7 +971,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-pnl-screening"
+name = "agent-pnl-screening-settlement-stream"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -991,40 +991,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-portfolio-health"
-version = "0.3.4"
-dependencies = [
- "agent-logic",
- "anyhow",
- "async-trait",
- "base64",
- "bs58",
- "chrono",
- "clap",
- "cloud-agent",
- "dotenvy",
- "ed25519-dalek",
- "hex",
- "message-signing",
- "once_cell",
- "orderbook-proto",
- "prost-types",
- "rand 0.8.6",
- "rust_decimal",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "tx-verifier",
- "uuid",
-]
-
-[[package]]
-name = "agent-portfolio-rebalancing"
+name = "agent-portfolio-health-snapshot"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1057,7 +1024,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-pre-trade-check"
+name = "agent-portfolio-rebalancing-target-weights"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-pre-trade-check-offline-rules"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -1069,7 +1069,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-readiness-check"
+name = "agent-readiness-check-pre-trade"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1102,7 +1102,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-risk-alert"
+name = "agent-risk-alert-passive"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1123,7 +1123,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-risk-exposure"
+name = "agent-risk-exposure-concentration"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1156,7 +1156,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-risk-management"
+name = "agent-risk-management-composite"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1178,7 +1178,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-scam-screening"
+name = "agent-scam-screening-threat-feed"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1200,7 +1200,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-selective-disclosure"
+name = "agent-selective-disclosure-filtered"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1217,7 +1217,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-signal-bot"
+name = "agent-signal-bot-jsonl"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1250,7 +1250,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-signature"
+name = "agent-signature-ed25519"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1265,7 +1265,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-smart-allocation"
+name = "agent-smart-allocation-buckets"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1299,7 +1299,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-spot-dca"
+name = "agent-spot-dca-scheduled"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1332,7 +1332,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-spot-grid"
+name = "agent-spot-grid-static"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1365,7 +1365,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-spread-capture"
+name = "agent-spread-capture-single-level"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1398,7 +1398,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-state-monitor"
+name = "agent-state-monitor-self-stream"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1417,7 +1417,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-strategy-genesis"
+name = "agent-strategy-genesis-keyword"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -1430,7 +1430,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-target-allocation"
+name = "agent-target-allocation-absolute-value"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1463,7 +1463,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-test-run"
+name = "agent-test-run-rpc-smoke"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1479,7 +1479,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-tpsl"
+name = "agent-tpsl-classic"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1512,7 +1512,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-trade-explain"
+name = "agent-trade-explain-rationale"
 version = "0.3.4"
 dependencies = [
  "anyhow",
@@ -1525,7 +1525,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-trading-history"
+name = "agent-trading-history-signed-chain"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1548,7 +1548,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-treasury-mgmt"
+name = "agent-treasury-mgmt-policy-routed"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1581,7 +1581,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-trend-analysis"
+name = "agent-trend-analysis-ta-indicators"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1600,7 +1600,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-trend-following"
+name = "agent-trend-following-ema-crossover"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1633,7 +1633,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-twap"
+name = "agent-twap-linear"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1666,7 +1666,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-volatility-screening"
+name = "agent-volatility-screening-rolling-stddev"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1685,7 +1685,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-watchlist"
+name = "agent-watchlist-passive"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1704,7 +1704,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-witnesses"
+name = "agent-witnesses-shell-hooks"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1722,7 +1722,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-yield-rotation"
+name = "agent-yield-rotation-carry-ranking"
 version = "0.3.4"
 dependencies = [
  "agent-logic",

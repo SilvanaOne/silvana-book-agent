@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "intelligence"
+order = 5
+
+[agent]
+slug        = "anomaly-classifier"
+name        = "Anomaly Classifier"
+description = "Clusters audit-anomaly records into abuse categories (spoofing / wash_trading / stuck_settlement / normal_volatility) via a rule-based co-occurrence classifier. Drop-in ML model behind the same interface for production."
+icon        = "layers"
+status      = "active"
+
+required_balance   = "None — offline"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=anomaly-classifier"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Rule-Clustering"
+language = "rust"
+order    = 1
+tags     = ["ml", "clustering", "audit"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/anomaly-classifier/rule-clustering-rust"
+demo       = "https://silvana.one/agents/demo/anomaly-classifier-rule-clustering/"

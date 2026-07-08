@@ -1,0 +1,26 @@
+[package]
+name = "agent-selective-disclosure-filtered"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-selective-disclosure-filtered"
+path = "src/main.rs"
+
+[dependencies]
+agent-logic = { path = "../agent-logic" }
+message-signing = { path = "../message-signing" }
+
+clap = { workspace = true, features = ["derive", "env"] }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util"] }
+
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }

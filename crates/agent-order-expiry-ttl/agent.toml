@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "tx_flow"
+order = 1
+
+[agent]
+slug        = "order-expiry"
+name        = "Order Expiry"
+description = "Periodically scans your active orders and cancels any whose age exceeds a configurable TTL — keeps the book free of stale quotes."
+icon        = "timer-off"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=order-expiry"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "TTL"
+language = "rust"
+order    = 1
+tags     = ["ttl", "cleanup"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/order-expiry/ttl-rust"
+demo       = "https://silvana.one/agents/demo/order-expiry-ttl/"

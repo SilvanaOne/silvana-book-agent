@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "portfolio_mgmt"
+order = 7
+
+[agent]
+slug        = "treasury-mgmt"
+name        = "Treasury Management"
+description = "Policy + approval-routed rebalancer — per-trade ceiling, rolling 24 h notional cap, and an approval threshold above which trades queue for human sign-off."
+icon        = "building-2"
+status      = "active"
+
+required_balance   = "$1000 min"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=treasury-mgmt"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Policy-Routed"
+language = "rust"
+order    = 1
+tags     = ["treasury", "policy", "approval"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/treasury-mgmt/policy-routed-rust"
+demo       = "https://silvana.one/agents/demo/treasury-mgmt-policy-routed/"

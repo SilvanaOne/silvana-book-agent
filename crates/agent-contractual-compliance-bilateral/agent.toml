@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "compliance"
+order = 5
+
+[agent]
+slug        = "contractual-compliance"
+name        = "Contractual Compliance"
+description = "Evaluates bilateral contractual obligations against live activity — flags any order or settlement that violates a party's contract terms."
+icon        = "file-text"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=contractual-compliance"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Bilateral"
+language = "rust"
+order    = 1
+tags     = ["contracts", "obligations"]
+
+[template.resources]
+docs       = "https://docs.silvana.one/agents/contractual-compliance/bilateral-rust"
+demo       = "https://silvana.one/agents/demo/contractual-compliance-bilateral/"
