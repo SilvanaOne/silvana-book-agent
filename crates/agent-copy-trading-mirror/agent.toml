@@ -31,4 +31,4 @@ tags     = ["copy-trading", "mirror", "leader-follower"]
 demo     = "https://silvana.one/agents/demo/copy-trading-mirror/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/copy-trading/mirror-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-copy-trading-mirror/doc.md"

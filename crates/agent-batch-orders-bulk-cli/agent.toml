@@ -31,4 +31,4 @@ tags     = ["batch", "bulk", "cli"]
 demo     = "https://silvana.one/agents/demo/batch-orders-bulk-cli/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/batch-orders/bulk-cli-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-batch-orders-bulk-cli/doc.md"

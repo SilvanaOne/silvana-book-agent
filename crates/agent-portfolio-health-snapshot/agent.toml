@@ -31,4 +31,4 @@ tags     = ["report", "exposure"]
 demo     = "https://silvana.one/agents/demo/portfolio-health-snapshot/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/portfolio-health/snapshot-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-portfolio-health-snapshot/doc.md"

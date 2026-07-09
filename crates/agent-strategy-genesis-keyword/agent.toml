@@ -31,4 +31,4 @@ tags     = ["chat-to-strategy", "nlp", "codegen"]
 demo     = "https://silvana.one/agents/demo/strategy-genesis-keyword/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/strategy-genesis/keyword-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-strategy-genesis-keyword/doc.md"

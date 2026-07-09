@@ -31,4 +31,4 @@ tags     = ["take-profit", "stop-loss", "trailing"]
 demo     = "https://silvana.one/agents/demo/tpsl-classic/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/tpsl/classic-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-tpsl-classic/doc.md"

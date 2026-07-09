@@ -31,4 +31,4 @@ tags     = ["ema", "reversion"]
 demo     = "https://silvana.one/agents/demo/mean-reversion-ema/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/mean-reversion/ema-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-mean-reversion-ema/doc.md"

@@ -31,4 +31,4 @@ tags     = ["rules", "offline", "validator"]
 demo     = "https://silvana.one/agents/demo/pre-trade-check-offline-rules/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/pre-trade-check/offline-rules-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-pre-trade-check-offline-rules/doc.md"

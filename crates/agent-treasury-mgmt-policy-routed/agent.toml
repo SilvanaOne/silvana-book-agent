@@ -31,4 +31,4 @@ tags     = ["treasury", "policy", "approval"]
 demo     = "https://silvana.one/agents/demo/treasury-mgmt-policy-routed/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/treasury-mgmt/policy-routed-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-treasury-mgmt-policy-routed/doc.md"

@@ -31,4 +31,4 @@ tags     = ["ai", "llm", "signal-generation"]
 demo     = "https://silvana.one/agents/demo/ai-signal-llm-schema/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/ai-signal/llm-schema-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-ai-signal-llm-schema/doc.md"

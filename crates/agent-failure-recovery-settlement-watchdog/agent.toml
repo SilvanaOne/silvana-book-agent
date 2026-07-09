@@ -31,4 +31,4 @@ tags     = ["watchdog", "settlement", "recovery"]
 demo     = "https://silvana.one/agents/demo/failure-recovery-settlement-watchdog/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/failure-recovery/settlement-watchdog-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-failure-recovery-settlement-watchdog/doc.md"

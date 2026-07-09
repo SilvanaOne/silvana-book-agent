@@ -31,4 +31,4 @@ tags     = ["yield", "carry", "rotation"]
 demo     = "https://silvana.one/agents/demo/yield-rotation-carry-ranking/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/yield-rotation/carry-ranking-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-yield-rotation-carry-ranking/doc.md"

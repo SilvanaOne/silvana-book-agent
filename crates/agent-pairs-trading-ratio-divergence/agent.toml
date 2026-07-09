@@ -31,4 +31,4 @@ tags     = ["pairs", "stat-arb", "dual-leg"]
 demo     = "https://silvana.one/agents/demo/pairs-trading-ratio-divergence/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/pairs-trading/ratio-divergence-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-pairs-trading-ratio-divergence/doc.md"

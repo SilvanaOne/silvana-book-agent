@@ -31,4 +31,4 @@ tags     = ["concentration", "enforcement"]
 demo     = "https://silvana.one/agents/demo/concentration-risk-enforcer/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/concentration-risk/enforcer-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-concentration-risk-enforcer/doc.md"

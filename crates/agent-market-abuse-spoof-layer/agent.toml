@@ -31,4 +31,4 @@ tags     = ["spoofing", "layering", "self-audit"]
 demo     = "https://silvana.one/agents/demo/market-abuse-spoof-layer/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/market-abuse/spoof-layer-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-market-abuse-spoof-layer/doc.md"

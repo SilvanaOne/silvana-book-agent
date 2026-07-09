@@ -31,4 +31,4 @@ tags     = ["events", "webhook", "notify"]
 demo     = "https://silvana.one/agents/demo/notifier-multi-sink/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/notifier/multi-sink-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-notifier-multi-sink/doc.md"

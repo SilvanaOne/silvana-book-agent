@@ -31,4 +31,4 @@ tags     = ["alerts", "monitoring"]
 demo     = "https://silvana.one/agents/demo/risk-alert-passive/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/risk-alert/passive-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-risk-alert-passive/doc.md"

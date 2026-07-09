@@ -31,4 +31,4 @@ tags     = ["twap", "iceberg", "block"]
 demo     = "https://silvana.one/agents/demo/block-execution-twap-iceberg/"
 
 [template.resources]
-docs       = "https://docs.silvana.one/agents/block-execution/twap-iceberg-rust"
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-block-execution-twap-iceberg/doc.md"
