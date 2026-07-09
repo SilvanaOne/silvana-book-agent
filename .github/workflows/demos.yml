@@ -94,16 +94,21 @@ jobs:
             # (b) PLUS demos whose :latest image is missing in GHCR — i.e. newly
             # added or renamed demos that were never published under this name.
             # Without this, a rename that isn't touched again never gets built.
-            owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+            #
+            # One `docker manifest inspect` per demo is a network round-trip, so
+            # run them in parallel (serially this took ~4 min for 86 demos).
+            export OWNER_LC="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
             if [ -n "${GHCR_TOKEN:-}" ]; then
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null 2>&1 || true
-              while read -r name; do
-                if ! docker manifest inspect "ghcr.io/${owner_lc}/${name}:latest" >/dev/null 2>&1; then
-                  echo "  not in registry → will build: ${name}"
-                  KEEP="${KEEP}"$'\n'"${name}"
-                fi
-              done < <(echo "$ALL" | jq -r '.[].name')
+              MISSING="$(echo "$ALL" | jq -r '.[].name' | xargs -P 16 -I{} \
+                bash -c 'docker manifest inspect "ghcr.io/${OWNER_LC}/$1:latest" >/dev/null 2>&1 || echo "$1"' _ {})"
               docker logout ghcr.io >/dev/null 2>&1 || true
+              if [ -n "$MISSING" ]; then
+                echo "Not in registry → will build:"; echo "$MISSING" | sed 's/^/  /'
+                KEEP="${KEEP}"$'\n'"${MISSING}"
+              else
+                echo "All demos already published."
+              fi
             else
               echo "WARN: GIT_TOKEN_RP not set — skipping registry existence check."
             fi
