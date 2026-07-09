@@ -369,6 +369,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-copy-trading-proportional"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-dca-portfolio-multi-market"
 version = "0.3.4"
 dependencies = [
@@ -538,6 +552,39 @@ dependencies = [
 
 [[package]]
 name = "agent-infinite-grid-mid-following"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-infinite-grid-volatility-scaled"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1332,6 +1379,105 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-spot-dca-value-averaging"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-spot-grid-geometric"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-spot-grid-skewed"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
 name = "agent-spot-grid-static"
 version = "0.3.4"
 dependencies = [
@@ -1476,6 +1622,39 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-tpsl-bracket"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
 ]
 
 [[package]]

@@ -78,6 +78,12 @@ members = [
     "crates/agent-strategy-genesis-keyword",
     "crates/agent-trade-explain-rationale",
     "crates/agent-anomaly-classifier-rule-clustering",
+    "crates/agent-spot-grid-geometric",
+    "crates/agent-spot-grid-skewed",
+    "crates/agent-spot-dca-value-averaging",
+    "crates/agent-copy-trading-proportional",
+    "crates/agent-tpsl-bracket",
+    "crates/agent-infinite-grid-volatility-scaled",
 ]
 default-members = [
     "crates/cloud-agent",
@@ -156,6 +162,12 @@ default-members = [
     "crates/agent-strategy-genesis-keyword",
     "crates/agent-trade-explain-rationale",
     "crates/agent-anomaly-classifier-rule-clustering",
+    "crates/agent-spot-grid-geometric",
+    "crates/agent-spot-grid-skewed",
+    "crates/agent-spot-dca-value-averaging",
+    "crates/agent-copy-trading-proportional",
+    "crates/agent-tpsl-bracket",
+    "crates/agent-infinite-grid-volatility-scaled",
 ]
 
 [workspace.package]
