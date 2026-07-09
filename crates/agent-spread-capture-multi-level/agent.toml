@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 6
+
+[agent]
+slug        = "spread-capture"
+name        = "Spread Capture"
+description = "Single-level two-sided market making — keeps one bid and one offer at mid ± half-spread, skipping a side when net inventory leaves the configured band."
+icon        = "git-pull-request-arrow"
+status      = "active"
+
+required_balance   = "$200 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=spread-capture"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Multi-Level"
+language = "rust"
+order    = 2
+tags     = ["marketmaker", "spread", "multi-level"]
+demo     = "https://silvana.one/agents/demo/spread-capture-multi-level/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spread-capture-multi-level/doc.md"

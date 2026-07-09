@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 11
+
+[agent]
+slug        = "pairs-trading"
+name        = "Pairs Trading"
+description = "Trades two related markets against each other when the price ratio diverges from a target — opposite-direction orders per leg, one live pair at a time."
+icon        = "arrow-left-right"
+status      = "active"
+
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=pairs-trading"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Z-Score"
+language = "rust"
+order    = 2
+tags     = ["pairs-trading", "zscore", "stat-arb"]
+demo     = "https://silvana.one/agents/demo/pairs-trading-zscore/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-pairs-trading-zscore/doc.md"

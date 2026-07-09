@@ -1,0 +1,23 @@
+{
+  "name": "agent-order-expiry-price-drift-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Interactive demo for agent-order-expiry-price-drift: watch resting orders get cancelled when their price drifts away from the current mid by more than a configurable threshold.",
+  "scripts": {
+    "dev": "next dev -p 3084",
+    "build": "next build",
+    "start": "next start -p 3084",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "typescript": "5.5.3"
+  }
+}

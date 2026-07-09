@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 4
+
+[agent]
+slug        = "twap"
+name        = "TWAP Execution"
+description = "Slice a large parent order into equal time-spaced child orders to reduce market impact. Each slice is priced at mid ± offset, optionally clamped by a worst-acceptable limit."
+icon        = "clock-fading"
+status      = "active"
+
+required_balance   = "$100 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=twap"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "VWAP"
+language = "rust"
+order    = 2
+tags     = ["twap", "vwap", "volume-weighted", "execution"]
+demo     = "https://silvana.one/agents/demo/twap-vwap/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-twap-vwap/doc.md"

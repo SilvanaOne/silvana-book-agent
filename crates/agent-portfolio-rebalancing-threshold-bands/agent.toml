@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "portfolio_mgmt"
+order = 3
+
+[agent]
+slug        = "portfolio-rebalancing"
+name        = "Portfolio Rebalancing"
+description = "Maintains target weights across instruments. Each cycle values the portfolio in quote currency, compares against targets, and places one rebalance order per breach."
+icon        = "scale"
+status      = "active"
+
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=portfolio-rebalancing"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Threshold Bands"
+language = "rust"
+order    = 2
+tags     = ["portfolio", "rebalancing", "bands", "threshold"]
+demo     = "https://silvana.one/agents/demo/portfolio-rebalancing-threshold-bands/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-portfolio-rebalancing-threshold-bands/doc.md"

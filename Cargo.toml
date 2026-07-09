@@ -84,6 +84,16 @@ members = [
     "crates/agent-copy-trading-proportional",
     "crates/agent-tpsl-bracket",
     "crates/agent-infinite-grid-volatility-scaled",
+    "crates/agent-twap-vwap",
+    "crates/agent-mean-reversion-bollinger",
+    "crates/agent-iceberg-execution-adaptive",
+    "crates/agent-pairs-trading-zscore",
+    "crates/agent-trend-following-macd",
+    "crates/agent-spread-capture-multi-level",
+    "crates/agent-order-expiry-price-drift",
+    "crates/agent-volatility-screening-parkinson",
+    "crates/agent-trend-analysis-multi-timeframe",
+    "crates/agent-portfolio-rebalancing-threshold-bands",
 ]
 default-members = [
     "crates/cloud-agent",
@@ -168,6 +178,16 @@ default-members = [
     "crates/agent-copy-trading-proportional",
     "crates/agent-tpsl-bracket",
     "crates/agent-infinite-grid-volatility-scaled",
+    "crates/agent-twap-vwap",
+    "crates/agent-mean-reversion-bollinger",
+    "crates/agent-iceberg-execution-adaptive",
+    "crates/agent-pairs-trading-zscore",
+    "crates/agent-trend-following-macd",
+    "crates/agent-spread-capture-multi-level",
+    "crates/agent-order-expiry-price-drift",
+    "crates/agent-volatility-screening-parkinson",
+    "crates/agent-trend-analysis-multi-timeframe",
+    "crates/agent-portfolio-rebalancing-threshold-bands",
 ]
 
 [workspace.package]

@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 14
+
+[agent]
+slug        = "iceberg-execution"
+name        = "Iceberg Execution"
+description = "Splits a large parent order into visible chunks — only one chunk is on the book at a time so the true size of the parent stays hidden."
+icon        = "triangle"
+status      = "active"
+
+required_balance   = "$500 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=iceberg-execution"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Adaptive"
+language = "rust"
+order    = 2
+tags     = ["iceberg", "adaptive", "execution"]
+demo     = "https://silvana.one/agents/demo/iceberg-execution-adaptive/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-iceberg-execution-adaptive/doc.md"

@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "trading"
+order = 5
+
+[agent]
+slug        = "mean-reversion"
+name        = "Mean Reversion"
+description = "Trades the snap-back when mid diverges from a rolling EMA by more than a configurable threshold. Places a single limit order at the EMA target and refuses to stack duplicates."
+icon        = "trending-down"
+status      = "active"
+
+required_balance   = "$100 min"
+supported_assets   = "CC, USDC"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=mean-reversion"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Bollinger"
+language = "rust"
+order    = 2
+tags     = ["mean-reversion", "bollinger", "bands"]
+demo     = "https://silvana.one/agents/demo/mean-reversion-bollinger/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-mean-reversion-bollinger/doc.md"

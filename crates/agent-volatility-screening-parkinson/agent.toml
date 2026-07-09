@@ -1,0 +1,34 @@
+schema_version = 1
+
+[category]
+slug  = "risk"
+order = 4
+
+[agent]
+slug        = "volatility-screening"
+name        = "Volatility Screening"
+description = "Maintains a rolling window of log returns and publishes the annualized realized volatility per market. Read-only — feeds downstream risk and quoting agents."
+icon        = "activity-square"
+status      = "active"
+
+required_balance   = "None — read-only"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=volatility-screening"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name     = "Parkinson"
+language = "rust"
+order    = 2
+tags     = ["volatility", "parkinson", "high-low", "range-based"]
+demo     = "https://silvana.one/agents/demo/volatility-screening-parkinson/"
+
+[template.resources]
+docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-volatility-screening-parkinson/doc.md"

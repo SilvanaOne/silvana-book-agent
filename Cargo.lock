@@ -518,6 +518,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-iceberg-execution-adaptive"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
 name = "agent-iceberg-execution-hidden-parent"
 version = "0.3.4"
 dependencies = [
@@ -827,6 +860,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mean-reversion-bollinger"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
 name = "agent-mean-reversion-ema"
 version = "0.3.4"
 dependencies = [
@@ -907,6 +973,24 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-order-expiry-price-drift"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "prost-types",
+ "rustls",
  "tokio",
  "tonic",
  "tracing",
@@ -1018,6 +1102,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-pairs-trading-zscore"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
 name = "agent-pnl-screening-settlement-stream"
 version = "0.3.4"
 dependencies = [
@@ -1072,6 +1189,39 @@ dependencies = [
 
 [[package]]
 name = "agent-portfolio-rebalancing-target-weights"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-portfolio-rebalancing-threshold-bands"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1511,6 +1661,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-spread-capture-multi-level"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
 name = "agent-spread-capture-single-level"
 version = "0.3.4"
 dependencies = [
@@ -1760,6 +1943,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-trend-analysis-multi-timeframe"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "agent-trend-analysis-ta-indicators"
 version = "0.3.4"
 dependencies = [
@@ -1780,6 +1982,39 @@ dependencies = [
 
 [[package]]
 name = "agent-trend-following-ema-crossover"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-trend-following-macd"
 version = "0.3.4"
 dependencies = [
  "agent-logic",
@@ -1842,6 +2077,58 @@ dependencies = [
  "tracing-subscriber",
  "tx-verifier",
  "uuid",
+]
+
+[[package]]
+name = "agent-twap-vwap"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bs58",
+ "chrono",
+ "clap",
+ "cloud-agent",
+ "dotenvy",
+ "ed25519-dalek",
+ "hex",
+ "message-signing",
+ "once_cell",
+ "orderbook-proto",
+ "prost-types",
+ "rand 0.8.6",
+ "rust_decimal",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "tx-verifier",
+ "uuid",
+]
+
+[[package]]
+name = "agent-volatility-screening-parkinson"
+version = "0.3.4"
+dependencies = [
+ "agent-logic",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "orderbook-proto",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
