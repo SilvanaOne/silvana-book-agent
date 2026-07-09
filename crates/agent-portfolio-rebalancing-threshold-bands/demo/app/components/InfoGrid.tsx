@@ -76,7 +76,7 @@ export function InfoGrid({ portfoliorebalancing, walk }: Props) {
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span className="k">{w.instrument}</span>
                   <span className={`v ${w.breach ? "accent" : ""}`}>
-                    cur {(w.currentWeight * 100).toFixed(2)}% -> tgt {(w.targetWeight * 100).toFixed(2)}%
+                    cur {(w.currentWeight * 100).toFixed(2)}% → tgt {(w.targetWeight * 100).toFixed(2)}%
                     {" "}(dev {w.deviationPct >= 0 ? "+" : ""}{w.deviationPct.toFixed(2)}pp)
                   </span>
                 </div>
