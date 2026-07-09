@@ -15,6 +15,7 @@ pub mod confirm;
 pub mod config;
 pub mod fees;
 pub mod forecast;
+pub mod ledger_health;
 pub mod liquidity;
 pub mod logging;
 pub mod order_manager;

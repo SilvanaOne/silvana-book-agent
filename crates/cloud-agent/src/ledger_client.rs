@@ -740,8 +740,20 @@ impl DAppProviderClient {
         };
 
         for attempt in 0..max_retries {
-            // 1. Prepare (fresh contracts each attempt — contracts may become stale)
-            let prepared = self.prepare_transaction(req.clone()).await?;
+            // 1. Prepare (fresh contracts each attempt — contracts may become stale).
+            //    A prepare failure propagates out of submit_transaction, so signal
+            //    the ledger-health breaker here too — otherwise an outage that
+            //    manifests at prepare (participant / ledger-service unreachable)
+            //    would never trip it and the agent would keep quoting into it.
+            let prepared = match self.prepare_transaction(req.clone()).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                        agent_logic::ledger_health::record_submit_failure();
+                    }
+                    return Err(e);
+                }
+            };
 
             info!(
                 "Transaction prepared: id={}, command_id={}, traffic={}",
@@ -850,6 +862,8 @@ impl DAppProviderClient {
                         ).await {
                             info!("Transaction recovered via ledger updates: command_id={}, update_id={}",
                                 prepared.command_id, recovered.update_id);
+                            // The tx landed despite the gRPC error — ledger is reachable.
+                            agent_logic::ledger_health::record_submit_success();
                             return Ok(recovered);
                         }
                     }
@@ -862,6 +876,12 @@ impl DAppProviderClient {
                         );
                         tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
                         continue;
+                    }
+                    // Terminal failure for this submission (retries exhausted). Signal
+                    // the ledger-health breaker once per submit_transaction call, only
+                    // for true sequencer-unreachable errors (not business rejections).
+                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                        agent_logic::ledger_health::record_submit_failure();
                     }
                     return Err(e);
                 }
@@ -888,9 +908,12 @@ impl DAppProviderClient {
                         ).await {
                             info!("DUPLICATE_COMMAND recovered via ledger updates: command_id={}, update_id={}",
                                 prepared.command_id, recovered.update_id);
+                            agent_logic::ledger_health::record_submit_success();
                             return Ok(recovered);
                         }
                     }
+                    // The command was accepted by the ledger (duplicate) — ledger is up.
+                    agent_logic::ledger_health::record_submit_success();
                     anyhow::bail!("Command already submitted (DUPLICATE_COMMAND): {}", error_msg);
                 }
 
@@ -918,8 +941,18 @@ impl DAppProviderClient {
                     tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
                     continue;
                 }
+                // Terminal failure for this submission (retries exhausted). Signal the
+                // ledger-health breaker once per call, only for sequencer-unreachable
+                // errors (SEQUENCER_BACKPRESSURE already handled above via its own pause).
+                if agent_logic::ledger_health::is_sequencer_unreachable(error_msg) {
+                    agent_logic::ledger_health::record_submit_failure();
+                }
                 anyhow::bail!("Transaction failed: {}", error_msg);
             }
+
+            // Successful submission — the ledger is reachable; clear the
+            // ledger-health breaker so RFQ quoting resumes.
+            agent_logic::ledger_health::record_submit_success();
 
             // Post-success: nudge the auto-topup runner. Non-blocking;
             // the runner has its own task and its own client, so this

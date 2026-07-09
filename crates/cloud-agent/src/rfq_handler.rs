@@ -190,6 +190,31 @@ impl RfqHandler {
             });
         }
 
+        // Reject RFQs when ledger submission is failing (sequencer unreachable /
+        // SEQUENCER_REQUEST_FAILED). Quoting into an outage reserves inventory that
+        // can never settle at CreateDvp/allocate, saturating the reservation pool
+        // and pinning available liquidity at ~0. Ledger-wide, since a sequencer
+        // outage is instrument-agnostic. Self-clears when submissions recover or
+        // the cooldown elapses (time-based probe). Quote-time only — do not reject
+        // already-accepted proposals here (their reject path itself submits to the
+        // down ledger); the settlement watchdog drains those internally.
+        if agent_logic::ledger_health::is_unhealthy() {
+            warn!("RFQ {}: rejected — ledger temporarily unavailable (sequencer submission failing)", rfq_id);
+            return RfqResponse::Reject(RfqReject {
+                rfq_id,
+                lp_party_id: self.party_id.clone(),
+                lp_name: self.lp_config.name.clone(),
+                reason: RfqRejectionReason::TemporarilyUnavailable as i32,
+                reason_detail: Some("Ledger temporarily unavailable".to_string()),
+                rejected_at: Some(prost_types::Timestamp {
+                    seconds: chrono::Utc::now().timestamp(),
+                    nanos: 0,
+                }),
+                min_quantity: None,
+                max_quantity: None,
+            });
+        }
+
         // Reject RFQs when sequencer is critically overloaded (coefficient < OVERLOAD_THRESHOLD - 0.1).
         // At this level even proposing new trades would fail with SEQUENCER_BACKPRESSURE.
         if agent_logic::forecast::is_rfq_rejected_by_overload() {

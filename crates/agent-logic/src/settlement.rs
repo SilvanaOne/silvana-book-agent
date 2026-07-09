@@ -284,6 +284,70 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
     }
 
+    /// True when a still-tracked settlement has not yet allocated on-chain (stage
+    /// strictly before `Allocated`). Only such proposals are safe for the agent
+    /// to cancel on the server: cETH locks on-chain only at the reserver's own
+    /// `Allocate`, so before that the reservation is internal accounting and no
+    /// live/settling DVP is torn down.
+    fn is_pre_allocation(&self, proposal_id: &str) -> bool {
+        matches!(
+            self.active_settlements.get(proposal_id).map(|s| s.stage),
+            Some(
+                SettlementStage::ProposalReceived
+                    | SettlementStage::DvpFeePaid
+                    | SettlementStage::DvpProposed
+                    | SettlementStage::DvpAccepted
+                    | SettlementStage::AllocationFeePaid
+            )
+        )
+    }
+
+    /// Best-effort server-side cancel for a proposal the agent is permanently
+    /// abandoning. Without this the server keeps the proposal `pending`, so
+    /// `poll_pending_proposals` re-surfaces it (and after a restart the capped
+    /// `rejected_proposals` dedup set can re-adopt it) — the rediscovery ratchet.
+    /// Cancelling flips it to a terminal DB status so it drops out of
+    /// `get_pending_proposals`.
+    ///
+    /// Spawned (non-blocking) so a slow/failed RPC never stalls the apply loop.
+    /// The RPC targets the orderbook server (not the sequencer), so it still
+    /// works during a ledger outage. Local cleanup (release + removal) is done by
+    /// the caller regardless of whether this RPC succeeds. MUST only be called
+    /// when `is_pre_allocation` — never cancel a DVP the agent already allocated
+    /// for, which could still settle.
+    fn notify_server_cancel(&self, proposal_id: &str, reason: &str) {
+        let config = self.config.clone();
+        let pid = proposal_id.to_string();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            let jwt = match generate_jwt(
+                &config.party_id,
+                &config.role,
+                &config.private_key_bytes,
+                config.token_ttl_secs,
+                Some(config.node_name.as_str()),
+            ) {
+                Ok(j) => j,
+                Err(e) => {
+                    debug!("[{}] Best-effort cancel: JWT generation failed: {}", pid, e);
+                    return;
+                }
+            };
+            let mut client = match OrderbookRpcClient::connect(&config.orderbook_grpc_url, Some(jwt)).await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("[{}] Best-effort cancel: RPC connect failed: {}", pid, e);
+                    return;
+                }
+            };
+            match client.cancel_settlement(&pid, &reason).await {
+                Ok(true) => info!("[{}] Server settlement cancelled (agent abandoned): {}", pid, reason),
+                Ok(false) => debug!("[{}] Server declined cancel (already terminal?)", pid),
+                Err(e) => debug!("[{}] Best-effort cancel RPC failed: {}", pid, e),
+            }
+        });
+    }
+
     /// True when a tracked settlement has outlived its settlement window — or its
     /// allocation window while allocation is still pending per the locally-tracked
     /// stage. Used to bypass the retry backoff so the deadline watchdog in
@@ -626,12 +690,55 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         {
             let tracker = self.tracker.lock().await;
             if tracker.has_settlement_order(&proposal_id) {
+                drop(tracker);
+
+                // Restart hygiene: don't re-adopt/re-advance a proposal already past
+                // its settle deadline. It cannot complete (its on-chain settleBefore
+                // has passed) and would otherwise sit in active_settlements churning
+                // re-advances until the watchdog grinds it down — the mechanism that
+                // ballooned active_settlements across restarts during the outage.
+                // Best-effort cancel it on the server so it reaches a terminal DB
+                // status; the server's own settled/in-flight guards make this safe
+                // even if it had allocated (past settleBefore it can't settle anyway).
+                if let Some(created_at) = &proposal.created_at {
+                    let (_allocate_window, settle_window) = expiry_windows(
+                        &proposal.origin,
+                        self.config.allocate_before_secs,
+                        self.config.settle_before_secs,
+                    );
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    if now - created_at.seconds > settle_window as i64 {
+                        info!(
+                            "[{}] Restored proposal past settle deadline ({}s old, max {}s) — abandoning instead of re-advancing",
+                            proposal_id, now - created_at.seconds, settle_window
+                        );
+                        // Release the order's pending_quantity + drop the
+                        // settlement_orders entry, exactly as the exhausted-abandon
+                        // arms do. Without this, abandoning here (never re-adopting,
+                        // so the deadline watchdog never runs and — if the server
+                        // declines the cancel because the proposal already allocated
+                        // — no terminal stream event ever fires) permanently strands
+                        // the reserved pending_quantity, understating that order's
+                        // remaining capacity across restarts.
+                        {
+                            let mut t = self.tracker.lock().await;
+                            t.mark_failed(&proposal_id);
+                        }
+                        self.rejected_proposals.insert(proposal_id.clone());
+                        self.notify_server_cancel(&proposal_id, "agent abandoned on restart: past settle deadline");
+                        self.update_actionable_count();
+                        return Ok(());
+                    }
+                }
+
                 info!(
                     "[{}] Restored proposal from saved state, skipping re-verification (role: {})",
                     proposal_id,
                     if is_buyer { "buyer" } else { "seller" }
                 );
-                drop(tracker);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if self.config.auto_settle {
@@ -1321,6 +1428,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         "[{}] Settlement permanently failed after {} retries: {:#}",
                         proposal_id, entry.retry_count, error
                     );
+                    // Tell the server we've abandoned it (pre-allocation only) so it
+                    // reaches a terminal DB status and stops being re-surfaced by
+                    // poll_pending_proposals. Best-effort; read stage before removal.
+                    if self.is_pre_allocation(&proposal_id) {
+                        self.notify_server_cancel(&proposal_id, "agent abandoned: deadline/error exhausted");
+                    }
                     self.release_commitment(&proposal_id);
                     {
                         let mut t = self.tracker.lock().await;
@@ -1409,6 +1522,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         "[{}] Settlement permanently failed after {} timeouts",
                         proposal_id, entry.retry_count
                     );
+                    // Tell the server we've abandoned it (pre-allocation only) so it
+                    // reaches a terminal DB status and stops being re-surfaced. Best-
+                    // effort; read stage before removal.
+                    if self.is_pre_allocation(&proposal_id) {
+                        self.notify_server_cancel(&proposal_id, "agent abandoned: settlement timed out");
+                    }
                     // Release the CC reservation, mirroring the sibling terminal
                     // arms (Rejected/Terminal/Error-exhausted). Without this the
                     // orphan leaks until the next heartbeat reconcile.
@@ -2328,6 +2447,30 @@ mod tests {
         assert_eq!(lm.available_cc().await, Decimal::from(95));
         assert!(!exec.active_settlements.contains_key("p1"));
         assert!(exec.completed_proposals.contains("p1"));
+    }
+
+    // The cancel-on-abandon safety gate: the agent may tell the server to cancel
+    // a proposal it abandons only while it is pre-allocation (stage < Allocated).
+    // cETH locks on-chain at the reserver's own Allocate, so cancelling at/after
+    // Allocated could tear down a still-settling DVP.
+    #[tokio::test]
+    async fn test_is_pre_allocation_gate_by_stage() {
+        let (mut exec, _lm) = committed_executor().await;
+        for (stage, expected) in [
+            (SettlementStage::ProposalReceived, true),
+            (SettlementStage::DvpFeePaid, true),
+            (SettlementStage::DvpProposed, true),
+            (SettlementStage::DvpAccepted, true),
+            (SettlementStage::AllocationFeePaid, true),
+            (SettlementStage::Allocated, false),
+            (SettlementStage::AwaitingSettlement, false),
+            (SettlementStage::Settled, false),
+        ] {
+            exec.active_settlements.get_mut("p1").unwrap().stage = stage;
+            assert_eq!(exec.is_pre_allocation("p1"), expected, "stage {stage:?}");
+        }
+        // Unknown proposal is never cancellable.
+        assert!(!exec.is_pre_allocation("nope"));
     }
 
     #[tokio::test]
