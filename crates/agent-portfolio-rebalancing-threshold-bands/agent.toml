@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["portfolio", "rebalancing", "bands", "threshold"]
 demo     = "https://silvana.one/agents/demo/portfolio-rebalancing-threshold-bands/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-portfolio-rebalancing-threshold-bands/doc.md"

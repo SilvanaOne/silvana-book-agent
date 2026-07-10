@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["signals", "jsonl", "executor"]
 demo     = "https://silvana.one/agents/demo/signal-bot-jsonl/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-signal-bot-jsonl/doc.md"

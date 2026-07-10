@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["gate", "pre-trade"]
 demo     = "https://silvana.one/agents/demo/readiness-check-pre-trade/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-readiness-check-pre-trade/doc.md"

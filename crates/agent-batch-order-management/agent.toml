@@ -1,0 +1,35 @@
+schema_version = 1
+
+[category]
+slug  = "portfolio_mgmt"
+order = 4
+
+[agent]
+slug        = "batch-order-management"
+name        = "Batch Order Management"
+description = "Portfolio-level batch order management on Silvana — dashboard, API, worker, and Prisma-backed audit for previewing and executing rebalances across many positions at once."
+icon        = "layers"
+status      = "preview"
+
+required_balance   = "Canton wallet keys via Silvana Vault"
+supported_assets   = "CC, USDC, cETH"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=batch-order-management"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name      = "Batch Order Management v1"
+language  = "typescript"
+order     = 1
+tags      = ["batch", "portfolio", "rebalance", "featured"]
+demo      = "https://bamagent.spcatcher.cfd"
+demo_type = "featured"
+
+[template.resources]
+docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-batch-order-management"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["iceberg", "adaptive", "execution"]
 demo     = "https://silvana.one/agents/demo/iceberg-execution-adaptive/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-iceberg-execution-adaptive/doc.md"

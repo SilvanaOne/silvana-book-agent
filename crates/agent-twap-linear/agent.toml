@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["execution", "time-sliced"]
 demo     = "https://silvana.one/agents/demo/twap-linear/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-twap-linear/doc.md"

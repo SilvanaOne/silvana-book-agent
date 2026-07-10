@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["algo", "execution", "dispatcher"]
 demo     = "https://silvana.one/agents/demo/algo-order-dispatcher/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-algo-order-dispatcher/doc.md"

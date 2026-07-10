@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["trigger", "snipe"]
 demo     = "https://silvana.one/agents/demo/order-matching-trigger/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-order-matching-trigger/doc.md"

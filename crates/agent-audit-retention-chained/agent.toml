@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["audit", "retention", "rotation", "signed"]
 demo     = "https://silvana.one/agents/demo/audit-retention-chained/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-audit-retention-chained/doc.md"

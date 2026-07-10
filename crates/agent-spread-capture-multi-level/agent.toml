@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["marketmaker", "spread", "multi-level"]
 demo     = "https://silvana.one/agents/demo/spread-capture-multi-level/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spread-capture-multi-level/doc.md"

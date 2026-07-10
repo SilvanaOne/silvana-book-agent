@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["trend-following", "macd", "momentum"]
 demo     = "https://silvana.one/agents/demo/trend-following-macd/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-trend-following-macd/doc.md"

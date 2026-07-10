@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["pairs", "stat-arb", "dual-leg"]
 demo     = "https://silvana.one/agents/demo/pairs-trading-ratio-divergence/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-pairs-trading-ratio-divergence/doc.md"

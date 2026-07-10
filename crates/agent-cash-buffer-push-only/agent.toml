@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["treasury", "transfer-cc"]
 demo     = "https://silvana.one/agents/demo/cash-buffer-push-only/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-cash-buffer-push-only/doc.md"

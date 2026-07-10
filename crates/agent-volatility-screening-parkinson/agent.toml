@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["volatility", "parkinson", "high-low", "range-based"]
 demo     = "https://silvana.one/agents/demo/volatility-screening-parkinson/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-volatility-screening-parkinson/doc.md"

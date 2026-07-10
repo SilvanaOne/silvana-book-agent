@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["allocation", "targets"]
 demo     = "https://silvana.one/agents/demo/target-allocation-absolute-value/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-target-allocation-absolute-value/doc.md"

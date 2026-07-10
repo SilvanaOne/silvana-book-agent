@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["approval", "queue", "manual"]
 demo     = "https://silvana.one/agents/demo/human-approval-queue/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-human-approval-queue/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["healthcheck", "pre-flight"]
 demo     = "https://silvana.one/agents/demo/test-run-rpc-smoke/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-test-run-rpc-smoke/doc.md"

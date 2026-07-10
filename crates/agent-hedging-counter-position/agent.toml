@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["hedging", "exposure"]
 demo     = "https://silvana.one/agents/demo/hedging-counter-position/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-hedging-counter-position/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["inventory", "risk", "auto-hedge"]
 demo     = "https://silvana.one/agents/demo/inventory-risk-auto-hedge/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-inventory-risk-auto-hedge/doc.md"

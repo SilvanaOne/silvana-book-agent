@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["price-feed", "scheduled"]
 demo     = "https://silvana.one/agents/demo/oracle-scheduled/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-oracle-scheduled/doc.md"

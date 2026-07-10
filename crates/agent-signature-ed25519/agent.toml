@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["ed25519", "signing", "cli"]
 demo     = "https://silvana.one/agents/demo/signature-ed25519/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-signature-ed25519/doc.md"

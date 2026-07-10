@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["alerts", "monitoring"]
 demo     = "https://silvana.one/agents/demo/risk-alert-passive/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-risk-alert-passive/doc.md"

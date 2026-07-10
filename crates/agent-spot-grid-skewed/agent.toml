@@ -29,6 +29,7 @@ language = "rust"
 order    = 3
 tags     = ["marketmaker", "grid", "inventory-aware"]
 demo     = "https://silvana.one/agents/demo/spot-grid-skewed/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spot-grid-skewed/doc.md"

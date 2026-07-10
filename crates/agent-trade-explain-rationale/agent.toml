@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["ai", "explain", "counterfactual", "audit"]
 demo     = "https://silvana.one/agents/demo/trade-explain-rationale/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-trade-explain-rationale/doc.md"

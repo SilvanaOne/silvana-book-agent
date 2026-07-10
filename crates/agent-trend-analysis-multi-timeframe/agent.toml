@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["trend-analysis", "multi-timeframe", "confluence"]
 demo     = "https://silvana.one/agents/demo/trend-analysis-multi-timeframe/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-trend-analysis-multi-timeframe/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["dca", "value-averaging", "dynamic-size"]
 demo     = "https://silvana.one/agents/demo/spot-dca-value-averaging/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spot-dca-value-averaging/doc.md"

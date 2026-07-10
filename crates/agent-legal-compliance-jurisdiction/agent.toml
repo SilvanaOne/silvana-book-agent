@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["legal", "jurisdiction"]
 demo     = "https://silvana.one/agents/demo/legal-compliance-jurisdiction/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-legal-compliance-jurisdiction/doc.md"

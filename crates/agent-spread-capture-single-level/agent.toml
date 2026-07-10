@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["marketmaker", "inventory-clamp"]
 demo     = "https://silvana.one/agents/demo/spread-capture-single-level/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spread-capture-single-level/doc.md"

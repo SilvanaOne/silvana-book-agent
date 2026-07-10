@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["dca", "scheduler"]
 demo     = "https://silvana.one/agents/demo/spot-dca-scheduled/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spot-dca-scheduled/doc.md"

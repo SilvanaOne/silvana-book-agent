@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["ai", "llm", "signal-generation"]
 demo     = "https://silvana.one/agents/demo/ai-signal-llm-schema/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-ai-signal-llm-schema/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["read-only", "market-data"]
 demo     = "https://silvana.one/agents/demo/watchlist-passive/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-watchlist-passive/doc.md"

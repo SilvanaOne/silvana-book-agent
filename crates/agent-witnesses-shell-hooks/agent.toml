@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["events", "shell", "witness"]
 demo     = "https://silvana.one/agents/demo/witnesses-shell-hooks/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-witnesses-shell-hooks/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["iceberg", "hidden-size", "execution"]
 demo     = "https://silvana.one/agents/demo/iceberg-execution-hidden-parent/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-iceberg-execution-hidden-parent/doc.md"

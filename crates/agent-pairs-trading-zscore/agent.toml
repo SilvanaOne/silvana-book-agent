@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["pairs-trading", "zscore", "stat-arb"]
 demo     = "https://silvana.one/agents/demo/pairs-trading-zscore/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-pairs-trading-zscore/doc.md"

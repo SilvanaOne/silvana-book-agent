@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["pnl", "position", "cost-basis"]
 demo     = "https://silvana.one/agents/demo/pnl-screening-settlement-stream/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-pnl-screening-settlement-stream/doc.md"

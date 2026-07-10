@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["marketmaker", "grid", "geometric"]
 demo     = "https://silvana.one/agents/demo/spot-grid-geometric/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-spot-grid-geometric/doc.md"

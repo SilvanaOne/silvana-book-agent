@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["market-data", "fanout"]
 demo     = "https://silvana.one/agents/demo/orderbook-streaming-depth-fanout/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-orderbook-streaming-depth-fanout/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["copy-trading", "mirror", "leader-follower"]
 demo     = "https://silvana.one/agents/demo/copy-trading-mirror/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-copy-trading-mirror/doc.md"

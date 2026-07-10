@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["ema", "reversion"]
 demo     = "https://silvana.one/agents/demo/mean-reversion-ema/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-mean-reversion-ema/doc.md"

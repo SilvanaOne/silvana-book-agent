@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["blocklist", "screening"]
 demo     = "https://silvana.one/agents/demo/blocked-party-blocklist/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-blocked-party-blocklist/doc.md"

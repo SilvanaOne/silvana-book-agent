@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["grid", "dynamic", "volatility", "adaptive"]
 demo     = "https://silvana.one/agents/demo/infinite-grid-volatility-scaled/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-infinite-grid-volatility-scaled/doc.md"

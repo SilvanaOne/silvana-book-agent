@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["read-only", "subscriptions"]
 demo     = "https://silvana.one/agents/demo/state-monitor-self-stream/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-state-monitor-self-stream/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["spoofing", "layering", "self-audit"]
 demo     = "https://silvana.one/agents/demo/market-abuse-spoof-layer/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-market-abuse-spoof-layer/doc.md"

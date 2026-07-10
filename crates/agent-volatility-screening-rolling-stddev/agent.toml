@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["realized-vol", "rolling-window"]
 demo     = "https://silvana.one/agents/demo/volatility-screening-rolling-stddev/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-volatility-screening-rolling-stddev/doc.md"

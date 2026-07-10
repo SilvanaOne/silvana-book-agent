@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["report", "exposure"]
 demo     = "https://silvana.one/agents/demo/portfolio-health-snapshot/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-portfolio-health-snapshot/doc.md"

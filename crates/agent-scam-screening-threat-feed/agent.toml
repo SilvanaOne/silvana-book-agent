@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["scam", "threat-feed"]
 demo     = "https://silvana.one/agents/demo/scam-screening-threat-feed/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-scam-screening-threat-feed/doc.md"

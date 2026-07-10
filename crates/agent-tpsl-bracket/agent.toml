@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["take-profit", "stop-loss", "bracket", "oco"]
 demo     = "https://silvana.one/agents/demo/tpsl-bracket/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-tpsl-bracket/doc.md"

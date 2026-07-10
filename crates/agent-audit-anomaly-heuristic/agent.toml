@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["audit", "anomaly", "post-hoc"]
 demo     = "https://silvana.one/agents/demo/audit-anomaly-heuristic/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-audit-anomaly-heuristic/doc.md"

@@ -27,9 +27,9 @@ url = "https://silvana.one/contact"
 name = "Arbitrage Agent v1"
 language = "typescript"
 order = 1
-tags = ["arbitrage", "cross-venue", "scanner"]
+tags = ["arbitrage", "cross-venue", "scanner", "featured"]
 demo = "https://arbitrage.spcatcher.cfd"
+demo_type = "featured"
 
 [template.resources]
 docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage"
-demo       = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage#quick-start"

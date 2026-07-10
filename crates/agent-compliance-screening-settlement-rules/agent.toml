@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["compliance", "policy", "settlements"]
 demo     = "https://silvana.one/agents/demo/compliance-screening-settlement-rules/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-compliance-screening-settlement-rules/doc.md"

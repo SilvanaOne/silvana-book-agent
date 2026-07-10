@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["dca", "multi-market"]
 demo     = "https://silvana.one/agents/demo/dca-portfolio-multi-market/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-dca-portfolio-multi-market/doc.md"

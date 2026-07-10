@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["twap", "vwap", "volume-weighted", "execution"]
 demo     = "https://silvana.one/agents/demo/twap-vwap/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-twap-vwap/doc.md"

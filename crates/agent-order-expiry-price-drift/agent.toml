@@ -29,6 +29,7 @@ language = "rust"
 order    = 2
 tags     = ["expiry", "cancel", "drift"]
 demo     = "https://silvana.one/agents/demo/order-expiry-price-drift/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-order-expiry-price-drift/doc.md"

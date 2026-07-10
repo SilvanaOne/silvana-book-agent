@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["twap", "iceberg", "block"]
 demo     = "https://silvana.one/agents/demo/block-execution-twap-iceberg/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-block-execution-twap-iceberg/doc.md"

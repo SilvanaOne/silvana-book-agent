@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["events", "webhook", "notify"]
 demo     = "https://silvana.one/agents/demo/notifier-multi-sink/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-notifier-multi-sink/doc.md"

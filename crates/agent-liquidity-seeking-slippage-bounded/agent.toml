@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["adaptive", "slippage", "execution"]
 demo     = "https://silvana.one/agents/demo/liquidity-seeking-slippage-bounded/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-liquidity-seeking-slippage-bounded/doc.md"

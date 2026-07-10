@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["grid", "dynamic", "market-making"]
 demo     = "https://silvana.one/agents/demo/infinite-grid-mid-following/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-infinite-grid-mid-following/doc.md"

@@ -29,6 +29,7 @@ language = "rust"
 order    = 1
 tags     = ["news", "sentiment", "nlp"]
 demo     = "https://silvana.one/agents/demo/news-sentiment-lexicon/"
+demo_type = "basic"
 
 [template.resources]
 docs       = "https://github.com/SilvanaOne/silvana-book-agent/blob/new-agents/crates/agent-news-sentiment-lexicon/doc.md"
