@@ -3,8 +3,10 @@
 //! Discovers the LP's on-ledger `AtomicDVP` venues (one per pair), validates
 //! them against the local market config + quote key, and exposes the validated
 //! market ids for the AtomicRfqStream handshake. Venue CREATION is CLI setup —
-//! never the agent. Any validation failure disables rfq_v2 for that market
-//! only (logged loudly, never crashes); v1 keeps working.
+//! never the agent — and goes through `AtomicDVPService_CreateVenue` on the
+//! provider-signed singleton (server-built; the ledger-service discloses the
+//! service — fa-design G2). Any validation failure disables rfq_v2 for that
+//! market only (logged loudly, never crashes); v1 keeps working.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,9 +15,9 @@ use tracing::{info, warn};
 
 use crate::ledger_client::DAppProviderClient;
 
-pub const TEMPLATE_ATOMIC_DVP: &str = "#atomic-dvp-v1:AtomicDVP:AtomicDVP";
-pub const TEMPLATE_SETTLEMENT_TICKET: &str = "#atomic-dvp-v1:AtomicDVP:SettlementTicket";
-pub const TEMPLATE_TICKET_SERVICE: &str = "#atomic-dvp-v1:AtomicDVP:TicketService";
+pub const TEMPLATE_ATOMIC_DVP: &str = "#atomic-dvp-v2:AtomicDVP:AtomicDVP";
+pub const TEMPLATE_SETTLEMENT_TICKET: &str = "#atomic-dvp-v2:AtomicDVP:SettlementTicket";
+pub const TEMPLATE_ATOMIC_DVP_SERVICE: &str = "#atomic-dvp-v2:AtomicDVP:AtomicDVPService";
 
 /// A validated (or not) on-ledger AtomicDVP venue owned by this LP.
 #[derive(Debug, Clone)]
@@ -26,7 +28,8 @@ pub struct VenueEntry {
     /// create-arguments JSON (verbatim value; string-typed decimals preserved)
     pub payload: serde_json::Value,
     pub synchronizer_id: String,
-    pub operator: String,
+    /// the global featured-app party — a venue co-signatory (fa-design G1/G4)
+    pub provider: String,
     pub pair_name: String,
     pub base_admin: String,
     pub base_id: String,
@@ -93,7 +96,7 @@ impl VenueRegistry {
                 template_id: c.template_id,
                 created_event_blob: c.created_event_blob,
                 synchronizer_id: c.synchronizer_id,
-                operator: s("/operator").unwrap_or_default(),
+                provider: s("/provider").unwrap_or_default(),
                 pair_name: pair_name.clone(),
                 base_admin: s("/baseInstrumentId/admin").unwrap_or_default(),
                 base_id: s("/baseInstrumentId/id").unwrap_or_default(),

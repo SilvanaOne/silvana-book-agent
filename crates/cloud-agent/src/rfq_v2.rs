@@ -22,10 +22,12 @@ use tracing::{debug, info, warn};
 use agent_logic::config::{RfqV2Config, RfqV2MarketConfig};
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::state::SavedPendingV2;
-use atomic_quote::envelope::{canonical_from_dvp, QuoteJson, ENVELOPE_VERSION};
+use atomic_quote::envelope::{
+    canonical_from_dvp, InstrumentIdJson, LpFeeJson, QuoteJson, ENVELOPE_VERSION,
+};
 use atomic_quote::{render_decimal, sign_quote, verify_quote, QuoteSide};
 use orderbook_proto::rfqv2::{
-    AtomicAcsContract, AtomicDisclosedContract, AtomicQuote, AtomicQuoteEnvelope,
+    AtomicAcsContract, AtomicDisclosedContract, AtomicFeeSpec, AtomicQuote, AtomicQuoteEnvelope,
     RfqConfirmReject, RfqConfirmRejectReason, RfqConfirmRequest,
 };
 
@@ -66,6 +68,9 @@ enum PendingV2 {
         lp_pays_token: String,
         notional_usd: Option<f64>,
         valid_until: Instant,
+        /// The AUTHORITATIVE settlement fee received with the RFQ fan-out —
+        /// signed into Quote.lpFees at confirm (design §14 D20). None = zero-fee pair.
+        settlement_fee: Option<AtomicFeeSpec>,
     },
     Confirmed {
         holding_cids: Vec<String>,
@@ -183,6 +188,7 @@ impl RfqV2State {
         market_id: &str,
         side: QuoteSide,
         priced: &PricedQuote,
+        settlement_fee: Option<AtomicFeeSpec>,
     ) -> Result<(), String> {
         let mi = self
             .market_instruments
@@ -212,6 +218,7 @@ impl RfqV2State {
                 lp_pays_token,
                 notional_usd: priced.notional_usd,
                 valid_until,
+                settlement_fee,
             },
         );
         Ok(())
@@ -279,6 +286,7 @@ impl RfqV2State {
                 lp_pays: (InstrumentKey, Decimal),
                 lp_pays_token: String,
                 notional_usd: Option<f64>,
+                settlement_fee: Option<AtomicFeeSpec>,
             },
         }
         let lookup = {
@@ -299,6 +307,7 @@ impl RfqV2State {
                     lp_pays_token,
                     notional_usd,
                     valid_until,
+                    settlement_fee,
                 }) => {
                     if now >= *valid_until {
                         Lookup::ExpiredIndicative
@@ -311,13 +320,23 @@ impl RfqV2State {
                             lp_pays: lp_pays.clone(),
                             lp_pays_token: lp_pays_token.clone(),
                             notional_usd: *notional_usd,
+                            settlement_fee: settlement_fee.clone(),
                         }
                     }
                 }
             }
         };
-        let (market_id, side, base_amount, quote_amount, lp_pays, lp_pays_token, notional_usd) =
-            match lookup {
+        #[allow(clippy::type_complexity)]
+        let (market_id, side, base_amount, quote_amount, lp_pays, lp_pays_token, notional_usd, settlement_fee): (
+            String,
+            QuoteSide,
+            Decimal,
+            Decimal,
+            (InstrumentKey, Decimal),
+            String,
+            Option<f64>,
+            Option<AtomicFeeSpec>,
+        ) = match lookup {
                 Lookup::NotFound => {
                     return Err(self.reject(
                         &req,
@@ -362,6 +381,7 @@ impl RfqV2State {
                     lp_pays,
                     lp_pays_token,
                     notional_usd,
+                    settlement_fee,
                 } => (
                     market_id,
                     side,
@@ -370,8 +390,19 @@ impl RfqV2State {
                     lp_pays,
                     lp_pays_token,
                     notional_usd,
+                    settlement_fee,
                 ),
             };
+
+        // Defense-in-depth (design §14 D18): the confirm echoes the cached fee —
+        // it must equal what this LP received with the RFQ fan-out.
+        if req.settlement_fee != settlement_fee {
+            return Err(self.reject(
+                &req,
+                RfqConfirmRejectReason::InternalError,
+                "confirm settlement_fee does not match the RFQ-time fee",
+            ));
+        }
 
         // Step 2 — venue (leg orientation was fixed at phase 1: user Buy ⇒ LP
         // pays base; user Sell ⇒ LP pays quote)
@@ -479,6 +510,18 @@ impl RfqV2State {
                 }
             };
 
+        // The settlement fee is signed INTO the quote (Quote.lpFees -> message
+        // v4); the atomic-quote crate selects v3/v4 by lp_fees presence.
+        let lp_fees_json: Option<Vec<LpFeeJson>> = settlement_fee.as_ref().map(|f| {
+            vec![LpFeeJson {
+                receiver: f.receiver.clone(),
+                instrument_id: InstrumentIdJson {
+                    admin: f.instrument_admin.clone(),
+                    id: f.instrument_id.clone(),
+                },
+                amount: f.amount.clone(),
+            }]
+        });
         let quote_json = QuoteJson {
             quote_id: quote_id.clone(),
             ticket_id: ticket_id.clone(),
@@ -488,9 +531,7 @@ impl RfqV2State {
             quote_amount: quote_amount_str.clone(),
             created_at_micros: created_at_micros.to_string(),
             valid_until_micros: valid_until_micros.to_string(),
-            // RFQ-v2 transport is fee-less for now (v1 message); LP-required
-            // fees arrive with the proto extension (fees-design rev 2).
-            lp_fees: None,
+            lp_fees: lp_fees_json,
         };
 
         // Step 6 — canonical + sign + SELF-VERIFY against the venue's
@@ -579,6 +620,7 @@ impl RfqV2State {
                 quote_amount: quote_amount_str,
                 created_at_micros,
                 valid_until_micros,
+                lp_fees: settlement_fee.iter().cloned().collect(),
             }),
             canonical_message: canonical,
             quote_signature: signature,

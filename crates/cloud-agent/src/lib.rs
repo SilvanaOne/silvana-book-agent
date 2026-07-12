@@ -406,8 +406,6 @@ pub enum AtomicCommands {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Create the LP's TicketService (idempotent — prints the existing cid if present)
-    TicketService,
     /// AtomicDVP venue operations (one venue per LP per market pair)
     Venue {
         #[command(subcommand)]
@@ -436,7 +434,7 @@ pub enum AtomicCommands {
         #[arg(long)]
         market: Option<String>,
     },
-    /// Orchestrate LP setup: keygen → ticket-service → venues → receiving
+    /// Orchestrate LP setup: keygen → service check → venues → receiving
     /// preapprovals → ticket batch → denomination splits
     Setup,
 }
@@ -448,9 +446,6 @@ pub enum AtomicVenueCommands {
         /// Market ID (pairName), format "BASE-QUOTE"
         #[arg(long)]
         market: String,
-        /// Operator party (default: the server's settlement operator)
-        #[arg(long)]
-        operator: Option<String>,
         /// Quote keyfile path override
         #[arg(long)]
         quote_key_file: Option<String>,
@@ -1602,7 +1597,13 @@ pub async fn run_lp_atomic_stream(
                                             atomic_quote::QuoteSide::Sell
                                         };
                                         match state
-                                            .register_indicative(&quote_id, &request.market_id, side, &priced)
+                                            .register_indicative(
+                                                &quote_id,
+                                                &request.market_id,
+                                                side,
+                                                &priced,
+                                                request.settlement_fee.clone(),
+                                            )
                                             .await
                                         {
                                             Err(e) => reject(e, String::new(), String::new()),
@@ -1626,6 +1627,9 @@ pub async fn run_lp_atomic_stream(
                                                     lp_party_id: config.party_id.clone(),
                                                     lp_name: lp_name.clone(),
                                                     quoted_at: Some(now_ts()),
+                                                    // echo of the authoritative fee — the relay
+                                                    // drops the quote on any mismatch (design §14 D19)
+                                                    settlement_fee: request.settlement_fee.clone(),
                                                 })
                                             }
                                         }
@@ -3726,7 +3730,7 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
 struct AtomicVenueSummary {
     contract_id: String,
     pair_name: String,
-    operator: String,
+    provider: String,
     base_admin: String,
     base_id: String,
     quote_admin: String,
@@ -3757,7 +3761,7 @@ async fn atomic_find_venues(
         venues.push(AtomicVenueSummary {
             contract_id: c.contract_id,
             pair_name: s("/pairName").unwrap_or_default(),
-            operator: s("/operator").unwrap_or_default(),
+            provider: s("/provider").unwrap_or_default(),
             base_admin: s("/baseInstrumentId/admin").unwrap_or_default(),
             base_id: s("/baseInstrumentId/id").unwrap_or_default(),
             quote_admin: s("/quoteInstrumentId/admin").unwrap_or_default(),
@@ -3768,23 +3772,16 @@ async fn atomic_find_venues(
     Ok(venues)
 }
 
-/// This LP's TicketService contract id, if any.
-async fn atomic_find_ticket_service(
+/// The provider-signed AtomicDVPService singleton's contract id, if visible.
+/// The agent can only OBSERVE it (via the ledger-service's provider-side
+/// query) — creation is ops: `orderbook atomic service` (fa-design G2).
+async fn atomic_find_service(
     client: &mut AtomicProviderClient,
-    party_id: &str,
 ) -> Result<Option<String>> {
     let resp = client
-        .get_atomic_contracts(&[venue_registry::TEMPLATE_TICKET_SERVICE.to_string()], &[])
+        .get_atomic_contracts(&[venue_registry::TEMPLATE_ATOMIC_DVP_SERVICE.to_string()], &[])
         .await?;
-    for c in resp.contracts {
-        let lp = serde_json::from_str::<serde_json::Value>(&c.payload_json)
-            .ok()
-            .and_then(|v| v.get("lp").and_then(|l| l.as_str()).map(str::to_string));
-        if lp.as_deref() == Some(party_id) || lp.is_none() {
-            return Ok(Some(c.contract_id));
-        }
-    }
-    Ok(None)
+    Ok(resp.contracts.into_iter().next().map(|c| c.contract_id))
 }
 
 /// Contract ids of this LP's live SettlementTickets.
@@ -3946,11 +3943,6 @@ async fn atomic_split_denominations(
             PrepareAtomicTransactionRequest, SplitHoldingsParams, SplitSpec,
         };
         let mut atomic_client = atomic_swap::create_atomic_client(config).await?;
-        let ticket_service_cid = atomic_find_ticket_service(&mut atomic_client, &config.party_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!("no TicketService on ledger — run `atomic ticket-service` first")
-            })?;
         let splits: Vec<SplitSpec> = to_make
             .iter()
             .map(|(denom, count)| SplitSpec {
@@ -3968,7 +3960,6 @@ async fn atomic_split_denominations(
             .submit_atomic_transaction(
                 PrepareAtomicTransactionRequest {
                     params: Some(AtomicParams::SplitHoldings(SplitHoldingsParams {
-                        ticket_service_cid,
                         instrument_id: on_chain_id.to_string(),
                         instrument_admin: admin.to_string(),
                         input_holding_cids: input_cids,
@@ -3996,7 +3987,7 @@ pub async fn run_atomic(
 ) -> Result<()> {
     use orderbook_proto::rfqv2::{
         prepare_atomic_transaction_request::Params as AtomicParams, CancelTicketsParams,
-        CreateAtomicDvpVenueParams, CreateTicketServiceParams, IssueTicketsParams,
+        CreateAtomicDvpVenueParams, IssueTicketsParams,
         PrepareAtomicTransactionRequest, UpdateVenueKeyParams,
     };
 
@@ -4013,35 +4004,9 @@ pub async fn run_atomic(
             println!("SPKI public key: {}", kf.pub_spki_hex);
         }
 
-        AtomicCommands::TicketService => {
-            let mut client = atomic_swap::create_atomic_client(&config).await?;
-            let expectation = OperationExpectation::CreateTicketService {
-                lp_party: config.party_id.clone(),
-            };
-            match client
-                .submit_atomic_transaction(
-                    PrepareAtomicTransactionRequest {
-                        params: Some(AtomicParams::CreateTicketService(CreateTicketServiceParams {})),
-                        request_signature: None,
-                    },
-                    &expectation,
-                    verbose,
-                    dry_run,
-                    force,
-                )
-                .await
-            {
-                Ok(resp) => println!("TicketService created, update id: {}", resp.update_id),
-                // Idempotency: the server error carries the existing contract id
-                Err(e) if format!("{:#}", e).contains("already exists") => {
-                    println!("TicketService already exists: {:#}", e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
 
         AtomicCommands::Venue { command } => match command {
-            AtomicVenueCommands::Create { market, operator, quote_key_file } => {
+            AtomicVenueCommands::Create { market, quote_key_file } => {
                 let ((base_id, base_admin), (quote_id, quote_admin)) =
                     atomic_resolve_market_pair(&config, &market)?;
                 let key_path = atomic_quote::resolve_keyfile_path(quote_key_file.as_deref());
@@ -4086,7 +4051,6 @@ pub async fn run_atomic(
                                     quote_instrument_id: quote_id,
                                     quote_instrument_admin: quote_admin,
                                     quote_public_key_spki_hex: kf.pub_spki_hex,
-                                    operator_party: operator,
                                 },
                             )),
                             request_signature: None,
@@ -4185,10 +4149,6 @@ pub async fn run_atomic(
                     println!("Issued {} tickets, update id: {}", count, resp.update_id);
                 }
                 AtomicTicketCommands::Cancel { cids, all_free } => {
-                    let ticket_service_cid =
-                        atomic_find_ticket_service(&mut client, &config.party_id)
-                            .await?
-                            .ok_or_else(|| anyhow!("no TicketService on ledger"))?;
                     let ticket_cids: Vec<String> = if all_free {
                         atomic_list_live_tickets(&mut client, &config.party_id).await?
                     } else {
@@ -4216,7 +4176,6 @@ pub async fn run_atomic(
                         .submit_atomic_transaction(
                             PrepareAtomicTransactionRequest {
                                 params: Some(AtomicParams::CancelTickets(CancelTicketsParams {
-                                    ticket_service_cid,
                                     ticket_cids,
                                 })),
                                 request_signature: None,
@@ -4301,15 +4260,15 @@ pub async fn run_atomic(
                     None => "no local keyfile to compare",
                 };
                 println!("{}: {}", v.pair_name, v.contract_id);
-                println!("  operator:  {}", v.operator);
+                println!("  provider:  {}", v.provider);
                 println!("  base:      {} (admin {})", v.base_id, v.base_admin);
                 println!("  quote:     {} (admin {})", v.quote_id, v.quote_admin);
                 println!("  quote key: {}", key_status);
             }
 
-            match atomic_find_ticket_service(&mut client, &config.party_id).await? {
-                Some(cid) => println!("\nTicketService: {}", cid),
-                None => println!("\nTicketService: (none)"),
+            match atomic_find_service(&mut client).await? {
+                Some(cid) => println!("\nAtomicDVPService singleton: {}", cid),
+                None => println!("\nAtomicDVPService singleton: (none — ops must run `orderbook atomic service`)"),
             }
             let tickets = atomic_list_live_tickets(&mut client, &config.party_id).await?;
             println!("Live tickets:  {}", tickets.len());
@@ -4366,28 +4325,17 @@ pub async fn run_atomic(
 
             let mut client = atomic_swap::create_atomic_client(&config).await?;
 
-            // 2. ticket-service (ignore already-exists)
-            let expectation = OperationExpectation::CreateTicketService {
-                lp_party: config.party_id.clone(),
-            };
-            match client
-                .submit_atomic_transaction(
-                    PrepareAtomicTransactionRequest {
-                        params: Some(AtomicParams::CreateTicketService(CreateTicketServiceParams {})),
-                        request_signature: None,
-                    },
-                    &expectation,
-                    verbose,
-                    dry_run,
-                    force,
-                )
-                .await
-            {
-                Ok(resp) => println!("[2/6] TicketService created (update {})", resp.update_id),
-                Err(e) if format!("{:#}", e).contains("already exists") => {
-                    println!("[2/6] TicketService already exists");
+            // 2. AtomicDVPService singleton PRESENCE CHECK — the agent cannot
+            // create it (sole signatory = the provider, fa-design G2); venue
+            // creation below would fail server-side anyway, so fail early here.
+            match atomic_find_service(&mut client).await? {
+                Some(cid) => println!("[2/6] AtomicDVPService singleton present: {cid}"),
+                None => {
+                    return Err(anyhow!(
+                        "[2/6] AtomicDVPService singleton not found — the provider must \
+                         bootstrap it first (ops: `orderbook atomic service`)"
+                    ));
                 }
-                Err(e) => return Err(e),
             }
 
             // 3. venue per rfq_v2-enabled market (skip existing with matching key)
@@ -4439,7 +4387,6 @@ pub async fn run_atomic(
                                             quote_instrument_id: quote_id,
                                             quote_instrument_admin: quote_admin,
                                             quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
-                                            operator_party: None,
                                         },
                                     )),
                                     request_signature: None,

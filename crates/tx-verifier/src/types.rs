@@ -108,7 +108,7 @@ pub enum OperationExpectation {
     AtomicDvpSettle {
         user_party: String,
         venue_cid: String,
-        template_id: String, // "#atomic-dvp-v1:AtomicDVP:AtomicDVP"
+        template_id: String, // "#atomic-dvp-v2:AtomicDVP:AtomicDVP"
         quote_id: String,
         ticket_id: String,
         ticket_cid: Option<String>,
@@ -123,9 +123,6 @@ pub enum OperationExpectation {
         valid_until_micros: i64,
         lp_input_holding_cids: Vec<String>,
         user_input_holding_cids: Vec<String>,
-    },
-    CreateTicketService {
-        lp_party: String,
     },
     IssueTickets {
         lp_party: String,

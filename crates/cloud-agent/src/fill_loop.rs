@@ -969,9 +969,16 @@ async fn atomic_round(
         }
     };
 
+    // Fee visibility before accept (design §14 D21): accepting implies consent;
+    // the settle path asserts the signed lpFees equal exactly this.
+    let fee_display = best
+        .settlement_fee
+        .as_ref()
+        .map(|f| format!("{} {} -> {}", f.amount, f.instrument_id, f.receiver))
+        .unwrap_or_else(|| "none".to_string());
     info!(
-        "[round {}] Accepting atomic quote {} @ {} (qty={}, LP={})",
-        round, best.quote_id, best.price, best.quantity, best.lp_name
+        "[round {}] Accepting atomic quote {} @ {} (qty={}, LP={}, settlement fee: {})",
+        round, best.quote_id, best.price, best.quantity, best.lp_name, fee_display
     );
 
     let accept_resp = match client.accept_quote_atomic(&rfq_id, &best.quote_id, Some(15)).await {

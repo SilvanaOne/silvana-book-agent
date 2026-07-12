@@ -2259,7 +2259,6 @@ pub fn inspect(
             let mode = if ticket_id.is_empty() { "ticketless" } else { "ticketed" };
             format!("AtomicDvpSettle({}, {})", quote_id, mode)
         }
-        OperationExpectation::CreateTicketService { .. } => "CreateTicketService".to_string(),
         OperationExpectation::IssueTickets { ticket_count, .. } => {
             format!("IssueTickets({} tickets)", ticket_count)
         }

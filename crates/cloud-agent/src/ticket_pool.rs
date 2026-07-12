@@ -282,7 +282,7 @@ mod tests {
         TicketAcsInfo {
             ticket_id: tid.to_string(),
             contract_id: format!("00{tid}"),
-            template_id: Some("#atomic-dvp-v1:AtomicDVP:SettlementTicket".to_string()),
+            template_id: Some("#atomic-dvp-v2:AtomicDVP:SettlementTicket".to_string()),
             created_event_blob: Some(format!("blob-{tid}")),
             payload_json: Some(format!("{{\"ticketId\":\"{tid}\"}}")),
         }

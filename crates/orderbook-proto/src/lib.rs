@@ -189,7 +189,7 @@ pub use rfqv2::{
     RfqConfirmRequest, RfqConfirmReject, RfqConfirmRejectReason,
     AtomicServerToLp, AtomicLpToServer,
     // Ledger ops
-    AtomicMessageSignature, Fee, AtomicDvpSettleParams, CreateTicketServiceParams,
+    AtomicFeeSpec, AtomicMessageSignature, Fee, AtomicDvpSettleParams,
     IssueTicketsParams, SplitSpec, SplitHoldingsParams, CreateAtomicDvpVenueParams,
     UpdateVenueKeyParams, CancelTicketsParams,
     PrepareAtomicTransactionRequest, PrepareAtomicTransactionResponse,

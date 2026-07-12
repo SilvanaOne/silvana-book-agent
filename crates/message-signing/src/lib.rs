@@ -331,6 +331,17 @@ pub fn canonical_prepare_atomic_request(params_canonical: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// One SIGNED LP-required fee as it rides the settle request canonical
+/// (mirrors the rfqv2 `AtomicFeeSpec` / the v4 canonical fee block —
+/// design §14 D18/D21).
+pub struct AtomicLpFee<'a> {
+    pub receiver: &'a str,
+    pub instrument_admin: &'a str,
+    pub instrument_id: &'a str,
+    /// canonical DAML-show decimal string
+    pub amount: &'a str,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn canonical_params_atomic_dvp_settle(
     venue_cid: &str,
@@ -346,6 +357,7 @@ pub fn canonical_params_atomic_dvp_settle(
     ticket_cid: Option<&str>,
     lp_input_holding_cids: &[String],
     user_input_holding_cids: &[String],
+    lp_fees: &[AtomicLpFee<'_>],
 ) -> String {
     let mut s = format!(
         "param_type=AtomicDvpSettle\nvenue_cid={}\nquote_id={}\nticket_id={}\nuser={}\nside={}\nbase_amount={}\nquote_amount={}\ncreated_at_micros={}\nvalid_until_micros={}\nquote_signature={}\n",
@@ -365,11 +377,18 @@ pub fn canonical_params_atomic_dvp_settle(
     }
     s.push_str(&format!("lp_input_holding_cids={}\n", lp_input_holding_cids.join(",")));
     s.push_str(&format!("user_input_holding_cids={}\n", user_input_holding_cids.join(",")));
+    // Fee block, mirroring the v4 canonical-message layout; omitted entirely
+    // when there are no fees (byte-compat with fee-less settles — design §14 D21).
+    if !lp_fees.is_empty() {
+        s.push_str(&format!("fee_count={}\n", lp_fees.len()));
+        for (i, f) in lp_fees.iter().enumerate() {
+            s.push_str(&format!("fee_{}_receiver={}\n", i, f.receiver));
+            s.push_str(&format!("fee_{}_admin={}\n", i, f.instrument_admin));
+            s.push_str(&format!("fee_{}_id={}\n", i, f.instrument_id));
+            s.push_str(&format!("fee_{}_amount={}\n", i, f.amount));
+        }
+    }
     s
-}
-
-pub fn canonical_params_create_ticket_service() -> String {
-    "param_type=CreateTicketService\n".to_string()
 }
 
 pub fn canonical_params_issue_tickets(ticket_ids: &[String]) -> String {
@@ -380,7 +399,6 @@ pub fn canonical_params_issue_tickets(ticket_ids: &[String]) -> String {
 }
 
 pub fn canonical_params_split_holdings(
-    ticket_service_cid: &str,
     instrument_id: &str,
     instrument_admin: &str,
     splits: &[(String, u32)],
@@ -392,8 +410,7 @@ pub fn canonical_params_split_holdings(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "param_type=SplitHoldings\nticket_service_cid={}\ninstrument_id={}\ninstrument_admin={}\nsplits={}\ninput_holding_cids={}\n",
-        ticket_service_cid,
+        "param_type=SplitHoldings\ninstrument_id={}\ninstrument_admin={}\nsplits={}\ninput_holding_cids={}\n",
         instrument_id,
         instrument_admin,
         splits_joined,
@@ -408,9 +425,10 @@ pub fn canonical_params_create_atomic_dvp_venue(
     quote_instrument_id: &str,
     quote_instrument_admin: &str,
     quote_public_key_spki_hex: &str,
-    operator_party: Option<&str>,
 ) -> String {
-    let mut s = format!(
+    // atomic-dvp-v2: the venue's provider is fixed by the AtomicDVPService
+    // singleton — no operator_party line (design §13 D11).
+    format!(
         "param_type=CreateAtomicDvpVenue\npair_name={}\nbase_instrument_id={}\nbase_instrument_admin={}\nquote_instrument_id={}\nquote_instrument_admin={}\nquote_public_key={}\n",
         pair_name,
         base_instrument_id,
@@ -418,11 +436,7 @@ pub fn canonical_params_create_atomic_dvp_venue(
         quote_instrument_id,
         quote_instrument_admin,
         quote_public_key_spki_hex
-    );
-    if let Some(op) = operator_party {
-        s.push_str(&format!("operator_party={}\n", op));
-    }
-    s
+    )
 }
 
 pub fn canonical_params_update_venue_key(venue_cid: &str, new_quote_public_key_spki_hex: &str) -> String {
@@ -432,10 +446,9 @@ pub fn canonical_params_update_venue_key(venue_cid: &str, new_quote_public_key_s
     )
 }
 
-pub fn canonical_params_cancel_tickets(ticket_service_cid: &str, ticket_cids: &[String]) -> String {
+pub fn canonical_params_cancel_tickets(ticket_cids: &[String]) -> String {
     format!(
-        "param_type=CancelTickets\nticket_service_cid={}\nticket_cids={}\n",
-        ticket_service_cid,
+        "param_type=CancelTickets\nticket_cids={}\n",
         ticket_cids.join(",")
     )
 }
@@ -938,6 +951,32 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    #[test]
+    fn atomic_settle_canonical_fee_block() {
+        let base = |fees: &[AtomicLpFee<'_>]| {
+            canonical_params_atomic_dvp_settle(
+                "00venue", "q-1", "t-1", "user::1", "Buy", "10.0", "25.5",
+                1_000, 2_000, "30deadbeef", Some("00tkt"),
+                &["00lp1".into()], &["00u1".into()], fees,
+            )
+        };
+        // fee-less: byte-identical to the pre-fee layout (no fee_count line)
+        let no_fees = base(&[]);
+        assert!(!no_fees.contains("fee_count="));
+        assert!(no_fees.ends_with("user_input_holding_cids=00u1\n"));
+        // one fee: v4-shaped block appended after the cid lines
+        let one = base(&[AtomicLpFee {
+            receiver: "fee::1",
+            instrument_admin: "dso::1",
+            instrument_id: "Amulet",
+            amount: "1.2",
+        }]);
+        assert!(one.starts_with(&no_fees));
+        assert!(one.ends_with(
+            "fee_count=1\nfee_0_receiver=fee::1\nfee_0_admin=dso::1\nfee_0_id=Amulet\nfee_0_amount=1.2\n"
+        ));
+    }
 
     #[test]
     fn verify_persisted_tx_fees_authorization_roundtrip() {

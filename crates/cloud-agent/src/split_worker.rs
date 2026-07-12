@@ -37,7 +37,7 @@ use tx_verifier::OperationExpectation;
 use crate::holdings_cache::{HoldingsCache, InstrumentKey};
 use crate::ledger_client::{AtomicProviderClient, DAppProviderClient};
 use crate::ticket_pool::{TicketAcsInfo, TicketPool};
-use crate::venue_registry::{TEMPLATE_SETTLEMENT_TICKET, TEMPLATE_TICKET_SERVICE};
+use crate::venue_registry::TEMPLATE_SETTLEMENT_TICKET;
 
 /// One LP-pays instrument of a market, resolved for splitting.
 #[derive(Debug, Clone)]
@@ -347,8 +347,9 @@ async fn split_cc(
     Ok(resp.update_id)
 }
 
-/// Utility split via `TicketService_SplitHoldings` (CIP-56 self-transfer plan
-/// resolved by the ledger service).
+/// Utility split via `AtomicDVPService_SplitHoldings` (CIP-56 self-transfer
+/// plan resolved by the ledger service, which discovers + discloses the
+/// provider-signed singleton itself — fa-design G2).
 async fn split_utility(
     config: &BaseConfig,
     atomic_client: &mut AtomicProviderClient,
@@ -356,12 +357,6 @@ async fn split_utility(
     input_cids: &[String],
     splits: &[(Decimal, u32)],
 ) -> Result<String> {
-    let ticket_service_cid = find_ticket_service(atomic_client, &config.party_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!("no TicketService on ledger — run `atomic setup` (ticket-service create) first")
-        })?;
-
     let split_specs: Vec<SplitSpec> = splits
         .iter()
         .map(|(denom, count)| SplitSpec {
@@ -379,7 +374,6 @@ async fn split_utility(
         .submit_atomic_transaction(
             PrepareAtomicTransactionRequest {
                 params: Some(AtomicParams::SplitHoldings(SplitHoldingsParams {
-                    ticket_service_cid,
                     instrument_id: instrument.on_chain_id.clone(),
                     instrument_admin: instrument.admin.clone(),
                     input_holding_cids: input_cids.to_vec(),
@@ -394,25 +388,6 @@ async fn split_utility(
         )
         .await?;
     Ok(resp.update_id)
-}
-
-/// Discover the LP's TicketService contract id.
-async fn find_ticket_service(
-    client: &mut AtomicProviderClient,
-    party_id: &str,
-) -> Result<Option<String>> {
-    let resp = client
-        .get_atomic_contracts(&[TEMPLATE_TICKET_SERVICE.to_string()], &[])
-        .await?;
-    for c in resp.contracts {
-        let lp = serde_json::from_str::<serde_json::Value>(&c.payload_json)
-            .ok()
-            .and_then(|v| v.get("lp").and_then(|l| l.as_str()).map(str::to_string));
-        if lp.as_deref() == Some(party_id) || lp.is_none() {
-            return Ok(Some(c.contract_id));
-        }
-    }
-    Ok(None)
 }
 
 /// Reconcile the ticket pool from the on-ledger SettlementTicket set.

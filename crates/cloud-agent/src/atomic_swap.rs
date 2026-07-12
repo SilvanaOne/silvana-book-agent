@@ -122,9 +122,24 @@ pub fn envelope_from_proto(env: &AtomicQuoteEnvelope) -> Result<QuoteEnvelope> {
             quote_amount: quote.quote_amount.clone(),
             created_at_micros: quote.created_at_micros.to_string(),
             valid_until_micros: quote.valid_until_micros.to_string(),
-            // RFQ-v2 transport is fee-less for now (v1 message); LP-required
-            // fees arrive with the proto extension (fees-design rev 2).
-            lp_fees: None,
+            lp_fees: if quote.lp_fees.is_empty() {
+                None
+            } else {
+                Some(
+                    quote
+                        .lp_fees
+                        .iter()
+                        .map(|f| atomic_quote::envelope::LpFeeJson {
+                            receiver: f.receiver.clone(),
+                            instrument_id: atomic_quote::envelope::InstrumentIdJson {
+                                admin: f.instrument_admin.clone(),
+                                id: f.instrument_id.clone(),
+                            },
+                            amount: f.amount.clone(),
+                        })
+                        .collect(),
+                )
+            },
         },
         canonical_message: env.canonical_message.clone(),
         quote_signature: env.quote_signature.clone(),
@@ -346,6 +361,23 @@ impl AtomicSwapper {
                 reason: format!("H14: quote side {} != {}", env.quote.side, expected_side),
             });
         }
+        // Fee consent (design §14 D21): the SIGNED lpFees must equal the fee
+        // displayed on the accepted quote — neither the LP nor the relay can
+        // raise the fee after display.
+        let signed_fees = envelope
+            .quote
+            .as_ref()
+            .map(|q| q.lp_fees.clone())
+            .unwrap_or_default();
+        let displayed_fees: Vec<_> = accepted.settlement_fee.iter().cloned().collect();
+        if signed_fees != displayed_fees {
+            return Ok(SwapOutcome::Requote {
+                reason: format!(
+                    "signed lpFees {:?} differ from the displayed settlement fee {:?}",
+                    signed_fees, displayed_fees
+                ),
+            });
+        }
 
         // ---- SELECT own holdings (sending leg) --------------------------
         // User Buy ⇒ user pays quote leg; Sell ⇒ user pays base leg.
@@ -367,19 +399,68 @@ impl AtomicSwapper {
         } else {
             instrument_key(&pay_admin, &pay_id)
         };
+        // Fee funding (design §14 D21): fees are CC and ride the ONE user-side
+        // pool — coverage must be GUARANTEED, not incidental. Target =
+        // fee × 1.02 + 1 CC (amulet sender-fee headroom, the dvp CLI margin).
+        let fee_cc_total: Decimal = signed_fees
+            .iter()
+            .filter(|f| f.instrument_id == "Amulet")
+            .filter_map(|f| Decimal::from_str(&f.amount).ok())
+            .sum();
+        let fee_funding_target = if fee_cc_total > Decimal::ZERO {
+            fee_cc_total * Decimal::new(102, 2) + Decimal::ONE
+        } else {
+            Decimal::ZERO
+        };
+        // Does the user RECEIVE CC (proceeds can fund the fee)?
+        let receive_id = match direction {
+            FillDirection::Buy => venue("/baseInstrumentId/id")?,
+            FillDirection::Sell => venue("/quoteInstrumentId/id")?,
+        };
+        let receive_amount = match direction {
+            FillDirection::Buy => base_amount,
+            FillDirection::Sell => quote_amount,
+        };
+        let proceeds_cover_fee = receive_id == "Amulet" && receive_amount >= fee_funding_target;
+
         let max_inputs = max_input_holdings.min(20);
+        // When the user PAYS CC, the leg selection itself must also cover the
+        // fee (leg change alone can be arbitrarily small).
+        let select_target = if is_cc {
+            amount_needed + fee_funding_target
+        } else {
+            amount_needed
+        };
         let picks = self
             .cache
-            .select_for_disclosure(&pay_key, amount_needed, max_inputs, is_cc)
+            .select_for_disclosure(&pay_key, select_target, max_inputs, is_cc)
             .await;
-        let Some(picks) = picks else {
+        let Some(mut picks) = picks else {
             return Ok(SwapOutcome::Requote {
                 reason: format!(
                     "own holdings selection failed for {} (need {}; cache cold or insufficient)",
-                    pay_key, amount_needed
+                    pay_key, select_target
                 ),
             });
         };
+        // Fee paid in CC while neither the pay leg is CC nor the proceeds
+        // cover it: add dedicated CC funding cids to the pool.
+        if fee_funding_target > Decimal::ZERO && !is_cc && !proceeds_cover_fee {
+            let slots = max_inputs.saturating_sub(picks.len()).max(1);
+            let fee_picks = self
+                .cache
+                .select_for_disclosure(&CC_INSTRUMENT.to_string(), fee_funding_target, slots, true)
+                .await;
+            let Some(fee_picks) = fee_picks else {
+                return Ok(SwapOutcome::Requote {
+                    reason: format!(
+                        "CC fee-funding selection failed (need {} CC for the settlement fee)",
+                        fee_funding_target
+                    ),
+                });
+            };
+            picks.extend(fee_picks);
+        }
         let own_cids: Vec<String> = picks.iter().map(|h| h.contract_id.clone()).collect();
 
         let valid_until_micros: i64 = env.quote.valid_until_micros.parse()?;
@@ -403,7 +484,6 @@ impl AtomicSwapper {
             quote_signature_der_hex: envelope.quote_signature.clone(),
             canonical_message: envelope.canonical_message.clone(),
             lp_party: lp_party.clone(),
-            operator_party: venue("/operator")?,
             pair_name: venue("/pairName")?,
             base_instrument_id: venue("/baseInstrumentId/id")?,
             base_instrument_admin: venue("/baseInstrumentId/admin")?,
@@ -415,6 +495,7 @@ impl AtomicSwapper {
             envelope_disclosures: envelope.disclosed.clone(),
             user_input_holding_cids: own_cids.clone(),
             synchronizer_id: self.config.synchronizer_id.clone(),
+            lp_fees: signed_fees.clone(),
         };
         let expectation = OperationExpectation::AtomicDvpSettle {
             user_party: self.config.party_id.clone(),

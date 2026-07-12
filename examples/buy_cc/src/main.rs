@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
         confirm_lock.clone(),
         lm,
         agent_logic::shutdown::Shutdown::new(),
+        cloud_agent::holdings_cache::HoldingsCache::new(false),
     );
 
     // Create settler for atomic multicall settlements
@@ -110,10 +111,11 @@ async fn main() -> Result<()> {
         min_settlement: args.min_settlement,
         max_settlement: args.amount,
         interval_secs: args.poll_period,
+        atomic: false,
     };
 
     // Keep backend alive so its ACS worker keeps refreshing amulets
     let _backend_guard = backend;
 
-    fill_loop::run_fill_loop(config, settler, params, None, None).await
+    fill_loop::run_fill_loop(config, settler, params, None, None, None).await
 }

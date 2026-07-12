@@ -40,9 +40,24 @@ message AtomicAcsContract {
   string payload_json = 4;        // create-arguments JSON, verbatim text
 }
 
-// The 8 DAML Quote fields (atomic-dvp-v1 AtomicDVP.Quote record). Amounts are
-// canonical-decimal strings (DAML `show @Decimal` rendering); times are epoch
-// microseconds; side is the DAML constructor name.
+// One SIGNED LP-required fee — the DAML `FeeSpec` economic triple
+// (atomic-dvp fees-design §3.1) as it rides `Quote.lpFees` and the v4
+// canonical fee block. `amount` MUST be in the canonical DAML-show decimal
+// form (trailing fractional zeros stripped, integral values as `X.0`) so that
+// wire equality, the rpc's rule-8 string check, and the on-ledger rendering
+// are byte-identical (design §14 D17).
+message AtomicFeeSpec {
+  string receiver = 1;          // full party id (the orderbook fee party)
+  string instrument_admin = 2;  // fee InstrumentId.admin (DSO for CC)
+  string instrument_id = 3;     // fee InstrumentId.id ("Amulet" for CC)
+  string amount = 4;            // canonical-decimal string, > 0
+}
+
+// The 9 DAML Quote fields (atomic-dvp-v2 AtomicDVP.Quote record: 8 + lpFees).
+// Amounts are canonical-decimal strings (DAML `show @Decimal` rendering);
+// times are epoch microseconds; side is the DAML constructor name. lp_fees
+// maps 1:1 to `Quote.lpFees`: empty = None (message v3), non-empty = Some
+// (message v4 with the signed fee block).
 message AtomicQuote {
   string quote_id = 1;             // UUIDv7 == canonical line 13 quote_nonce
   string ticket_id = 2;            // "" = ticketless (canonical line 16 ALWAYS present)
@@ -52,6 +67,7 @@ message AtomicQuote {
   string quote_amount = 6;
   int64 created_at_micros = 7;
   int64 valid_until_micros = 8;
+  repeated AtomicFeeSpec lp_fees = 9;  // SIGNED settlement fee(s); design §14 D18
 }
 
 // version "silvana.atomic-dvp.envelope.v1". Rev-7 of the AtomicDVP design:
@@ -62,7 +78,7 @@ message AtomicQuoteEnvelope {
   string synchronizer_id = 2;
   AtomicAcsContract dvp = 3;                        // the AtomicDVP venue (payload carries quotePublicKey)
   AtomicQuote quote = 4;
-  string canonical_message = 5;                     // 16-line text; client MUST re-derive and compare (H14)
+  string canonical_message = 5;                     // v3: 16 lines / v4: 16 + fee block; client MUST re-derive and compare (H14)
   string quote_signature = 6;                       // ASN.1 DER, lowercase hex, secp256k1 over SHA256(msg)
   AtomicAcsContract ticket = 7;                     // present iff quote.ticket_id != ""
   repeated string lp_input_holding_cids = 8;        // <= 20
@@ -94,6 +110,10 @@ message AtomicQuoteInfo {
   string quantity = 5;                // base
   string quote_quantity = 6;
   google.protobuf.Timestamp valid_until = 7;   // indicative/soft-reserve expiry
+  // The settlement fee the accepted quote will carry (signed into the LP's
+  // quote at confirm). Absent = zero-fee pair. Display before accept; the
+  // client asserts the signed envelope's lp_fees equals this (design §14 D21).
+  optional AtomicFeeSpec settlement_fee = 8;
 }
 
 message AtomicRejectInfo {
@@ -164,11 +184,23 @@ message GetAtomicRfqAuditLogResponse {
   repeated AtomicRfqAuditEntry entries = 1;
 }
 
+message EstimateAtomicFeeRequest {
+  string market_id = 1;
+}
+
+// Advisory estimate (per-call, uncached); the per-RFQ cache set at
+// RequestQuotes time is the authority (design §14 D19).
+message EstimateAtomicFeeResponse {
+  string fee_usd = 1;                          // pre-conversion USD amount
+  optional AtomicFeeSpec settlement_fee = 2;   // absent = zero-fee pair
+}
+
 service RfqV2Service {
   rpc RequestQuotes(RequestQuotesV2Request) returns (RequestQuotesV2Response);
   rpc AcceptQuoteAtomic(AcceptQuoteAtomicRequest) returns (AcceptQuoteAtomicResponse);
   rpc GetAtomicLiquidityProviders(GetAtomicLiquidityProvidersRequest) returns (GetAtomicLiquidityProvidersResponse);
   rpc GetAtomicRfqAuditLog(GetAtomicRfqAuditLogRequest) returns (GetAtomicRfqAuditLogResponse);
+  rpc EstimateAtomicFee(EstimateAtomicFeeRequest) returns (EstimateAtomicFeeResponse);
 }
 
 // ============================================================================
@@ -203,6 +235,10 @@ message AtomicRfqRequest {
   string quantity = 4;
   google.protobuf.Timestamp respond_by = 5;
   google.protobuf.Timestamp created_at = 6;
+  // The AUTHORITATIVE settlement fee for this RFQ (computed by orderbook-rpc,
+  // cached per rfq_id): the LP must echo it on the indicative quote and sign
+  // it into Quote.lpFees at confirm. Absent = zero-fee pair (design §14 D18/D19).
+  optional AtomicFeeSpec settlement_fee = 7;
 }
 
 // Phase 1: LP -> server indicative quote (soft reserve taken).
@@ -219,6 +255,10 @@ message AtomicRfqQuote {
   string lp_party_id = 10;
   string lp_name = 11;
   google.protobuf.Timestamp quoted_at = 12;
+  // Echo of AtomicRfqRequest.settlement_fee — the server drops the quote
+  // (fee_mismatch audit) unless it equals the cached fee field-for-field,
+  // absence included (design §14 D19 check a).
+  optional AtomicFeeSpec settlement_fee = 13;
 }
 
 message AtomicRfqReject {
@@ -242,6 +282,9 @@ message RfqConfirmRequest {
   string quote_quantity = 7;
   string price = 8;
   google.protobuf.Timestamp respond_by = 9;
+  // Confirm-time echo of the cached fee (defense-in-depth; the LP signs its
+  // OWN stored copy from the request, this lets it cross-check — design §14 D18).
+  optional AtomicFeeSpec settlement_fee = 10;
 }
 
 enum RfqConfirmRejectReason {

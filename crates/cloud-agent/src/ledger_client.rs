@@ -1275,6 +1275,16 @@ pub fn build_canonical_from_prepare_atomic_request(
                 .quote
                 .as_ref()
                 .context("AtomicDvpSettleParams missing quote")?;
+            let lp_fees: Vec<message_signing::AtomicLpFee<'_>> = p
+                .lp_fees
+                .iter()
+                .map(|f| message_signing::AtomicLpFee {
+                    receiver: &f.receiver,
+                    instrument_admin: &f.instrument_admin,
+                    instrument_id: &f.instrument_id,
+                    amount: &f.amount,
+                })
+                .collect();
             message_signing::canonical_params_atomic_dvp_settle(
                 &p.venue_cid,
                 &quote.quote_id,
@@ -1289,10 +1299,8 @@ pub fn build_canonical_from_prepare_atomic_request(
                 p.ticket_cid.as_deref(),
                 &p.lp_input_holding_cids,
                 &p.user_input_holding_cids,
+                &lp_fees,
             )
-        }
-        AtomicParams::CreateTicketService(_) => {
-            message_signing::canonical_params_create_ticket_service()
         }
         AtomicParams::IssueTickets(p) => {
             message_signing::canonical_params_issue_tickets(&p.ticket_ids)
@@ -1301,7 +1309,6 @@ pub fn build_canonical_from_prepare_atomic_request(
             let splits: Vec<(String, u32)> =
                 p.splits.iter().map(|s| (s.amount.clone(), s.count)).collect();
             message_signing::canonical_params_split_holdings(
-                &p.ticket_service_cid,
                 &p.instrument_id,
                 &p.instrument_admin,
                 &splits,
@@ -1316,17 +1323,15 @@ pub fn build_canonical_from_prepare_atomic_request(
                 &p.quote_instrument_id,
                 &p.quote_instrument_admin,
                 &p.quote_public_key_spki_hex,
-                p.operator_party.as_deref(),
             )
         }
         AtomicParams::UpdateVenueKey(p) => message_signing::canonical_params_update_venue_key(
             &p.venue_cid,
             &p.new_quote_public_key_spki_hex,
         ),
-        AtomicParams::CancelTickets(p) => message_signing::canonical_params_cancel_tickets(
-            &p.ticket_service_cid,
-            &p.ticket_cids,
-        ),
+        AtomicParams::CancelTickets(p) => {
+            message_signing::canonical_params_cancel_tickets(&p.ticket_cids)
+        }
     };
     Ok(message_signing::canonical_prepare_atomic_request(&params_canonical))
 }
