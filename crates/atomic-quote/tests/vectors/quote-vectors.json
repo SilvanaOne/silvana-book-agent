@@ -413,6 +413,179 @@
       "signatureDerHex": "304502206dc05726e8046852cfecf4df5c3d1bac6bbde362b973f5f59f98ebedd6d92fcc02210083f7cb38d701e9f6657d5223ec86b80d1c623972d892c1bf2617443c8c49679c",
       "expectVerify": true,
       "aborts": false
+    },
+    {
+      "name": "lpfee-one",
+      "note": "v2: one LP-required fee (wallet, 1.5 USDX); 21-line message",
+      "fields": {
+        "lp": "lp",
+        "operator": "operator",
+        "pair": "HCX/USDX",
+        "baseAdmin": "registrar",
+        "baseId": "HCX",
+        "quoteAdmin": "registrar",
+        "quoteInstrId": "USDX",
+        "user": "user",
+        "side": "BUY",
+        "baseAmount": "10.0",
+        "quoteAmount": "25.5",
+        "quoteNonce": "00000000-0000-7000-8000-0000000000n7",
+        "createdAtMicros": "1767225540000000",
+        "validUntilMicros": "1767229200000000",
+        "ticketId": "00000000-0000-7000-8000-0000000000t1",
+        "lpFees": [
+          {
+            "receiver": "wallet",
+            "admin": "registrar",
+            "id": "USDX",
+            "amount": "1.5"
+          }
+        ]
+      },
+      "canonicalMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_count=1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\n",
+      "signedMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_count=1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\n",
+      "sha256Hex": "677759525ea90e723b79679dc8d0c665f914f8dcb5bd3a26de7766a24c6315a3",
+      "signatureDerHex": "3045022100bff37e385f4a74ac4baf78a841703e09d2beb3b2f7893a3443a4572a5db402f402203b156090f7f5732ace79d127ec1b5cdd816069f5bc2b4b6c4728f18c9fda5628",
+      "expectVerify": true,
+      "aborts": false
+    },
+    {
+      "name": "lpfee-two",
+      "note": "v2: two LP-required fees (wallet 1.5 USDX + lp 0.25 HCX); block order = lpFees list order",
+      "fields": {
+        "lp": "lp",
+        "operator": "operator",
+        "pair": "HCX/USDX",
+        "baseAdmin": "registrar",
+        "baseId": "HCX",
+        "quoteAdmin": "registrar",
+        "quoteInstrId": "USDX",
+        "user": "user",
+        "side": "BUY",
+        "baseAmount": "10.0",
+        "quoteAmount": "25.5",
+        "quoteNonce": "00000000-0000-7000-8000-0000000000n8",
+        "createdAtMicros": "1767225540000000",
+        "validUntilMicros": "1767229200000000",
+        "ticketId": "00000000-0000-7000-8000-0000000000t2",
+        "lpFees": [
+          {
+            "receiver": "wallet",
+            "admin": "registrar",
+            "id": "USDX",
+            "amount": "1.5"
+          },
+          {
+            "receiver": "lp",
+            "admin": "registrar",
+            "id": "HCX",
+            "amount": "0.25"
+          }
+        ]
+      },
+      "canonicalMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n8\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t2\nfee_count=2\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\nfee_1_receiver=lp\nfee_1_admin=registrar\nfee_1_id=HCX\nfee_1_amount=0.25\n",
+      "signedMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n8\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t2\nfee_count=2\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\nfee_1_receiver=lp\nfee_1_admin=registrar\nfee_1_id=HCX\nfee_1_amount=0.25\n",
+      "sha256Hex": "7e447230911bcee1778c8c02b2221aa96dec2258e02d9258cf367886e6592327",
+      "signatureDerHex": "3045022100c4c1bcc1340d46268b28e55295689955631dbfec1ce57e5510df6e8847b2ef50022007efa98e26a55b93a5042ed64327f54e3520e825e767b7240a9505ff52783e91",
+      "expectVerify": true,
+      "aborts": false
+    },
+    {
+      "name": "lpfee-tampered-amount",
+      "note": "LPFEE-NEG: submitter shrinks the required fee 1.5 -> 0.5 after signing",
+      "fields": {
+        "lp": "lp",
+        "operator": "operator",
+        "pair": "HCX/USDX",
+        "baseAdmin": "registrar",
+        "baseId": "HCX",
+        "quoteAdmin": "registrar",
+        "quoteInstrId": "USDX",
+        "user": "user",
+        "side": "BUY",
+        "baseAmount": "10.0",
+        "quoteAmount": "25.5",
+        "quoteNonce": "00000000-0000-7000-8000-0000000000n7",
+        "createdAtMicros": "1767225540000000",
+        "validUntilMicros": "1767229200000000",
+        "ticketId": "00000000-0000-7000-8000-0000000000t1",
+        "lpFees": [
+          {
+            "receiver": "wallet",
+            "admin": "registrar",
+            "id": "USDX",
+            "amount": "0.5"
+          }
+        ]
+      },
+      "canonicalMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_count=1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=0.5\n",
+      "signedMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_count=1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\n",
+      "sha256Hex": "677759525ea90e723b79679dc8d0c665f914f8dcb5bd3a26de7766a24c6315a3",
+      "signatureDerHex": "3045022100bff37e385f4a74ac4baf78a841703e09d2beb3b2f7893a3443a4572a5db402f402203b156090f7f5732ace79d127ec1b5cdd816069f5bc2b4b6c4728f18c9fda5628",
+      "expectVerify": false,
+      "aborts": false
+    },
+    {
+      "name": "lpfee-omitted-fee-count",
+      "note": "v2 signer bug: message WITHOUT fee_count=; must NOT verify against the fixed-layout reconstruction (fail-safe)",
+      "fields": {
+        "lp": "lp",
+        "operator": "operator",
+        "pair": "HCX/USDX",
+        "baseAdmin": "registrar",
+        "baseId": "HCX",
+        "quoteAdmin": "registrar",
+        "quoteInstrId": "USDX",
+        "user": "user",
+        "side": "BUY",
+        "baseAmount": "10.0",
+        "quoteAmount": "25.5",
+        "quoteNonce": "00000000-0000-7000-8000-0000000000n7",
+        "createdAtMicros": "1767225540000000",
+        "validUntilMicros": "1767229200000000",
+        "ticketId": "00000000-0000-7000-8000-0000000000t1",
+        "lpFees": [
+          {
+            "receiver": "wallet",
+            "admin": "registrar",
+            "id": "USDX",
+            "amount": "1.5"
+          }
+        ]
+      },
+      "canonicalMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_count=1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\n",
+      "signedMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\n",
+      "sha256Hex": "61bfd0d220cda17f3ea2c507fa6da79a3839ceec2850864d4f3fad16a8a0d096",
+      "signatureDerHex": "304402203ff2beecee6d171794c5cb948847b50b14b025da4dbf3959cdd5157ad2e8b2760220030bcd9206eac204a0e26ab7512ea5bf2503abfaacae71aff19dec32cb002d17",
+      "expectVerify": false,
+      "aborts": false
+    },
+    {
+      "name": "lpfee-stripped-to-v1",
+      "note": "LPFEE-NEG-04: v2-signed bytes presented as a v1 (lpFees=None) quote; the format flips at line 1, so verification fails",
+      "fields": {
+        "lp": "lp",
+        "operator": "operator",
+        "pair": "HCX/USDX",
+        "baseAdmin": "registrar",
+        "baseId": "HCX",
+        "quoteAdmin": "registrar",
+        "quoteInstrId": "USDX",
+        "user": "user",
+        "side": "BUY",
+        "baseAmount": "10.0",
+        "quoteAmount": "25.5",
+        "quoteNonce": "00000000-0000-7000-8000-0000000000n7",
+        "createdAtMicros": "1767225540000000",
+        "validUntilMicros": "1767229200000000",
+        "ticketId": "00000000-0000-7000-8000-0000000000t1"
+      },
+      "canonicalMessage": "msg_type=silvana.atomic-dvp.quote.v1\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\n",
+      "signedMessage": "msg_type=silvana.atomic-dvp.quote.v2\nlp=lp\noperator=operator\npair=HCX/USDX\nbase_admin=registrar\nbase_id=HCX\nquote_admin=registrar\nquote_id=USDX\nuser=user\nside=BUY\nbase_amount=10.0\nquote_amount=25.5\nquote_nonce=00000000-0000-7000-8000-0000000000n7\ncreated_at_micros=1767225540000000\nvalid_until_micros=1767229200000000\nticket_id=00000000-0000-7000-8000-0000000000t1\nfee_count=1\nfee_0_receiver=wallet\nfee_0_admin=registrar\nfee_0_id=USDX\nfee_0_amount=1.5\n",
+      "sha256Hex": "677759525ea90e723b79679dc8d0c665f914f8dcb5bd3a26de7766a24c6315a3",
+      "signatureDerHex": "3045022100bff37e385f4a74ac4baf78a841703e09d2beb3b2f7893a3443a4572a5db402f402203b156090f7f5732ace79d127ec1b5cdd816069f5bc2b4b6c4728f18c9fda5628",
+      "expectVerify": false,
+      "aborts": false
     }
   ]
 }

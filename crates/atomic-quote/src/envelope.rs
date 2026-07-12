@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
 
-use crate::{build_canonical_message, verify_quote, CanonicalQuoteFields, QuoteSide};
+use crate::{build_canonical_message, verify_quote, CanonicalQuoteFields, LpFeeSpec, QuoteSide};
 
 pub const ENVELOPE_VERSION: &str = "silvana.atomic-dvp.envelope.v1";
 
@@ -25,6 +25,24 @@ pub struct AcsContractJson {
     pub template_id: String,
     pub created_event_blob: String,
     pub payload: Value,
+}
+
+/// A Daml `InstrumentId` as Ledger-API JSON.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct InstrumentIdJson {
+    pub admin: String,
+    pub id: String,
+}
+
+/// One LP-required fee — the Daml `FeeSpec` record as Ledger-API JSON
+/// (fees-design rev 2). Part of the SIGNED quote (canonical message v2).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LpFeeJson {
+    pub receiver: String,
+    pub instrument_id: InstrumentIdJson,
+    /// plain decimal string
+    pub amount: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -39,6 +57,11 @@ pub struct QuoteJson {
     pub quote_amount: String,
     pub created_at_micros: String,
     pub valid_until_micros: String,
+    /// Quote.lpFees: None = no LP-required fees (v1 message, byte-identical to
+    /// pre-fee envelopes); Some (non-empty) = v2 message. serde(default) keeps
+    /// old envelope files parseable.
+    #[serde(default)]
+    pub lp_fees: Option<Vec<LpFeeJson>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -69,6 +92,21 @@ pub fn canonical_from_dvp(dvp_payload: &Value, quote: &QuoteJson) -> Result<Stri
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("AtomicDVP payload missing {ptr}"))
     };
+    let lp_fees = match &quote.lp_fees {
+        None => None,
+        Some(fees) => Some(
+            fees.iter()
+                .map(|f| {
+                    Ok(LpFeeSpec {
+                        receiver: &f.receiver,
+                        admin: &f.instrument_id.admin,
+                        id: &f.instrument_id.id,
+                        amount: Decimal::from_str(&f.amount)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    };
     let fields = CanonicalQuoteFields {
         lp: s("/lp")?,
         operator: s("/operator")?,
@@ -85,6 +123,7 @@ pub fn canonical_from_dvp(dvp_payload: &Value, quote: &QuoteJson) -> Result<Stri
         created_at_micros: quote.created_at_micros.parse()?,
         valid_until_micros: quote.valid_until_micros.parse()?,
         ticket_id: &quote.ticket_id,
+        lp_fees,
     };
     build_canonical_message(&fields)
 }
@@ -190,6 +229,7 @@ mod tests {
             quote_amount: "25.0".into(),
             created_at_micros: "1000000".into(),
             valid_until_micros: "999999999999999".into(),
+            lp_fees: None,
         };
         let canonical = canonical_from_dvp(&dvp_payload, &quote).unwrap();
         let sig = crate::sign_quote(&kf.priv_scalar_hex, &canonical).unwrap();

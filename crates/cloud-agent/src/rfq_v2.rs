@@ -488,6 +488,9 @@ impl RfqV2State {
             quote_amount: quote_amount_str.clone(),
             created_at_micros: created_at_micros.to_string(),
             valid_until_micros: valid_until_micros.to_string(),
+            // RFQ-v2 transport is fee-less for now (v1 message); LP-required
+            // fees arrive with the proto extension (fees-design rev 2).
+            lp_fees: None,
         };
 
         // Step 6 — canonical + sign + SELF-VERIFY against the venue's

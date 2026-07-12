@@ -25,6 +25,11 @@ pub mod envelope;
 
 pub const MSG_TYPE: &str = "silvana.atomic-dvp.quote.v1";
 
+/// v2 = v1 + the LP-required fee block (atomic-dvp fees-design §3.6). Selected
+/// automatically by `lp_fees` presence; the two formats differ at line 1, so no
+/// byte string verifies under both (domain separation).
+pub const MSG_TYPE_V2: &str = "silvana.atomic-dvp.quote.v2";
+
 /// Signing-scheme identifier for the quote signature.
 pub const SIGNING_SCHEME: &str = "secp256k1-sha256-v1";
 
@@ -72,6 +77,18 @@ impl QuoteSide {
     }
 }
 
+/// One LP-required fee — the SIGNED economic triple (receiver, instrument,
+/// amount) of atomic-dvp `FeeSpec` (fees-design §3.1). Factory cids/contexts
+/// are unsignable and travel outside the payload.
+pub struct LpFeeSpec<'a> {
+    pub receiver: &'a str,
+    /// fee InstrumentId.admin
+    pub admin: &'a str,
+    /// fee InstrumentId.id (verbatim; no newline)
+    pub id: &'a str,
+    pub amount: Decimal,
+}
+
 /// The 16 semantic values of the canonical message. NOTE the two overloaded
 /// names: line 8 `quote_id=` is the quote-INSTRUMENT id (`quote_instr_id`);
 /// line 13 `quote_nonce=` is the Quote.quoteId nonce (`quote_nonce`).
@@ -92,6 +109,10 @@ pub struct CanonicalQuoteFields<'a> {
     pub valid_until_micros: i64,
     /// "" = ticketless; the line is emitted regardless (never omitted).
     pub ticket_id: &'a str,
+    /// LP-required fees (Quote.lpFees, fees-design rev 2). None -> v1 message,
+    /// byte-identical to before; Some (must be non-empty) -> v2 message with
+    /// the fee block. NEVER pass Some(vec![]) — Some [] has no encoding.
+    pub lp_fees: Option<Vec<LpFeeSpec<'a>>>,
 }
 
 /// Render a decimal exactly like DAML's `show @Decimal` (Numeric.toUnscaledString):
@@ -109,31 +130,53 @@ pub fn render_decimal(v: Decimal) -> Result<String> {
     Ok(if s.contains('.') { s } else { format!("{s}.0") })
 }
 
-/// The signed payload: exactly 16 `key=value\n` lines in fixed order, trailing
-/// `\n` on the last line. Errors if any value contains a newline.
+/// The signed payload (design §5.1; fees-design §3.6):
+/// * `lp_fees = None` — v1: exactly 16 `key=value\n` lines in fixed order,
+///   byte-identical to the pre-fee format;
+/// * `lp_fees = Some(fees)` (non-empty) — v2: the same 16 lines with line 1
+///   replaced by `msg_type=silvana.atomic-dvp.quote.v2`, then `fee_count=N`
+///   and 4 lines per fee (0-based, list order): fee_<i>_receiver / _admin /
+///   _id / _amount.
+/// Trailing `\n` on every line. Errors if any value contains a newline.
 pub fn build_canonical_message(f: &CanonicalQuoteFields) -> Result<String> {
     let base_amount = render_decimal(f.base_amount)?;
     let quote_amount = render_decimal(f.quote_amount)?;
-    let lines: [(&str, &str); 16] = [
-        ("msg_type", MSG_TYPE),
-        ("lp", f.lp),
-        ("operator", f.operator),
-        ("pair", f.pair),
-        ("base_admin", f.base_admin),
-        ("base_id", f.base_id),
-        ("quote_admin", f.quote_admin),
-        ("quote_id", f.quote_instr_id),
-        ("user", f.user),
-        ("side", f.side.canonical()),
-        ("base_amount", &base_amount),
-        ("quote_amount", &quote_amount),
-        ("quote_nonce", f.quote_nonce),
-        ("created_at_micros", &f.created_at_micros.to_string()),
-        ("valid_until_micros", &f.valid_until_micros.to_string()),
-        ("ticket_id", f.ticket_id),
+    let msg_type = match &f.lp_fees {
+        None => MSG_TYPE,
+        Some(fees) if fees.is_empty() => {
+            bail!("lp_fees must be non-empty when present (Some [] has no canonical encoding)")
+        }
+        Some(_) => MSG_TYPE_V2,
+    };
+    let mut lines: Vec<(String, String)> = vec![
+        ("msg_type".into(), msg_type.into()),
+        ("lp".into(), f.lp.into()),
+        ("operator".into(), f.operator.into()),
+        ("pair".into(), f.pair.into()),
+        ("base_admin".into(), f.base_admin.into()),
+        ("base_id".into(), f.base_id.into()),
+        ("quote_admin".into(), f.quote_admin.into()),
+        ("quote_id".into(), f.quote_instr_id.into()),
+        ("user".into(), f.user.into()),
+        ("side".into(), f.side.canonical().into()),
+        ("base_amount".into(), base_amount),
+        ("quote_amount".into(), quote_amount),
+        ("quote_nonce".into(), f.quote_nonce.into()),
+        ("created_at_micros".into(), f.created_at_micros.to_string()),
+        ("valid_until_micros".into(), f.valid_until_micros.to_string()),
+        ("ticket_id".into(), f.ticket_id.into()),
     ];
+    if let Some(fees) = &f.lp_fees {
+        lines.push(("fee_count".into(), fees.len().to_string()));
+        for (i, fee) in fees.iter().enumerate() {
+            lines.push((format!("fee_{i}_receiver"), fee.receiver.into()));
+            lines.push((format!("fee_{i}_admin"), fee.admin.into()));
+            lines.push((format!("fee_{i}_id"), fee.id.into()));
+            lines.push((format!("fee_{i}_amount"), render_decimal(fee.amount)?));
+        }
+    }
     let mut out = String::new();
-    for (k, v) in lines {
+    for (k, v) in &lines {
         if v.contains('\n') {
             bail!("newline in canonical field {k}");
         }
@@ -328,6 +371,16 @@ mod tests {
                 _ => panic!("bad micros"),
             }
         };
+        let lp_fees = fields.get("lpFees").and_then(|v| v.as_array()).map(|fees| {
+            fees.iter()
+                .map(|f| LpFeeSpec {
+                    receiver: f["receiver"].as_str().unwrap(),
+                    admin: f["admin"].as_str().unwrap(),
+                    id: f["id"].as_str().unwrap(),
+                    amount: Decimal::from_str(f["amount"].as_str().unwrap()).unwrap(),
+                })
+                .collect()
+        });
         CanonicalQuoteFields {
             lp: s("lp"),
             operator: s("operator"),
@@ -344,6 +397,7 @@ mod tests {
             created_at_micros: micros("createdAtMicros"),
             valid_until_micros: micros("validUntilMicros"),
             ticket_id: s("ticketId"),
+            lp_fees,
         }
     }
 
@@ -404,7 +458,29 @@ mod tests {
             assert!(!verify_quote(sig_hex, canonical, wrong_pub) || name == "wrong-key");
             checked += 1;
         }
-        assert!(checked >= 15, "expected the full vector set, got {checked}");
+        assert!(checked >= 20, "expected the full vector set incl. v2 lpfee cases, got {checked}");
+    }
+
+    #[test]
+    fn v2_fee_block_structure() {
+        let v = vectors();
+        let one = v["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "lpfee-one")
+            .expect("lpfee-one vector present");
+        let msg = build_canonical_message(&fields_from_vector(&one["fields"])).unwrap();
+        let lines: Vec<&str> = msg.trim_end_matches('\n').split('\n').collect();
+        assert_eq!(lines.len(), 21);
+        assert_eq!(lines[0], "msg_type=silvana.atomic-dvp.quote.v2");
+        assert_eq!(lines[16], "fee_count=1");
+        assert!(lines[17].starts_with("fee_0_receiver="));
+        assert!(lines[20].starts_with("fee_0_amount="));
+        // Some [] has no encoding
+        let mut empty = fields_from_vector(&one["fields"]);
+        empty.lp_fees = Some(vec![]);
+        assert!(build_canonical_message(&empty).is_err());
     }
 
     #[test]

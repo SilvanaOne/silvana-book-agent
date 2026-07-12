@@ -122,6 +122,9 @@ pub fn envelope_from_proto(env: &AtomicQuoteEnvelope) -> Result<QuoteEnvelope> {
             quote_amount: quote.quote_amount.clone(),
             created_at_micros: quote.created_at_micros.to_string(),
             valid_until_micros: quote.valid_until_micros.to_string(),
+            // RFQ-v2 transport is fee-less for now (v1 message); LP-required
+            // fees arrive with the proto extension (fees-design rev 2).
+            lp_fees: None,
         },
         canonical_message: env.canonical_message.clone(),
         quote_signature: env.quote_signature.clone(),
