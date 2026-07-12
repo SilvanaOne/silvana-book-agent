@@ -35,7 +35,7 @@ pub struct InstrumentIdJson {
 }
 
 /// One LP-required fee — the Daml `FeeSpec` record as Ledger-API JSON
-/// (fees-design rev 2). Part of the SIGNED quote (canonical message v2).
+/// (fees-design rev 2). Part of the SIGNED quote (canonical message v4).
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LpFeeJson {
@@ -57,9 +57,10 @@ pub struct QuoteJson {
     pub quote_amount: String,
     pub created_at_micros: String,
     pub valid_until_micros: String,
-    /// Quote.lpFees: None = no LP-required fees (v1 message, byte-identical to
-    /// pre-fee envelopes); Some (non-empty) = v2 message. serde(default) keeps
-    /// old envelope files parseable.
+    /// Quote.lpFees: None = no LP-required fees (v3 message); Some (non-empty)
+    /// = v4 message. serde(default) keeps old envelope files parseable.
+    /// The ENVELOPE wrapper format is unchanged (still envelope.v1) — only the
+    /// dvp payload shape (provider field) and the message version moved.
     #[serde(default)]
     pub lp_fees: Option<Vec<LpFeeJson>>,
 }
@@ -109,7 +110,7 @@ pub fn canonical_from_dvp(dvp_payload: &Value, quote: &QuoteJson) -> Result<Stri
     };
     let fields = CanonicalQuoteFields {
         lp: s("/lp")?,
-        operator: s("/operator")?,
+        provider: s("/provider")?,
         pair: s("/pairName")?,
         base_admin: s("/baseInstrumentId/admin")?,
         base_id: s("/baseInstrumentId/id")?,
@@ -214,7 +215,7 @@ mod tests {
         let kf = crate::gen_keypair().unwrap();
         let dvp_payload = json!({
             "lp": "lp::1220aa",
-            "operator": "op::1220bb",
+            "provider": "prov::1220bb",
             "pairName": "CC-USDC",
             "baseInstrumentId": {"admin": "dso::1220cc", "id": "Amulet"},
             "quoteInstrumentId": {"admin": "reg::1220dd", "id": "USDC"},
@@ -238,7 +239,7 @@ mod tests {
             synchronizer_id: "sync::1".into(),
             dvp: AcsContractJson {
                 contract_id: "00venue".into(),
-                template_id: "#atomic-dvp-v1:AtomicDVP:AtomicDVP".into(),
+                template_id: "#atomic-dvp-v2:AtomicDVP:AtomicDVP".into(),
                 created_event_blob: "blob".into(),
                 payload: dvp_payload,
             },

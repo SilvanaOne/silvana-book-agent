@@ -1,10 +1,11 @@
 //! AtomicDVP canonical quote message + secp256k1 quote-key signing.
 //!
 //! Byte-exact Rust replica of what the on-ledger choice reconstructs
-//! (`canonicalQuoteMessage` in atomic-dvp-v1) and what `DA.Crypto.Text.secp256k1`
+//! (`canonicalQuoteMessage` in atomic-dvp-v2) and what `DA.Crypto.Text.secp256k1`
 //! verifies: ECDSA/secp256k1 over SHA256(utf8(canonical_message)), ASN.1 DER
 //! signature (lowercase hex), X.509 SPKI public key with an uncompressed point
-//! (lowercase hex). Spec: atomic-dvp/plans/atomic-dvp-design.md §5; reference
+//! (lowercase hex). Spec: atomic-dvp/plans/atomic-dvp-design.md §5 +
+//! atomic-dvp-fa-design.md §4 (v3/v4: line 3 is `provider=`); reference
 //! implementations: the DAML module and tests/.../helpers/quoteSigner.ts.
 //! Proven against the committed cross-language golden vectors (see tests below).
 //!
@@ -23,12 +24,12 @@ use std::path::{Path, PathBuf};
 
 pub mod envelope;
 
-pub const MSG_TYPE: &str = "silvana.atomic-dvp.quote.v1";
+pub const MSG_TYPE: &str = "silvana.atomic-dvp.quote.v3";
 
-/// v2 = v1 + the LP-required fee block (atomic-dvp fees-design §3.6). Selected
+/// v4 = v3 + the LP-required fee block (atomic-dvp fees-design §3.6). Selected
 /// automatically by `lp_fees` presence; the two formats differ at line 1, so no
 /// byte string verifies under both (domain separation).
-pub const MSG_TYPE_V2: &str = "silvana.atomic-dvp.quote.v2";
+pub const MSG_TYPE_V4: &str = "silvana.atomic-dvp.quote.v4";
 
 /// Signing-scheme identifier for the quote signature.
 pub const SIGNING_SCHEME: &str = "secp256k1-sha256-v1";
@@ -94,7 +95,7 @@ pub struct LpFeeSpec<'a> {
 /// line 13 `quote_nonce=` is the Quote.quoteId nonce (`quote_nonce`).
 pub struct CanonicalQuoteFields<'a> {
     pub lp: &'a str,
-    pub operator: &'a str,
+    pub provider: &'a str,
     pub pair: &'a str,
     pub base_admin: &'a str,
     pub base_id: &'a str,
@@ -109,9 +110,9 @@ pub struct CanonicalQuoteFields<'a> {
     pub valid_until_micros: i64,
     /// "" = ticketless; the line is emitted regardless (never omitted).
     pub ticket_id: &'a str,
-    /// LP-required fees (Quote.lpFees, fees-design rev 2). None -> v1 message,
-    /// byte-identical to before; Some (must be non-empty) -> v2 message with
-    /// the fee block. NEVER pass Some(vec![]) — Some [] has no encoding.
+    /// LP-required fees (Quote.lpFees, fees-design rev 2). None -> v3 message;
+    /// Some (must be non-empty) -> v4 message with the fee block. NEVER pass
+    /// Some(vec![]) — Some [] has no encoding.
     pub lp_fees: Option<Vec<LpFeeSpec<'a>>>,
 }
 
@@ -130,11 +131,11 @@ pub fn render_decimal(v: Decimal) -> Result<String> {
     Ok(if s.contains('.') { s } else { format!("{s}.0") })
 }
 
-/// The signed payload (design §5.1; fees-design §3.6):
-/// * `lp_fees = None` — v1: exactly 16 `key=value\n` lines in fixed order,
-///   byte-identical to the pre-fee format;
-/// * `lp_fees = Some(fees)` (non-empty) — v2: the same 16 lines with line 1
-///   replaced by `msg_type=silvana.atomic-dvp.quote.v2`, then `fee_count=N`
+/// The signed payload (design §5.1; fees-design §3.6; fa-design §4 — line 3
+/// carries the venue's `provider`):
+/// * `lp_fees = None` — v3: exactly 16 `key=value\n` lines in fixed order;
+/// * `lp_fees = Some(fees)` (non-empty) — v4: the same 16 lines with line 1
+///   replaced by `msg_type=silvana.atomic-dvp.quote.v4`, then `fee_count=N`
 ///   and 4 lines per fee (0-based, list order): fee_<i>_receiver / _admin /
 ///   _id / _amount.
 /// Trailing `\n` on every line. Errors if any value contains a newline.
@@ -146,12 +147,12 @@ pub fn build_canonical_message(f: &CanonicalQuoteFields) -> Result<String> {
         Some(fees) if fees.is_empty() => {
             bail!("lp_fees must be non-empty when present (Some [] has no canonical encoding)")
         }
-        Some(_) => MSG_TYPE_V2,
+        Some(_) => MSG_TYPE_V4,
     };
     let mut lines: Vec<(String, String)> = vec![
         ("msg_type".into(), msg_type.into()),
         ("lp".into(), f.lp.into()),
-        ("operator".into(), f.operator.into()),
+        ("provider".into(), f.provider.into()),
         ("pair".into(), f.pair.into()),
         ("base_admin".into(), f.base_admin.into()),
         ("base_id".into(), f.base_id.into()),
@@ -383,7 +384,7 @@ mod tests {
         });
         CanonicalQuoteFields {
             lp: s("lp"),
-            operator: s("operator"),
+            provider: s("provider"),
             pair: s("pair"),
             base_admin: s("baseAdmin"),
             base_id: s("baseId"),
@@ -458,11 +459,11 @@ mod tests {
             assert!(!verify_quote(sig_hex, canonical, wrong_pub) || name == "wrong-key");
             checked += 1;
         }
-        assert!(checked >= 20, "expected the full vector set incl. v2 lpfee cases, got {checked}");
+        assert!(checked >= 20, "expected the full vector set incl. v4 lpfee cases, got {checked}");
     }
 
     #[test]
-    fn v2_fee_block_structure() {
+    fn v4_fee_block_structure() {
         let v = vectors();
         let one = v["cases"]
             .as_array()
@@ -473,7 +474,7 @@ mod tests {
         let msg = build_canonical_message(&fields_from_vector(&one["fields"])).unwrap();
         let lines: Vec<&str> = msg.trim_end_matches('\n').split('\n').collect();
         assert_eq!(lines.len(), 21);
-        assert_eq!(lines[0], "msg_type=silvana.atomic-dvp.quote.v2");
+        assert_eq!(lines[0], "msg_type=silvana.atomic-dvp.quote.v4");
         assert_eq!(lines[16], "fee_count=1");
         assert!(lines[17].starts_with("fee_0_receiver="));
         assert!(lines[20].starts_with("fee_0_amount="));
@@ -509,7 +510,7 @@ mod tests {
     #[test]
     fn keypair_roundtrip() {
         let kf = gen_keypair().unwrap();
-        let msg = "msg_type=silvana.atomic-dvp.quote.v1\nlp=lp\n";
+        let msg = "msg_type=silvana.atomic-dvp.quote.v3\nlp=lp\n";
         let sig = sign_quote(&kf.priv_scalar_hex, msg).unwrap();
         assert!(verify_quote(&sig, msg, &kf.pub_spki_hex));
         assert!(!verify_quote(&sig, "tampered", &kf.pub_spki_hex));
