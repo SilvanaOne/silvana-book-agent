@@ -19,8 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ledger.proto has been split into per-domain files; all share the
     // silvana.ledger.v1 package and compile into a single descriptor pool.
+    // bridge.proto cross-imports silvana/rfqv2/v1/atomic_ledger.proto (rev 3:
+    // the shared tunnel carries the atomic RPCs), so the silvana.rfqv2.v1
+    // files MUST be compiled in the same unit — prost emits relative
+    // super::…::rfqv2::v1 paths in the generated ledger code.
     let ledger_proto_dir = "../../proto/silvana/ledger/v1";
-    let ledger_protos: Vec<String> = [
+    let rfqv2_proto_dir = "../../proto/silvana/rfqv2/v1";
+    let mut ledger_protos: Vec<String> = [
         "common.proto",
         "queries.proto",
         "onboarding.proto",
@@ -39,6 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .iter()
     .map(|f| format!("{}/{}", ledger_proto_dir, f))
     .collect();
+    ledger_protos.extend(
+        ["rfqv2.proto", "atomic_ledger.proto"]
+            .iter()
+            .map(|f| format!("{}/{}", rfqv2_proto_dir, f)),
+    );
     // tonic-prost-build's compile_with_config requires both `protos` and
     // `includes` slices to use the same generic type — so for the ledger
     // call (which uses Vec<String>) we need a String-typed include list.
@@ -119,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &proto_includes
         )?;
 
-    // Configure for ledger protos (split into multiple files in same package)
+    // Configure for ledger + rfqv2 protos (one compile unit; see note above)
     let mut config_ledger = Config::new();
     config_ledger.protoc_arg("--experimental_allow_proto3_optional");
 
@@ -149,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../../proto/silvana/settlement/");
     println!("cargo:rerun-if-changed=../../proto/silvana/pricing/");
     println!("cargo:rerun-if-changed=../../proto/silvana/ledger/");
+    println!("cargo:rerun-if-changed=../../proto/silvana/rfqv2/");
 
     Ok(())
 }

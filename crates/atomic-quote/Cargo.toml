@@ -1,0 +1,17 @@
+[package]
+name = "atomic-quote"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AtomicDVP canonical quote message + secp256k1 quote-key signing (silvana.atomic-dvp.quote.v1)"
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand.workspace = true
+rust_decimal = { version = "1.36", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

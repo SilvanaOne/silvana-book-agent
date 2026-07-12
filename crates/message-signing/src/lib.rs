@@ -313,6 +313,134 @@ pub fn canonical_params_faucet(token_name: &str, token_admin: &str, ticket: &str
 }
 
 // ============================================================================
+// Canonical payload builders — RFQ V2 (AtomicDVP), PrepareAtomicTransactionRequest
+//
+// V2 operation identity is the params oneof ARM (the v1 TransactionOperation
+// enum is not used), so the wrapper carries the param_type-bearing params
+// canonical directly. Disclosure blobs are deliberately EXCLUDED from the
+// canonicals: blob <-> contract-id integrity is enforced by Canton at exercise
+// time; only the cids are covered.
+// ============================================================================
+
+/// Canonical payload for PrepareAtomicTransactionRequest.
+pub fn canonical_prepare_atomic_request(params_canonical: &str) -> Vec<u8> {
+    format!(
+        "msg_type=PrepareAtomicTransactionRequest\n{}",
+        params_canonical
+    )
+    .into_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_params_atomic_dvp_settle(
+    venue_cid: &str,
+    quote_id: &str,
+    ticket_id: &str,
+    user: &str,
+    side: &str,
+    base_amount: &str,
+    quote_amount: &str,
+    created_at_micros: i64,
+    valid_until_micros: i64,
+    quote_signature_der_hex: &str,
+    ticket_cid: Option<&str>,
+    lp_input_holding_cids: &[String],
+    user_input_holding_cids: &[String],
+) -> String {
+    let mut s = format!(
+        "param_type=AtomicDvpSettle\nvenue_cid={}\nquote_id={}\nticket_id={}\nuser={}\nside={}\nbase_amount={}\nquote_amount={}\ncreated_at_micros={}\nvalid_until_micros={}\nquote_signature={}\n",
+        venue_cid,
+        quote_id,
+        ticket_id,
+        user,
+        side,
+        base_amount,
+        quote_amount,
+        created_at_micros,
+        valid_until_micros,
+        quote_signature_der_hex
+    );
+    if let Some(t) = ticket_cid {
+        s.push_str(&format!("ticket_cid={}\n", t));
+    }
+    s.push_str(&format!("lp_input_holding_cids={}\n", lp_input_holding_cids.join(",")));
+    s.push_str(&format!("user_input_holding_cids={}\n", user_input_holding_cids.join(",")));
+    s
+}
+
+pub fn canonical_params_create_ticket_service() -> String {
+    "param_type=CreateTicketService\n".to_string()
+}
+
+pub fn canonical_params_issue_tickets(ticket_ids: &[String]) -> String {
+    format!(
+        "param_type=IssueTickets\nticket_ids={}\n",
+        ticket_ids.join(",")
+    )
+}
+
+pub fn canonical_params_split_holdings(
+    ticket_service_cid: &str,
+    instrument_id: &str,
+    instrument_admin: &str,
+    splits: &[(String, u32)],
+    input_holding_cids: &[String],
+) -> String {
+    let splits_joined = splits
+        .iter()
+        .map(|(amount, count)| format!("{}x{}", amount, count))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "param_type=SplitHoldings\nticket_service_cid={}\ninstrument_id={}\ninstrument_admin={}\nsplits={}\ninput_holding_cids={}\n",
+        ticket_service_cid,
+        instrument_id,
+        instrument_admin,
+        splits_joined,
+        input_holding_cids.join(",")
+    )
+}
+
+pub fn canonical_params_create_atomic_dvp_venue(
+    pair_name: &str,
+    base_instrument_id: &str,
+    base_instrument_admin: &str,
+    quote_instrument_id: &str,
+    quote_instrument_admin: &str,
+    quote_public_key_spki_hex: &str,
+    operator_party: Option<&str>,
+) -> String {
+    let mut s = format!(
+        "param_type=CreateAtomicDvpVenue\npair_name={}\nbase_instrument_id={}\nbase_instrument_admin={}\nquote_instrument_id={}\nquote_instrument_admin={}\nquote_public_key={}\n",
+        pair_name,
+        base_instrument_id,
+        base_instrument_admin,
+        quote_instrument_id,
+        quote_instrument_admin,
+        quote_public_key_spki_hex
+    );
+    if let Some(op) = operator_party {
+        s.push_str(&format!("operator_party={}\n", op));
+    }
+    s
+}
+
+pub fn canonical_params_update_venue_key(venue_cid: &str, new_quote_public_key_spki_hex: &str) -> String {
+    format!(
+        "param_type=UpdateVenueKey\nvenue_cid={}\nnew_quote_public_key={}\n",
+        venue_cid, new_quote_public_key_spki_hex
+    )
+}
+
+pub fn canonical_params_cancel_tickets(ticket_service_cid: &str, ticket_cids: &[String]) -> String {
+    format!(
+        "param_type=CancelTickets\nticket_service_cid={}\nticket_cids={}\n",
+        ticket_service_cid,
+        ticket_cids.join(",")
+    )
+}
+
+// ============================================================================
 // Canonical payload builders — Onboarding RPCs
 //
 // Used by RegisterAgent, GetOnboardingStatus, and SubmitOnboardingSignature.

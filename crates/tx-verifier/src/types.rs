@@ -101,6 +101,56 @@ pub enum OperationExpectation {
     TerminateLock {
         party: String,
     },
+    /// RFQ V2 (AtomicDVP) single-transaction settle — the user's own funds are
+    /// at risk, so `user_input_holding_cids` must match the prepared exercise
+    /// exactly (Phase-B inspector). Until Phase B, the H14 envelope pre-check
+    /// in the agent is the effective guard.
+    AtomicDvpSettle {
+        user_party: String,
+        venue_cid: String,
+        template_id: String, // "#atomic-dvp-v1:AtomicDVP:AtomicDVP"
+        quote_id: String,
+        ticket_id: String,
+        ticket_cid: Option<String>,
+        side: String,
+        base_amount: String,
+        quote_amount: String,
+        lp_party: String,
+        base_instrument_id: String,
+        base_instrument_admin: String,
+        quote_instrument_id: String,
+        quote_instrument_admin: String,
+        valid_until_micros: i64,
+        lp_input_holding_cids: Vec<String>,
+        user_input_holding_cids: Vec<String>,
+    },
+    CreateTicketService {
+        lp_party: String,
+    },
+    IssueTickets {
+        lp_party: String,
+        ticket_count: usize,
+    },
+    SplitHoldings {
+        lp_party: String,
+        instrument_id: String,
+        split_count: usize,
+        input_cids: Vec<String>,
+    },
+    CreateAtomicDvpVenue {
+        lp_party: String,
+        pair_name: String,
+        quote_public_key_spki_hex: String,
+    },
+    UpdateVenueKey {
+        lp_party: String,
+        venue_cid: String,
+        new_key_spki_hex: String,
+    },
+    CancelTickets {
+        lp_party: String,
+        ticket_count: usize,
+    },
 }
 
 /// Result of transaction verification

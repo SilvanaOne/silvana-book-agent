@@ -46,6 +46,39 @@ pub struct SavedState {
     /// Flow tracker state for depletion detection (restored on restart)
     #[serde(default)]
     pub flow_tracker: Vec<SavedTokenFlow>,
+    /// RFQ V2: SettlementTicket pool state (blobs NOT persisted — re-fetched
+    /// from the ACS after restart)
+    #[serde(default)]
+    pub atomic_tickets: Vec<SavedTicket>,
+    /// RFQ V2: Confirmed quotes still inside their signed validity window —
+    /// their holdings/ticket reservations must be restored BEFORE the first
+    /// ACS refresh so a restarted LP never double-discloses them
+    #[serde(default)]
+    pub pending_v2_quotes: Vec<SavedPendingV2>,
+}
+
+/// Serializable RFQ V2 SettlementTicket pool entry
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedTicket {
+    pub ticket_id: String,
+    pub contract_id: String,
+    /// "free" | "assigned" | "spent"
+    pub status: String,
+    /// quote_id when status == "assigned"
+    pub quote_id: Option<String>,
+    /// Wall-clock assignment expiry (epoch ms) when status == "assigned"
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Serializable RFQ V2 Confirmed quote (hard reserve backing a live envelope)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedPendingV2 {
+    pub quote_id: String,
+    pub market_id: String,
+    pub holding_cids: Vec<String>,
+    /// "" = ticketless
+    pub ticket_id: String,
+    pub valid_until_micros: i64,
 }
 
 /// Serializable mirror of `TrackedOrder` from order_tracker.rs
@@ -121,6 +154,8 @@ impl SavedState {
             quoted_rfq_trades: Vec::new(),
             fill_state: None,
             flow_tracker: Vec::new(),
+            atomic_tickets: Vec::new(),
+            pending_v2_quotes: Vec::new(),
         }
     }
 }
@@ -274,6 +309,13 @@ pub fn prune_state(state: &mut SavedState) {
     state
         .accepted_rfq_trades
         .retain(|t| active_proposal_ids.contains(t.proposal_id.as_str()));
+
+    // Drop V2 quotes whose signed window (+ a generous grace) has passed —
+    // the on-ledger window check makes a late settle impossible.
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    state
+        .pending_v2_quotes
+        .retain(|q| q.valid_until_micros + 120_000_000 > now_micros);
 
     info!(
         "State pruned: orders {}->{} (removed {}, fixed {} stale pending), \

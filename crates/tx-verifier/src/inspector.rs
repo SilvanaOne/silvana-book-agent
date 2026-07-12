@@ -2255,6 +2255,24 @@ pub fn inspect(
             format!("ResizeLock({})", new_amount)
         }
         OperationExpectation::TerminateLock { .. } => "TerminateLock".to_string(),
+        OperationExpectation::AtomicDvpSettle { quote_id, ticket_id, .. } => {
+            let mode = if ticket_id.is_empty() { "ticketless" } else { "ticketed" };
+            format!("AtomicDvpSettle({}, {})", quote_id, mode)
+        }
+        OperationExpectation::CreateTicketService { .. } => "CreateTicketService".to_string(),
+        OperationExpectation::IssueTickets { ticket_count, .. } => {
+            format!("IssueTickets({} tickets)", ticket_count)
+        }
+        OperationExpectation::SplitHoldings { instrument_id, split_count, .. } => {
+            format!("SplitHoldings({} {} splits)", split_count, instrument_id)
+        }
+        OperationExpectation::CreateAtomicDvpVenue { pair_name, .. } => {
+            format!("CreateAtomicDvpVenue({})", pair_name)
+        }
+        OperationExpectation::UpdateVenueKey { .. } => "UpdateVenueKey".to_string(),
+        OperationExpectation::CancelTickets { ticket_count, .. } => {
+            format!("CancelTickets({} tickets)", ticket_count)
+        }
     };
 
     // Verbose: dump full JSON

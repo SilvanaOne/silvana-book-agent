@@ -1234,3 +1234,478 @@ fn sign_hash_bytes(private_key_bytes: &[u8; 32], hash_bytes: &[u8]) -> Result<St
     Ok(BASE64.encode(signature.to_bytes()))
 }
 
+// ============================================================================
+// RFQ V2 (AtomicDVP) — AtomicDvpProviderService client
+// ============================================================================
+
+use orderbook_proto::rfqv2::{
+    atomic_dvp_provider_service_client::AtomicDvpProviderServiceClient,
+    prepare_atomic_transaction_request::Params as AtomicParams,
+    AtomicMessageSignature, ExecuteAtomicTransactionResponse as AtomicExecuteResponse,
+    ExecuteAtomicTransactionRequest, GetAtomicContractsRequest, GetAtomicContractsResponse,
+    PrepareAtomicTransactionRequest, PrepareAtomicTransactionResponse,
+};
+
+/// Marker prefix for ambiguous execute failures (the settle MAY have landed on
+/// ledger despite the error). Callers MUST reconcile via ledger state before
+/// re-quoting — see [`is_ambiguous_execute_error`].
+pub const ATOMIC_EXECUTE_AMBIGUOUS: &str = "ATOMIC_EXECUTE_AMBIGUOUS";
+
+/// True when an error from [`AtomicProviderClient::submit_atomic_transaction`]
+/// means the transaction may have committed (recovery scan unavailable) — the
+/// caller must reconcile before retrying with different inputs.
+pub fn is_ambiguous_execute_error(err: &anyhow::Error) -> bool {
+    format!("{:#}", err).contains(ATOMIC_EXECUTE_AMBIGUOUS)
+}
+
+/// Build the canonical payload for a PrepareAtomicTransactionRequest.
+/// V2 operation identity = the params oneof arm (no operation int); field
+/// order per arm matches the message-signing canonical builders exactly —
+/// the ledger-service verify arms must use the same builders.
+pub fn build_canonical_from_prepare_atomic_request(
+    req: &PrepareAtomicTransactionRequest,
+) -> Result<Vec<u8>> {
+    let params = req
+        .params
+        .as_ref()
+        .context("PrepareAtomicTransactionRequest missing params")?;
+    let params_canonical = match params {
+        AtomicParams::AtomicDvpSettle(p) => {
+            let quote = p
+                .quote
+                .as_ref()
+                .context("AtomicDvpSettleParams missing quote")?;
+            message_signing::canonical_params_atomic_dvp_settle(
+                &p.venue_cid,
+                &quote.quote_id,
+                &quote.ticket_id,
+                &quote.user,
+                &quote.side,
+                &quote.base_amount,
+                &quote.quote_amount,
+                quote.created_at_micros,
+                quote.valid_until_micros,
+                &p.quote_signature_der_hex,
+                p.ticket_cid.as_deref(),
+                &p.lp_input_holding_cids,
+                &p.user_input_holding_cids,
+            )
+        }
+        AtomicParams::CreateTicketService(_) => {
+            message_signing::canonical_params_create_ticket_service()
+        }
+        AtomicParams::IssueTickets(p) => {
+            message_signing::canonical_params_issue_tickets(&p.ticket_ids)
+        }
+        AtomicParams::SplitHoldings(p) => {
+            let splits: Vec<(String, u32)> =
+                p.splits.iter().map(|s| (s.amount.clone(), s.count)).collect();
+            message_signing::canonical_params_split_holdings(
+                &p.ticket_service_cid,
+                &p.instrument_id,
+                &p.instrument_admin,
+                &splits,
+                &p.input_holding_cids,
+            )
+        }
+        AtomicParams::CreateAtomicDvpVenue(p) => {
+            message_signing::canonical_params_create_atomic_dvp_venue(
+                &p.pair_name,
+                &p.base_instrument_id,
+                &p.base_instrument_admin,
+                &p.quote_instrument_id,
+                &p.quote_instrument_admin,
+                &p.quote_public_key_spki_hex,
+                p.operator_party.as_deref(),
+            )
+        }
+        AtomicParams::UpdateVenueKey(p) => message_signing::canonical_params_update_venue_key(
+            &p.venue_cid,
+            &p.new_quote_public_key_spki_hex,
+        ),
+        AtomicParams::CancelTickets(p) => message_signing::canonical_params_cancel_tickets(
+            &p.ticket_service_cid,
+            &p.ticket_cids,
+        ),
+    };
+    Ok(message_signing::canonical_prepare_atomic_request(&params_canonical))
+}
+
+/// Client for the AtomicDvpProviderService gRPC API (RFQ V2 / AtomicDVP).
+/// Twin of [`DAppProviderClient`] — same auth, signing, and verification
+/// machinery over the V2-isolated service.
+pub struct AtomicProviderClient {
+    client: AtomicDvpProviderServiceClient<
+        tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>,
+    >,
+    party_id: String,
+    private_key_bytes: [u8; 32],
+    ledger_service_public_key: [u8; 32],
+}
+
+impl AtomicProviderClient {
+    /// Create a new AtomicProviderClient (same 9-arg shape as DAppProviderClient::new)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        grpc_url: &str,
+        party_id: &str,
+        role: &str,
+        private_key_bytes: &[u8; 32],
+        ttl_secs: u64,
+        node_name: Option<&str>,
+        ledger_service_public_key: &[u8; 32],
+        connection_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+    ) -> Result<Self> {
+        let channel = DAppProviderClient::create_channel(
+            grpc_url,
+            connection_timeout_secs,
+            request_timeout_secs,
+        )
+        .await?;
+        let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let interceptor = AuthInterceptor {
+            token: Arc::new(RwLock::new(jwt)),
+            expires_at: Arc::new(RwLock::new(now + ttl_secs)),
+            party_id: party_id.to_string(),
+            role: role.to_string(),
+            private_key_bytes: *private_key_bytes,
+            ttl_secs,
+            node_name: node_name.map(|s| s.to_string()),
+        };
+        let client = AtomicDvpProviderServiceClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(16 * 1024 * 1024);
+        Ok(Self {
+            client,
+            party_id: party_id.to_string(),
+            private_key_bytes: *private_key_bytes,
+            ledger_service_public_key: *ledger_service_public_key,
+        })
+    }
+
+    fn verify_server_key(&self, public_key_b64url: &str) -> Result<()> {
+        let key = parse_public_key(public_key_b64url)
+            .context("Failed to parse ledger service public key from response")?;
+        if key != self.ledger_service_public_key {
+            return Err(anyhow!(
+                "Ledger service public key mismatch — response key does not match configured LEDGER_SERVICE_PUBLIC_KEY"
+            ));
+        }
+        Ok(())
+    }
+
+    fn sign_as_atomic(&self, canonical: &[u8]) -> AtomicMessageSignature {
+        let sig_data = sign_canonical(&self.private_key_bytes, canonical);
+        AtomicMessageSignature {
+            signature: sig_data.signature_b64,
+            public_key: sig_data.public_key_b64url,
+            signing_scheme: sig_data.signing_scheme,
+        }
+    }
+
+    /// Prepare an atomic transaction (Phase 1): sign the request, verify the
+    /// response + fees signatures.
+    pub async fn prepare_atomic(
+        &mut self,
+        mut req: PrepareAtomicTransactionRequest,
+    ) -> Result<PrepareAtomicTransactionResponse> {
+        let canonical = build_canonical_from_prepare_atomic_request(&req)?;
+        req.request_signature = Some(self.sign_as_atomic(&canonical));
+
+        let resp = self
+            .client
+            .prepare_atomic_transaction(req)
+            .await
+            .map_err(|s| {
+                anyhow!("PrepareAtomicTransaction RPC failed ({}): {}", s.code(), s.message())
+            })?;
+        let response = resp.into_inner();
+
+        let resp_sig = response
+            .response_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing response_signature from ledger service"))?;
+        self.verify_server_key(&resp_sig.public_key)?;
+        let canonical_resp = canonical_prepare_response(
+            &response.transaction_id,
+            &response.prepared_transaction_hash,
+            &response.command_id,
+            &response.prepared_transaction,
+            &response.hashing_scheme_version,
+        );
+        verify_canonical(
+            &self.ledger_service_public_key,
+            &canonical_resp,
+            &resp_sig.signature,
+            &resp_sig.signing_scheme,
+        )
+        .context("PrepareAtomicTransaction response signature verification failed")?;
+
+        let fees_sig = response
+            .fees_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing fees_signature from ledger service"))?;
+        self.verify_server_key(&fees_sig.public_key)?;
+        let fees_canonical = message_signing::canonical_tx_fees_authorization(
+            &self.party_id,
+            &response.transaction_id,
+            &response.fees_json,
+        );
+        verify_canonical(
+            &self.ledger_service_public_key,
+            &fees_canonical,
+            &fees_sig.signature,
+            &fees_sig.signing_scheme,
+        )
+        .context("PrepareAtomicTransaction fees_signature verification failed")?;
+
+        Ok(response)
+    }
+
+    /// Execute a signed atomic transaction (Phase 2). `fees_json` MUST be the
+    /// exact string echoed from the prepare response.
+    pub async fn execute_atomic(
+        &mut self,
+        transaction_id: &str,
+        signature: &str,
+        fees_json: &str,
+    ) -> Result<AtomicExecuteResponse> {
+        let canonical = canonical_execute_request(transaction_id, signature);
+        let request_signature = Some(self.sign_as_atomic(&canonical));
+
+        let fees_canonical = message_signing::canonical_tx_fees_authorization(
+            &self.party_id,
+            transaction_id,
+            fees_json,
+        );
+        let fees_authorization = Some(self.sign_as_atomic(&fees_canonical));
+
+        let resp = self
+            .client
+            .execute_atomic_transaction(ExecuteAtomicTransactionRequest {
+                transaction_id: transaction_id.to_string(),
+                signature: signature.to_string(),
+                fees_json: fees_json.to_string(),
+                request_signature,
+                fees_authorization,
+            })
+            .await
+            .map_err(|s| {
+                anyhow!("ExecuteAtomicTransaction RPC failed ({}): {}", s.code(), s.message())
+            })?;
+        let response = resp.into_inner();
+
+        // Response canonical: the ExecuteAtomicTransactionResponse's `message`
+        // field maps to the v1 canonical's error_message slot (empty = None);
+        // contract_id / rewards do not exist on the atomic response.
+        let resp_sig = response
+            .response_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing response_signature from ledger service"))?;
+        self.verify_server_key(&resp_sig.public_key)?;
+        let msg_opt = (!response.message.is_empty()).then_some(response.message.as_str());
+        let canonical_resp = canonical_execute_response(
+            response.success,
+            &response.update_id,
+            None,
+            msg_opt,
+            None,
+            None,
+        );
+        verify_canonical(
+            &self.ledger_service_public_key,
+            &canonical_resp,
+            &resp_sig.signature,
+            &resp_sig.signing_scheme,
+        )
+        .context("ExecuteAtomicTransaction response signature verification failed")?;
+
+        Ok(response)
+    }
+
+    /// Discovery + targeted blob backfill for the atomic-dvp templates.
+    pub async fn get_atomic_contracts(
+        &mut self,
+        template_ids: &[String],
+        contract_ids: &[String],
+    ) -> Result<GetAtomicContractsResponse> {
+        let resp = self
+            .client
+            .get_atomic_contracts(GetAtomicContractsRequest {
+                template_ids: template_ids.to_vec(),
+                contract_ids: contract_ids.to_vec(),
+            })
+            .await
+            .map_err(|s| anyhow!("GetAtomicContracts RPC failed ({}): {}", s.code(), s.message()))?;
+        Ok(resp.into_inner())
+    }
+
+    /// High-level: prepare → tx-verify → sign → execute, mirroring
+    /// [`DAppProviderClient::submit_transaction`]. No update-scan recovery here
+    /// (the atomic service exposes no GetUpdates): an execute failure whose
+    /// commit status is unknowable is returned as a distinct
+    /// [`ATOMIC_EXECUTE_AMBIGUOUS`] error so callers can reconcile via ledger
+    /// state before re-quoting (double-fill guard).
+    pub async fn submit_atomic_transaction(
+        &mut self,
+        req: PrepareAtomicTransactionRequest,
+        expectation: &OperationExpectation,
+        verbose: bool,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<AtomicExecuteResponse> {
+        let max_retries = *MAX_RETRIES;
+
+        for attempt in 0..max_retries {
+            // 1. Prepare (fresh contracts each attempt — contracts may become stale)
+            let prepared = match self.prepare_atomic(req.clone()).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                        agent_logic::ledger_health::record_submit_failure();
+                    }
+                    return Err(e);
+                }
+            };
+
+            info!(
+                "Atomic transaction prepared: id={}, command_id={}",
+                prepared.transaction_id, prepared.command_id,
+            );
+
+            // 2. Verify transaction and compute hash
+            let verification = tx_verifier::verify_and_hash(
+                &prepared.prepared_transaction,
+                &prepared.prepared_transaction_hash,
+                &prepared.hashing_scheme_version,
+                expectation,
+                verbose,
+            )?;
+
+            for w in &verification.warnings {
+                warn!("TX verification: {}", w);
+            }
+
+            if dry_run {
+                println!("--- DRY RUN (atomic) ---");
+                println!("Inspection: {}", if verification.accepted { "ACCEPTED" } else { "REJECTED" });
+                println!("Summary: {}", verification.summary);
+                if let Some(reason) = &verification.rejection_reason {
+                    println!("Rejection: {}", reason);
+                }
+                println!("--- NOT SIGNED, NOT EXECUTED ---");
+                return Ok(AtomicExecuteResponse {
+                    success: false,
+                    update_id: String::new(),
+                    message: "dry run — not executed".to_string(),
+                    created_contracts_json: String::new(),
+                    response_signature: None,
+                });
+            }
+
+            if !verification.accepted {
+                if force {
+                    warn!(
+                        "Atomic transaction verification REJECTED but --force is set, proceeding: {}",
+                        verification.rejection_reason.as_deref().unwrap_or("unknown")
+                    );
+                } else {
+                    anyhow::bail!(
+                        "Atomic transaction verification REJECTED: {}",
+                        verification.rejection_reason.unwrap_or_default()
+                    );
+                }
+            }
+
+            // 3. Hash selection (Phase A sentinel = sign server hash)
+            let hash_to_sign = if verification.computed_hash == [0u8; 32] {
+                warn!("Phase A: signing server-provided hash (verification stub active)");
+                BASE64
+                    .decode(&prepared.prepared_transaction_hash)
+                    .context("Failed to decode prepared_transaction_hash")?
+            } else {
+                verification.computed_hash.to_vec()
+            };
+            let signature = sign_hash_bytes(&self.private_key_bytes, &hash_to_sign)?;
+
+            // 4. Execute — echo fees_json verbatim
+            let result = match self
+                .execute_atomic(&prepared.transaction_id, &signature, &prepared.fees_json)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transport error after the execute was sent: the tx may
+                    // have landed. Do NOT blind-retry with a fresh prepare —
+                    // surface a distinct error kind for caller reconciliation.
+                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                        agent_logic::ledger_health::record_submit_failure();
+                    }
+                    return Err(anyhow!(
+                        "{}: execute failed with transport error (tx may have committed): {:#}",
+                        ATOMIC_EXECUTE_AMBIGUOUS,
+                        e
+                    ));
+                }
+            };
+
+            if !result.success {
+                let error_msg = result.message.as_str();
+
+                if error_msg.contains("SEQUENCER_BACKPRESSURE") {
+                    warn!(
+                        "SEQUENCER_BACKPRESSURE on atomic tx (attempt {}/{}) [{}]",
+                        attempt + 1, max_retries, prepared.command_id
+                    );
+                    signal_sequencer_backpressure();
+                }
+
+                // DUPLICATE_COMMAND: the command was accepted earlier — commit
+                // status unknown without an update scan.
+                if error_msg.contains("DUPLICATE_COMMAND") {
+                    agent_logic::ledger_health::record_submit_success();
+                    return Err(anyhow!(
+                        "{}: DUPLICATE_COMMAND (an earlier submission likely committed): {}",
+                        ATOMIC_EXECUTE_AMBIGUOUS,
+                        error_msg
+                    ));
+                }
+
+                // INACTIVE_CONTRACTS: safe to re-prepare (nothing committed)
+                if error_msg.contains("INACTIVE_CONTRACTS") {
+                    if attempt < max_retries - 1 {
+                        warn!(
+                            "INACTIVE_CONTRACTS on atomic tx (attempt {}/{}), re-preparing in 2s [{}]",
+                            attempt + 1, max_retries, prepared.command_id
+                        );
+                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                        continue;
+                    }
+                    anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
+                }
+
+                if attempt < max_retries - 1 {
+                    let delay = BASE_DELAY_MS * 2_u64.pow(attempt);
+                    let jitter = rand::thread_rng().gen_range(0..delay / 10 + 1);
+                    warn!(
+                        "Atomic transaction error (attempt {}/{}): {} — retrying in {}ms [{}]",
+                        attempt + 1, max_retries, error_msg, delay + jitter, prepared.command_id
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
+                    continue;
+                }
+                if agent_logic::ledger_health::is_sequencer_unreachable(error_msg) {
+                    agent_logic::ledger_health::record_submit_failure();
+                }
+                anyhow::bail!("Atomic transaction failed: {}", error_msg);
+            }
+
+            agent_logic::ledger_health::record_submit_success();
+            return Ok(result);
+        }
+
+        unreachable!("Retry loop should have returned or errored")
+    }
+}
+

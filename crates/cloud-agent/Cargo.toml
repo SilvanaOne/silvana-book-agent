@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 # Shared logic
 agent-logic = { path = "../agent-logic" }
+atomic-quote = { path = "../atomic-quote" }
 orderbook-proto = { path = "../orderbook-proto" }
 tx-verifier = { path = "../tx-verifier" }
 message-signing = { path = "../message-signing" }

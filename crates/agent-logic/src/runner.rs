@@ -102,6 +102,13 @@ pub struct AgentOptions {
     pub fill_state: Option<Arc<Mutex<Option<SavedFillState>>>>,
     /// Accept all proposals without verification (for migration from old worker without saved state)
     pub no_reject: bool,
+    /// RFQ V2: snapshot provider invoked at state-save time. The cloud-agent
+    /// supplies a closure snapshotting the ticket pool + Confirmed V2 quotes.
+    /// RESTORE of these is NOT done here: it happens in `run_cloud_agent`
+    /// when the caches are constructed, BEFORE any worker starts.
+    pub atomic_v2_snapshot: Option<
+        Arc<dyn Fn() -> (Vec<crate::state::SavedTicket>, Vec<crate::state::SavedPendingV2>) + Send + Sync>,
+    >,
 }
 
 /// Run the agent event loop
@@ -883,6 +890,20 @@ where
         // Save fill loop state if present
         if let Some(ref fill_state) = options.fill_state {
             saved.fill_state = fill_state.lock().await.clone();
+        }
+
+        // Save RFQ V2 ticket pool + Confirmed quote reservations
+        if let Some(ref snapshot) = options.atomic_v2_snapshot {
+            let (tickets, pending) = snapshot();
+            if !tickets.is_empty() || !pending.is_empty() {
+                info!(
+                    "Saving RFQ V2 state: {} ticket(s), {} pending quote(s)",
+                    tickets.len(),
+                    pending.len()
+                );
+            }
+            saved.atomic_tickets = tickets;
+            saved.pending_v2_quotes = pending;
         }
 
         // Save flow tracker state for depletion detection on restart

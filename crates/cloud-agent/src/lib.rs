@@ -34,20 +34,28 @@ use orderbook_proto::ledger::{
 use tx_verifier::OperationExpectation;
 
 pub mod accept_settle;
-pub mod amulet_cache;
 pub mod acs_worker;
+pub mod atomic_swap;
 pub mod backend;
 pub mod config;
 pub mod fill_loop;
+pub mod holdings_cache;
 pub mod ledger_client;
 pub mod merge_worker;
 pub mod payment_queue;
 pub mod rfq_handler;
+pub mod rfq_v2;
+pub mod split_worker;
+pub mod ticket_pool;
 pub mod topup;
+pub mod updates_worker;
+pub mod venue_registry;
 
 pub use accept_settle::MulticallSettler;
+pub use atomic_swap::AtomicSwapper;
 pub use backend::CloudSettlementBackend;
-pub use ledger_client::DAppProviderClient;
+pub use holdings_cache::HoldingsCache;
+pub use ledger_client::{AtomicProviderClient, DAppProviderClient};
 
 /// Off-chain prepaid traffic balance + credit ceiling, parsed from the
 /// `GetPrepaidTrafficBalance` RPC response into typed Decimals.
@@ -390,6 +398,93 @@ pub enum FaucetCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum AtomicCommands {
+    /// Generate (or load) the local secp256k1 quote-signing keypair — no ledger access
+    Keygen {
+        /// Keyfile path (default: ATOMIC_QUOTE_KEY_FILE env or ./atomic-quote-key.json)
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Create the LP's TicketService (idempotent — prints the existing cid if present)
+    TicketService,
+    /// AtomicDVP venue operations (one venue per LP per market pair)
+    Venue {
+        #[command(subcommand)]
+        command: AtomicVenueCommands,
+    },
+    /// SettlementTicket operations
+    Tickets {
+        #[command(subcommand)]
+        command: AtomicTicketCommands,
+    },
+    /// Split own holdings into pre-set denominations
+    Split {
+        /// Market ID (e.g. "CC-USDC")
+        #[arg(long)]
+        market: String,
+        /// Which leg to split: "base" | "quote"
+        #[arg(long)]
+        instrument: String,
+        /// Split specs, comma-separated "AMOUNTxCOUNT" (e.g. "10x20,100x5")
+        #[arg(long)]
+        splits: String,
+    },
+    /// Read-only status: venues (+ key match), live tickets, denomination histogram
+    Status {
+        /// Restrict to one market (pairName)
+        #[arg(long)]
+        market: Option<String>,
+    },
+    /// Orchestrate LP setup: keygen → ticket-service → venues → receiving
+    /// preapprovals → ticket batch → denomination splits
+    Setup,
+}
+
+#[derive(Subcommand)]
+pub enum AtomicVenueCommands {
+    /// Create the AtomicDVP venue for a market pair
+    Create {
+        /// Market ID (pairName), format "BASE-QUOTE"
+        #[arg(long)]
+        market: String,
+        /// Operator party (default: the server's settlement operator)
+        #[arg(long)]
+        operator: Option<String>,
+        /// Quote keyfile path override
+        #[arg(long)]
+        quote_key_file: Option<String>,
+    },
+    /// Rotate the venue's quote key — KILLS all live envelopes + old-key signatures
+    RotateKey {
+        /// Market ID (pairName)
+        #[arg(long)]
+        market: String,
+        /// Quote keyfile path override
+        #[arg(long)]
+        quote_key_file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AtomicTicketCommands {
+    /// Issue a batch of SettlementTickets (client-generated UUIDv7 ids)
+    Issue {
+        /// Number of tickets to issue
+        #[arg(long)]
+        count: u32,
+    },
+    /// Cancel tickets by contract id, or all live tickets with --all-free
+    Cancel {
+        /// Ticket contract IDs (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        cids: Vec<String>,
+        /// Cancel ALL live tickets owned by this LP
+        #[arg(long)]
+        all_free: bool,
+    },
+}
+
 // ============================================================================
 // Library functions
 // ============================================================================
@@ -455,7 +550,11 @@ pub async fn run_cloud_agent(
         config.depletion_min_hours,
     );
 
-    // Register token aliases from server market data (symbol → instrument_id)
+    // Register token aliases from server market data (symbol → instrument_id).
+    // Also capture market_id → (base_instrument, quote_instrument) for the
+    // RFQ V2 venue validation / split targets.
+    let mut market_instrument_ids: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     {
         let mut client = agent_logic::client::OrderbookClient::new(&config).await?;
         match client.get_markets().await {
@@ -466,6 +565,10 @@ pub async fn run_cloud_agent(
                         liquidity_manager.register_alias(parts[0], &market.base_instrument).await;
                         liquidity_manager.register_alias(parts[1], &market.quote_instrument).await;
                     }
+                    market_instrument_ids.insert(
+                        market.market_id.clone(),
+                        (market.base_instrument.clone(), market.quote_instrument.clone()),
+                    );
                 }
                 info!("Registered token aliases from {} markets", markets.len());
             }
@@ -480,23 +583,79 @@ pub async fn run_cloud_agent(
     // The runner's Ctrl-C handler signals it on first Ctrl-C; every loop with
     // a clone wakes immediately.
     let lp_shutdown = Shutdown::new();
+
+    // RFQ V2 activation: LP-level switch + quote key present (config::assemble
+    // validated the pairing already; this is belt-and-braces).
+    let rfq_v2_cfg = config
+        .liquidity_provider
+        .as_ref()
+        .and_then(|lp| lp.rfq_v2.clone())
+        .filter(|v2| v2.enabled);
+    let rfq_v2_active =
+        config.liquidity_provider.is_some() && rfq_v2_cfg.is_some() && config.atomic_quote_key.is_some();
+
+    // ONE shared multi-instrument holdings pool for RFQ v1 + V2. The splitter
+    // reserve (largest holding per instrument) only exists in V2 mode so plain
+    // v1 deployments keep their exact selection behavior.
+    let holdings_cache = holdings_cache::HoldingsCache::new(rfq_v2_active);
+
+    let mut atomic_v2_snapshot: Option<
+        Arc<
+            dyn Fn() -> (
+                    Vec<agent_logic::state::SavedTicket>,
+                    Vec<agent_logic::state::SavedPendingV2>,
+                ) + Send
+                + Sync,
+        >,
+    > = None;
+
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
         let mut rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
         rfq_handler.set_liquidity_manager(liquidity_manager.clone());
         let quoted_trades = rfq_handler.quoted_trades();
+        let rfq_handler = Arc::new(rfq_handler);
 
         info!(
             "LP mode enabled: name={}, starting settlement stream",
             config.liquidity_provider.as_ref().unwrap().name
         );
-        let config_clone = config.clone();
-        let lp_shutdown_clone = lp_shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_lp_settlement_stream(config_clone, rfq_handler, lp_shutdown_clone).await {
-                tracing::error!("LP settlement stream failed: {}", e);
+        {
+            let config_clone = config.clone();
+            let lp_shutdown_clone = lp_shutdown.clone();
+            let handler = rfq_handler.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_lp_settlement_stream(config_clone, handler, lp_shutdown_clone).await {
+                    tracing::error!("LP settlement stream failed: {}", e);
+                }
+            });
+        }
+
+        // ---- RFQ V2 stack (updates watcher, split/ticket maintenance, atomic stream) ----
+        if rfq_v2_active {
+            let v2cfg = rfq_v2_cfg.clone().expect("checked by rfq_v2_active");
+            let quote_key = config.atomic_quote_key.clone().expect("checked by rfq_v2_active");
+            match setup_rfq_v2(
+                &config,
+                &v2cfg,
+                &quote_key,
+                &market_instrument_ids,
+                rfq_handler.clone(),
+                holdings_cache.clone(),
+                liquidity_manager.clone(),
+                no_restore,
+                version_info,
+                lp_shutdown.clone(),
+            )
+            .await
+            {
+                Ok(snapshot) => atomic_v2_snapshot = Some(snapshot),
+                Err(e) => {
+                    // Never crash v1 over a V2 wiring failure.
+                    tracing::error!("RFQ V2 setup failed — atomic quoting disabled, v1 continues: {:#}", e);
+                }
             }
-        });
+        }
 
         Some(quoted_trades)
     } else {
@@ -506,7 +665,7 @@ pub async fn run_cloud_agent(
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
     let backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock,
-        liquidity_manager, lp_shutdown.clone(),
+        liquidity_manager, lp_shutdown.clone(), holdings_cache,
     );
 
     let ledger_client = DAppProviderClient::new(
@@ -593,12 +752,258 @@ pub async fn run_cloud_agent(
             no_restore,
             fill_state: None,
             no_reject,
+            atomic_v2_snapshot,
         },
     )
     .await
 }
 
+/// Wire the RFQ V2 stack: ticket pool + venue registry + quote state, restore
+/// saved reservations, spawn the updates watcher + maintenance worker, and —
+/// when at least one venue validates — the atomic RFQ stream.
+///
+/// Returns the SavedState snapshot provider for the runner's shutdown save.
+#[allow(clippy::too_many_arguments)]
+async fn setup_rfq_v2(
+    config: &BaseConfig,
+    v2cfg: &agent_logic::config::RfqV2Config,
+    quote_key: &agent_logic::config::AtomicQuoteKey,
+    market_instrument_ids: &std::collections::HashMap<String, (String, String)>,
+    rfq_handler: Arc<rfq_handler::RfqHandler>,
+    holdings_cache: Arc<holdings_cache::HoldingsCache>,
+    liquidity_manager: Arc<agent_logic::liquidity::LiquidityManager>,
+    no_restore: bool,
+    version_info: Option<&str>,
+    lp_shutdown: Shutdown,
+) -> Result<
+    Arc<
+        dyn Fn() -> (
+                Vec<agent_logic::state::SavedTicket>,
+                Vec<agent_logic::state::SavedPendingV2>,
+            ) + Send
+            + Sync,
+    >,
+> {
+    use holdings_cache::{instrument_key, CC_INSTRUMENT};
+
+    let lp_config = config
+        .liquidity_provider
+        .as_ref()
+        .ok_or_else(|| anyhow!("LP config required for RFQ V2"))?;
+
+    // Per-market V2 metadata: resolved instruments, expected venue shape,
+    // split targets.
+    let mut market_v2 = std::collections::HashMap::new();
+    let mut market_instruments = std::collections::HashMap::new();
+    let mut expected_venues = std::collections::HashMap::new();
+    let mut split_targets: Vec<split_worker::SplitTarget> = Vec::new();
+
+    for market in &config.markets {
+        if !market.enabled {
+            continue;
+        }
+        let Some(rfq) = market.rfq.as_ref().filter(|r| r.enabled) else { continue };
+        let Some(v2m) = rfq.v2.as_ref().filter(|v| v.enabled) else { continue };
+
+        // Orderbook instrument ids: server market data, else market_id split.
+        let (base_instr, quote_instr) = market_instrument_ids
+            .get(&market.market_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let parts: Vec<&str> = market.market_id.split('-').collect();
+                if parts.len() == 2 {
+                    (parts[0].to_string(), parts[1].to_string())
+                } else {
+                    (market.market_id.clone(), String::new())
+                }
+            });
+        let (base_ocid, base_admin) = config.resolve_instrument(&base_instr);
+        let (quote_ocid, quote_admin) = config.resolve_instrument(&quote_instr);
+        let base_is_cc = base_ocid == "Amulet";
+        let quote_is_cc = quote_ocid == "Amulet";
+        let base_key = if base_is_cc {
+            CC_INSTRUMENT.to_string()
+        } else {
+            instrument_key(&base_admin, &base_ocid)
+        };
+        let quote_key_instr = if quote_is_cc {
+            CC_INSTRUMENT.to_string()
+        } else {
+            instrument_key(&quote_admin, &quote_ocid)
+        };
+
+        expected_venues.insert(
+            market.market_id.clone(),
+            venue_registry::ExpectedVenue {
+                base_id: base_ocid.clone(),
+                base_admin: base_admin.clone(),
+                quote_id: quote_ocid.clone(),
+                quote_admin: quote_admin.clone(),
+            },
+        );
+        market_instruments.insert(
+            market.market_id.clone(),
+            rfq_v2::MarketInstruments {
+                base_key: base_key.clone(),
+                base_is_cc,
+                quote_key: quote_key_instr.clone(),
+                quote_is_cc,
+            },
+        );
+        market_v2.insert(market.market_id.clone(), v2m.clone());
+
+        let default_rung = market
+            .base_order_size
+            .as_ref()
+            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+            .map(|amt| (amt, lp_config.max_concurrent_rfqs as u32));
+        split_targets.push(split_worker::SplitTarget {
+            market_id: market.market_id.clone(),
+            denominations: v2m.denominations.clone(),
+            default_rung,
+            instruments: vec![
+                split_worker::SplitInstrument {
+                    key: base_key,
+                    is_cc: base_is_cc,
+                    on_chain_id: base_ocid,
+                    admin: base_admin,
+                },
+                split_worker::SplitInstrument {
+                    key: quote_key_instr,
+                    is_cc: quote_is_cc,
+                    on_chain_id: quote_ocid,
+                    admin: quote_admin,
+                },
+            ],
+        });
+    }
+
+    if market_v2.is_empty() {
+        return Err(anyhow!(
+            "liquidity_provider.rfq_v2 is enabled but no enabled market has [markets.rfq.v2] enabled"
+        ));
+    }
+
+    let ticket_pool = v2cfg
+        .ticket_threshold_usd
+        .is_some()
+        .then(|| Arc::new(ticket_pool::TicketPool::new()));
+    let venue_registry = Arc::new(venue_registry::VenueRegistry::new(
+        config.party_id.clone(),
+        quote_key.pub_spki_hex.clone(),
+        expected_venues,
+    ));
+
+    let state = Arc::new(rfq_v2::RfqV2State::new(
+        config.party_id.clone(),
+        lp_config.name.clone(),
+        config.synchronizer_id.clone(),
+        quote_key.priv_scalar_hex.clone(),
+        v2cfg.clone(),
+        market_v2,
+        market_instruments,
+        holdings_cache.clone(),
+        ticket_pool.clone(),
+        venue_registry.clone(),
+        liquidity_manager,
+    ));
+
+    // RESTORE saved V2 state BEFORE any worker starts: an already-delivered
+    // envelope is self-contained (the ledger verifies it), so the reservations
+    // backing it must exist before the first ACS refresh could hand those
+    // holdings to another selection.
+    if !no_restore {
+        if let Some(saved) = agent_logic::state::load_state(&PathBuf::from("agent-state.json"))
+            .filter(|s| s.party_id == config.party_id)
+        {
+            if let Some(pool) = &ticket_pool {
+                pool.restore(saved.atomic_tickets);
+            }
+            state.restore_pending(saved.pending_v2_quotes).await;
+        }
+    }
+
+    // Initial venue discovery + validation
+    let mut discovery_client = DAppProviderClient::new(
+        &config.orderbook_grpc_url,
+        &config.party_id,
+        &config.role,
+        &config.private_key_bytes,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+        &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
+    )
+    .await
+    .context("RFQ V2: failed to create venue discovery client")?;
+    if let Err(e) = venue_registry.refresh(&mut discovery_client).await {
+        tracing::error!("RFQ V2: initial venue refresh failed: {:#}", e);
+    }
+    let validated = venue_registry.validated_market_ids();
+
+    // Workers exist whenever V2 is enabled (cache freshness, ticket refill,
+    // splits) — the quoting stream additionally requires a validated venue.
+    let (settle_tx, settle_rx) = tokio::sync::mpsc::unbounded_channel();
+    updates_worker::spawn_updates_worker(
+        config.clone(),
+        holdings_cache.clone(),
+        ticket_pool.clone(),
+        venue_registry.clone(),
+        settle_tx,
+        v2cfg.updates_poll_interval_secs,
+        lp_shutdown.clone(),
+    );
+    split_worker::spawn_maintenance_worker(
+        config.clone(),
+        holdings_cache,
+        ticket_pool.clone(),
+        split_targets,
+        v2cfg.clone(),
+        lp_shutdown.clone(),
+    );
+
+    if validated.is_empty() {
+        tracing::error!(
+            "RFQ V2 enabled but NO market has a validated AtomicDVP venue — \
+             atomic stream not started (v1 continues). Run `atomic setup` and restart."
+        );
+    } else {
+        info!("RFQ V2 enabled for markets: {:?}", validated);
+        let config_clone = config.clone();
+        let state_clone = state.clone();
+        let agent_version = version_info.unwrap_or("unknown").to_string();
+        let shutdown_clone = lp_shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_lp_atomic_stream(
+                config_clone,
+                rfq_handler,
+                state_clone,
+                settle_rx,
+                agent_version,
+                shutdown_clone,
+            )
+            .await
+            {
+                tracing::error!("LP atomic stream failed: {}", e);
+            }
+        });
+    }
+
+    let pool_for_snap = ticket_pool;
+    let state_for_snap = state;
+    Ok(Arc::new(move || {
+        let tickets = pool_for_snap
+            .as_ref()
+            .map(|p| p.snapshot())
+            .unwrap_or_default();
+        let pending = state_for_snap.snapshot_pending();
+        (tickets, pending)
+    }))
+}
+
 /// Run a buyer/seller fill loop with background settlement processing
+#[allow(clippy::too_many_arguments)]
 pub async fn run_fill(
     config: BaseConfig,
     direction: fill_loop::FillDirection,
@@ -608,6 +1013,7 @@ pub async fn run_fill(
     min_settlement: f64,
     max_settlement: Option<f64>,
     interval: u64,
+    atomic: bool,
     verbose: bool,
     dry_run: bool,
     force: bool,
@@ -617,7 +1023,11 @@ pub async fn run_fill(
         fill_loop::FillDirection::Buy => "buy",
         fill_loop::FillDirection::Sell => "sell",
     };
-    info!("Starting {} mode: market={}, amount={}, interval={}s", dir_str, market, amount, interval);
+    info!(
+        "Starting {} mode: market={}, amount={}, interval={}s{}",
+        dir_str, market, amount, interval,
+        if atomic { " (atomic RFQ V2)" } else { "" }
+    );
 
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
     let fill_lm = agent_logic::liquidity::LiquidityManager::new(
@@ -644,6 +1054,7 @@ pub async fn run_fill(
     let backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock.clone(), fill_lm,
         fill_backend_shutdown.clone(),
+        holdings_cache::HoldingsCache::new(false),
     );
 
     // The fill loop doesn't use the settlement-machine / payment-queue paths.
@@ -655,7 +1066,21 @@ pub async fn run_fill(
         dry_run,
         force,
         confirm,
-        confirm_lock,
+        confirm_lock: confirm_lock.clone(),
+    });
+
+    // RFQ V2 taker driver — shares the backend's holdings cache (its ACS
+    // worker populates every instrument, blobs included).
+    let atomic_swapper = atomic.then(|| {
+        Arc::new(atomic_swap::AtomicSwapper {
+            config: config.clone(),
+            cache: backend.holdings_cache().clone(),
+            verbose,
+            dry_run,
+            force,
+            confirm,
+            confirm_lock,
+        })
     });
 
     let params = fill_loop::FillParams {
@@ -666,6 +1091,7 @@ pub async fn run_fill(
         min_settlement,
         max_settlement: max_settlement.unwrap_or(amount),
         interval_secs: interval,
+        atomic,
     };
 
     // Check for saved fill state
@@ -676,7 +1102,7 @@ pub async fn run_fill(
 
     // Keep `backend` alive so its ACS worker keeps refreshing amulets until return.
     let _backend_guard = backend;
-    let result = fill_loop::run_fill_loop(config, settler, params, saved_fill_state, Some(state_file)).await;
+    let result = fill_loop::run_fill_loop(config, settler, params, atomic_swapper, saved_fill_state, Some(state_file)).await;
     // Signal backend shutdown on natural completion too — covers paths where
     // the fill loop returns without a Ctrl-C (target filled, error, etc.).
     fill_backend_shutdown.signal();
@@ -684,7 +1110,7 @@ pub async fn run_fill(
 }
 
 /// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handler::RfqHandler, shutdown: Shutdown) -> Result<()> {
+pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_handler::RfqHandler>, shutdown: Shutdown) -> Result<()> {
     use orderbook_proto::settlement::{
         settlement_service_client::SettlementServiceClient,
         CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
@@ -951,6 +1377,296 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: rfq_handl
             return Ok(());
         }
         tracing::warn!("LP settlement stream disconnected, reconnecting in 5s");
+        if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+            return Ok(());
+        }
+    }
+}
+
+/// Run the RFQ V2 atomic stream (design §5.5): a second bidi stream parallel
+/// to the v1 settlement stream. Phase 1 (AtomicRfqRequest) prices through the
+/// SHARED v1 pipeline and soft-reserves; phase 2 (RfqConfirmRequest) hard
+/// reserves, signs, and returns the disclosure envelope.
+pub async fn run_lp_atomic_stream(
+    config: BaseConfig,
+    rfq_handler: Arc<rfq_handler::RfqHandler>,
+    state: Arc<rfq_v2::RfqV2State>,
+    mut settle_rx: tokio::sync::mpsc::UnboundedReceiver<rfq_v2::SettleObserved>,
+    agent_version: String,
+    shutdown: Shutdown,
+) -> Result<()> {
+    use orderbook_proto::rfqv2::{
+        atomic_rfq_service_client::AtomicRfqServiceClient,
+        atomic_lp_to_server::Message as LpMessage,
+        atomic_server_to_lp::Message as ServerMessage,
+        AtomicHandshake, AtomicHeartbeat, AtomicLpToServer, AtomicRfqReject,
+    };
+    use tokio_stream::StreamExt;
+
+    let lp_name = state.lp_name().to_string();
+
+    // Settle-observation consumer: lives across stream reconnects so watcher
+    // events are handled even while the stream is down.
+    {
+        let state_clone = state.clone();
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_clone.wait() => return,
+                    obs = settle_rx.recv() => {
+                        match obs {
+                            Some(obs) => {
+                                state_clone.handle_settle_observed(&obs.quote_id, &obs.update_id).await;
+                            }
+                            None => return, // watcher gone
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn now_ts() -> prost_types::Timestamp {
+        prost_types::Timestamp {
+            seconds: chrono::Utc::now().timestamp(),
+            nanos: 0,
+        }
+    }
+    fn wrap(seq: u64, message: LpMessage) -> AtomicLpToServer {
+        AtomicLpToServer {
+            session_id: String::new(),
+            sequence_number: seq,
+            message: Some(message),
+            sent_at: Some(now_ts()),
+        }
+    }
+
+    loop {
+        if shutdown.is_shutting_down() {
+            info!("LP atomic stream shutting down, not reconnecting");
+            return Ok(());
+        }
+
+        info!("Connecting LP atomic stream to {}", config.orderbook_grpc_url);
+
+        let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Atomic stream: failed to connect: {}, retrying in 5s", e);
+                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
+        let mut client = AtomicRfqServiceClient::new(channel)
+            .max_decoding_message_size(16 * 1024 * 1024);
+
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<AtomicLpToServer>(64);
+        let outbound_stream = tokio_stream::wrappers::ReceiverStream::new(outbound_rx);
+
+        let response = match client.atomic_rfq_stream(outbound_stream).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to open atomic RFQ stream: {}, retrying in 5s", e);
+                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
+        let mut inbound = response.into_inner();
+
+        let handshake = wrap(
+            0,
+            LpMessage::Handshake(AtomicHandshake {
+                party_ids: vec![config.party_id.clone()],
+                lp_name: lp_name.clone(),
+                agent_version: agent_version.clone(),
+                market_ids: state.validated_market_ids(),
+            }),
+        );
+        if outbound_tx.send(handshake).await.is_err() {
+            tracing::error!("Atomic stream: failed to send handshake, retrying");
+            if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                return Ok(());
+            }
+            continue;
+        }
+
+        info!("LP atomic stream connected, listening for atomic RFQ requests");
+
+        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+        let mut heartbeat_interval = tokio::time::interval(
+            std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+        );
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat_interval.tick().await; // skip the immediate first tick
+        let mut sweep_interval =
+            tokio::time::interval(std::time::Duration::from_secs(10));
+        sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut client_seq: u64 = 0;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => {
+                    info!("LP atomic stream observed shutdown, breaking inner loop");
+                    break;
+                }
+                _ = heartbeat_interval.tick() => {
+                    client_seq += 1;
+                    let hb = wrap(client_seq, LpMessage::Heartbeat(AtomicHeartbeat { at: Some(now_ts()) }));
+                    if outbound_tx.send(hb).await.is_err() {
+                        tracing::warn!("LP atomic stream send-failed on heartbeat, reconnecting");
+                        break;
+                    }
+                }
+                _ = sweep_interval.tick() => {
+                    // Releases expired soft reserves / hard reserves / ticket
+                    // assignments (traceability row 9)
+                    state.sweep(std::time::Instant::now()).await;
+                }
+                msg_result = inbound.next() => {
+                    let msg = match msg_result {
+                        None => {
+                            tracing::warn!("LP atomic stream ended (None), reconnecting");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("LP atomic stream error: {}", e);
+                            break;
+                        }
+                        Some(Ok(m)) => m,
+                    };
+
+                    match msg.message {
+                        Some(ServerMessage::HandshakeAck(ack)) => {
+                            info!("LP atomic handshake acknowledged: success={} session={}", ack.success, ack.session_id);
+                        }
+                        Some(ServerMessage::Heartbeat(_)) => {
+                            // Server-side keepalive — no action needed.
+                        }
+                        Some(ServerMessage::RfqRequest(request)) => {
+                            if shutdown.is_shutting_down() {
+                                info!("Ignoring atomic RFQ {} - shutting down", request.rfq_id);
+                                break;
+                            }
+                            info!(
+                                "Received atomic RFQ: rfq_id={}, market={}, direction={}, qty={}",
+                                request.rfq_id, request.market_id, request.direction, request.quantity
+                            );
+
+                            let reject = |reason: String, min: String, max: String| {
+                                LpMessage::Reject(AtomicRfqReject {
+                                    rfq_id: request.rfq_id.clone(),
+                                    market_id: request.market_id.clone(),
+                                    reason,
+                                    lp_party_id: config.party_id.clone(),
+                                    min_quantity: min,
+                                    max_quantity: max,
+                                })
+                            };
+
+                            // V2 direction is a string; the shared pricing fn
+                            // takes the v1 i32 enum (1=BUY user buys, 2=SELL)
+                            let direction = match request.direction.to_ascii_lowercase().as_str() {
+                                "buy" => 1,
+                                "sell" => 2,
+                                _ => 0,
+                            };
+
+                            let message = if direction == 0 {
+                                reject(format!("invalid direction '{}'", request.direction), String::new(), String::new())
+                            } else if !state.quotable(&request.market_id) {
+                                reject("market not available for atomic RFQ".to_string(), String::new(), String::new())
+                            } else {
+                                match rfq_handler
+                                    .price_rfq(&request.rfq_id, &request.market_id, direction, &request.quantity)
+                                    .await
+                                {
+                                    Err(r) => reject(
+                                        r.reason_detail.unwrap_or_else(|| format!("{:?}", r.reason)),
+                                        r.min_quantity.unwrap_or_default(),
+                                        r.max_quantity.unwrap_or_default(),
+                                    ),
+                                    Ok(priced) => {
+                                        let quote_id = uuid::Uuid::now_v7().to_string();
+                                        let side = if direction == 1 {
+                                            atomic_quote::QuoteSide::Buy
+                                        } else {
+                                            atomic_quote::QuoteSide::Sell
+                                        };
+                                        match state
+                                            .register_indicative(&quote_id, &request.market_id, side, &priced)
+                                            .await
+                                        {
+                                            Err(e) => reject(e, String::new(), String::new()),
+                                            Ok(()) => {
+                                                let now = chrono::Utc::now();
+                                                let valid_until = now
+                                                    + chrono::Duration::seconds(priced.valid_for_secs as i64);
+                                                LpMessage::Quote(orderbook_proto::rfqv2::AtomicRfqQuote {
+                                                    rfq_id: request.rfq_id.clone(),
+                                                    quote_id,
+                                                    market_id: request.market_id.clone(),
+                                                    direction: request.direction.clone(),
+                                                    price: priced.price_str.clone(),
+                                                    quantity: priced.quantity_str.clone(),
+                                                    quote_quantity: priced.quote_quantity_str.clone(),
+                                                    valid_for_secs: priced.valid_for_secs,
+                                                    valid_until: Some(prost_types::Timestamp {
+                                                        seconds: valid_until.timestamp(),
+                                                        nanos: 0,
+                                                    }),
+                                                    lp_party_id: config.party_id.clone(),
+                                                    lp_name: lp_name.clone(),
+                                                    quoted_at: Some(now_ts()),
+                                                })
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            client_seq += 1;
+                            if outbound_tx.send(wrap(client_seq, message)).await.is_err() {
+                                tracing::error!("Failed to send atomic RFQ response, stream may be closed");
+                                break;
+                            }
+                        }
+                        Some(ServerMessage::ConfirmRequest(req)) => {
+                            info!(
+                                "Received atomic confirm: rfq_id={}, quote_id={}, user={}",
+                                req.rfq_id, req.quote_id, req.user_party
+                            );
+                            let message = match state.handle_confirm(req).await {
+                                Ok(envelope) => LpMessage::Envelope(envelope),
+                                Err(reject) => LpMessage::ConfirmReject(reject),
+                            };
+                            client_seq += 1;
+                            if outbound_tx.send(wrap(client_seq, message)).await.is_err() {
+                                tracing::error!("Failed to send atomic confirm response, stream may be closed");
+                                break;
+                            }
+                        }
+                        None => {
+                            tracing::debug!("LP atomic stream received empty message");
+                        }
+                    }
+                }
+            }
+        }
+
+        if shutdown.is_shutting_down() {
+            info!("LP atomic stream shutting down after disconnect");
+            return Ok(());
+        }
+        tracing::warn!("LP atomic stream disconnected, reconnecting in 5s");
         if shutdown.sleep(std::time::Duration::from_secs(5)).await {
             return Ok(());
         }
@@ -2996,6 +3712,889 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
             ).await?;
 
             println!("Terminate lock submitted, update id: {}", result.update_id);
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Atomic (RFQ V2 / AtomicDVP) commands
+// ============================================================================
+
+/// An on-ledger AtomicDVP venue owned by this LP (CLI view).
+struct AtomicVenueSummary {
+    contract_id: String,
+    pair_name: String,
+    operator: String,
+    base_admin: String,
+    base_id: String,
+    quote_admin: String,
+    quote_id: String,
+    quote_public_key: String,
+}
+
+/// This LP's venues from the ACS (via `GetAtomicContracts`).
+async fn atomic_find_venues(
+    client: &mut AtomicProviderClient,
+    party_id: &str,
+) -> Result<Vec<AtomicVenueSummary>> {
+    let resp = client
+        .get_atomic_contracts(&[venue_registry::TEMPLATE_ATOMIC_DVP.to_string()], &[])
+        .await?;
+    let mut venues = Vec::new();
+    for c in resp.contracts {
+        if !c.template_id.contains("AtomicDVP:AtomicDVP") {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&c.payload_json) else {
+            continue;
+        };
+        let s = |ptr: &str| payload.pointer(ptr).and_then(|v| v.as_str()).map(str::to_string);
+        if s("/lp").as_deref() != Some(party_id) {
+            continue;
+        }
+        venues.push(AtomicVenueSummary {
+            contract_id: c.contract_id,
+            pair_name: s("/pairName").unwrap_or_default(),
+            operator: s("/operator").unwrap_or_default(),
+            base_admin: s("/baseInstrumentId/admin").unwrap_or_default(),
+            base_id: s("/baseInstrumentId/id").unwrap_or_default(),
+            quote_admin: s("/quoteInstrumentId/admin").unwrap_or_default(),
+            quote_id: s("/quoteInstrumentId/id").unwrap_or_default(),
+            quote_public_key: s("/quotePublicKey").unwrap_or_default(),
+        });
+    }
+    Ok(venues)
+}
+
+/// This LP's TicketService contract id, if any.
+async fn atomic_find_ticket_service(
+    client: &mut AtomicProviderClient,
+    party_id: &str,
+) -> Result<Option<String>> {
+    let resp = client
+        .get_atomic_contracts(&[venue_registry::TEMPLATE_TICKET_SERVICE.to_string()], &[])
+        .await?;
+    for c in resp.contracts {
+        let lp = serde_json::from_str::<serde_json::Value>(&c.payload_json)
+            .ok()
+            .and_then(|v| v.get("lp").and_then(|l| l.as_str()).map(str::to_string));
+        if lp.as_deref() == Some(party_id) || lp.is_none() {
+            return Ok(Some(c.contract_id));
+        }
+    }
+    Ok(None)
+}
+
+/// Contract ids of this LP's live SettlementTickets.
+async fn atomic_list_live_tickets(
+    client: &mut AtomicProviderClient,
+    party_id: &str,
+) -> Result<Vec<String>> {
+    let resp = client
+        .get_atomic_contracts(&[venue_registry::TEMPLATE_SETTLEMENT_TICKET.to_string()], &[])
+        .await?;
+    let mut cids = Vec::new();
+    for c in resp.contracts {
+        if !c.template_id.contains("AtomicDVP:SettlementTicket") {
+            continue;
+        }
+        let lp = serde_json::from_str::<serde_json::Value>(&c.payload_json)
+            .ok()
+            .and_then(|v| v.get("lp").and_then(|l| l.as_str()).map(str::to_string));
+        if lp.is_some() && lp.as_deref() != Some(party_id) {
+            continue;
+        }
+        cids.push(c.contract_id);
+    }
+    Ok(cids)
+}
+
+/// Resolve a "BASE-QUOTE" market id to on-chain (id, admin) pairs.
+fn atomic_resolve_market_pair(
+    config: &BaseConfig,
+    market_id: &str,
+) -> Result<((String, String), (String, String))> {
+    let (base, quote) = market_id
+        .split_once('-')
+        .ok_or_else(|| anyhow!("market id '{}' must have the form BASE-QUOTE", market_id))?;
+    let (base_id, base_admin) = config.resolve_instrument(base);
+    let (quote_id, quote_admin) = config.resolve_instrument(quote);
+    if base_admin.is_empty() || quote_admin.is_empty() {
+        return Err(anyhow!(
+            "cannot resolve instrument admins for market {} (base {}: '{}', quote {}: '{}') — \
+             instrument registry not populated",
+            market_id, base, base_admin, quote, quote_admin
+        ));
+    }
+    Ok(((base_id, base_admin), (quote_id, quote_admin)))
+}
+
+/// Split own holdings of one instrument into denomination rungs.
+/// `only_deficit`: only create what's missing per rung `[denom, 2*denom)`
+/// (setup mode); otherwise split exactly the requested rungs. CC uses the v1
+/// `SplitCc` operation; utility instruments go through
+/// `TicketService_SplitHoldings`. Returns the update id, or None when there
+/// was nothing to do.
+#[allow(clippy::too_many_arguments)]
+async fn atomic_split_denominations(
+    config: &BaseConfig,
+    on_chain_id: &str,
+    admin: &str,
+    rungs: &[(rust_decimal::Decimal, u32)],
+    only_deficit: bool,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+) -> Result<Option<String>> {
+    use rust_decimal::Decimal;
+
+    let is_cc = on_chain_id == "Amulet";
+    let instr_key = if is_cc {
+        holdings_cache::CC_INSTRUMENT.to_string()
+    } else {
+        holdings_cache::instrument_key(admin, on_chain_id)
+    };
+
+    let mut v1_client = atomic_swap::create_v1_client(config).await?;
+    let contracts = v1_client
+        .get_active_contracts(&[
+            holdings_cache::TEMPLATE_AMULET.to_string(),
+            holdings_cache::TEMPLATE_HOLDING.to_string(),
+        ])
+        .await?;
+    let mut holdings: Vec<holdings_cache::CachedHolding> =
+        acs_worker::parse_acs_holdings(contracts, &config.party_id)
+            .into_iter()
+            .filter(|h| h.instrument == instr_key)
+            .collect();
+    holdings.sort_by(|a, b| b.amount.cmp(&a.amount)); // descending
+
+    let to_make: Vec<(Decimal, u32)> = if only_deficit {
+        rungs
+            .iter()
+            .filter_map(|(denom, count)| {
+                let have = holdings
+                    .iter()
+                    .filter(|h| h.amount >= *denom && h.amount < *denom * Decimal::TWO)
+                    .count() as u32;
+                (have < *count).then(|| (*denom, count - have))
+            })
+            .collect()
+    } else {
+        rungs.to_vec()
+    };
+    if to_make.is_empty() {
+        return Ok(None);
+    }
+
+    let mut total: Decimal = to_make.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
+    if is_cc {
+        // CC fee margin (holding-fee decay + transfer fees)
+        total = total * Decimal::new(102, 2) + Decimal::ONE;
+    }
+
+    // Largest-first input selection until the total is covered (cap 20).
+    let mut input_cids: Vec<String> = Vec::new();
+    let mut covered = Decimal::ZERO;
+    for h in &holdings {
+        if input_cids.len() >= 20 || covered >= total {
+            break;
+        }
+        input_cids.push(h.contract_id.clone());
+        covered += h.amount;
+    }
+    if covered < total {
+        return Err(anyhow!(
+            "insufficient {} holdings for splits: have {}, need {}",
+            instr_key, covered, total
+        ));
+    }
+
+    if is_cc {
+        let mut output_amounts: Vec<String> = Vec::new();
+        for (denom, count) in &to_make {
+            for _ in 0..*count {
+                output_amounts.push(denom.to_string());
+            }
+        }
+        let expectation = OperationExpectation::SplitCc {
+            party: config.party_id.clone(),
+            output_amounts: output_amounts.clone(),
+        };
+        let resp = v1_client
+            .submit_transaction(
+                PrepareTransactionRequest {
+                    operation: TransactionOperation::SplitCc as i32,
+                    params: Some(Params::SplitCc(SplitCcParams {
+                        output_amounts,
+                        amulet_cids: input_cids,
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                verbose,
+                dry_run,
+                force,
+            )
+            .await?;
+        Ok(Some(resp.update_id))
+    } else {
+        use orderbook_proto::rfqv2::{
+            prepare_atomic_transaction_request::Params as AtomicParams,
+            PrepareAtomicTransactionRequest, SplitHoldingsParams, SplitSpec,
+        };
+        let mut atomic_client = atomic_swap::create_atomic_client(config).await?;
+        let ticket_service_cid = atomic_find_ticket_service(&mut atomic_client, &config.party_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("no TicketService on ledger — run `atomic ticket-service` first")
+            })?;
+        let splits: Vec<SplitSpec> = to_make
+            .iter()
+            .map(|(denom, count)| SplitSpec {
+                amount: denom.to_string(),
+                count: *count,
+            })
+            .collect();
+        let expectation = OperationExpectation::SplitHoldings {
+            lp_party: config.party_id.clone(),
+            instrument_id: on_chain_id.to_string(),
+            split_count: splits.len(),
+            input_cids: input_cids.clone(),
+        };
+        let resp = atomic_client
+            .submit_atomic_transaction(
+                PrepareAtomicTransactionRequest {
+                    params: Some(AtomicParams::SplitHoldings(SplitHoldingsParams {
+                        ticket_service_cid,
+                        instrument_id: on_chain_id.to_string(),
+                        instrument_admin: admin.to_string(),
+                        input_holding_cids: input_cids,
+                        splits,
+                    })),
+                    request_signature: None,
+                },
+                &expectation,
+                verbose,
+                dry_run,
+                force,
+            )
+            .await?;
+        Ok(Some(resp.update_id))
+    }
+}
+
+pub async fn run_atomic(
+    config: BaseConfig,
+    command: AtomicCommands,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+) -> Result<()> {
+    use orderbook_proto::rfqv2::{
+        prepare_atomic_transaction_request::Params as AtomicParams, CancelTicketsParams,
+        CreateAtomicDvpVenueParams, CreateTicketServiceParams, IssueTicketsParams,
+        PrepareAtomicTransactionRequest, UpdateVenueKeyParams,
+    };
+
+    match command {
+        AtomicCommands::Keygen { out } => {
+            let path = atomic_quote::resolve_keyfile_path(out.as_deref());
+            let existed = path.exists();
+            let kf = atomic_quote::load_or_create_keyfile(&path, true)?;
+            println!(
+                "{} quote keyfile {}",
+                if existed { "Loaded" } else { "Created" },
+                path.display()
+            );
+            println!("SPKI public key: {}", kf.pub_spki_hex);
+        }
+
+        AtomicCommands::TicketService => {
+            let mut client = atomic_swap::create_atomic_client(&config).await?;
+            let expectation = OperationExpectation::CreateTicketService {
+                lp_party: config.party_id.clone(),
+            };
+            match client
+                .submit_atomic_transaction(
+                    PrepareAtomicTransactionRequest {
+                        params: Some(AtomicParams::CreateTicketService(CreateTicketServiceParams {})),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await
+            {
+                Ok(resp) => println!("TicketService created, update id: {}", resp.update_id),
+                // Idempotency: the server error carries the existing contract id
+                Err(e) if format!("{:#}", e).contains("already exists") => {
+                    println!("TicketService already exists: {:#}", e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        AtomicCommands::Venue { command } => match command {
+            AtomicVenueCommands::Create { market, operator, quote_key_file } => {
+                let ((base_id, base_admin), (quote_id, quote_admin)) =
+                    atomic_resolve_market_pair(&config, &market)?;
+                let key_path = atomic_quote::resolve_keyfile_path(quote_key_file.as_deref());
+                let kf = atomic_quote::load_or_create_keyfile(&key_path, false).with_context(|| {
+                    format!(
+                        "quote keyfile missing/invalid at {} — run `atomic keygen` first",
+                        key_path.display()
+                    )
+                })?;
+                let mut client = atomic_swap::create_atomic_client(&config).await?;
+                if let Some(existing) = atomic_find_venues(&mut client, &config.party_id)
+                    .await?
+                    .into_iter()
+                    .find(|v| v.pair_name == market)
+                {
+                    if existing.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) {
+                        println!(
+                            "Venue for {} already exists with the current key: {}",
+                            market, existing.contract_id
+                        );
+                        return Ok(());
+                    }
+                    return Err(anyhow!(
+                        "venue for {} already exists ({}) with a DIFFERENT quote key — \
+                         use `atomic venue rotate-key --market {}`",
+                        market, existing.contract_id, market
+                    ));
+                }
+                let expectation = OperationExpectation::CreateAtomicDvpVenue {
+                    lp_party: config.party_id.clone(),
+                    pair_name: market.clone(),
+                    quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
+                };
+                let resp = client
+                    .submit_atomic_transaction(
+                        PrepareAtomicTransactionRequest {
+                            params: Some(AtomicParams::CreateAtomicDvpVenue(
+                                CreateAtomicDvpVenueParams {
+                                    pair_name: market.clone(),
+                                    base_instrument_id: base_id,
+                                    base_instrument_admin: base_admin,
+                                    quote_instrument_id: quote_id,
+                                    quote_instrument_admin: quote_admin,
+                                    quote_public_key_spki_hex: kf.pub_spki_hex,
+                                    operator_party: operator,
+                                },
+                            )),
+                            request_signature: None,
+                        },
+                        &expectation,
+                        verbose,
+                        dry_run,
+                        force,
+                    )
+                    .await?;
+                println!("AtomicDVP venue created for {}, update id: {}", market, resp.update_id);
+            }
+            AtomicVenueCommands::RotateKey { market, quote_key_file } => {
+                let key_path = atomic_quote::resolve_keyfile_path(quote_key_file.as_deref());
+                let kf = atomic_quote::load_or_create_keyfile(&key_path, false).with_context(|| {
+                    format!(
+                        "quote keyfile missing/invalid at {} — run `atomic keygen` first",
+                        key_path.display()
+                    )
+                })?;
+                let mut client = atomic_swap::create_atomic_client(&config).await?;
+                let venue = atomic_find_venues(&mut client, &config.party_id)
+                    .await?
+                    .into_iter()
+                    .find(|v| v.pair_name == market)
+                    .ok_or_else(|| anyhow!("no AtomicDVP venue for market {}", market))?;
+                println!("############################################################");
+                println!("# WARNING: rotating the quote key ARCHIVES + RECREATES the");
+                println!("# venue contract. EVERY live signed envelope dies instantly");
+                println!("# (its disclosed venue cid goes stale) and EVERY signature");
+                println!("# made with the old key becomes unverifiable. Run this only");
+                println!("# with the LP agent drained of in-flight V2 quotes.");
+                println!("############################################################");
+                println!("Venue: {} (cid {})", venue.pair_name, venue.contract_id);
+                if confirm && !dry_run {
+                    let lock = agent_logic::confirm::new_confirm_lock();
+                    agent_logic::confirm::confirm_transaction(
+                        &lock,
+                        "Rotate AtomicDVP venue key",
+                        &format!("market: {}, venue: {}", market, venue.contract_id),
+                    )
+                    .await?;
+                }
+                let expectation = OperationExpectation::UpdateVenueKey {
+                    lp_party: config.party_id.clone(),
+                    venue_cid: venue.contract_id.clone(),
+                    new_key_spki_hex: kf.pub_spki_hex.clone(),
+                };
+                let resp = client
+                    .submit_atomic_transaction(
+                        PrepareAtomicTransactionRequest {
+                            params: Some(AtomicParams::UpdateVenueKey(UpdateVenueKeyParams {
+                                venue_cid: venue.contract_id,
+                                new_quote_public_key_spki_hex: kf.pub_spki_hex,
+                            })),
+                            request_signature: None,
+                        },
+                        &expectation,
+                        verbose,
+                        dry_run,
+                        force,
+                    )
+                    .await?;
+                println!("Venue key rotated for {}, update id: {}", market, resp.update_id);
+                println!("(the venue has a NEW contract id — restart the LP agent to re-validate)");
+            }
+        },
+
+        AtomicCommands::Tickets { command } => {
+            let mut client = atomic_swap::create_atomic_client(&config).await?;
+            match command {
+                AtomicTicketCommands::Issue { count } => {
+                    if count == 0 {
+                        return Err(anyhow!("--count must be > 0"));
+                    }
+                    let ticket_ids: Vec<String> =
+                        (0..count).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+                    let expectation = OperationExpectation::IssueTickets {
+                        lp_party: config.party_id.clone(),
+                        ticket_count: ticket_ids.len(),
+                    };
+                    let resp = client
+                        .submit_atomic_transaction(
+                            PrepareAtomicTransactionRequest {
+                                params: Some(AtomicParams::IssueTickets(IssueTicketsParams {
+                                    ticket_ids,
+                                })),
+                                request_signature: None,
+                            },
+                            &expectation,
+                            verbose,
+                            dry_run,
+                            force,
+                        )
+                        .await?;
+                    println!("Issued {} tickets, update id: {}", count, resp.update_id);
+                }
+                AtomicTicketCommands::Cancel { cids, all_free } => {
+                    let ticket_service_cid =
+                        atomic_find_ticket_service(&mut client, &config.party_id)
+                            .await?
+                            .ok_or_else(|| anyhow!("no TicketService on ledger"))?;
+                    let ticket_cids: Vec<String> = if all_free {
+                        atomic_list_live_tickets(&mut client, &config.party_id).await?
+                    } else {
+                        cids
+                    };
+                    if ticket_cids.is_empty() {
+                        println!("No tickets to cancel");
+                        return Ok(());
+                    }
+                    println!("Cancelling {} ticket(s)", ticket_cids.len());
+                    if confirm && !dry_run {
+                        let lock = agent_logic::confirm::new_confirm_lock();
+                        agent_logic::confirm::confirm_transaction(
+                            &lock,
+                            "Cancel SettlementTickets",
+                            &format!("{} ticket(s)", ticket_cids.len()),
+                        )
+                        .await?;
+                    }
+                    let expectation = OperationExpectation::CancelTickets {
+                        lp_party: config.party_id.clone(),
+                        ticket_count: ticket_cids.len(),
+                    };
+                    let resp = client
+                        .submit_atomic_transaction(
+                            PrepareAtomicTransactionRequest {
+                                params: Some(AtomicParams::CancelTickets(CancelTicketsParams {
+                                    ticket_service_cid,
+                                    ticket_cids,
+                                })),
+                                request_signature: None,
+                            },
+                            &expectation,
+                            verbose,
+                            dry_run,
+                            force,
+                        )
+                        .await?;
+                    println!("Tickets cancelled, update id: {}", resp.update_id);
+                }
+            }
+        }
+
+        AtomicCommands::Split { market, instrument, splits } => {
+            let specs: Vec<String> = splits
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let rungs = split_worker::parse_splits(&specs)?;
+            let (base_instr, quote_instr) = market
+                .split_once('-')
+                .ok_or_else(|| anyhow!("market id '{}' must have the form BASE-QUOTE", market))?;
+            let target = match instrument.to_ascii_lowercase().as_str() {
+                "base" => base_instr,
+                "quote" => quote_instr,
+                other => {
+                    return Err(anyhow!("--instrument must be 'base' or 'quote', got '{}'", other))
+                }
+            };
+            let (on_chain_id, admin) = config.resolve_instrument(target);
+            if on_chain_id != "Amulet" && admin.is_empty() {
+                return Err(anyhow!(
+                    "cannot resolve registry admin for instrument '{}' — instrument registry not populated",
+                    target
+                ));
+            }
+            if confirm && !dry_run {
+                let lock = agent_logic::confirm::new_confirm_lock();
+                agent_logic::confirm::confirm_transaction(
+                    &lock,
+                    "Split holdings",
+                    &format!("market: {}, instrument: {} ({}), splits: {}", market, target, on_chain_id, splits),
+                )
+                .await?;
+            }
+            match atomic_split_denominations(
+                &config, &on_chain_id, &admin, &rungs, false, verbose, dry_run, force,
+            )
+            .await?
+            {
+                Some(update_id) => println!("Split submitted, update id: {}", update_id),
+                None => println!("Nothing to split"),
+            }
+        }
+
+        AtomicCommands::Status { market } => {
+            let mut client = atomic_swap::create_atomic_client(&config).await?;
+            let key_path = atomic_quote::resolve_keyfile_path(None);
+            let local_key = key_path
+                .exists()
+                .then(|| atomic_quote::load_or_create_keyfile(&key_path, false).ok())
+                .flatten();
+
+            println!("\n=== AtomicDVP venues ===\n");
+            let venues = atomic_find_venues(&mut client, &config.party_id).await?;
+            let shown: Vec<&AtomicVenueSummary> = venues
+                .iter()
+                .filter(|v| market.as_deref().is_none_or(|m| v.pair_name == m))
+                .collect();
+            if shown.is_empty() {
+                println!("(none)");
+            }
+            for v in shown {
+                let key_status = match &local_key {
+                    Some(kf) if v.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) => {
+                        "MATCHES local keyfile"
+                    }
+                    Some(_) => "DOES NOT MATCH local keyfile",
+                    None => "no local keyfile to compare",
+                };
+                println!("{}: {}", v.pair_name, v.contract_id);
+                println!("  operator:  {}", v.operator);
+                println!("  base:      {} (admin {})", v.base_id, v.base_admin);
+                println!("  quote:     {} (admin {})", v.quote_id, v.quote_admin);
+                println!("  quote key: {}", key_status);
+            }
+
+            match atomic_find_ticket_service(&mut client, &config.party_id).await? {
+                Some(cid) => println!("\nTicketService: {}", cid),
+                None => println!("\nTicketService: (none)"),
+            }
+            let tickets = atomic_list_live_tickets(&mut client, &config.party_id).await?;
+            println!("Live tickets:  {}", tickets.len());
+
+            // Denomination histogram of own unlocked holdings, per instrument
+            let mut v1_client = atomic_swap::create_v1_client(&config).await?;
+            let contracts = v1_client
+                .get_active_contracts(&[
+                    holdings_cache::TEMPLATE_AMULET.to_string(),
+                    holdings_cache::TEMPLATE_HOLDING.to_string(),
+                ])
+                .await?;
+            let holdings = acs_worker::parse_acs_holdings(contracts, &config.party_id);
+            let mut histogram: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<rust_decimal::Decimal, usize>,
+            > = std::collections::BTreeMap::new();
+            for h in &holdings {
+                *histogram
+                    .entry(h.instrument.clone())
+                    .or_default()
+                    .entry(h.amount.normalize())
+                    .or_default() += 1;
+            }
+            println!("\n=== Holdings denomination histogram ===\n");
+            if histogram.is_empty() {
+                println!("(no unlocked holdings)");
+            }
+            for (instrument, buckets) in &histogram {
+                let count: usize = buckets.values().sum();
+                let total: rust_decimal::Decimal = buckets
+                    .iter()
+                    .map(|(amount, n)| *amount * rust_decimal::Decimal::from(*n as u64))
+                    .sum();
+                println!("{} — {} holding(s), total {}:", instrument, count, total);
+                for (amount, n) in buckets {
+                    println!("  {} x{}", amount, n);
+                }
+            }
+        }
+
+        AtomicCommands::Setup => {
+            println!("=== Atomic (RFQ V2) setup for {} ===", config.party_id);
+
+            // 1. keygen (create if absent)
+            let key_path = atomic_quote::resolve_keyfile_path(None);
+            let existed = key_path.exists();
+            let kf = atomic_quote::load_or_create_keyfile(&key_path, true)?;
+            println!(
+                "[1/6] Quote key ({}): {}",
+                if existed { "existing" } else { "created" },
+                kf.pub_spki_hex
+            );
+
+            let mut client = atomic_swap::create_atomic_client(&config).await?;
+
+            // 2. ticket-service (ignore already-exists)
+            let expectation = OperationExpectation::CreateTicketService {
+                lp_party: config.party_id.clone(),
+            };
+            match client
+                .submit_atomic_transaction(
+                    PrepareAtomicTransactionRequest {
+                        params: Some(AtomicParams::CreateTicketService(CreateTicketServiceParams {})),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await
+            {
+                Ok(resp) => println!("[2/6] TicketService created (update {})", resp.update_id),
+                Err(e) if format!("{:#}", e).contains("already exists") => {
+                    println!("[2/6] TicketService already exists");
+                }
+                Err(e) => return Err(e),
+            }
+
+            // 3. venue per rfq_v2-enabled market (skip existing with matching key)
+            let v2_markets: Vec<&agent_logic::config::MarketConfig> = config
+                .markets
+                .iter()
+                .filter(|m| m.enabled)
+                .filter(|m| {
+                    m.rfq
+                        .as_ref()
+                        .is_some_and(|r| r.enabled && r.v2.as_ref().is_some_and(|v| v.enabled))
+                })
+                .collect();
+            if v2_markets.is_empty() {
+                println!(
+                    "[3/6] No [markets.rfq.v2]-enabled markets in agent.toml — \
+                     skipping venues / preapprovals / splits"
+                );
+            }
+            let venues = atomic_find_venues(&mut client, &config.party_id).await?;
+            for m in &v2_markets {
+                if let Some(v) = venues.iter().find(|v| v.pair_name == m.market_id) {
+                    if v.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) {
+                        println!("[3/6] Venue for {} exists with matching key — skipped", m.market_id);
+                    } else {
+                        tracing::warn!(
+                            "[3/6] Venue for {} exists with a DIFFERENT key ({}) — \
+                             run `atomic venue rotate-key --market {}`",
+                            m.market_id, v.contract_id, m.market_id
+                        );
+                    }
+                    continue;
+                }
+                match atomic_resolve_market_pair(&config, &m.market_id) {
+                    Ok(((base_id, base_admin), (quote_id, quote_admin))) => {
+                        let expectation = OperationExpectation::CreateAtomicDvpVenue {
+                            lp_party: config.party_id.clone(),
+                            pair_name: m.market_id.clone(),
+                            quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
+                        };
+                        match client
+                            .submit_atomic_transaction(
+                                PrepareAtomicTransactionRequest {
+                                    params: Some(AtomicParams::CreateAtomicDvpVenue(
+                                        CreateAtomicDvpVenueParams {
+                                            pair_name: m.market_id.clone(),
+                                            base_instrument_id: base_id,
+                                            base_instrument_admin: base_admin,
+                                            quote_instrument_id: quote_id,
+                                            quote_instrument_admin: quote_admin,
+                                            quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
+                                            operator_party: None,
+                                        },
+                                    )),
+                                    request_signature: None,
+                                },
+                                &expectation,
+                                verbose,
+                                dry_run,
+                                force,
+                            )
+                            .await
+                        {
+                            Ok(resp) => println!(
+                                "[3/6] Venue created for {} (update {})",
+                                m.market_id, resp.update_id
+                            ),
+                            Err(e) => tracing::warn!(
+                                "[3/6] Venue creation for {} failed: {:#}",
+                                m.market_id, e
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!("[3/6] {} skipped: {:#}", m.market_id, e),
+                }
+            }
+
+            // 4. LP receiving preapprovals per non-CC instrument across those
+            // markets (the LP can receive either leg depending on direction)
+            let mut v1_client = atomic_swap::create_v1_client(&config).await?;
+            let mut instruments: Vec<String> = Vec::new();
+            for m in &v2_markets {
+                if let Some((base, quote)) = m.market_id.split_once('-') {
+                    for instr in [base, quote] {
+                        if !instruments.iter().any(|i| i == instr) {
+                            instruments.push(instr.to_string());
+                        }
+                    }
+                }
+            }
+            for instr in &instruments {
+                match atomic_swap::ensure_receiver_preapproval(
+                    &config, &mut v1_client, instr, verbose, dry_run, force,
+                )
+                .await
+                {
+                    Ok(true) => println!("[4/6] Receiving preapproval created for {}", instr),
+                    Ok(false) => println!(
+                        "[4/6] Receiving preapproval for {} already present / not needed",
+                        instr
+                    ),
+                    Err(e) => tracing::warn!("[4/6] Preapproval for {} failed: {:#}", instr, e),
+                }
+            }
+
+            // 5. ticket batch iff ticket_threshold_usd is configured (D1)
+            let v2cfg = config
+                .liquidity_provider
+                .as_ref()
+                .and_then(|lp| lp.rfq_v2.as_ref());
+            match v2cfg {
+                Some(v2) if v2.ticket_threshold_usd.is_some() => {
+                    let live = atomic_list_live_tickets(&mut client, &config.party_id)
+                        .await?
+                        .len();
+                    if live >= v2.ticket_low_water {
+                        println!(
+                            "[5/6] {} live tickets (>= low water {}) — issue skipped",
+                            live, v2.ticket_low_water
+                        );
+                    } else {
+                        let ticket_ids: Vec<String> = (0..v2.ticket_batch_size)
+                            .map(|_| uuid::Uuid::now_v7().to_string())
+                            .collect();
+                        let expectation = OperationExpectation::IssueTickets {
+                            lp_party: config.party_id.clone(),
+                            ticket_count: ticket_ids.len(),
+                        };
+                        match client
+                            .submit_atomic_transaction(
+                                PrepareAtomicTransactionRequest {
+                                    params: Some(AtomicParams::IssueTickets(IssueTicketsParams {
+                                        ticket_ids,
+                                    })),
+                                    request_signature: None,
+                                },
+                                &expectation,
+                                verbose,
+                                dry_run,
+                                force,
+                            )
+                            .await
+                        {
+                            Ok(resp) => println!(
+                                "[5/6] Issued {} tickets (update {})",
+                                v2.ticket_batch_size, resp.update_id
+                            ),
+                            Err(e) => tracing::warn!("[5/6] Ticket issue failed: {:#}", e),
+                        }
+                    }
+                }
+                _ => println!(
+                    "[5/6] ticket_threshold_usd not configured — tickets skipped (ticketless quoting)"
+                ),
+            }
+
+            // 6. denomination splits per market x instrument (best effort)
+            let max_concurrent = config
+                .liquidity_provider
+                .as_ref()
+                .map(|lp| lp.max_concurrent_rfqs)
+                .unwrap_or(10);
+            for m in &v2_markets {
+                let Some(v2m) = m.rfq.as_ref().and_then(|r| r.v2.as_ref()) else { continue };
+                let rungs: Vec<(rust_decimal::Decimal, u32)> = if v2m.denominations.is_empty() {
+                    m.base_order_size
+                        .as_ref()
+                        .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                        .map(|amt| vec![(amt, max_concurrent as u32)])
+                        .unwrap_or_default()
+                } else {
+                    match split_worker::parse_splits(&v2m.denominations) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("[6/6] {}: bad denominations: {:#}", m.market_id, e);
+                            continue;
+                        }
+                    }
+                };
+                if rungs.is_empty() {
+                    continue;
+                }
+                let Some((base, quote)) = m.market_id.split_once('-') else { continue };
+                for instr in [base, quote] {
+                    let (on_chain_id, admin) = config.resolve_instrument(instr);
+                    match atomic_split_denominations(
+                        &config, &on_chain_id, &admin, &rungs, true, verbose, dry_run, force,
+                    )
+                    .await
+                    {
+                        Ok(Some(update_id)) => println!(
+                            "[6/6] Split committed for {} / {} (update {})",
+                            m.market_id, instr, update_id
+                        ),
+                        Ok(None) => println!(
+                            "[6/6] Denomination coverage OK for {} / {}",
+                            m.market_id, instr
+                        ),
+                        Err(e) => tracing::warn!(
+                            "[6/6] Split for {} / {} failed: {:#}",
+                            m.market_id, instr, e
+                        ),
+                    }
+                }
+            }
+
+            println!("Setup complete. Run `atomic status` to verify, then restart the agent.");
         }
     }
 

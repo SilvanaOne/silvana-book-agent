@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use cloud_agent::{
     InfoCommands, PreapprovalCommands, TransferCommands, SignCommands,
     UserServiceCommands, SubscriptionCommands, LockCommands, FaucetCommands,
+    AtomicCommands,
     populate_instruments, run_cloud_agent, run_fill, run_info, run_preapproval,
     run_subscription, run_transfer, run_sign, run_user_service, run_faucet,
-    run_lock, run_generate_private_key, run_onboard,
+    run_lock, run_atomic, run_generate_private_key, run_onboard,
     fill_loop,
     config,
 };
@@ -103,6 +104,11 @@ enum Commands {
         #[command(subcommand)]
         command: LockCommands,
     },
+    /// Atomic DVP (RFQ V2) operations: quote key, ticket service, venues, tickets, splits
+    Atomic {
+        #[command(subcommand)]
+        command: AtomicCommands,
+    },
     /// Buy a specified amount via RFQ, repeating until filled
     Buy {
         /// Market ID to buy on
@@ -123,6 +129,9 @@ enum Commands {
         /// Retry interval in seconds (default: 60)
         #[arg(long, default_value = "60")]
         interval: u64,
+        /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
+        #[arg(long)]
+        atomic: bool,
     },
     /// Sell a specified amount via RFQ, repeating until filled
     Sell {
@@ -144,6 +153,9 @@ enum Commands {
         /// Retry interval in seconds (default: 60)
         #[arg(long, default_value = "60")]
         interval: u64,
+        /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
+        #[arg(long)]
+        atomic: bool,
     },
     /// Generate a new Ed25519 private key (no config needed)
     GeneratePrivateKey,
@@ -258,11 +270,12 @@ async fn main() -> Result<()> {
         Commands::UserService { command } => run_user_service(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Faucet { command } => run_faucet(base_config, command, verbose).await,
         Commands::Lock { command } => run_lock(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval } => {
-            run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
+        Commands::Atomic { command } => run_atomic(base_config, command, verbose, dry_run, force, confirm).await,
+        Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval, atomic } => {
+            run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, verbose, dry_run, force, confirm).await
         }
-        Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval } => {
-            run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, verbose, dry_run, force, confirm).await
+        Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval, atomic } => {
+            run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, verbose, dry_run, force, confirm).await
         }
         Commands::GeneratePrivateKey => unreachable!(),
         Commands::Onboard { .. } => unreachable!(),
