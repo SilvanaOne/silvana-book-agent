@@ -10,7 +10,7 @@ use clap::Subcommand;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use agent_logic::config::BaseConfig;
 use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
@@ -1063,6 +1063,7 @@ async fn setup_rfq_v2(
 
 /// Run a buyer/seller fill loop with background settlement processing
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_fill(
     config: BaseConfig,
     direction: fill_loop::FillDirection,
@@ -1073,6 +1074,7 @@ pub async fn run_fill(
     max_settlement: Option<f64>,
     interval: u64,
     atomic: bool,
+    fee_tokens: Vec<String>,
     verbose: bool,
     dry_run: bool,
     force: bool,
@@ -1083,10 +1085,18 @@ pub async fn run_fill(
         fill_loop::FillDirection::Sell => "sell",
     };
     info!(
-        "Starting {} mode: market={}, amount={}, interval={}s{}",
+        "Starting {} mode: market={}, amount={}, interval={}s{}{}",
         dir_str, market, amount, interval,
-        if atomic { " (atomic RFQ V2)" } else { "" }
+        if atomic { " (atomic RFQ V2)" } else { "" },
+        if atomic && !fee_tokens.is_empty() {
+            format!(" fee_tokens={fee_tokens:?}")
+        } else {
+            String::new()
+        }
     );
+    if !atomic && !fee_tokens.is_empty() {
+        warn!("--fee-token only applies to --atomic (RFQ V2) fills — ignored on the v1 path");
+    }
 
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
     let fill_lm = agent_logic::liquidity::LiquidityManager::new(
@@ -1151,6 +1161,7 @@ pub async fn run_fill(
         max_settlement: max_settlement.unwrap_or(amount),
         interval_secs: interval,
         atomic,
+        fee_tokens,
     };
 
     // Check for saved fill state

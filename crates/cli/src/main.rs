@@ -132,6 +132,10 @@ enum Commands {
         /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
         #[arg(long)]
         atomic: bool,
+        /// Settlement-fee token preference for --atomic, priority order
+        /// (repeatable, e.g. --fee-token USDC --fee-token CC). Default: CC.
+        #[arg(long = "fee-token")]
+        fee_token: Vec<String>,
     },
     /// Sell a specified amount via RFQ, repeating until filled
     Sell {
@@ -156,6 +160,10 @@ enum Commands {
         /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
         #[arg(long)]
         atomic: bool,
+        /// Settlement-fee token preference for --atomic, priority order
+        /// (repeatable, e.g. --fee-token USDC --fee-token CC). Default: CC.
+        #[arg(long = "fee-token")]
+        fee_token: Vec<String>,
     },
     /// Generate a new Ed25519 private key (no config needed)
     GeneratePrivateKey,
@@ -271,11 +279,11 @@ async fn main() -> Result<()> {
         Commands::Faucet { command } => run_faucet(base_config, command, verbose).await,
         Commands::Lock { command } => run_lock(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Atomic { command } => run_atomic(base_config, command, verbose, dry_run, force, confirm).await,
-        Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval, atomic } => {
-            run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, verbose, dry_run, force, confirm).await
+        Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token } => {
+            run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token, verbose, dry_run, force, confirm).await
         }
-        Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval, atomic } => {
-            run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, verbose, dry_run, force, confirm).await
+        Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token } => {
+            run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token, verbose, dry_run, force, confirm).await
         }
         Commands::GeneratePrivateKey => unreachable!(),
         Commands::Onboard { .. } => unreachable!(),

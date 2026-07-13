@@ -399,38 +399,61 @@ impl AtomicSwapper {
         } else {
             instrument_key(&pay_admin, &pay_id)
         };
-        // Fee funding (design §14 D21): fees are CC and ride the ONE user-side
-        // pool — coverage must be GUARANTEED, not incidental. Target =
-        // fee × 1.02 + 1 CC (amulet sender-fee headroom, the dvp CLI margin).
-        let fee_cc_total: Decimal = signed_fees
-            .iter()
-            .filter(|f| f.instrument_id == "Amulet")
-            .filter_map(|f| Decimal::from_str(&f.amount).ok())
-            .sum();
-        let fee_funding_target = if fee_cc_total > Decimal::ZERO {
-            fee_cc_total * Decimal::new(102, 2) + Decimal::ONE
-        } else {
-            Decimal::ZERO
+        // Fee funding (design §14 D21, generalized for fee-token selection):
+        // fees ride the ONE user-side pool — coverage must be GUARANTEED, not
+        // incidental. Per fee instrument: CC targets fee × 1.02 + 1 CC (amulet
+        // sender-fee headroom, the dvp CLI margin); utility tokens (USDC…)
+        // transfer one-step via the receiver's preapproval with no
+        // token-denominated sender fee, so the exact amount suffices.
+        let mut fee_totals: Vec<((String, String), Decimal)> = Vec::new();
+        for f in &signed_fees {
+            let Ok(a) = Decimal::from_str(&f.amount) else {
+                continue;
+            };
+            let key = (f.instrument_admin.clone(), f.instrument_id.clone());
+            match fee_totals.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, total)) => *total += a,
+                None => fee_totals.push((key, a)),
+            }
+        }
+        let fee_target = |id: &str, total: Decimal| {
+            if id == "Amulet" {
+                total * Decimal::new(102, 2) + Decimal::ONE
+            } else {
+                total
+            }
         };
-        // Does the user RECEIVE CC (proceeds can fund the fee)?
-        let receive_id = match direction {
-            FillDirection::Buy => venue("/baseInstrumentId/id")?,
-            FillDirection::Sell => venue("/quoteInstrumentId/id")?,
+        // CC is unique by id "Amulet"; utility instruments match on admin+id.
+        let fee_matches = |admin: &str, id: &str, other_admin: &str, other_id: &str| {
+            id == other_id && (id == "Amulet" || admin == other_admin)
+        };
+
+        // What the user RECEIVES (proceeds can fund a same-instrument fee).
+        let (receive_admin, receive_id) = match direction {
+            FillDirection::Buy => (
+                venue("/baseInstrumentId/admin")?,
+                venue("/baseInstrumentId/id")?,
+            ),
+            FillDirection::Sell => (
+                venue("/quoteInstrumentId/admin")?,
+                venue("/quoteInstrumentId/id")?,
+            ),
         };
         let receive_amount = match direction {
             FillDirection::Buy => base_amount,
             FillDirection::Sell => quote_amount,
         };
-        let proceeds_cover_fee = receive_id == "Amulet" && receive_amount >= fee_funding_target;
 
         let max_inputs = max_input_holdings.min(100);
-        // When the user PAYS CC, the leg selection itself must also cover the
-        // fee (leg change alone can be arbitrarily small).
-        let select_target = if is_cc {
-            amount_needed + fee_funding_target
-        } else {
-            amount_needed
-        };
+        // When a fee is denominated in the PAY leg's instrument, the leg
+        // selection itself must also cover it (leg change alone can be
+        // arbitrarily small).
+        let pay_fee_extra: Decimal = fee_totals
+            .iter()
+            .filter(|((admin, id), _)| fee_matches(admin, id, &pay_admin, &pay_id))
+            .map(|((_, id), total)| fee_target(id, *total))
+            .sum();
+        let select_target = amount_needed + pay_fee_extra;
         let picks = self
             .cache
             .select_for_disclosure(&pay_key, select_target, max_inputs, is_cc)
@@ -443,19 +466,33 @@ impl AtomicSwapper {
                 ),
             });
         };
-        // Fee paid in CC while neither the pay leg is CC nor the proceeds
-        // cover it: add dedicated CC funding cids to the pool.
-        if fee_funding_target > Decimal::ZERO && !is_cc && !proceeds_cover_fee {
+        // Fees in OTHER instruments: covered by same-instrument proceeds when
+        // large enough, else add dedicated funding cids to the pool.
+        for ((admin, id), total) in &fee_totals {
+            if fee_matches(admin, id, &pay_admin, &pay_id) {
+                continue; // already inside select_target
+            }
+            let target = fee_target(id, *total);
+            if target <= Decimal::ZERO {
+                continue;
+            }
+            if fee_matches(admin, id, &receive_admin, &receive_id) && receive_amount >= target {
+                continue; // proceeds fund the fee
+            }
+            let fee_key = if id == "Amulet" {
+                CC_INSTRUMENT.to_string()
+            } else {
+                instrument_key(admin, id)
+            };
             let slots = max_inputs.saturating_sub(picks.len()).max(1);
             let fee_picks = self
                 .cache
-                .select_for_disclosure(&CC_INSTRUMENT.to_string(), fee_funding_target, slots, true)
+                .select_for_disclosure(&fee_key, target, slots, id == "Amulet")
                 .await;
             let Some(fee_picks) = fee_picks else {
                 return Ok(SwapOutcome::Requote {
                     reason: format!(
-                        "CC fee-funding selection failed (need {} CC for the settlement fee)",
-                        fee_funding_target
+                        "{id} fee-funding selection failed (need {target} {id} for the settlement fee)"
                     ),
                 });
             };

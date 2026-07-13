@@ -50,6 +50,9 @@ pub struct FillParams {
     /// `RfqV2Service` + `AtomicDvpProviderService` instead of the v1
     /// accept/proposal/multicall ladder. Default false (v1 path untouched).
     pub atomic: bool,
+    /// RFQ V2 settlement-fee token preference, priority order (instruments
+    /// symbols, e.g. ["USDC", "CC"]). Empty = CC. Atomic path only.
+    pub fee_tokens: Vec<String>,
 }
 
 /// Sleep that can be interrupted by shutdown signal. Returns true if shutdown was requested.
@@ -885,6 +888,7 @@ async fn atomic_round(
             &format!("{:.10}", request_amount),
             vec![],
             Some(15),
+            params.fee_tokens.clone(),
         )
         .await
     {
@@ -946,6 +950,7 @@ async fn atomic_round(
                 &format!("{:.10}", request_amount),
                 vec![],
                 Some(15),
+                params.fee_tokens.clone(),
             )
             .await
         {

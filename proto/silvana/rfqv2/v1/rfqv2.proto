@@ -100,6 +100,18 @@ message RequestQuotesV2Request {
   string quantity = 3;                // base quantity
   repeated string lp_names = 4;       // optional filter
   optional uint32 timeout_secs = 5;   // default 10, clamp 1..30
+  // OPTIONAL priority-ordered fee-token preference (instruments-table symbols,
+  // e.g. "USDC", "CC"). The first entry in the rpc's supported set (config
+  // `settlement_fee_tokens`) denominates the settlement fee. Empty = CC
+  // (existing behavior). Non-empty with no supported entry = INVALID_ARGUMENT
+  // listing the supported tokens.
+  repeated string fee_tokens = 6;
+  // Swap-venue delegation: when present, the caller's JWT must be a
+  // platform-signed swap-venue token (aud = JWT_SWAP_VENUE_AUDIENCE) whose sub
+  // is registered in the swap_venues table; the RFQ is then created FOR this
+  // party (it owns the RFQ, is revealed to the LP at confirm, and signs
+  // settlement with its own Canton key). Absent => user = JWT sub (unchanged).
+  optional string user = 7;
 }
 
 message AtomicQuoteInfo {
@@ -137,6 +149,10 @@ message AcceptQuoteAtomicRequest {
   string rfq_id = 1;
   string quote_id = 2;
   optional uint32 timeout_secs = 3;   // confirm round-trip wait; default 10, clamp 1..30
+  // Swap-venue delegation (see RequestQuotesV2Request.user). Present => the
+  // caller must be a registered swap venue; the accept is performed FOR this
+  // party, which must be the RFQ's owner.
+  optional string user = 4;
 }
 
 // LP rejects travel in the response BODY (gRPC OK + success=false) so the
@@ -186,6 +202,9 @@ message GetAtomicRfqAuditLogResponse {
 
 message EstimateAtomicFeeRequest {
   string market_id = 1;
+  // Same semantics as RequestQuotesV2Request.fee_tokens, so the advisory
+  // estimate matches what RequestQuotes will cache for the same preference.
+  repeated string fee_tokens = 2;
 }
 
 // Advisory estimate (per-call, uncached); the per-RFQ cache set at
