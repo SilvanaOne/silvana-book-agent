@@ -149,8 +149,8 @@ pub async fn run_fill_loop(
         .and_then(|m| m.rfq.as_ref())
         .and_then(|r| r.v2.as_ref())
         .map(|v| v.max_input_holdings)
-        .unwrap_or(20)
-        .min(20);
+        .unwrap_or(100)
+        .min(100);
     if params.atomic {
         let swapper = atomic_swapper
             .as_ref()

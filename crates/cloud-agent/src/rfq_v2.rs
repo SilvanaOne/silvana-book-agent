@@ -114,6 +114,13 @@ pub struct RfqV2State {
     pending: Mutex<HashMap<String, PendingV2>>,
     /// contract id (holding or ticket) -> quote_id
     correlation: Mutex<HashMap<String, String>>,
+    /// On-demand split support: agent config + per-instrument ladder rungs.
+    /// When indicative-time selection finds no disclosable holdings but the
+    /// splitter reserve could fund the leg, a single-flight background split
+    /// is kicked so the confirm (where the quote is SIGNED) can succeed.
+    base_config: agent_logic::config::BaseConfig,
+    split_rungs: HashMap<InstrumentKey, (crate::split_worker::SplitInstrument, Vec<(Decimal, u32)>)>,
+    splits_in_flight: Arc<Mutex<std::collections::HashSet<InstrumentKey>>>,
 }
 
 impl RfqV2State {
@@ -130,7 +137,17 @@ impl RfqV2State {
         ticket_pool: Option<Arc<TicketPool>>,
         venue_registry: Arc<VenueRegistry>,
         liquidity_manager: Arc<LiquidityManager>,
+        base_config: agent_logic::config::BaseConfig,
+        split_targets: &[crate::split_worker::SplitTarget],
     ) -> Self {
+        let split_rungs = split_targets
+            .iter()
+            .filter_map(|t| {
+                crate::split_worker::parse_splits(&t.denominations)
+                    .ok()
+                    .map(|rungs| (t.instrument.key.clone(), (t.instrument.clone(), rungs)))
+            })
+            .collect();
         Self {
             party_id,
             lp_name,
@@ -145,7 +162,52 @@ impl RfqV2State {
             liquidity_manager,
             pending: Mutex::new(HashMap::new()),
             correlation: Mutex::new(HashMap::new()),
+            base_config,
+            split_rungs,
+            splits_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Kick a single-flight background denomination split for `instrument`
+    /// (no-op when no ladder is configured or a split is already in flight).
+    /// Called from the indicative phase so rungs exist by confirm time —
+    /// the LP must not sign a quote it cannot fund.
+    fn kick_on_demand_split(&self, instrument: &InstrumentKey) {
+        let Some((split_instr, rungs)) = self.split_rungs.get(instrument).cloned() else {
+            return;
+        };
+        {
+            let mut in_flight = self.splits_in_flight.lock().unwrap();
+            if !in_flight.insert(instrument.clone()) {
+                return; // already splitting this instrument
+            }
+        }
+        info!(
+            "On-demand split kicked for {} (indicative-time selection empty)",
+            instrument
+        );
+        let config = self.base_config.clone();
+        let cache = self.cache.clone();
+        let in_flight = self.splits_in_flight.clone();
+        let key = instrument.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut client = crate::atomic_swap::create_atomic_client(&config).await?;
+                crate::split_worker::ensure_denominations(
+                    &config, &cache, &mut client, &split_instr, &rungs,
+                )
+                .await
+            }
+            .await;
+            if let Err(e) = result {
+                warn!("On-demand split for {} failed: {:#}", key, e);
+            }
+            in_flight.lock().unwrap().remove(&key);
+        });
+    }
+
+    fn split_in_flight(&self, instrument: &InstrumentKey) -> bool {
+        self.splits_in_flight.lock().unwrap().contains(instrument)
     }
 
     pub fn lp_name(&self) -> &str {
@@ -214,13 +276,34 @@ impl RfqV2State {
                 side,
                 base_amount: priced.quantity,
                 quote_amount: priced.quote_quantity,
-                lp_pays: (lp_pays_key, lp_pays_amount),
+                lp_pays: (lp_pays_key.clone(), lp_pays_amount),
                 lp_pays_token,
                 notional_usd: priced.notional_usd,
                 valid_until,
                 settlement_fee,
             },
         );
+
+        // Dry-run the cid-level selection the confirm will need. If it comes
+        // up empty (e.g. everything sits in the splitter reserve), kick a
+        // background split NOW so rungs exist before the quote is signed.
+        let is_cc = match side {
+            QuoteSide::Buy => mi.base_is_cc,
+            QuoteSide::Sell => mi.quote_is_cc,
+        };
+        let max_inputs = self
+            .market_v2
+            .get(market_id)
+            .map(|m| m.max_input_holdings)
+            .unwrap_or(100);
+        if self
+            .cache
+            .select_for_disclosure(&lp_pays_key, lp_pays_amount, max_inputs, is_cc)
+            .await
+            .is_none()
+        {
+            self.kick_on_demand_split(&lp_pays_key);
+        }
         Ok(())
     }
 
@@ -433,13 +516,28 @@ impl RfqV2State {
             .market_v2
             .get(&market_id)
             .map(|m| m.max_input_holdings)
-            .unwrap_or(20);
+            .unwrap_or(100);
         let expires_at = now
             + Duration::from_secs(self.v2.atomic_quote_valid_secs + self.v2.settle_grace_secs);
-        let picks = self
+        let mut picks = self
             .cache
             .select_for_disclosure(&lp_pays.0, lp_pays.1, max_inputs, is_cc)
             .await;
+        // An indicative-time on-demand split may still be committing (~8 s on
+        // devnet vs the relay's 10-30 s confirm window): give it a bounded
+        // wait before giving up.
+        if picks.is_none() && self.split_in_flight(&lp_pays.0) {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                picks = self
+                    .cache
+                    .select_for_disclosure(&lp_pays.0, lp_pays.1, max_inputs, is_cc)
+                    .await;
+                if picks.is_some() {
+                    break;
+                }
+            }
+        }
         let Some(picks) = picks else {
             self.release_on_reject(&quote_id, &[], false).await;
             return Err(self.reject(

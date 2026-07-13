@@ -121,6 +121,10 @@ pub struct HoldingsCache {
     /// Splitter reserve active only in RFQ V2 mode — otherwise v1 behavior is
     /// unchanged (no permanent exclusion of the largest amulet).
     splitter_reserve_enabled: bool,
+    /// Per-instrument dust threshold (= the instrument's smallest ladder
+    /// rung). Holdings strictly below it are swept as EXTRA inputs into V2
+    /// settles so the settle's change output consolidates them.
+    dust_below: RwLock<HashMap<InstrumentKey, Decimal>>,
 }
 
 impl HoldingsCache {
@@ -130,7 +134,14 @@ impl HoldingsCache {
             consumed: RwLock::new(HashMap::new()),
             reserved: RwLock::new(HashMap::new()),
             splitter_reserve_enabled,
+            dust_below: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Set the per-instrument dust-merge thresholds (smallest ladder rung per
+    /// instrument). Called once at startup from the split-target derivation.
+    pub async fn set_dust_thresholds(&self, thresholds: HashMap<InstrumentKey, Decimal>) {
+        *self.dust_below.write().await = thresholds;
     }
 
     /// The exact legacy `AmuletCache` method surface, scoped to CC.
@@ -283,12 +294,38 @@ impl HoldingsCache {
 
         let selectable = self.get_selectable(instrument, true).await;
 
-        let picks = select_from(&selectable, target, max_inputs)?;
+        let mut picks = select_from(&selectable, target, max_inputs)?;
         if picks.iter().any(|h| h.created_event_blob.is_none()) {
             debug!(
                 "select_for_disclosure({instrument}): combination includes blob-pending holdings — unavailable until ACS backfill"
             );
             return None;
+        }
+
+        // Dust merge: sweep sub-rung holdings into the settle as extra inputs
+        // (smallest first) so the change output consolidates them. Only after
+        // coverage is met, only blob-ready holdings, never past max_inputs.
+        let dust_below = self.dust_below.read().await.get(instrument).copied();
+        if let Some(threshold) = dust_below {
+            let picked: std::collections::HashSet<&str> =
+                picks.iter().map(|h| h.contract_id.as_str()).collect();
+            let dust: Vec<CachedHolding> = selectable
+                .iter() // ascending by amount
+                .filter(|h| {
+                    h.amount < threshold
+                        && h.created_event_blob.is_some()
+                        && !picked.contains(h.contract_id.as_str())
+                })
+                .take(max_inputs.saturating_sub(picks.len()))
+                .cloned()
+                .collect();
+            if !dust.is_empty() {
+                debug!(
+                    "select_for_disclosure({instrument}): sweeping {} dust holding(s) (< {threshold}) for consolidation",
+                    dust.len()
+                );
+                picks.extend(dust);
+            }
         }
         Some(picks)
     }
@@ -776,6 +813,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(picks.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dust_merge_appends_sub_rung_holdings_up_to_cap() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .set_dust_thresholds(
+                [(USDC.to_string(), "15".parse().unwrap())].into_iter().collect(),
+            )
+            .await;
+        cache
+            .add_created(vec![
+                holding("reserve", USDC, "1000", true), // splitter reserve — excluded
+                holding("rung", USDC, "25", true),      // covers the target alone
+                holding("dust1", USDC, "0.5", true),
+                holding("dust2", USDC, "3", true),
+                holding("dust3", USDC, "7", true),
+                holding("dust-noblob", USDC, "1", false), // blob-pending — never swept
+            ])
+            .await;
+
+        // Coverage from "rung", then dust ascending up to the cap.
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "20".parse().unwrap(), 4, false)
+            .await
+            .unwrap();
+        let cids: Vec<&str> = picks.iter().map(|h| h.contract_id.as_str()).collect();
+        assert_eq!(cids[0], "rung");
+        assert_eq!(&cids[1..], &["dust1", "dust2", "dust3"]);
+
+        // Cap respected: max_inputs 2 → coverage + one dust only.
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "20".parse().unwrap(), 2, false)
+            .await
+            .unwrap();
+        assert_eq!(picks.len(), 2);
+
+        // No threshold configured → no sweep.
+        cache.set_dust_thresholds(Default::default()).await;
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "20".parse().unwrap(), 4, false)
+            .await
+            .unwrap();
+        assert_eq!(picks.len(), 1);
     }
 
     #[tokio::test]

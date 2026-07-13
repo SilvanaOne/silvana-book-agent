@@ -788,7 +788,13 @@ async fn setup_rfq_v2(
     let mut market_v2 = std::collections::HashMap::new();
     let mut market_instruments = std::collections::HashMap::new();
     let mut expected_venues = std::collections::HashMap::new();
-    let mut split_targets: Vec<split_worker::SplitTarget> = Vec::new();
+    // Legacy per-market ladder candidates (instrument, market ladder,
+    // default rung) — used only when the global per-instrument map is empty.
+    let mut legacy_split_candidates: Vec<(
+        split_worker::SplitInstrument,
+        Vec<String>,
+        Option<(rust_decimal::Decimal, u32)>,
+    )> = Vec::new();
 
     for market in &config.markets {
         if !market.enabled {
@@ -849,26 +855,85 @@ async fn setup_rfq_v2(
             .as_ref()
             .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
             .map(|amt| (amt, lp_config.max_concurrent_rfqs as u32));
-        split_targets.push(split_worker::SplitTarget {
-            market_id: market.market_id.clone(),
-            denominations: v2m.denominations.clone(),
+        legacy_split_candidates.push((
+            split_worker::SplitInstrument {
+                key: base_key,
+                is_cc: base_is_cc,
+                on_chain_id: base_ocid,
+                admin: base_admin,
+            },
+            v2m.denominations.clone(),
             default_rung,
-            instruments: vec![
-                split_worker::SplitInstrument {
-                    key: base_key,
-                    is_cc: base_is_cc,
-                    on_chain_id: base_ocid,
-                    admin: base_admin,
-                },
-                split_worker::SplitInstrument {
-                    key: quote_key_instr,
-                    is_cc: quote_is_cc,
-                    on_chain_id: quote_ocid,
-                    admin: quote_admin,
-                },
-            ],
-        });
+        ));
+        legacy_split_candidates.push((
+            split_worker::SplitInstrument {
+                key: quote_key_instr,
+                is_cc: quote_is_cc,
+                on_chain_id: quote_ocid,
+                admin: quote_admin,
+            },
+            v2m.denominations.clone(),
+            default_rung,
+        ));
     }
+
+    // Split targets: ONE ladder per instrument. The global
+    // [liquidity_provider.rfq_v2.denominations] map wins; without it, fall
+    // back to per-market ladders applied to both legs (first market wins per
+    // instrument).
+    let split_targets: Vec<split_worker::SplitTarget> = if !v2cfg.denominations.is_empty() {
+        let mut out = Vec::new();
+        for (symbol, ladder) in &v2cfg.denominations {
+            let (on_chain_id, admin) = config.resolve_instrument(symbol);
+            let is_cc = on_chain_id == "Amulet";
+            if !is_cc && admin.is_empty() {
+                tracing::warn!(
+                    "rfq_v2.denominations: cannot resolve instrument '{}' — ladder ignored",
+                    symbol
+                );
+                continue;
+            }
+            let key = if is_cc {
+                CC_INSTRUMENT.to_string()
+            } else {
+                instrument_key(&admin, &on_chain_id)
+            };
+            out.push(split_worker::SplitTarget {
+                instrument: split_worker::SplitInstrument { key, is_cc, on_chain_id, admin },
+                denominations: ladder.clone(),
+            });
+        }
+        out
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (instr, denoms, default_rung) in legacy_split_candidates {
+            let ladder = if denoms.is_empty() {
+                default_rung
+                    .map(|(amt, count)| vec![format!("{amt}x{count}")])
+                    .unwrap_or_default()
+            } else {
+                denoms
+            };
+            if ladder.is_empty() || !seen.insert(instr.key.clone()) {
+                continue;
+            }
+            out.push(split_worker::SplitTarget { instrument: instr, denominations: ladder });
+        }
+        out
+    };
+
+    // Dust-merge thresholds: an instrument's smallest ladder rung. Holdings
+    // below it get swept into settles as extra inputs for consolidation.
+    let mut dust_thresholds = std::collections::HashMap::new();
+    for t in &split_targets {
+        if let Ok(rungs) = split_worker::parse_splits(&t.denominations) {
+            if let Some(min) = rungs.iter().map(|(d, _)| *d).min() {
+                dust_thresholds.insert(t.instrument.key.clone(), min);
+            }
+        }
+    }
+    holdings_cache.set_dust_thresholds(dust_thresholds).await;
 
     if market_v2.is_empty() {
         return Err(anyhow!(
@@ -898,6 +963,8 @@ async fn setup_rfq_v2(
         ticket_pool.clone(),
         venue_registry.clone(),
         liquidity_manager,
+        config.clone(),
+        &split_targets,
     ));
 
     // RESTORE saved V2 state BEFORE any worker starts: an already-delivered
@@ -3950,11 +4017,11 @@ async fn atomic_split_denominations(
         total = total * Decimal::new(102, 2) + Decimal::ONE;
     }
 
-    // Largest-first input selection until the total is covered (cap 20).
+    // Largest-first input selection until the total is covered (cap 100).
     let mut input_cids: Vec<String> = Vec::new();
     let mut covered = Decimal::ZERO;
     for h in &holdings {
-        if input_cids.len() >= 20 || covered >= total {
+        if input_cids.len() >= 100 || covered >= total {
             break;
         }
         input_cids.push(h.contract_id.clone());
@@ -4534,53 +4601,71 @@ pub async fn run_atomic(
                 ),
             }
 
-            // 6. denomination splits per market x instrument (best effort)
+            // 6. denomination splits per INSTRUMENT (best effort). The global
+            // [liquidity_provider.rfq_v2.denominations] ladder map wins; the
+            // legacy per-market ladders (applied to both legs, first market
+            // wins per instrument) remain as fallback.
             let max_concurrent = config
                 .liquidity_provider
                 .as_ref()
                 .map(|lp| lp.max_concurrent_rfqs)
                 .unwrap_or(10);
-            for m in &v2_markets {
-                let Some(v2m) = m.rfq.as_ref().and_then(|r| r.v2.as_ref()) else { continue };
-                let rungs: Vec<(rust_decimal::Decimal, u32)> = if v2m.denominations.is_empty() {
-                    m.base_order_size
-                        .as_ref()
-                        .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
-                        .map(|amt| vec![(amt, max_concurrent as u32)])
-                        .unwrap_or_default()
-                } else {
-                    match split_worker::parse_splits(&v2m.denominations) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("[6/6] {}: bad denominations: {:#}", m.market_id, e);
-                            continue;
+            let global_denoms = v2cfg
+                .map(|v| v.denominations.clone())
+                .unwrap_or_default();
+            let mut instrument_ladders: Vec<(String, Vec<String>)> = Vec::new();
+            if !global_denoms.is_empty() {
+                for (symbol, ladder) in &global_denoms {
+                    instrument_ladders.push((symbol.clone(), ladder.clone()));
+                }
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                for m in &v2_markets {
+                    let Some(v2m) = m.rfq.as_ref().and_then(|r| r.v2.as_ref()) else { continue };
+                    let ladder: Vec<String> = if v2m.denominations.is_empty() {
+                        m.base_order_size
+                            .as_ref()
+                            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                            .map(|amt| vec![format!("{amt}x{max_concurrent}")])
+                            .unwrap_or_default()
+                    } else {
+                        v2m.denominations.clone()
+                    };
+                    if ladder.is_empty() {
+                        continue;
+                    }
+                    let Some((base, quote)) = m.market_id.split_once('-') else { continue };
+                    for instr in [base, quote] {
+                        if seen.insert(instr.to_string()) {
+                            instrument_ladders.push((instr.to_string(), ladder.clone()));
                         }
                     }
-                };
+                }
+            }
+            for (symbol, ladder) in instrument_ladders {
+                let rungs: Vec<(rust_decimal::Decimal, u32)> =
+                    match split_worker::parse_splits(&ladder) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("[6/6] {}: bad denominations: {:#}", symbol, e);
+                            continue;
+                        }
+                    };
                 if rungs.is_empty() {
                     continue;
                 }
-                let Some((base, quote)) = m.market_id.split_once('-') else { continue };
-                for instr in [base, quote] {
-                    let (on_chain_id, admin) = config.resolve_instrument(instr);
-                    match atomic_split_denominations(
-                        &config, &on_chain_id, &admin, &rungs, true, verbose, dry_run, force,
-                    )
-                    .await
-                    {
-                        Ok(Some(update_id)) => println!(
-                            "[6/6] Split committed for {} / {} (update {})",
-                            m.market_id, instr, update_id
-                        ),
-                        Ok(None) => println!(
-                            "[6/6] Denomination coverage OK for {} / {}",
-                            m.market_id, instr
-                        ),
-                        Err(e) => tracing::warn!(
-                            "[6/6] Split for {} / {} failed: {:#}",
-                            m.market_id, instr, e
-                        ),
-                    }
+                let (on_chain_id, admin) = config.resolve_instrument(&symbol);
+                match atomic_split_denominations(
+                    &config, &on_chain_id, &admin, &rungs, true, verbose, dry_run, force,
+                )
+                .await
+                {
+                    Ok(Some(update_id)) => println!(
+                        "[6/6] Split committed for {} (update {})",
+                        symbol, update_id
+                    ),
+                    Ok(None) => println!("[6/6] Denomination coverage OK for {}", symbol),
+                    Err(e) => tracing::warn!("[6/6] Split for {} failed: {:#}", symbol, e),
                 }
             }
 

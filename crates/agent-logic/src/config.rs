@@ -483,14 +483,27 @@ impl BaseConfig {
             .map(|v2| v2.enabled)
             .unwrap_or(false);
 
+        let global_ladders = agent
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref())
+            .map(|v2| !v2.denominations.is_empty())
+            .unwrap_or(false);
         for market in &agent.markets {
             if let Some(v2m) = market.rfq.as_ref().and_then(|r| r.v2.as_ref()) {
-                if !(1..=20).contains(&v2m.max_input_holdings) {
+                if !(1..=100).contains(&v2m.max_input_holdings) {
                     return Err(anyhow!(
-                        "Market {}: [markets.rfq.v2] max_input_holdings={} must be 1..=20 \
+                        "Market {}: [markets.rfq.v2] max_input_holdings={} must be 1..=100 \
                          (relay protocol hard bound)",
                         market.market_id, v2m.max_input_holdings
                     ));
+                }
+                if global_ladders && !v2m.denominations.is_empty() {
+                    tracing::warn!(
+                        "Market {}: per-market [markets.rfq.v2].denominations is superseded by \
+                         the global [liquidity_provider.rfq_v2.denominations] map and ignored",
+                        market.market_id
+                    );
                 }
                 if v2m.enabled && !rfq_v2_enabled {
                     return Err(anyhow!(
@@ -821,8 +834,10 @@ pub struct RfqV2MarketConfig {
     /// Empty = default single rung base_order_size x max_concurrent_rfqs.
     #[serde(default)]
     pub denominations: Vec<String>,
-    /// Per-leg input-cid cap for LP disclosure selection. MUST be 1..=20
-    /// (the relay enforces the protocol hard bound of 20).
+    /// Per-leg input-cid cap for LP disclosure selection. MUST be 1..=100
+    /// (the relay enforces the protocol hard bound of 100). The headroom
+    /// above the coverage picks is used to sweep dust holdings into the
+    /// settle for consolidation.
     #[serde(default = "default_max_input_holdings")]
     pub max_input_holdings: usize,
 }
@@ -870,6 +885,15 @@ pub struct RfqV2Config {
     pub split_poll_interval_secs: u64,
     #[serde(default = "default_updates_poll_interval_secs")]
     pub updates_poll_interval_secs: u64,
+    /// GLOBAL per-instrument denomination ladders: symbol → "AMOUNTxCOUNT"
+    /// entries (e.g. `CC = ["100x10", "250x4"]`). One ladder per instrument,
+    /// shared by every market that pays that instrument — sized for the
+    /// typical $10-20 settlement. Supersedes the per-market
+    /// `[markets.rfq.v2].denominations` (which is warn-ignored when this map
+    /// is non-empty). The smallest rung doubles as the dust-merge threshold:
+    /// holdings below it are swept as extra inputs into settles.
+    #[serde(default)]
+    pub denominations: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for RfqV2Config {
@@ -883,6 +907,7 @@ impl Default for RfqV2Config {
             ticket_low_water: default_ticket_low_water(),
             split_poll_interval_secs: default_split_poll_interval_secs(),
             updates_poll_interval_secs: default_updates_poll_interval_secs(),
+            denominations: Default::default(),
         }
     }
 }
@@ -996,7 +1021,7 @@ fn default_updates_poll_interval_secs() -> u64 {
 }
 
 fn default_max_input_holdings() -> usize {
-    20
+    100
 }
 
 #[cfg(test)]
@@ -1121,7 +1146,26 @@ denominations = ["25x20", "100x10"]
         let v2m = agent.markets[0].rfq.as_ref().unwrap().v2.as_ref().unwrap();
         assert!(v2m.enabled);
         assert_eq!(v2m.denominations, vec!["25x20", "100x10"]);
-        assert_eq!(v2m.max_input_holdings, 20);
+        assert_eq!(v2m.max_input_holdings, 100);
+
+        // global per-instrument ladder map parses
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+enabled = true
+
+[liquidity_provider.rfq_v2.denominations]
+CC = ["100x10", "250x4"]
+USDC = ["15x10"]
+"#,
+        )
+        .unwrap();
+        let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        assert_eq!(v2.denominations["CC"], vec!["100x10", "250x4"]);
+        assert_eq!(v2.denominations["USDC"], vec!["15x10"]);
 
         // unquoted numeric threshold also parses
         let agent: AgentToml = toml::from_str(
@@ -1215,7 +1259,7 @@ name = "LP test"
         let cfg = BaseConfig::assemble(agent).unwrap();
         assert!(cfg.atomic_quote_key.is_none());
 
-        // D: max_input_holdings out of the 1..=20 protocol bound → error
+        // D: max_input_holdings out of the 1..=100 protocol bound → error
         set("RFQ_V2_ENABLED", "true");
         let agent: AgentToml = toml::from_str(
             r#"
@@ -1231,7 +1275,7 @@ max_quantity = "1000"
 
 [markets.rfq.v2]
 enabled = true
-max_input_holdings = 25
+max_input_holdings = 125
 "#,
         )
         .unwrap();

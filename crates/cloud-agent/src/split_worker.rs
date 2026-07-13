@@ -39,7 +39,7 @@ use crate::ledger_client::{AtomicProviderClient, DAppProviderClient};
 use crate::ticket_pool::{TicketAcsInfo, TicketPool};
 use crate::venue_registry::TEMPLATE_SETTLEMENT_TICKET;
 
-/// One LP-pays instrument of a market, resolved for splitting.
+/// One LP-pays instrument, resolved for splitting.
 #[derive(Debug, Clone)]
 pub struct SplitInstrument {
     pub key: InstrumentKey,
@@ -50,16 +50,14 @@ pub struct SplitInstrument {
     pub admin: String,
 }
 
-/// Per-market split policy (from `[markets.rfq.v2]`).
+/// Per-INSTRUMENT split policy: one global ladder per instrument, shared by
+/// every market that pays it (from `[liquidity_provider.rfq_v2.denominations]`,
+/// with a legacy per-market fallback derived at startup).
 #[derive(Debug, Clone)]
 pub struct SplitTarget {
-    pub market_id: String,
-    /// "AMOUNTxCOUNT" specs; empty = use `default_rung`
+    pub instrument: SplitInstrument,
+    /// "AMOUNTxCOUNT" specs
     pub denominations: Vec<String>,
-    /// base_order_size x max_concurrent_rfqs
-    pub default_rung: Option<(Decimal, u32)>,
-    /// both legs of the pair (LP can pay either depending on direction)
-    pub instruments: Vec<SplitInstrument>,
 }
 
 /// Parse "AMOUNTxCOUNT" split specs (port of the dvp `parse_splits`).
@@ -182,33 +180,25 @@ async fn tick(
         }
     }
 
-    // --- (b) denomination coverage per market x LP-pays instrument ---
+    // --- (b) denomination coverage per LP-pays instrument ---
     for target in targets {
-        let rungs: Vec<(Decimal, u32)> = if target.denominations.is_empty() {
-            target.default_rung.map(|r| vec![r]).unwrap_or_default()
-        } else {
-            match parse_splits(&target.denominations) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Market {}: bad denominations: {:#}", target.market_id, e);
-                    continue;
-                }
+        let rungs: Vec<(Decimal, u32)> = match parse_splits(&target.denominations) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("{}: bad denominations: {:#}", target.instrument.key, e);
+                continue;
             }
         };
         if rungs.is_empty() {
             continue;
         }
 
-        for instrument in &target.instruments {
-            if let Err(e) =
-                ensure_denominations(config, cache, &mut atomic_client, target, instrument, &rungs)
-                    .await
-            {
-                warn!(
-                    "Split for {} / {} failed: {:#}",
-                    target.market_id, instrument.key, e
-                );
-            }
+        if let Err(e) = ensure_denominations(
+            config, cache, &mut atomic_client, &target.instrument, &rungs,
+        )
+        .await
+        {
+            warn!("Split for {} failed: {:#}", target.instrument.key, e);
         }
     }
 
@@ -216,11 +206,12 @@ async fn tick(
 }
 
 /// Count coverage per rung and split deficits off the splitter reserve.
-async fn ensure_denominations(
+/// `pub(crate)` so the RFQ V2 indicative path can trigger an on-demand split
+/// before signing when selection comes up empty.
+pub(crate) async fn ensure_denominations(
     config: &BaseConfig,
     cache: &Arc<HoldingsCache>,
     atomic_client: &mut AtomicProviderClient,
-    target: &SplitTarget,
     instrument: &SplitInstrument,
     rungs: &[(Decimal, u32)],
 ) -> Result<()> {
@@ -278,9 +269,8 @@ async fn ensure_denominations(
     }
 
     info!(
-        "Splitting {} for {}: {:?} off reserve {} ({})",
+        "Splitting {}: {:?} off reserve {} ({})",
         instrument.key,
-        target.market_id,
         splits
             .iter()
             .map(|(d, c)| format!("{d}x{c}"))

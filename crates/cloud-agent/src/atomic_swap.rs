@@ -292,7 +292,7 @@ impl AtomicSwapper {
     /// → prepare/verify/sign/execute → confirm or classify the failure.
     ///
     /// `accepted` is the indicative quote the user accepted (`AtomicQuoteInfo`);
-    /// `max_input_holdings` is the per-market config cap (protocol bound 20).
+    /// `max_input_holdings` is the per-market config cap (protocol bound 100).
     pub async fn settle_envelope(
         &self,
         envelope: &AtomicQuoteEnvelope,
@@ -423,7 +423,7 @@ impl AtomicSwapper {
         };
         let proceeds_cover_fee = receive_id == "Amulet" && receive_amount >= fee_funding_target;
 
-        let max_inputs = max_input_holdings.min(20);
+        let max_inputs = max_input_holdings.min(100);
         // When the user PAYS CC, the leg selection itself must also cover the
         // fee (leg change alone can be arbitrarily small).
         let select_target = if is_cc {

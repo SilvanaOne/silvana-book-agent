@@ -81,7 +81,7 @@ message AtomicQuoteEnvelope {
   string canonical_message = 5;                     // v3: 16 lines / v4: 16 + fee block; client MUST re-derive and compare (H14)
   string quote_signature = 6;                       // ASN.1 DER, lowercase hex, secp256k1 over SHA256(msg)
   AtomicAcsContract ticket = 7;                     // present iff quote.ticket_id != ""
-  repeated string lp_input_holding_cids = 8;        // <= 20
+  repeated string lp_input_holding_cids = 8;        // <= 100
   repeated AtomicDisclosedContract disclosed = 9;   // venue + ticket + LP holdings, sanitized
   // transport-only (dropped when exporting to the reference envelope file format):
   string rfq_id = 10;

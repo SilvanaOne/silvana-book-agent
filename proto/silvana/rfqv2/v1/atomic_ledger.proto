@@ -59,7 +59,7 @@ message AtomicDvpSettleParams {
   optional string ticket_cid = 13;
   repeated string lp_input_holding_cids = 14;
   repeated AtomicDisclosedContract envelope_disclosures = 15;
-  // user-side inputs (agent-selected, <= 20):
+  // user-side inputs (agent-selected, <= 100):
   repeated string user_input_holding_cids = 16;
   string synchronizer_id = 17;
   // SIGNED LP-required fee(s), verbatim from the envelope's quote.lp_fees —
