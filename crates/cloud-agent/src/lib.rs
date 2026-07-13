@@ -400,12 +400,9 @@ pub enum FaucetCommands {
 
 #[derive(Subcommand)]
 pub enum AtomicCommands {
-    /// Generate (or load) the local secp256k1 quote-signing keypair — no ledger access
-    Keygen {
-        /// Keyfile path (default: ATOMIC_QUOTE_KEY_FILE env or ./atomic-quote-key.json)
-        #[arg(long)]
-        out: Option<String>,
-    },
+    /// Generate (or verify) the secp256k1 quote-signing key — prints the
+    /// ATOMIC_QUOTE_PRIVATE_KEY line for .env; never writes a file
+    Keygen,
     /// AtomicDVP venue operations (one venue per LP per market pair)
     Venue {
         #[command(subcommand)]
@@ -434,30 +431,30 @@ pub enum AtomicCommands {
         #[arg(long)]
         market: Option<String>,
     },
-    /// Orchestrate LP setup: keygen → service check → venues → receiving
-    /// preapprovals → ticket batch → denomination splits
-    Setup,
+    /// Orchestrate LP setup: key check → service-file check → venues →
+    /// receiving preapprovals → ticket batch → denomination splits
+    Setup {
+        /// AtomicDVPService disclosure JSON exported by the provider
+        /// (`orderbook atomic export --file …`)
+        #[arg(long, default_value = "atomic-dvp-service.json")]
+        service_file: String,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum AtomicVenueCommands {
-    /// Create the AtomicDVP venue for a market pair
+    /// Create the AtomicDVP venue for a market pair (key from ATOMIC_QUOTE_PRIVATE_KEY)
     Create {
         /// Market ID (pairName), format "BASE-QUOTE"
         #[arg(long)]
         market: String,
-        /// Quote keyfile path override
-        #[arg(long)]
-        quote_key_file: Option<String>,
     },
-    /// Rotate the venue's quote key — KILLS all live envelopes + old-key signatures
+    /// Rotate the venue's quote key to the current ATOMIC_QUOTE_PRIVATE_KEY —
+    /// KILLS all live envelopes + old-key signatures
     RotateKey {
         /// Market ID (pairName)
         #[arg(long)]
         market: String,
-        /// Quote keyfile path override
-        #[arg(long)]
-        quote_key_file: Option<String>,
     },
 }
 
@@ -1463,7 +1460,35 @@ pub async fn run_lp_atomic_stream(
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<AtomicLpToServer>(64);
         let outbound_stream = tokio_stream::wrappers::ReceiverStream::new(outbound_rx);
 
-        let response = match client.atomic_rfq_stream(outbound_stream).await {
+        // The V2 stream requires a Bearer JWT at open (no CantonNodeAuth
+        // fallback, unlike the v1 settlement stream). Fresh per reconnect.
+        let auth_header = agent_logic::auth::generate_jwt(
+            &config.party_id,
+            &config.role,
+            &config.private_key_bytes,
+            config.token_ttl_secs,
+            Some(&config.node_name),
+        )
+        .map_err(|e| anyhow!("{}", e))
+        .and_then(|jwt| {
+            format!("Bearer {}", jwt)
+                .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+                .map_err(|e| anyhow!("{}", e))
+        });
+        let auth_header = match auth_header {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Atomic stream: failed to build auth token: {}, retrying in 5s", e);
+                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let mut open_request = tonic::Request::new(outbound_stream);
+        open_request.metadata_mut().insert("authorization", auth_header);
+
+        let response = match client.atomic_rfq_stream(open_request).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Failed to open atomic RFQ stream: {}, retrying in 5s", e);
@@ -3772,16 +3797,49 @@ async fn atomic_find_venues(
     Ok(venues)
 }
 
-/// The provider-signed AtomicDVPService singleton's contract id, if visible.
-/// The agent can only OBSERVE it (via the ledger-service's provider-side
-/// query) — creation is ops: `orderbook atomic service` (fa-design G2).
-async fn atomic_find_service(
-    client: &mut AtomicProviderClient,
-) -> Result<Option<String>> {
-    let resp = client
-        .get_atomic_contracts(&[venue_registry::TEMPLATE_ATOMIC_DVP_SERVICE.to_string()], &[])
-        .await?;
-    Ok(resp.contracts.into_iter().next().map(|c| c.contract_id))
+/// The LP's secp256k1 quote-signing key, resolved from ATOMIC_QUOTE_PRIVATE_KEY
+/// ONLY (raw 32-byte scalar hex in .env). No keyfiles: the runtime agent and
+/// every CLI path share this single source, so the venue key and the signing
+/// key can never diverge.
+fn quote_key_from_env() -> Result<atomic_quote::QuoteKeyFile> {
+    let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "ATOMIC_QUOTE_PRIVATE_KEY is not set — run `atomic keygen` and add the \
+                 printed line to .env"
+            )
+        })?;
+    atomic_quote::keyfile_from_scalar(scalar.trim())
+        .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")
+}
+
+/// Read + validate the AtomicDVPService disclosure file the provider exported
+/// (`orderbook atomic export --file …`). The singleton is sole-signatory
+/// provider (fa-design G2), so it is INVISIBLE in the LP's ACS — this file is
+/// how the provider distributes the static blob (fa-design §3.1). Returns the
+/// contract id. The ledger-service independently discovers + discloses the
+/// service at prepare time; this file is the LP-side reference copy.
+fn read_service_file(path: &str) -> Result<String> {
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "cannot read the AtomicDVPService disclosure file {path} — ask the \
+             provider to export it: `orderbook atomic export --file {path}`"
+        )
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("{path} is not valid JSON"))?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let (cid, tid, blob) = (s("contractId"), s("templateId"), s("createdEventBlob"));
+    if cid.is_empty() || blob.is_empty() || !tid.contains(":AtomicDVPService") {
+        anyhow::bail!(
+            "{path} is not an AtomicDVPService disclosure (need contractId, \
+             createdEventBlob, templateId=…:AtomicDVPService) — re-export it: \
+             `orderbook atomic export --file {path}`"
+        );
+    }
+    Ok(cid)
 }
 
 /// Contract ids of this LP's live SettlementTickets.
@@ -3992,30 +4050,32 @@ pub async fn run_atomic(
     };
 
     match command {
-        AtomicCommands::Keygen { out } => {
-            let path = atomic_quote::resolve_keyfile_path(out.as_deref());
-            let existed = path.exists();
-            let kf = atomic_quote::load_or_create_keyfile(&path, true)?;
-            println!(
-                "{} quote keyfile {}",
-                if existed { "Loaded" } else { "Created" },
-                path.display()
-            );
-            println!("SPKI public key: {}", kf.pub_spki_hex);
+        AtomicCommands::Keygen => {
+            // Env-only key handling: never writes a file. Print material for .env.
+            match quote_key_from_env() {
+                Ok(kf) => {
+                    println!("ATOMIC_QUOTE_PRIVATE_KEY is set and valid.");
+                    println!("SPKI public key: {}", kf.pub_spki_hex);
+                }
+                Err(_) => {
+                    let kf = atomic_quote::gen_keypair()?;
+                    println!("Generated a new secp256k1 quote keypair (NOT persisted).");
+                    println!("Add this line to the agent's .env:");
+                    println!();
+                    println!("ATOMIC_QUOTE_PRIVATE_KEY={}", kf.priv_scalar_hex);
+                    println!();
+                    println!("SPKI public key: {}", kf.pub_spki_hex);
+                    println!("⚠ Keep the .env safe: this key signs all quotes for venues created with it.");
+                }
+            }
         }
 
 
         AtomicCommands::Venue { command } => match command {
-            AtomicVenueCommands::Create { market, quote_key_file } => {
+            AtomicVenueCommands::Create { market } => {
                 let ((base_id, base_admin), (quote_id, quote_admin)) =
                     atomic_resolve_market_pair(&config, &market)?;
-                let key_path = atomic_quote::resolve_keyfile_path(quote_key_file.as_deref());
-                let kf = atomic_quote::load_or_create_keyfile(&key_path, false).with_context(|| {
-                    format!(
-                        "quote keyfile missing/invalid at {} — run `atomic keygen` first",
-                        key_path.display()
-                    )
-                })?;
+                let kf = quote_key_from_env()?;
                 let mut client = atomic_swap::create_atomic_client(&config).await?;
                 if let Some(existing) = atomic_find_venues(&mut client, &config.party_id)
                     .await?
@@ -4063,14 +4123,8 @@ pub async fn run_atomic(
                     .await?;
                 println!("AtomicDVP venue created for {}, update id: {}", market, resp.update_id);
             }
-            AtomicVenueCommands::RotateKey { market, quote_key_file } => {
-                let key_path = atomic_quote::resolve_keyfile_path(quote_key_file.as_deref());
-                let kf = atomic_quote::load_or_create_keyfile(&key_path, false).with_context(|| {
-                    format!(
-                        "quote keyfile missing/invalid at {} — run `atomic keygen` first",
-                        key_path.display()
-                    )
-                })?;
+            AtomicVenueCommands::RotateKey { market } => {
+                let kf = quote_key_from_env()?;
                 let mut client = atomic_swap::create_atomic_client(&config).await?;
                 let venue = atomic_find_venues(&mut client, &config.party_id)
                     .await?
@@ -4236,11 +4290,7 @@ pub async fn run_atomic(
 
         AtomicCommands::Status { market } => {
             let mut client = atomic_swap::create_atomic_client(&config).await?;
-            let key_path = atomic_quote::resolve_keyfile_path(None);
-            let local_key = key_path
-                .exists()
-                .then(|| atomic_quote::load_or_create_keyfile(&key_path, false).ok())
-                .flatten();
+            let local_key = quote_key_from_env().ok();
 
             println!("\n=== AtomicDVP venues ===\n");
             let venues = atomic_find_venues(&mut client, &config.party_id).await?;
@@ -4266,9 +4316,12 @@ pub async fn run_atomic(
                 println!("  quote key: {}", key_status);
             }
 
-            match atomic_find_service(&mut client).await? {
-                Some(cid) => println!("\nAtomicDVPService singleton: {}", cid),
-                None => println!("\nAtomicDVPService singleton: (none — ops must run `orderbook atomic service`)"),
+            match read_service_file("atomic-dvp-service.json") {
+                Ok(cid) => println!("\nAtomicDVPService (from atomic-dvp-service.json): {}", cid),
+                Err(_) => println!(
+                    "\nAtomicDVPService: no atomic-dvp-service.json — get it from the \
+                     provider (`orderbook atomic export --file atomic-dvp-service.json`)"
+                ),
             }
             let tickets = atomic_list_live_tickets(&mut client, &config.party_id).await?;
             println!("Live tickets:  {}", tickets.len());
@@ -4310,33 +4363,23 @@ pub async fn run_atomic(
             }
         }
 
-        AtomicCommands::Setup => {
+        AtomicCommands::Setup { service_file } => {
             println!("=== Atomic (RFQ V2) setup for {} ===", config.party_id);
 
-            // 1. keygen (create if absent)
-            let key_path = atomic_quote::resolve_keyfile_path(None);
-            let existed = key_path.exists();
-            let kf = atomic_quote::load_or_create_keyfile(&key_path, true)?;
-            println!(
-                "[1/6] Quote key ({}): {}",
-                if existed { "existing" } else { "created" },
-                kf.pub_spki_hex
-            );
+            // 1. quote key from .env (ATOMIC_QUOTE_PRIVATE_KEY only — no
+            // keyfiles; the same resolution the runtime agent uses, so the
+            // venue key and the signing key can never diverge)
+            let kf = quote_key_from_env()?;
+            println!("[1/6] Quote key (from ATOMIC_QUOTE_PRIVATE_KEY): {}", kf.pub_spki_hex);
 
             let mut client = atomic_swap::create_atomic_client(&config).await?;
 
-            // 2. AtomicDVPService singleton PRESENCE CHECK — the agent cannot
-            // create it (sole signatory = the provider, fa-design G2); venue
-            // creation below would fail server-side anyway, so fail early here.
-            match atomic_find_service(&mut client).await? {
-                Some(cid) => println!("[2/6] AtomicDVPService singleton present: {cid}"),
-                None => {
-                    return Err(anyhow!(
-                        "[2/6] AtomicDVPService singleton not found — the provider must \
-                         bootstrap it first (ops: `orderbook atomic service`)"
-                    ));
-                }
-            }
+            // 2. AtomicDVPService disclosure file check — the singleton is
+            // provider-only (invisible in the LP's ACS); the provider exports
+            // its blob and the LP keeps a reference copy. Venue creation is
+            // prepared server-side with the server's own disclosure.
+            let service_cid = read_service_file(&service_file)?;
+            println!("[2/6] AtomicDVPService (from {service_file}): {service_cid}");
 
             // 3. venue per rfq_v2-enabled market (skip existing with matching key)
             let v2_markets: Vec<&agent_logic::config::MarketConfig> = config

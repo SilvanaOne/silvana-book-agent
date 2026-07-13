@@ -307,8 +307,8 @@ fn parse_created_holding(
                 .get("amount")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())?;
-            let admin = json.pointer("/instrumentId/admin").and_then(|v| v.as_str())?;
-            let id = json.pointer("/instrumentId/id").and_then(|v| v.as_str())?;
+            let admin = json.pointer("/instrument/source").and_then(|v| v.as_str())?;
+            let id = json.pointer("/instrument/id").and_then(|v| v.as_str())?;
             (instrument_key(admin, id), amount)
         }
         _ => return None,

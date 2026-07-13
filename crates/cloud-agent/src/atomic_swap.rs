@@ -802,8 +802,8 @@ impl AtomicSwapper {
                 }
                 let (Some(amount), Some(admin), Some(id)) = (
                     payload.get("amount").and_then(|v| v.as_str()).and_then(|s| s.parse::<Decimal>().ok()),
-                    payload.pointer("/instrumentId/admin").and_then(|v| v.as_str()),
-                    payload.pointer("/instrumentId/id").and_then(|v| v.as_str()),
+                    payload.pointer("/instrument/source").and_then(|v| v.as_str()),
+                    payload.pointer("/instrument/id").and_then(|v| v.as_str()),
                 ) else {
                     continue;
                 };

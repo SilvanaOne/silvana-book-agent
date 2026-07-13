@@ -135,7 +135,8 @@ async fn refresh_holdings(
 /// Parse a mixed Amulet + Holding ACS snapshot into cache entries.
 /// Amulet: skip Locked templates, amount = `amount.initialAmount`.
 /// Holding: `owner == party` and `lock` null; amount = `amount`;
-/// instrument = `instrumentId.{admin,id}`.
+/// instrument = `instrument.{source,id}` (`InstrumentIdentifier`: admin lives
+/// in `source`).
 pub(crate) fn parse_acs_holdings(
     contracts: Vec<orderbook_proto::ledger::ActiveContractInfo>,
     party_id: &str,
@@ -175,8 +176,8 @@ pub(crate) fn parse_acs_holdings(
                     .get("amount")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse().ok())?;
-                let admin = json.pointer("/instrumentId/admin").and_then(|v| v.as_str())?;
-                let id = json.pointer("/instrumentId/id").and_then(|v| v.as_str())?;
+                let admin = json.pointer("/instrument/source").and_then(|v| v.as_str())?;
+                let id = json.pointer("/instrument/id").and_then(|v| v.as_str())?;
                 Some(CachedHolding {
                     contract_id: c.contract_id,
                     template_id: c.template_id,
@@ -197,4 +198,93 @@ pub(crate) fn parse_acs_holdings(
 pub struct AmuletInfo {
     pub contract_id: String,
     pub amount: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_prost_value(v: &serde_json::Value) -> prost_types::Value {
+        use prost_types::value::Kind;
+        let kind = match v {
+            serde_json::Value::Null => Kind::NullValue(0),
+            serde_json::Value::Bool(b) => Kind::BoolValue(*b),
+            serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap()),
+            serde_json::Value::String(s) => Kind::StringValue(s.clone()),
+            serde_json::Value::Array(a) => Kind::ListValue(prost_types::ListValue {
+                values: a.iter().map(to_prost_value).collect(),
+            }),
+            serde_json::Value::Object(_) => Kind::StructValue(to_prost_struct(v)),
+        };
+        prost_types::Value { kind: Some(kind) }
+    }
+
+    fn to_prost_struct(v: &serde_json::Value) -> prost_types::Struct {
+        prost_types::Struct {
+            fields: v
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), to_prost_value(v)))
+                .collect(),
+        }
+    }
+
+    fn holding_contract(payload: serde_json::Value) -> orderbook_proto::ledger::ActiveContractInfo {
+        orderbook_proto::ledger::ActiveContractInfo {
+            contract_id: "00cid".to_string(),
+            template_id:
+                "112742269c282ab77490b7933f65582bc223e3bf6c120d81e0799cf0d99ecd9e:Utility.Registry.Holding.V0.Holding:Holding"
+                    .to_string(),
+            entity_name: "Holding".to_string(),
+            create_arguments: Some(to_prost_struct(&payload)),
+            created_event_blob: "blob".to_string(),
+            synchronizer_id: "sync".to_string(),
+            network_id: String::new(),
+        }
+    }
+
+    /// Real devnet Holding shape: `instrument: {id, scheme, source}` (the
+    /// admin party lives in `source`); unlocked holdings omit `lock`.
+    #[test]
+    fn parses_real_holding_shape() {
+        let lp = "lp::1220aa";
+        let unlocked = holding_contract(serde_json::json!({
+            "operator": "op::1220bb",
+            "provider": "reg::1220cc",
+            "registrar": "reg::1220cc",
+            "owner": lp,
+            "instrument": {
+                "id": "USDC",
+                "scheme": "RegistrarInternalScheme",
+                "source": "test-token-1::122034"
+            },
+            "label": "",
+            "amount": "1234.0000000000"
+        }));
+        let locked = holding_contract(serde_json::json!({
+            "operator": "op::1220bb",
+            "provider": "reg::1220cc",
+            "registrar": "reg::1220cc",
+            "owner": lp,
+            "instrument": {
+                "id": "USDC",
+                "scheme": "RegistrarInternalScheme",
+                "source": "test-token-1::122034"
+            },
+            "label": "",
+            "amount": "1.6101587500",
+            "lock": { "context": "alloc", "lockers": { "map": [] } }
+        }));
+        let other_owner = holding_contract(serde_json::json!({
+            "owner": "someone-else::1220dd",
+            "instrument": { "id": "USDC", "scheme": "RegistrarInternalScheme", "source": "test-token-1::122034" },
+            "amount": "9.0"
+        }));
+
+        let parsed = parse_acs_holdings(vec![unlocked, locked, other_owner], lp);
+        assert_eq!(parsed.len(), 1, "only the unlocked own holding survives");
+        assert_eq!(parsed[0].instrument, "test-token-1::122034::USDC");
+        assert_eq!(parsed[0].amount, Decimal::new(1234, 0));
+    }
 }

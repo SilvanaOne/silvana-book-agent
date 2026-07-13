@@ -194,9 +194,9 @@ pub struct BaseConfig {
     pub prepaid_traffic_topup_cc: Option<rust_decimal::Decimal>,
 
     /// RFQ V2 (AtomicDVP) secp256k1 quote-signing keypair. Loaded in `assemble`
-    /// iff `liquidity_provider.rfq_v2.enabled`; precedence:
-    /// ATOMIC_QUOTE_PRIVATE_KEY env (raw scalar hex) > keyfile at
-    /// `resolve_keyfile_path(ATOMIC_QUOTE_KEY_FILE or default)`.
+    /// iff `liquidity_provider.rfq_v2.enabled`, from the
+    /// ATOMIC_QUOTE_PRIVATE_KEY env var (raw 32-byte scalar hex) ONLY — no
+    /// keyfiles, so the runtime and every CLI path share one key source.
     pub atomic_quote_key: Option<AtomicQuoteKey>,
 }
 
@@ -512,25 +512,19 @@ impl BaseConfig {
             }
         }
 
-        // Quote key: required iff RFQ V2 is enabled. Precedence:
-        // ATOMIC_QUOTE_PRIVATE_KEY (raw scalar hex) > keyfile (never auto-created here).
+        // Quote key: required iff RFQ V2 is enabled. ENV-ONLY — no keyfiles:
+        // ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex) is the single
+        // source for the runtime AND the atomic CLI, so the venue key and the
+        // signing key can never diverge.
         let atomic_quote_key = if rfq_v2_enabled {
             let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY").ok()
-                .filter(|s| !s.trim().is_empty());
-            let kf = match scalar {
-                Some(s) => atomic_quote::keyfile_from_scalar(s.trim())
-                    .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")?,
-                None => {
-                    let path = atomic_quote::resolve_keyfile_path(None);
-                    atomic_quote::load_or_create_keyfile(&path, false).with_context(|| {
-                        format!(
-                            "RFQ V2 is enabled but the quote keyfile {} could not be loaded \
-                             (set ATOMIC_QUOTE_PRIVATE_KEY or ATOMIC_QUOTE_KEY_FILE)",
-                            path.display()
-                        )
-                    })?
-                }
-            };
+                .filter(|s| !s.trim().is_empty())
+                .context(
+                    "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
+                     run `atomic keygen` and add the printed line to .env",
+                )?;
+            let kf = atomic_quote::keyfile_from_scalar(scalar.trim())
+                .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")?;
             Some(AtomicQuoteKey(kf))
         } else {
             None
@@ -1169,7 +1163,7 @@ ticket_threshold_usd = 250.5
         set("PARTY_SETTLEMENT_OPERATOR", "op::1220dd");
         set("NODE_NAME", "test-node");
         set("LEDGER_SERVICE_PUBLIC_KEY", &bs58::encode([7u8; 32]).into_string());
-        for k in ["RFQ_V2_ENABLED", "TICKET_THRESHOLD_USD", "TICKET_BATCH_SIZE", "ATOMIC_QUOTE_PRIVATE_KEY", "ATOMIC_QUOTE_KEY_FILE"] {
+        for k in ["RFQ_V2_ENABLED", "TICKET_THRESHOLD_USD", "TICKET_BATCH_SIZE", "ATOMIC_QUOTE_PRIVATE_KEY"] {
             unset(k);
         }
 
@@ -1275,12 +1269,11 @@ atomic_quote_valid_secs = 0
         let err = BaseConfig::assemble(agent).unwrap_err().to_string();
         assert!(err.contains("atomic_quote_valid_secs"), "got: {err}");
 
-        // G: enabled without any key source → error (keyfile default path absent)
+        // G: enabled without the env key → error (env-only, no keyfile fallback)
         unset("ATOMIC_QUOTE_PRIVATE_KEY");
-        set("ATOMIC_QUOTE_KEY_FILE", "/nonexistent/quote-key.json");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
         let err = format!("{:#}", BaseConfig::assemble(agent).unwrap_err());
-        assert!(err.contains("quote keyfile"), "got: {err}");
+        assert!(err.contains("ATOMIC_QUOTE_PRIVATE_KEY"), "got: {err}");
 
         // cleanup
         for k in [
@@ -1288,7 +1281,6 @@ atomic_quote_valid_secs = 0
             "TICKET_THRESHOLD_USD",
             "TICKET_BATCH_SIZE",
             "ATOMIC_QUOTE_PRIVATE_KEY",
-            "ATOMIC_QUOTE_KEY_FILE",
         ] {
             unset(k);
         }
