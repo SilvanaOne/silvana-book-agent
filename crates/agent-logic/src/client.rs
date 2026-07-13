@@ -17,6 +17,11 @@ use orderbook_proto::{
         AcceptQuoteRequest, AcceptQuoteResponse,
         GetRoundsDataRequest, GetRoundsDataResponse,
     },
+    rfqv2::{
+        rfq_v2_service_client::RfqV2ServiceClient,
+        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, RfqConfirmRejectReason,
+        RequestQuotesV2Request, RequestQuotesV2Response,
+    },
 };
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +49,8 @@ struct ExternalAuthData {
 pub struct OrderbookClient {
     pricing_client: PricingServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
     orderbook_client: OrderbookServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
+    /// RFQ V2 (AtomicDVP) user-facing service — same channel/auth as v1
+    rfqv2_client: RfqV2ServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
     // Raw client for streaming (interceptors don't work well with streaming)
     raw_orderbook_client: OrderbookServiceClient<Channel>,
     auth_data: ExternalAuthData,
@@ -90,6 +97,12 @@ impl OrderbookClient {
 
         let orderbook_client = OrderbookServiceClient::with_interceptor(
             channel.clone(),
+            auth_interceptor.clone(),
+        )
+        .max_decoding_message_size(16 * 1024 * 1024);
+
+        let rfqv2_client = RfqV2ServiceClient::with_interceptor(
+            channel.clone(),
             auth_interceptor,
         )
         .max_decoding_message_size(16 * 1024 * 1024);
@@ -100,6 +113,7 @@ impl OrderbookClient {
         Ok(Self {
             pricing_client,
             orderbook_client,
+            rfqv2_client,
             raw_orderbook_client,
             auth_data,
         })
@@ -419,6 +433,60 @@ impl OrderbookClient {
         Ok(response.into_inner())
     }
 
+    /// Request RFQ V2 (AtomicDVP) quotes from V2-connected liquidity providers
+    pub async fn request_quotes_atomic(
+        &mut self,
+        market_id: &str,
+        direction: &str,
+        quantity: &str,
+        lp_names: Vec<String>,
+        timeout_secs: Option<u32>,
+    ) -> Result<RequestQuotesV2Response> {
+        let request = Request::new(RequestQuotesV2Request {
+            market_id: market_id.to_string(),
+            direction: direction.to_string(),
+            quantity: quantity.to_string(),
+            lp_names,
+            timeout_secs,
+        });
+
+        let response = self
+            .rfqv2_client
+            .request_quotes(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("request_quotes_atomic failed: {}", e.message()))?;
+
+        Ok(response.into_inner())
+    }
+
+    /// Accept an RFQ V2 quote — blocks up to the confirm round trip
+    /// (`timeout_secs`, server default 10 s, clamp 1..30).
+    ///
+    /// An LP reject travels in the response BODY: gRPC OK + `success=false`
+    /// with `reject_reason`/`reject_detail` set — NOT a transport error. Only
+    /// transport-level failures (timeout, LP disconnect, V2-unaware server)
+    /// surface as `Err`. Use [`atomic_reject_reason_name`] to render the enum.
+    pub async fn accept_quote_atomic(
+        &mut self,
+        rfq_id: &str,
+        quote_id: &str,
+        timeout_secs: Option<u32>,
+    ) -> Result<AcceptQuoteAtomicResponse> {
+        let request = Request::new(AcceptQuoteAtomicRequest {
+            rfq_id: rfq_id.to_string(),
+            quote_id: quote_id.to_string(),
+            timeout_secs,
+        });
+
+        let response = self
+            .rfqv2_client
+            .accept_quote_atomic(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("accept_quote_atomic failed ({}): {}", e.code(), e.message()))?;
+
+        Ok(response.into_inner())
+    }
+
     /// Get the party ID for this client
     pub fn party_id(&self) -> &str {
         &self.auth_data.party_id
@@ -446,6 +514,14 @@ impl OrderbookClient {
             .map_err(|e| anyhow::anyhow!("get_rounds_data failed: {}", e.message()))?;
         Ok(response.into_inner())
     }
+}
+
+/// Human-readable name for an RFQ V2 LP confirm-reject reason code
+/// (`AcceptQuoteAtomicResponse.reject_reason`).
+pub fn atomic_reject_reason_name(code: i32) -> &'static str {
+    RfqConfirmRejectReason::try_from(code)
+        .map(|r| r.as_str_name())
+        .unwrap_or("RFQ_CONFIRM_REJECT_REASON_UNKNOWN")
 }
 
 /// Authentication interceptor for gRPC requests with automatic JWT refresh

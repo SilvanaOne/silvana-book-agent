@@ -37,7 +37,7 @@ use tx_verifier::OperationExpectation;
 
 use tonic::transport::Channel;
 
-use crate::amulet_cache::{AmuletCache, CachedAmulet};
+use crate::holdings_cache::{CachedAmulet, CcView};
 use crate::ledger_client::DAppProviderClient;
 
 /// Default max concurrent allocation workers (critical path — highest priority)
@@ -162,7 +162,7 @@ impl PaymentQueue {
         force: bool,
         confirm: bool,
         confirm_lock: ConfirmLock,
-        cache: Arc<AmuletCache>,
+        cache: CcView,
         shutdown: Shutdown,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -318,7 +318,7 @@ impl PaymentQueue {
         force: bool,
         confirm: bool,
         confirm_lock: ConfirmLock,
-        cache: Arc<AmuletCache>,
+        cache: CcView,
         queued_allocations: Arc<AtomicU64>,
         queued_fees: Arc<AtomicU64>,
         max_alloc_workers: usize,
@@ -447,7 +447,14 @@ impl PaymentQueue {
                 );
                 // Off-chain PayFee needs no amulets — only CC allocations select.
                 let selected = if is_allocation {
-                    select_amulets_for_allocation(&selectable, estimated_cc)
+                    let mut sel = select_amulets_for_allocation(&selectable, estimated_cc);
+                    if sel.is_empty() {
+                        // Splitter-reserve fail-open: v1 settle success outranks
+                        // reserve preservation — retry including the reserve.
+                        let with_reserve = cache.get_selectable_amulets_incl_reserve().await;
+                        sel = select_amulets_for_allocation(&with_reserve, estimated_cc);
+                    }
+                    sel
                 } else {
                     Vec::new()
                 };
@@ -661,7 +668,7 @@ pub(crate) fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimat
 
 /// Process amulet cache updates after a successful transaction
 pub(crate) async fn process_tx_result(
-    cache: &Arc<AmuletCache>,
+    cache: &CcView,
     input_cids: &[String],
     result: &orderbook_proto::ledger::ExecuteTransactionResponse,
 ) {
@@ -698,7 +705,7 @@ pub(crate) async fn process_tx_result(
 }
 
 /// Handle INACTIVE_CONTRACTS error — mark amulets as consumed and release
-pub(crate) async fn handle_inactive_contracts(cache: &Arc<AmuletCache>, input_cids: &[String]) {
+pub(crate) async fn handle_inactive_contracts(cache: &CcView, input_cids: &[String]) {
     if !input_cids.is_empty() {
         cache.mark_consumed(input_cids, "inactive").await;
     }
@@ -781,7 +788,7 @@ async fn execute_allocate(
     force: bool,
     confirm: bool,
     confirm_lock: &ConfirmLock,
-    cache: &Arc<AmuletCache>,
+    cache: &CcView,
 ) -> Result<StepResult> {
     if confirm && !dry_run {
         confirm_transaction(

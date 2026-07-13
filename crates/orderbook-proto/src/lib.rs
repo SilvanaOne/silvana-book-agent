@@ -32,18 +32,48 @@ pub mod pricing {
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("pricing_descriptor");
 }
 
+// silvana.ledger.v1's bridge.proto cross-imports silvana.rfqv2.v1 (rev 3: the
+// shared tunnel carries the atomic RPCs), so both packages are compiled in ONE
+// unit and prost emits relative super::…::rfqv2::v1 paths — hence this nested
+// module tree mirroring the proto package hierarchy. The public `ledger` /
+// `rfqv2` alias modules below preserve the crate's existing API.
+mod proto_gen {
+    pub mod silvana {
+        pub mod ledger {
+            pub mod v1 {
+                tonic::include_proto!("silvana.ledger.v1");
+            }
+        }
+        pub mod rfqv2 {
+            pub mod v1 {
+                tonic::include_proto!("silvana.rfqv2.v1");
+            }
+        }
+    }
+}
+
+impl message_signing::AsCanonicalFee for proto_gen::silvana::ledger::v1::Fee {
+    fn entry_type(&self) -> &str { &self.entry_type }
+    fn description(&self) -> &str { &self.description }
+    fn amount_cc(&self) -> &str { &self.amount_cc }
+}
+
 /// DApp Provider service (CIP-0103) protobuf definitions
 pub mod ledger {
-    tonic::include_proto!("silvana.ledger.v1");
+    pub use crate::proto_gen::silvana::ledger::v1::*;
 
-    /// File descriptor set for DApp Provider service
+    /// File descriptor set for DApp Provider service (merged set: contains
+    /// both silvana.ledger.v1 and silvana.rfqv2.v1)
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("ledger_descriptor");
+}
 
-    impl message_signing::AsCanonicalFee for Fee {
-        fn entry_type(&self) -> &str { &self.entry_type }
-        fn description(&self) -> &str { &self.description }
-        fn amount_cc(&self) -> &str { &self.amount_cc }
-    }
+/// RFQ V2 (AtomicDVP) protobuf definitions — self-contained parallel stack
+pub mod rfqv2 {
+    pub use crate::proto_gen::silvana::rfqv2::v1::*;
+
+    /// File descriptor set for RFQ V2 services (merged set: contains both
+    /// silvana.ledger.v1 and silvana.rfqv2.v1)
+    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("ledger_descriptor");
 }
 
 /// Descriptor pool for orderbook service reflection
@@ -61,6 +91,10 @@ pub static PRICING_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
 /// Descriptor pool for ledger gateway service reflection
 pub static LEDGER_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
     Lazy::new(|| DescriptorPool::decode(ledger::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
+
+/// Descriptor pool for RFQ V2 service reflection
+pub static RFQV2_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
+    Lazy::new(|| DescriptorPool::decode(rfqv2::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
 
 // Re-export commonly used types for convenience
 pub use orderbook::{
@@ -136,6 +170,31 @@ pub use ledger::{
     RegisterAgentRequest, RegisterAgentResponse,
     GetOnboardingStatusRequest, GetOnboardingStatusResponse,
     SubmitOnboardingSignatureRequest, SubmitOnboardingSignatureResponse,
+};
+
+pub use rfqv2::{
+    rfq_v2_service_client::RfqV2ServiceClient,
+    atomic_rfq_service_client::AtomicRfqServiceClient,
+    atomic_dvp_provider_service_client::AtomicDvpProviderServiceClient,
+    // Envelope
+    AtomicDisclosedContract, AtomicAcsContract, AtomicQuote, AtomicQuoteEnvelope,
+    // User-facing
+    RequestQuotesV2Request, RequestQuotesV2Response, AtomicQuoteInfo, AtomicRejectInfo,
+    AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse,
+    GetAtomicLiquidityProvidersRequest, GetAtomicLiquidityProvidersResponse, AtomicLpInfo,
+    GetAtomicRfqAuditLogRequest, GetAtomicRfqAuditLogResponse, AtomicRfqAuditEntry,
+    // LP stream
+    AtomicHandshake, AtomicHandshakeAck, AtomicHeartbeat,
+    AtomicRfqRequest, AtomicRfqQuote, AtomicRfqReject,
+    RfqConfirmRequest, RfqConfirmReject, RfqConfirmRejectReason,
+    AtomicServerToLp, AtomicLpToServer,
+    // Ledger ops
+    AtomicFeeSpec, AtomicMessageSignature, Fee, AtomicDvpSettleParams,
+    IssueTicketsParams, SplitSpec, SplitHoldingsParams, CreateAtomicDvpVenueParams,
+    UpdateVenueKeyParams, CancelTicketsParams,
+    PrepareAtomicTransactionRequest, PrepareAtomicTransactionResponse,
+    ExecuteAtomicTransactionRequest, ExecuteAtomicTransactionResponse,
+    GetAtomicContractsRequest, GetAtomicContractsResponse,
 };
 
 #[cfg(test)]

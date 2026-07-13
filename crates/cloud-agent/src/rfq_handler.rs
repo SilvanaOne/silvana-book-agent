@@ -6,12 +6,16 @@
 //! When a LiquidityManager is configured, the handler:
 //! 1. Rejects RFQs when the LP lacks sufficient balance for the allocation + fees
 //! 2. Widens spreads based on token depletion rate (depletion coefficient)
+//!
+//! The pricing + gating pipeline is shared between RFQ v1
+//! (`handle_rfq_request`) and the RFQ V2 atomic stream (`price_rfq`).
 
 use agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::runner::QuotedTrade;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -38,6 +42,48 @@ pub struct RfqHandler {
 pub enum RfqResponse {
     Quote(RfqQuote),
     Reject(RfqReject),
+}
+
+/// A priced (accepted) RFQ — shared output of the v1/V2 pricing pipeline.
+/// The `*_str` fields are the exact v1 wire strings (`{:.10}` renders of the
+/// f64 computation); the Decimals are parsed from those strings so both
+/// representations agree digit-for-digit.
+pub(crate) struct PricedQuote {
+    #[allow(dead_code)] // consumed by the user-mode phase (atomic_swap)
+    pub market_id: String,
+    #[allow(dead_code)] // consumed by the user-mode phase (atomic_swap)
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub quote_quantity: Decimal,
+    pub price_str: String,
+    pub quantity_str: String,
+    pub quote_quantity_str: String,
+    /// (token symbol, amount) the LP pays/allocates on this trade
+    pub lp_pays: (String, Decimal),
+    /// USD notional of the quote leg, when a USD reference price exists
+    pub notional_usd: Option<f64>,
+    pub valid_for_secs: u32,
+    pub allocate_before_secs: u32,
+    pub settle_before_secs: u32,
+}
+
+/// A rejection from the shared pricing pipeline.
+pub(crate) struct RejectInfo {
+    pub reason: RfqRejectionReason,
+    pub reason_detail: Option<String>,
+    pub min_quantity: Option<String>,
+    pub max_quantity: Option<String>,
+}
+
+impl RejectInfo {
+    fn new(reason: RfqRejectionReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            reason_detail: Some(detail.into()),
+            min_quantity: None,
+            max_quantity: None,
+        }
+    }
 }
 
 impl RfqHandler {
@@ -87,29 +133,28 @@ impl RfqHandler {
         None
     }
 
-    /// Handle an incoming RFQ request
-    pub async fn handle_rfq_request(&self, request: RfqRequest) -> RfqResponse {
-        let rfq_id = request.rfq_id.clone();
-
+    /// Shared pricing + gating pipeline (v1 semantics, byte-identical outputs).
+    ///
+    /// `direction`: 1 = BUY (user buys base, LP sells base), 2 = SELL (user
+    /// sells base, LP buys base / sells quote) — the v1 `RfqRequest.direction`
+    /// enum values. `rfq_id` is used for logging only.
+    pub(crate) async fn price_rfq(
+        &self,
+        rfq_id: &str,
+        market_id: &str,
+        direction: i32,
+        quantity_str: &str,
+    ) -> Result<PricedQuote, RejectInfo> {
         // Find market config
-        let market_config = self.markets.iter().find(|m| m.market_id == request.market_id);
+        let market_config = self.markets.iter().find(|m| m.market_id == market_id);
         let market_config = match market_config {
             Some(m) if m.enabled => m,
             _ => {
-                debug!("RFQ {}: market {} not configured or disabled", rfq_id, request.market_id);
-                return RfqResponse::Reject(RfqReject {
-                    rfq_id,
-                    lp_party_id: self.party_id.clone(),
-                    lp_name: self.lp_config.name.clone(),
-                    reason: RfqRejectionReason::MarketNotSupported as i32,
-                    reason_detail: Some(format!("Market {} not supported", request.market_id)),
-                    rejected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                    min_quantity: None,
-                    max_quantity: None,
-                });
+                debug!("RFQ {}: market {} not configured or disabled", rfq_id, market_id);
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::MarketNotSupported,
+                    format!("Market {} not supported", market_id),
+                ));
             }
         };
 
@@ -117,40 +162,22 @@ impl RfqHandler {
         let rfq_config = match &market_config.rfq {
             Some(rfq) if rfq.enabled => rfq,
             _ => {
-                debug!("RFQ {}: RFQ not enabled for market {}", rfq_id, request.market_id);
-                return RfqResponse::Reject(RfqReject {
-                    rfq_id,
-                    lp_party_id: self.party_id.clone(),
-                    lp_name: self.lp_config.name.clone(),
-                    reason: RfqRejectionReason::MarketNotSupported as i32,
-                    reason_detail: Some("RFQ not enabled for this market".to_string()),
-                    rejected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                    min_quantity: None,
-                    max_quantity: None,
-                });
+                debug!("RFQ {}: RFQ not enabled for market {}", rfq_id, market_id);
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::MarketNotSupported,
+                    "RFQ not enabled for this market",
+                ));
             }
         };
 
         // Parse quantity
-        let quantity: f64 = match request.quantity.parse() {
+        let quantity: f64 = match quantity_str.parse() {
             Ok(q) => q,
             Err(_) => {
-                return RfqResponse::Reject(RfqReject {
-                    rfq_id,
-                    lp_party_id: self.party_id.clone(),
-                    lp_name: self.lp_config.name.clone(),
-                    reason: RfqRejectionReason::Unspecified as i32,
-                    reason_detail: Some("Invalid quantity".to_string()),
-                    rejected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                    min_quantity: None,
-                    max_quantity: None,
-                });
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::Unspecified,
+                    "Invalid quantity",
+                ));
             }
         };
 
@@ -159,32 +186,18 @@ impl RfqHandler {
         let max_qty: f64 = rfq_config.max_quantity.parse().unwrap_or(f64::MAX);
 
         if quantity < min_qty {
-            return RfqResponse::Reject(RfqReject {
-                rfq_id,
-                lp_party_id: self.party_id.clone(),
-                lp_name: self.lp_config.name.clone(),
-                reason: RfqRejectionReason::AmountTooSmall as i32,
+            return Err(RejectInfo {
+                reason: RfqRejectionReason::AmountTooSmall,
                 reason_detail: Some(format!("Min quantity: {}", min_qty)),
-                rejected_at: Some(prost_types::Timestamp {
-                    seconds: chrono::Utc::now().timestamp(),
-                    nanos: 0,
-                }),
                 min_quantity: Some(rfq_config.min_quantity.clone()),
                 max_quantity: Some(rfq_config.max_quantity.clone()),
             });
         }
 
         if quantity > max_qty {
-            return RfqResponse::Reject(RfqReject {
-                rfq_id,
-                lp_party_id: self.party_id.clone(),
-                lp_name: self.lp_config.name.clone(),
-                reason: RfqRejectionReason::AmountTooLarge as i32,
+            return Err(RejectInfo {
+                reason: RfqRejectionReason::AmountTooLarge,
                 reason_detail: Some(format!("Max quantity: {}", max_qty)),
-                rejected_at: Some(prost_types::Timestamp {
-                    seconds: chrono::Utc::now().timestamp(),
-                    nanos: 0,
-                }),
                 min_quantity: Some(rfq_config.min_quantity.clone()),
                 max_quantity: Some(rfq_config.max_quantity.clone()),
             });
@@ -200,69 +213,42 @@ impl RfqHandler {
         // down ledger); the settlement watchdog drains those internally.
         if agent_logic::ledger_health::is_unhealthy() {
             warn!("RFQ {}: rejected — ledger temporarily unavailable (sequencer submission failing)", rfq_id);
-            return RfqResponse::Reject(RfqReject {
-                rfq_id,
-                lp_party_id: self.party_id.clone(),
-                lp_name: self.lp_config.name.clone(),
-                reason: RfqRejectionReason::TemporarilyUnavailable as i32,
-                reason_detail: Some("Ledger temporarily unavailable".to_string()),
-                rejected_at: Some(prost_types::Timestamp {
-                    seconds: chrono::Utc::now().timestamp(),
-                    nanos: 0,
-                }),
-                min_quantity: None,
-                max_quantity: None,
-            });
+            return Err(RejectInfo::new(
+                RfqRejectionReason::TemporarilyUnavailable,
+                "Ledger temporarily unavailable",
+            ));
         }
 
         // Reject RFQs when sequencer is critically overloaded (coefficient < OVERLOAD_THRESHOLD - 0.1).
         // At this level even proposing new trades would fail with SEQUENCER_BACKPRESSURE.
         if agent_logic::forecast::is_rfq_rejected_by_overload() {
             warn!("RFQ {}: rejected — sequencer critically overloaded", rfq_id);
-            return RfqResponse::Reject(RfqReject {
-                rfq_id,
-                lp_party_id: self.party_id.clone(),
-                lp_name: self.lp_config.name.clone(),
-                reason: RfqRejectionReason::MarketConditions as i32,
-                reason_detail: Some("High demand, try later".to_string()),
-                rejected_at: Some(prost_types::Timestamp {
-                    seconds: chrono::Utc::now().timestamp(),
-                    nanos: 0,
-                }),
-                min_quantity: None,
-                max_quantity: None,
-            });
+            return Err(RejectInfo::new(
+                RfqRejectionReason::MarketConditions,
+                "High demand, try later",
+            ));
         }
 
         // Get mid-price
         let mid_prices = self.mid_prices.read().await;
-        let mid_price = match mid_prices.get(&request.market_id) {
+        let mid_price = match mid_prices.get(market_id) {
             Some(&price) if price > 0.0 => price,
             _ => {
-                warn!("RFQ {}: no mid-price for market {}", rfq_id, request.market_id);
-                return RfqResponse::Reject(RfqReject {
-                    rfq_id,
-                    lp_party_id: self.party_id.clone(),
-                    lp_name: self.lp_config.name.clone(),
-                    reason: RfqRejectionReason::TemporarilyUnavailable as i32,
-                    reason_detail: Some("No mid-price available".to_string()),
-                    rejected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                    min_quantity: None,
-                    max_quantity: None,
-                });
+                warn!("RFQ {}: no mid-price for market {}", rfq_id, market_id);
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "No mid-price available",
+                ));
             }
         };
         drop(mid_prices);
 
         // Parse market_id into base/quote tokens (e.g. "CC-USDCx" → ["CC", "USDCx"])
-        let market_parts: Vec<&str> = request.market_id.split('-').collect();
+        let market_parts: Vec<&str> = market_id.split('-').collect();
         let (base_token, quote_token) = if market_parts.len() == 2 {
             (market_parts[0], market_parts[1])
         } else {
-            (request.market_id.as_str(), "")
+            (market_id, "")
         };
 
         // Compute price based on direction and spread.
@@ -283,7 +269,7 @@ impl RfqHandler {
         // Depletion coefficient: widen spread on the side that depletes a scarce token
         let depletion_coeff = if let Some(ref lm) = self.liquidity_manager {
             // The token being sold by the LP is the one that depletes
-            let depleting_token = if request.direction == 1 {
+            let depleting_token = if direction == 1 {
                 base_token // LP sells base (e.g. CC)
             } else {
                 quote_token // LP sells quote (e.g. USDCx)
@@ -293,7 +279,7 @@ impl RfqHandler {
             0.0
         };
 
-        let price = if request.direction == 1 {
+        let price = if direction == 1 {
             // User is buying → LP offers at mid + spread
             mid_price * (1.0 + rfq_config.offer_spread_percent * (spread_multiplier + depletion_coeff) / 100.0)
         } else {
@@ -306,20 +292,16 @@ impl RfqHandler {
         // Guard against NaN/infinity from misconfigured spreads
         if !price.is_finite() || !quote_quantity.is_finite() || price <= 0.0 {
             warn!("RFQ {}: computed invalid price {:.6} or quantity {:.6}", rfq_id, price, quote_quantity);
-            return RfqResponse::Reject(RfqReject {
-                rfq_id,
-                lp_party_id: self.party_id.clone(),
-                lp_name: self.lp_config.name.clone(),
-                reason: RfqRejectionReason::TemporarilyUnavailable as i32,
-                reason_detail: Some("Price computation error".to_string()),
-                rejected_at: Some(prost_types::Timestamp {
-                    seconds: chrono::Utc::now().timestamp(),
-                    nanos: 0,
-                }),
-                min_quantity: None,
-                max_quantity: None,
-            });
+            return Err(RejectInfo::new(
+                RfqRejectionReason::TemporarilyUnavailable,
+                "Price computation error",
+            ));
         }
+
+        // USD reference for the quote leg (feeds the min-notional floor and the
+        // V2 ticket-threshold decision).
+        let usd_per_quote = self.token_usd_price(quote_token).await;
+        let notional_usd = usd_per_quote.map(|p| quote_quantity * p);
 
         // USD minimum-value floor (global LP default, per-market override).
         // Refuse to quote RFQs whose USD value falls below the configured minimum.
@@ -327,27 +309,17 @@ impl RfqHandler {
             .min_notional_usd
             .unwrap_or(self.lp_config.min_notional_usd);
         if min_notional_usd > 0.0 {
-            match self.token_usd_price(quote_token).await {
-                Some(usd_per_quote) => {
-                    let notional_usd = quote_quantity * usd_per_quote;
-                    if notional_usd < min_notional_usd {
+            match notional_usd {
+                Some(value_usd) => {
+                    if value_usd < min_notional_usd {
                         info!(
                             "RFQ {}: value ${:.2} < min ${:.2} — rejecting",
-                            rfq_id, notional_usd, min_notional_usd
+                            rfq_id, value_usd, min_notional_usd
                         );
-                        return RfqResponse::Reject(RfqReject {
-                            rfq_id,
-                            lp_party_id: self.party_id.clone(),
-                            lp_name: self.lp_config.name.clone(),
-                            reason: RfqRejectionReason::AmountTooSmall as i32,
-                            reason_detail: Some(format!("Min notional: ${:.2}", min_notional_usd)),
-                            rejected_at: Some(prost_types::Timestamp {
-                                seconds: chrono::Utc::now().timestamp(),
-                                nanos: 0,
-                            }),
-                            min_quantity: None,
-                            max_quantity: None,
-                        });
+                        return Err(RejectInfo::new(
+                            RfqRejectionReason::AmountTooSmall,
+                            format!("Min notional: ${:.2}", min_notional_usd),
+                        ));
                     }
                 }
                 // Missing cross price → fail open (don't block trading on a transient gap).
@@ -357,6 +329,13 @@ impl RfqHandler {
                 ),
             }
         }
+
+        // LP allocates base when user buys (dir=1), quote when user sells (dir=2)
+        let (alloc_token, alloc_amount) = if direction == 1 {
+            (base_token, quantity)     // LP sells base
+        } else {
+            (quote_token, quote_quantity) // LP sells quote
+        };
 
         // Liquidity gate: reject if LP lacks sufficient balance for the allocation + estimated fees
         if let Some(ref lm) = self.liquidity_manager {
@@ -368,27 +347,11 @@ impl RfqHandler {
                     "RFQ {}: rejecting — liquidity manager not yet ready (balances loading)",
                     rfq_id
                 );
-                return RfqResponse::Reject(RfqReject {
-                    rfq_id,
-                    lp_party_id: self.party_id.clone(),
-                    lp_name: self.lp_config.name.clone(),
-                    reason: RfqRejectionReason::TemporarilyUnavailable as i32,
-                    reason_detail: Some("Balances loading".to_string()),
-                    rejected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                    min_quantity: None,
-                    max_quantity: None,
-                });
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "Balances loading",
+                ));
             }
-
-            // LP allocates base when user buys (dir=1), quote when user sells (dir=2)
-            let (alloc_token, alloc_amount) = if request.direction == 1 {
-                (base_token, quantity)     // LP sells base
-            } else {
-                (quote_token, quote_quantity) // LP sells quote
-            };
 
             // Rough fee estimate: ~2 USD total for LP's dvp + allocation fees
             let fee_cc = lm.estimate_fee_cc(Decimal::TWO).await;
@@ -424,31 +387,18 @@ impl RfqHandler {
                         rfq_id, alloc_token, available, needed
                     );
                 }
-                return RfqResponse::Reject(RfqReject {
-                    rfq_id,
-                    lp_party_id: self.party_id.clone(),
-                    lp_name: self.lp_config.name.clone(),
-                    reason: RfqRejectionReason::TemporarilyUnavailable as i32,
-                    reason_detail: Some("Insufficient liquidity".to_string()),
-                    rejected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                    min_quantity: None,
-                    max_quantity: None,
-                });
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "Insufficient liquidity",
+                ));
             }
         }
 
-        let quote_id = Uuid::now_v7().to_string();
         let valid_for_secs = rfq_config
             .quote_valid_secs
             .unwrap_or(self.lp_config.default_quote_valid_secs);
 
-        let now = chrono::Utc::now();
-        let valid_until = now + chrono::Duration::seconds(valid_for_secs as i64);
-
-        let effective_spread = if request.direction == 1 {
+        let effective_spread = if direction == 1 {
             rfq_config.offer_spread_percent * (spread_multiplier + depletion_coeff)
         } else {
             rfq_config.bid_spread_percent * (spread_multiplier + depletion_coeff)
@@ -457,7 +407,7 @@ impl RfqHandler {
             "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{})",
             rfq_id,
             quantity,
-            request.market_id,
+            market_id,
             price,
             mid_price,
             effective_spread,
@@ -465,12 +415,77 @@ impl RfqHandler {
             if depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() }
         );
 
-        // Record trade for settlement verification
+        // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
+        let price_str = format!("{:.10}", price);
+        let quantity_dec_str = format!("{:.10}", quantity);
+        let quote_quantity_str = format!("{:.10}", quote_quantity);
+        let lp_pays_amount = Decimal::from_str(if direction == 1 {
+            &quantity_dec_str
+        } else {
+            &quote_quantity_str
+        })
+        .unwrap_or_default();
+
+        Ok(PricedQuote {
+            market_id: market_id.to_string(),
+            price: Decimal::from_str(&price_str).unwrap_or_default(),
+            quantity: Decimal::from_str(&quantity_dec_str).unwrap_or_default(),
+            quote_quantity: Decimal::from_str(&quote_quantity_str).unwrap_or_default(),
+            price_str,
+            quantity_str: quantity_dec_str,
+            quote_quantity_str,
+            lp_pays: (alloc_token.to_string(), lp_pays_amount),
+            notional_usd,
+            valid_for_secs,
+            allocate_before_secs: rfq_config.allocate_before_secs,
+            settle_before_secs: rfq_config.settle_before_secs,
+        })
+    }
+
+    fn build_reject(&self, rfq_id: String, r: RejectInfo) -> RfqReject {
+        RfqReject {
+            rfq_id,
+            lp_party_id: self.party_id.clone(),
+            lp_name: self.lp_config.name.clone(),
+            reason: r.reason as i32,
+            reason_detail: r.reason_detail,
+            rejected_at: Some(prost_types::Timestamp {
+                seconds: chrono::Utc::now().timestamp(),
+                nanos: 0,
+            }),
+            min_quantity: r.min_quantity,
+            max_quantity: r.max_quantity,
+        }
+    }
+
+    /// LP display name (used by the V2 stream handshake / messages).
+    pub fn lp_name(&self) -> &str {
+        &self.lp_config.name
+    }
+
+    /// Handle an incoming (v1) RFQ request
+    pub async fn handle_rfq_request(&self, request: RfqRequest) -> RfqResponse {
+        let rfq_id = request.rfq_id.clone();
+
+        let priced = match self
+            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return RfqResponse::Reject(self.build_reject(rfq_id, reject)),
+        };
+
+        let quote_id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now();
+        let valid_until = now + chrono::Duration::seconds(priced.valid_for_secs as i64);
+
+        // Record trade for settlement verification (v1 only — V2 settles are
+        // watcher-verified, never proposal-verified)
         self.quoted_trades.lock().await.push(QuotedTrade {
             market_id: request.market_id.clone(),
-            price: format!("{:.10}", price),
-            base_quantity: format!("{:.10}", quantity),
-            quote_quantity: format!("{:.10}", quote_quantity),
+            price: priced.price_str.clone(),
+            base_quantity: priced.quantity_str.clone(),
+            quote_quantity: priced.quote_quantity_str.clone(),
         });
 
         RfqResponse::Quote(RfqQuote {
@@ -478,10 +493,10 @@ impl RfqHandler {
             quote_id,
             market_id: request.market_id,
             direction: request.direction,
-            quantity: format!("{:.10}", quantity),
-            price: format!("{:.10}", price),
-            quote_quantity: format!("{:.10}", quote_quantity),
-            valid_for_secs,
+            quantity: priced.quantity_str,
+            price: priced.price_str,
+            quote_quantity: priced.quote_quantity_str,
+            valid_for_secs: priced.valid_for_secs,
             valid_until: Some(prost_types::Timestamp {
                 seconds: valid_until.timestamp(),
                 nanos: 0,
@@ -492,8 +507,8 @@ impl RfqHandler {
                 seconds: now.timestamp(),
                 nanos: 0,
             }),
-            allocate_before_secs: Some(rfq_config.allocate_before_secs),
-            settle_before_secs: Some(rfq_config.settle_before_secs),
+            allocate_before_secs: Some(priced.allocate_before_secs),
+            settle_before_secs: Some(priced.settle_before_secs),
         })
     }
 }

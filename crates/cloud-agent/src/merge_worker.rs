@@ -5,7 +5,6 @@
 //! cache, and executes a TransferCc to self (sender == receiver). The ledger
 //! consolidates the inputs into fewer output amulets.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
@@ -19,7 +18,7 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
-use crate::amulet_cache::AmuletCache;
+use crate::holdings_cache::CcView;
 use crate::ledger_client::DAppProviderClient;
 use crate::payment_queue::{process_tx_result, handle_inactive_contracts};
 
@@ -27,7 +26,7 @@ use crate::payment_queue::{process_tx_result, handle_inactive_contracts};
 /// Only call this if `config.merge_threshold` is Some.
 pub fn spawn_merge_worker(
     config: BaseConfig,
-    cache: Arc<AmuletCache>,
+    cache: CcView,
     shutdown: Shutdown,
 ) {
     let threshold = config.merge_threshold.unwrap_or(200);
@@ -68,7 +67,7 @@ pub fn spawn_merge_worker(
 
 async fn check_and_merge(
     config: &BaseConfig,
-    cache: &Arc<AmuletCache>,
+    cache: &CcView,
     threshold: usize,
     max_amulets: usize,
 ) -> anyhow::Result<Option<String>> {

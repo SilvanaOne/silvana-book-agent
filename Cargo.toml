@@ -4,6 +4,7 @@ members = [
     "crates/cloud-agent",
     "crates/cli",
     "crates/agent-logic",
+    "crates/atomic-quote",
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
@@ -13,13 +14,14 @@ default-members = [
     "crates/cloud-agent",
     "crates/cli",
     "crates/agent-logic",
+    "crates/atomic-quote",
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
 ]
 
 [workspace.package]
-version = "0.3.8"
+version = "0.4.0"
 edition = "2024"
 authors = ["DFST"]
 license = "Apache-2.0"

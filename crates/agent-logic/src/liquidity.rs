@@ -360,6 +360,10 @@ impl LiquidityManager {
     /// Returns the number of orphaned reservations dropped (for logging).
     pub async fn retain_commitments(&self, live_ids: &HashSet<String>) -> usize {
         let mut s = self.state.write().await;
+        // RFQ V2 soft reserves ("rfqv2:<quote_id>") are NOT settlement proposals
+        // and never appear in the runner's live set — they are released by the
+        // V2 sweep / confirm path, so the reconciler must not reap them.
+        let keep = |pid: &String| live_ids.contains(pid) || pid.starts_with("rfqv2:");
         // Count the UNION of orphaned proposal_ids across both maps, so the
         // returned count (and the runner's warn!) can't silently undercount if
         // an allocation commitment ever lacks a matching fee entry or vice versa.
@@ -369,24 +373,24 @@ impl LiquidityManager {
                 token_state
                     .allocation_commitments
                     .keys()
-                    .filter(|pid| !live_ids.contains(*pid)),
+                    .filter(|pid| !keep(*pid)),
             );
         }
         orphaned.extend(
             s.fee_commitments
                 .entries
                 .keys()
-                .filter(|pid| !live_ids.contains(*pid)),
+                .filter(|pid| !keep(*pid)),
         );
         let dropped = orphaned.len();
         for token_state in s.tokens.values_mut() {
             token_state
                 .allocation_commitments
-                .retain(|pid, _| live_ids.contains(pid));
+                .retain(|pid, _| keep(pid));
         }
         s.fee_commitments
             .entries
-            .retain(|pid, _| live_ids.contains(pid));
+            .retain(|pid, _| keep(pid));
         if dropped > 0 {
             debug!("Reconciled liquidity commitments: dropped {} orphaned reservation(s)", dropped);
         }

@@ -26,8 +26,8 @@ use orderbook_proto::ledger::{
 
 use tx_verifier::OperationExpectation;
 
-use crate::amulet_cache::AmuletCache;
 use crate::acs_worker::spawn_acs_worker;
+use crate::holdings_cache::{CcView, HoldingsCache};
 use crate::ledger_client::DAppProviderClient;
 use crate::payment_queue::PaymentQueue;
 
@@ -39,10 +39,13 @@ pub struct CloudSettlementBackend {
     force: bool,
     confirm: bool,
     confirm_lock: ConfirmLock,
-    /// Parallel payment queue with amulet cache
+    /// Parallel payment queue with holdings cache
     payment_queue: PaymentQueue,
-    /// Shared amulet cache for heartbeat stats
-    amulet_cache: Arc<AmuletCache>,
+    /// Shared multi-instrument holdings cache (created by the caller so RFQ V2
+    /// components can share it)
+    holdings_cache: Arc<HoldingsCache>,
+    /// CC view of the cache for heartbeat stats / multicall settlement
+    amulet_cache: CcView,
     /// Liquidity manager for balance tracking and commitment gating
     liquidity_manager: Arc<LiquidityManager>,
     /// Shared shutdown signal for background tasks (ACS / merge / payment queue).
@@ -52,6 +55,7 @@ pub struct CloudSettlementBackend {
 }
 
 impl CloudSettlementBackend {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: BaseConfig,
         verbose: bool,
@@ -61,16 +65,15 @@ impl CloudSettlementBackend {
         confirm_lock: ConfirmLock,
         liquidity_manager: Arc<LiquidityManager>,
         shutdown: Shutdown,
+        cache: Arc<HoldingsCache>,
     ) -> Self {
-        let cache = AmuletCache::new();
-
-        // Spawn ACS worker to refresh amulet cache and update liquidity manager
+        // Spawn ACS worker to refresh the holdings cache and update liquidity manager
         spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown.clone());
 
         // Spawn merge worker if threshold is configured
         if config.merge_threshold.is_some() {
             crate::merge_worker::spawn_merge_worker(
-                config.clone(), cache.clone(), shutdown.clone(),
+                config.clone(), cache.cc(), shutdown.clone(),
             );
         }
 
@@ -81,10 +84,11 @@ impl CloudSettlementBackend {
             force,
             confirm,
             confirm_lock.clone(),
-            cache.clone(),
+            cache.cc(),
             shutdown.clone(),
         );
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, amulet_cache: cache, liquidity_manager, shutdown }
+        let amulet_cache = cache.cc();
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, shutdown }
     }
 
     /// Create a new DAppProviderClient for this request
@@ -103,9 +107,14 @@ impl CloudSettlementBackend {
         .await
     }
 
-    /// Public accessor for the amulet cache (used by multicall settlement path).
-    pub fn amulet_cache(&self) -> &Arc<AmuletCache> {
+    /// Public accessor for the CC cache view (used by multicall settlement path).
+    pub fn amulet_cache(&self) -> &CcView {
         &self.amulet_cache
+    }
+
+    /// Public accessor for the shared multi-instrument holdings cache.
+    pub fn holdings_cache(&self) -> &Arc<HoldingsCache> {
+        &self.holdings_cache
     }
 }
 

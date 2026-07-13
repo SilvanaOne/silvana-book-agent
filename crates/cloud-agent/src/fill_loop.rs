@@ -46,6 +46,10 @@ pub struct FillParams {
     pub min_settlement: f64,
     pub max_settlement: f64,
     pub interval_secs: u64,
+    /// RFQ V2 (AtomicDVP): settle each round in ONE atomic transaction via
+    /// `RfqV2Service` + `AtomicDvpProviderService` instead of the v1
+    /// accept/proposal/multicall ladder. Default false (v1 path untouched).
+    pub atomic: bool,
 }
 
 /// Sleep that can be interrupted by shutdown signal. Returns true if shutdown was requested.
@@ -65,6 +69,7 @@ pub async fn run_fill_loop(
     config: BaseConfig,
     settler: Arc<MulticallSettler>,
     params: FillParams,
+    atomic_swapper: Option<Arc<crate::atomic_swap::AtomicSwapper>>,
     saved_fill_state: Option<SavedFillState>,
     state_file: Option<PathBuf>,
 ) -> Result<()> {
@@ -135,6 +140,37 @@ pub async fn run_fill_loop(
         Some(config.node_name.as_str()),
     )?);
 
+    // RFQ V2: receiver-preapproval preflight (once per loop start, design §6.5)
+    // and the per-market input-cid cap for own-holdings selection.
+    let atomic_max_inputs = config
+        .markets
+        .iter()
+        .find(|m| m.market_id == params.market_id)
+        .and_then(|m| m.rfq.as_ref())
+        .and_then(|r| r.v2.as_ref())
+        .map(|v| v.max_input_holdings)
+        .unwrap_or(20)
+        .min(20);
+    if params.atomic {
+        let swapper = atomic_swapper
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("atomic fill requires an AtomicSwapper"))?;
+        let receiving_instrument = match params.direction {
+            FillDirection::Buy => &base_instrument,
+            FillDirection::Sell => &quote_instrument,
+        };
+        crate::atomic_swap::ensure_receiver_preapproval(
+            &config,
+            &mut ledger,
+            receiving_instrument,
+            swapper.verbose,
+            swapper.dry_run,
+            swapper.force,
+        )
+        .await
+        .context("receiver-preapproval preflight failed")?;
+    }
+
     let (mut remaining, mut filled_total, mut round) = if let Some(ref fs) = saved_fill_state {
         let same_order = fs.direction == dir_str
             && fs.market_id == params.market_id
@@ -171,6 +207,7 @@ pub async fn run_fill_loop(
 
     let dir_name = dir_str;
     let mut monitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut abort_reason: Option<String> = None;
 
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
@@ -232,6 +269,62 @@ pub async fn run_fill_loop(
             "[round {}] Requesting quotes: {} {:.6} @ limit {:.6} (remaining={:.6})",
             round, dir_str, request_amount, price_limit, remaining
         );
+
+        // ---- RFQ V2 atomic round (one-transaction settle) ----------------
+        if params.atomic {
+            let swapper = atomic_swapper.as_ref().expect("checked at loop start");
+            match atomic_round(
+                &mut client,
+                swapper,
+                &params,
+                dir_str,
+                request_amount,
+                price_limit,
+                round,
+                atomic_max_inputs,
+            )
+            .await
+            {
+                AtomicRoundResult::Filled(fill) => {
+                    filled_total += fill.filled_base;
+                    remaining -= fill.filled_base;
+                    info!(
+                        "[round {}] Atomic settle committed: update={} — accepted={:.6}/{:.6} ({:.1}%)",
+                        round,
+                        fill.update_id,
+                        filled_total,
+                        params.total_amount,
+                        (filled_total / params.total_amount) * 100.0,
+                    );
+                    // Fill state persistence — identical to the v1 path.
+                    if let Some(ref path) = state_file {
+                        let snapshot = SavedFillState {
+                            direction: dir_name.to_string(),
+                            market_id: params.market_id.clone(),
+                            total_amount: params.total_amount,
+                            filled_total,
+                            remaining: remaining.max(0.0),
+                            round,
+                        };
+                        let _ = save_fill_state_only(path, &config.party_id, snapshot);
+                    }
+                    interruptible_sleep(Duration::from_millis(100), &fill_shutdown, &shutdown_flag).await;
+                }
+                AtomicRoundResult::Retry => {
+                    if interruptible_sleep(interval, &fill_shutdown, &shutdown_flag).await {
+                    }
+                }
+                AtomicRoundResult::DryRun => {
+                    warn!("[round {}] Dry run — atomic settle prepared+verified only, exiting", round);
+                    break;
+                }
+                AtomicRoundResult::Abort(reason) => {
+                    abort_reason = Some(reason);
+                    break;
+                }
+            }
+            continue;
+        }
 
         let rfq_response = match client
             .request_quotes(
@@ -498,6 +591,13 @@ pub async fn run_fill_loop(
         interruptible_sleep(Duration::from_millis(100), &fill_shutdown, &shutdown_flag).await;
     }
 
+    if let Some(reason) = abort_reason {
+        anyhow::bail!(
+            "atomic fill loop aborted (filled {:.6}/{:.6}): {}",
+            filled_total, params.total_amount, reason
+        );
+    }
+
     // Wait for all settlement monitors to complete before exiting
     let total_monitors = monitor_handles.len();
     if total_monitors > 0 && !shutdown_flag.load(Ordering::Relaxed) {
@@ -746,6 +846,208 @@ fn split_market(market_id: &str) -> (String, String) {
         Some((b, q)) => (b.to_string(), q.to_string()),
         None => (market_id.to_string(), String::new()),
     }
+}
+
+// ============================================================================
+// RFQ V2 atomic round
+// ============================================================================
+
+use orderbook_proto::rfqv2::AtomicQuoteInfo;
+
+use crate::atomic_swap::{AtomicFill, AtomicSwapper, SwapOutcome};
+
+enum AtomicRoundResult {
+    Filled(AtomicFill),
+    /// Transient failure — wait one interval and try a fresh round.
+    Retry,
+    DryRun,
+    /// Commit status unknowable — the loop must stop (double-fill guard).
+    Abort(String),
+}
+
+/// One atomic round: request V2 quotes → price-limit filter + pick best
+/// (same selection logic as v1) → AcceptQuoteAtomic → settle the envelope.
+#[allow(clippy::too_many_arguments)]
+async fn atomic_round(
+    client: &mut OrderbookClient,
+    swapper: &AtomicSwapper,
+    params: &FillParams,
+    dir_str: &str,
+    mut request_amount: f64,
+    price_limit: f64,
+    round: u32,
+    max_input_holdings: usize,
+) -> AtomicRoundResult {
+    let rfq_response = match client
+        .request_quotes_atomic(
+            &params.market_id,
+            dir_str,
+            &format!("{:.10}", request_amount),
+            vec![],
+            Some(15),
+        )
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("[round {}] Atomic RFQ request failed: {}", round, e);
+            return AtomicRoundResult::Retry;
+        }
+    };
+
+    info!(
+        "[round {}] Atomic RFQ {}: {} quotes, {} rejections (requested={}, responded={})",
+        round, rfq_response.rfq_id,
+        rfq_response.quotes.len(), rfq_response.rejections.len(),
+        rfq_response.lps_requested, rfq_response.lps_responded
+    );
+
+    let within_limit = |q: &&AtomicQuoteInfo| {
+        let price: f64 = q.price.parse().unwrap_or(0.0);
+        match params.direction {
+            FillDirection::Buy => price <= price_limit,
+            FillDirection::Sell => price >= price_limit,
+        }
+    };
+    let acceptable: Vec<&AtomicQuoteInfo> = rfq_response.quotes.iter().filter(within_limit).collect();
+
+    let (rfq_id, best) = if let Some(best) = pick_best_atomic_quote_opt(&acceptable, params.direction)
+    {
+        (rfq_response.rfq_id.clone(), best.clone())
+    } else {
+        // Adapted retry from LP size hints — mirror of the v1 flow.
+        let mut best_max: Option<f64> = None;
+        for rejection in &rfq_response.rejections {
+            if let Ok(max_val) = rejection.max_quantity.parse::<f64>() {
+                if max_val >= params.min_settlement {
+                    best_max = Some(match best_max {
+                        Some(current) => current.max(max_val),
+                        None => max_val,
+                    });
+                }
+            }
+        }
+        let adapted_max = match best_max {
+            Some(v) if v < request_amount => v,
+            _ => {
+                warn!("[round {}] No acceptable atomic quotes within limit {:.6}", round, price_limit);
+                return AtomicRoundResult::Retry;
+            }
+        };
+        info!(
+            "[round {}] No atomic quotes at limit {:.6}. LP max={:.6}, retrying with adapted amount",
+            round, price_limit, adapted_max
+        );
+        request_amount = adapted_max;
+        let retry_resp = match client
+            .request_quotes_atomic(
+                &params.market_id,
+                dir_str,
+                &format!("{:.10}", request_amount),
+                vec![],
+                Some(15),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[round {}] Adapted atomic RFQ failed: {}", round, e);
+                return AtomicRoundResult::Retry;
+            }
+        };
+        let retry_quotes: Vec<&AtomicQuoteInfo> =
+            retry_resp.quotes.iter().filter(within_limit).collect();
+        match pick_best_atomic_quote_opt(&retry_quotes, params.direction) {
+            Some(best) => (retry_resp.rfq_id.clone(), best.clone()),
+            None => {
+                warn!(
+                    "[round {}] No acceptable atomic quotes even at adapted amount {:.6}",
+                    round, request_amount
+                );
+                return AtomicRoundResult::Retry;
+            }
+        }
+    };
+
+    // Fee visibility before accept (design §14 D21): accepting implies consent;
+    // the settle path asserts the signed lpFees equal exactly this.
+    let fee_display = best
+        .settlement_fee
+        .as_ref()
+        .map(|f| format!("{} {} -> {}", f.amount, f.instrument_id, f.receiver))
+        .unwrap_or_else(|| "none".to_string());
+    info!(
+        "[round {}] Accepting atomic quote {} @ {} (qty={}, LP={}, settlement fee: {})",
+        round, best.quote_id, best.price, best.quantity, best.lp_name, fee_display
+    );
+
+    let accept_resp = match client.accept_quote_atomic(&rfq_id, &best.quote_id, Some(15)).await {
+        Ok(r) if r.success => r,
+        Ok(r) => {
+            // gRPC OK + success=false is an LP reject in the body — never a
+            // transport error; branch on the typed reason.
+            let reason = agent_logic::client::atomic_reject_reason_name(r.reject_reason);
+            let detail = if r.reject_detail.is_empty() { &r.message } else { &r.reject_detail };
+            warn!(
+                "[round {}] Atomic accept rejected by LP {}: {} ({})",
+                round, best.lp_name, reason, detail
+            );
+            return AtomicRoundResult::Retry;
+        }
+        Err(e) => {
+            warn!("[round {}] Atomic accept error: {}", round, e);
+            return AtomicRoundResult::Retry;
+        }
+    };
+    let Some(envelope) = accept_resp.envelope else {
+        warn!("[round {}] Atomic accept succeeded but carried no envelope", round);
+        return AtomicRoundResult::Retry;
+    };
+    info!(
+        "[round {}] Envelope received for quote {} (ticket='{}', lp_inputs={}, disclosed={})",
+        round,
+        best.quote_id,
+        envelope.quote.as_ref().map(|q| q.ticket_id.as_str()).unwrap_or(""),
+        envelope.lp_input_holding_cids.len(),
+        envelope.disclosed.len(),
+    );
+
+    match swapper
+        .settle_envelope(&envelope, &best, params.direction, max_input_holdings)
+        .await
+    {
+        Ok(SwapOutcome::Filled(fill)) => AtomicRoundResult::Filled(fill),
+        Ok(SwapOutcome::Requote { reason }) => {
+            warn!("[round {}] Atomic settle needs re-quote: {}", round, reason);
+            AtomicRoundResult::Retry
+        }
+        Ok(SwapOutcome::Abort { reason }) => AtomicRoundResult::Abort(reason),
+        Ok(SwapOutcome::DryRun) => AtomicRoundResult::DryRun,
+        Err(e) => {
+            warn!("[round {}] Atomic settle error: {:#}", round, e);
+            AtomicRoundResult::Retry
+        }
+    }
+}
+
+/// Pick the best atomic quote (lowest price for buy, highest for sell).
+fn pick_best_atomic_quote_opt<'a>(
+    quotes: &[&'a AtomicQuoteInfo],
+    direction: FillDirection,
+) -> Option<&'a AtomicQuoteInfo> {
+    match direction {
+        FillDirection::Buy => quotes.iter().min_by(|a, b| {
+            let pa: f64 = a.price.parse().unwrap_or(f64::MAX);
+            let pb: f64 = b.price.parse().unwrap_or(f64::MAX);
+            pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        FillDirection::Sell => quotes.iter().max_by(|a, b| {
+            let pa: f64 = a.price.parse().unwrap_or(f64::NEG_INFINITY);
+            let pb: f64 = b.price.parse().unwrap_or(f64::NEG_INFINITY);
+            pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+        }),
+    }
+    .copied()
 }
 
 use orderbook_proto::orderbook::RfqQuoteInfo;

@@ -15,8 +15,6 @@
 //! returns `traffic_estimate.total_bytes`; the second is submitted with the
 //! actual CC amount computed from bytes × rate.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use rust_decimal::prelude::FromStr as _;
 use rust_decimal::Decimal;
@@ -33,27 +31,20 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
-use crate::amulet_cache::AmuletCache;
+use crate::holdings_cache::{CcView, TEMPLATE_HOLDING};
 use crate::ledger_client::DAppProviderClient;
 use crate::payment_queue::{process_tx_result, select_amulets_for_allocation};
 
 /// Options/flags for the multicall settlement (verbose, dry_run, force, confirm).
 pub struct MulticallSettler {
     pub config: BaseConfig,
-    pub amulet_cache: Arc<AmuletCache>,
+    pub amulet_cache: CcView,
     pub verbose: bool,
     pub dry_run: bool,
     pub force: bool,
     pub confirm: bool,
     pub confirm_lock: ConfirmLock,
 }
-
-/// CIP-56 Holding template uploaded on this participant. Matches the constant
-/// exported by the SDK's `transactions` crate (`TEMPLATE_HOLDING`). Inlined
-/// here because `orderbook-cloud-agent` doesn't depend on `transactions`
-/// directly. If the SDK changes this template, update here too.
-const TEMPLATE_HOLDING: &str =
-    "#utility-registry-holding-v0:Utility.Registry.Holding.V0.Holding:Holding";
 
 /// Fetch unlocked CIP-56 Holdings owned by `party_id`. Mirrors
 /// `dvp/commands/multicall.rs::fetch_holdings` — filters by `owner == party_id`
@@ -143,7 +134,13 @@ impl MulticallSettler {
         let margin = Decimal::from(5);
         let estimated_cc = alloc_cc + margin;
         let selectable = self.amulet_cache.get_selectable_amulets().await;
-        let selected = select_amulets_for_allocation(&selectable, estimated_cc);
+        let mut selected = select_amulets_for_allocation(&selectable, estimated_cc);
+        if selected.is_empty() {
+            // Splitter-reserve fail-open: v1 settle success outranks reserve
+            // preservation — retry including the reserve.
+            let with_reserve = self.amulet_cache.get_selectable_amulets_incl_reserve().await;
+            selected = select_amulets_for_allocation(&with_reserve, estimated_cc);
+        }
         if selected.is_empty() {
             anyhow::bail!(
                 "Insufficient amulets for multicall settlement: need ~{} CC (alloc {} + margin {})",

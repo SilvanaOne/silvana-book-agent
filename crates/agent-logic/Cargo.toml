@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 orderbook-proto = { path = "../orderbook-proto" }
+atomic-quote = { path = "../atomic-quote" }
 anyhow = { workspace = true }
 async-trait = "0.1"
 base64 = { workspace = true }

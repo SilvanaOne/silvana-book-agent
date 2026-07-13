@@ -192,6 +192,32 @@ pub struct BaseConfig {
     pub min_prepaid_traffic_balance_cc: Option<rust_decimal::Decimal>,
     /// Amount to credit on each top-up, in CC.
     pub prepaid_traffic_topup_cc: Option<rust_decimal::Decimal>,
+
+    /// RFQ V2 (AtomicDVP) secp256k1 quote-signing keypair. Loaded in `assemble`
+    /// iff `liquidity_provider.rfq_v2.enabled`, from the
+    /// ATOMIC_QUOTE_PRIVATE_KEY env var (raw 32-byte scalar hex) ONLY — no
+    /// keyfiles, so the runtime and every CLI path share one key source.
+    pub atomic_quote_key: Option<AtomicQuoteKey>,
+}
+
+/// Wrapper around [`atomic_quote::QuoteKeyFile`] with a redacting `Debug`
+/// (the inner struct carries the private scalar and derives no Debug).
+#[derive(Clone)]
+pub struct AtomicQuoteKey(pub atomic_quote::QuoteKeyFile);
+
+impl std::fmt::Debug for AtomicQuoteKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicQuoteKey")
+            .field("pub_spki_hex", &self.0.pub_spki_hex)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for AtomicQuoteKey {
+    type Target = atomic_quote::QuoteKeyFile;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +263,7 @@ impl BaseConfig {
             depletion_min_hours: 1.0,
             min_prepaid_traffic_balance_cc: None,
             prepaid_traffic_topup_cc: None,
+            atomic_quote_key: None,
         }
     }
 }
@@ -273,7 +300,7 @@ impl BaseConfig {
     /// env vars. Instrument/registry info is populated later by
     /// [`BaseConfig::populate_instruments_from_rpc`]. Shared between
     /// strict/lenient loaders.
-    fn assemble(agent: AgentToml) -> Result<Self> {
+    fn assemble(mut agent: AgentToml) -> Result<Self> {
         // Instrument registry placeholders — filled by populate_instruments_from_rpc
         // after the cloud-agent fetches them over gRPC at startup.
         let onboarded_registries: Vec<String> = Vec::new();
@@ -423,6 +450,86 @@ impl BaseConfig {
                 )),
             };
 
+        // --- RFQ V2 env overrides (MERGE_* idiom) ---
+        if let Some(ref mut lp) = agent.liquidity_provider {
+            let rfq_v2_env: Option<bool> = std::env::var("RFQ_V2_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let ticket_threshold_env: Option<f64> = std::env::var("TICKET_THRESHOLD_USD")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let ticket_batch_env: Option<usize> = std::env::var("TICKET_BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            if rfq_v2_env.is_some() || ticket_threshold_env.is_some() || ticket_batch_env.is_some() {
+                let v2 = lp.rfq_v2.get_or_insert_with(RfqV2Config::default);
+                if let Some(enabled) = rfq_v2_env {
+                    v2.enabled = enabled;
+                }
+                if let Some(threshold) = ticket_threshold_env {
+                    v2.ticket_threshold_usd = Some(threshold);
+                }
+                if let Some(batch) = ticket_batch_env {
+                    v2.ticket_batch_size = batch;
+                }
+            }
+        }
+
+        // --- RFQ V2 validation + quote-key loading ---
+        let rfq_v2_enabled = agent
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref())
+            .map(|v2| v2.enabled)
+            .unwrap_or(false);
+
+        for market in &agent.markets {
+            if let Some(v2m) = market.rfq.as_ref().and_then(|r| r.v2.as_ref()) {
+                if !(1..=20).contains(&v2m.max_input_holdings) {
+                    return Err(anyhow!(
+                        "Market {}: [markets.rfq.v2] max_input_holdings={} must be 1..=20 \
+                         (relay protocol hard bound)",
+                        market.market_id, v2m.max_input_holdings
+                    ));
+                }
+                if v2m.enabled && !rfq_v2_enabled {
+                    return Err(anyhow!(
+                        "Market {} has [markets.rfq.v2] enabled but \
+                         [liquidity_provider.rfq_v2].enabled is not set — enable the LP-level \
+                         switch (or RFQ_V2_ENABLED=true) or disable the market",
+                        market.market_id
+                    ));
+                }
+            }
+        }
+
+        if let Some(v2) = agent.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()) {
+            if v2.ticket_batch_size == 0 {
+                return Err(anyhow!("[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"));
+            }
+            if v2.atomic_quote_valid_secs == 0 {
+                return Err(anyhow!("[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"));
+            }
+        }
+
+        // Quote key: required iff RFQ V2 is enabled. ENV-ONLY — no keyfiles:
+        // ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex) is the single
+        // source for the runtime AND the atomic CLI, so the venue key and the
+        // signing key can never diverge.
+        let atomic_quote_key = if rfq_v2_enabled {
+            let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY").ok()
+                .filter(|s| !s.trim().is_empty())
+                .context(
+                    "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
+                     run `atomic keygen` and add the printed line to .env",
+                )?;
+            let kf = atomic_quote::keyfile_from_scalar(scalar.trim())
+                .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")?;
+            Some(AtomicQuoteKey(kf))
+        } else {
+            None
+        };
+
         Ok(BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
@@ -460,6 +567,7 @@ impl BaseConfig {
             depletion_min_hours,
             min_prepaid_traffic_balance_cc,
             prepaid_traffic_topup_cc,
+            atomic_quote_key,
         })
     }
 
@@ -699,6 +807,24 @@ pub struct RfqMarketConfig {
     /// When set, takes precedence over `[liquidity_provider].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: Option<f64>,
+    /// RFQ V2 (AtomicDVP) per-market configuration — TOML `[markets.rfq.v2]`.
+    #[serde(default)]
+    pub v2: Option<RfqV2MarketConfig>,
+}
+
+/// RFQ V2 per-market configuration (`[markets.rfq.v2]`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RfqV2MarketConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pre-split denomination ladder, "AMOUNTxCOUNT" entries (e.g. "25x20").
+    /// Empty = default single rung base_order_size x max_concurrent_rfqs.
+    #[serde(default)]
+    pub denominations: Vec<String>,
+    /// Per-leg input-cid cap for LP disclosure selection. MUST be 1..=20
+    /// (the relay enforces the protocol hard bound of 20).
+    #[serde(default = "default_max_input_holdings")]
+    pub max_input_holdings: usize,
 }
 
 /// Liquidity provider configuration (LP agents only)
@@ -714,6 +840,73 @@ pub struct LiquidityProviderConfig {
     /// `[markets.rfq].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: f64,
+    /// RFQ V2 (AtomicDVP) LP-level configuration — TOML `[liquidity_provider.rfq_v2]`.
+    #[serde(default)]
+    pub rfq_v2: Option<RfqV2Config>,
+}
+
+/// RFQ V2 LP-level configuration (`[liquidity_provider.rfq_v2]`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RfqV2Config {
+    /// Master switch (default false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Signed-quote validity window in seconds, counted from LP confirm time.
+    #[serde(default = "default_atomic_quote_valid_secs")]
+    pub atomic_quote_valid_secs: u64,
+    /// Reservation/ticket TTL beyond the signed validity window.
+    #[serde(default = "default_settle_grace_secs")]
+    pub settle_grace_secs: u64,
+    /// USD notional at/above which a SettlementTicket is attached to the quote.
+    /// Absent = tickets are never created or used (all quotes ticketless).
+    /// Rate unavailable at confirm = fail CLOSED to ticketed.
+    #[serde(default, deserialize_with = "de_opt_f64_or_string")]
+    pub ticket_threshold_usd: Option<f64>,
+    #[serde(default = "default_ticket_batch_size")]
+    pub ticket_batch_size: usize,
+    #[serde(default = "default_ticket_low_water")]
+    pub ticket_low_water: usize,
+    #[serde(default = "default_split_poll_interval_secs")]
+    pub split_poll_interval_secs: u64,
+    #[serde(default = "default_updates_poll_interval_secs")]
+    pub updates_poll_interval_secs: u64,
+}
+
+impl Default for RfqV2Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            atomic_quote_valid_secs: default_atomic_quote_valid_secs(),
+            settle_grace_secs: default_settle_grace_secs(),
+            ticket_threshold_usd: None,
+            ticket_batch_size: default_ticket_batch_size(),
+            ticket_low_water: default_ticket_low_water(),
+            split_poll_interval_secs: default_split_poll_interval_secs(),
+            updates_poll_interval_secs: default_updates_poll_interval_secs(),
+        }
+    }
+}
+
+/// Accept `ticket_threshold_usd = 1000`, `= 1000.0`, or `= "1000"` (the design
+/// doc examples use a quoted string).
+fn de_opt_f64_or_string<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(f64),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(NumOrStr::Num(n)) => Ok(Some(n)),
+        Some(NumOrStr::Str(s)) => s
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|e| serde::de::Error::custom(format!("invalid decimal '{s}': {e}"))),
+    }
 }
 
 // ============================================================================
@@ -776,6 +969,34 @@ fn default_rfq_allocate_before_secs() -> u32 {
 
 fn default_rfq_settle_before_secs() -> u32 {
     1800 // 30 minutes
+}
+
+fn default_atomic_quote_valid_secs() -> u64 {
+    120
+}
+
+fn default_settle_grace_secs() -> u64 {
+    30
+}
+
+fn default_ticket_batch_size() -> usize {
+    50
+}
+
+fn default_ticket_low_water() -> usize {
+    50
+}
+
+fn default_split_poll_interval_secs() -> u64 {
+    60
+}
+
+fn default_updates_poll_interval_secs() -> u64 {
+    2
+}
+
+fn default_max_input_holdings() -> usize {
+    20
 }
 
 #[cfg(test)]
@@ -843,5 +1064,225 @@ min_notional_usd = 25.0
         .unwrap();
         assert_eq!(agent.liquidity_provider.as_ref().unwrap().min_notional_usd, 10.0);
         assert_eq!(agent.markets[0].rfq.as_ref().unwrap().min_notional_usd, Some(25.0));
+    }
+
+    #[test]
+    fn test_rfq_v2_toml_defaults_and_parse() {
+        // No [liquidity_provider.rfq_v2] / [markets.rfq.v2] → None
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[[markets]]
+market_id = "CC-USDCx"
+
+[markets.rfq]
+min_quantity = "5"
+max_quantity = "1000"
+"#,
+        )
+        .unwrap();
+        assert!(agent.liquidity_provider.as_ref().unwrap().rfq_v2.is_none());
+        assert!(agent.markets[0].rfq.as_ref().unwrap().v2.is_none());
+
+        // Full sections; ticket_threshold_usd tolerant of quoted decimals
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+enabled = true
+ticket_threshold_usd = "1000"
+
+[[markets]]
+market_id = "CC-USDCx"
+
+[markets.rfq]
+min_quantity = "5"
+max_quantity = "1000"
+
+[markets.rfq.v2]
+enabled = true
+denominations = ["25x20", "100x10"]
+"#,
+        )
+        .unwrap();
+        let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        assert!(v2.enabled);
+        assert_eq!(v2.atomic_quote_valid_secs, 120);
+        assert_eq!(v2.settle_grace_secs, 30);
+        assert_eq!(v2.ticket_threshold_usd, Some(1000.0));
+        assert_eq!(v2.ticket_batch_size, 50);
+        assert_eq!(v2.ticket_low_water, 50);
+        assert_eq!(v2.split_poll_interval_secs, 60);
+        assert_eq!(v2.updates_poll_interval_secs, 2);
+        let v2m = agent.markets[0].rfq.as_ref().unwrap().v2.as_ref().unwrap();
+        assert!(v2m.enabled);
+        assert_eq!(v2m.denominations, vec!["25x20", "100x10"]);
+        assert_eq!(v2m.max_input_holdings, 20);
+
+        // unquoted numeric threshold also parses
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+ticket_threshold_usd = 250.5
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            agent.liquidity_provider.unwrap().rfq_v2.unwrap().ticket_threshold_usd,
+            Some(250.5)
+        );
+    }
+
+    /// Env-mutating assemble test. Single test fn so the process-global env
+    /// is only touched from one thread; every scenario runs sequentially.
+    #[test]
+    fn test_rfq_v2_assemble_env_overrides_and_validation() {
+        fn set(k: &str, v: &str) {
+            unsafe { std::env::set_var(k, v) }
+        }
+        fn unset(k: &str) {
+            unsafe { std::env::remove_var(k) }
+        }
+
+        // Required base env
+        set("DSO", "dso::1220aa");
+        set("PARTY_AGENT", "lp::1220bb");
+        set(
+            "PARTY_AGENT_PRIVATE_KEY",
+            "EB92Q6V2a78t9ppqMuKLppyfzFgyYJciQEVHZKnXAhjEwVpx9aMbQN84SR4ceo3mbLUxQF7TLzaEujaTJnS7eRF",
+        );
+        set("ORDERBOOK_GRPC_URL", "https://example.test:443");
+        set("SYNCHRONIZER_ID", "sync::1220cc");
+        set("PARTY_SETTLEMENT_OPERATOR", "op::1220dd");
+        set("NODE_NAME", "test-node");
+        set("LEDGER_SERVICE_PUBLIC_KEY", &bs58::encode([7u8; 32]).into_string());
+        for k in ["RFQ_V2_ENABLED", "TICKET_THRESHOLD_USD", "TICKET_BATCH_SIZE", "ATOMIC_QUOTE_PRIVATE_KEY"] {
+            unset(k);
+        }
+
+        let market_v2_toml = r#"
+[liquidity_provider]
+name = "LP test"
+
+[[markets]]
+market_id = "CC-USDCx"
+
+[markets.rfq]
+min_quantity = "5"
+max_quantity = "1000"
+
+[markets.rfq.v2]
+enabled = true
+"#;
+
+        // A: market v2 enabled without the LP-level switch → error
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("liquidity_provider.rfq_v2"), "got: {err}");
+
+        // B: RFQ_V2_ENABLED forces the LP switch; scalar env supplies the key;
+        // TICKET_THRESHOLD_USD / TICKET_BATCH_SIZE override
+        let kf = atomic_quote::gen_keypair().unwrap();
+        set("RFQ_V2_ENABLED", "true");
+        set("ATOMIC_QUOTE_PRIVATE_KEY", &kf.priv_scalar_hex);
+        set("TICKET_THRESHOLD_USD", "250");
+        set("TICKET_BATCH_SIZE", "77");
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(agent).unwrap();
+        let v2 = cfg.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        assert!(v2.enabled);
+        assert_eq!(v2.ticket_threshold_usd, Some(250.0));
+        assert_eq!(v2.ticket_batch_size, 77);
+        let key = cfg.atomic_quote_key.as_ref().expect("quote key loaded");
+        assert_eq!(key.pub_spki_hex, kf.pub_spki_hex);
+
+        // C: disabled V2 loads no key even when the env var is set
+        unset("RFQ_V2_ENABLED");
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+"#,
+        )
+        .unwrap();
+        let cfg = BaseConfig::assemble(agent).unwrap();
+        assert!(cfg.atomic_quote_key.is_none());
+
+        // D: max_input_holdings out of the 1..=20 protocol bound → error
+        set("RFQ_V2_ENABLED", "true");
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[[markets]]
+market_id = "CC-USDCx"
+
+[markets.rfq]
+min_quantity = "5"
+max_quantity = "1000"
+
+[markets.rfq.v2]
+enabled = true
+max_input_holdings = 25
+"#,
+        )
+        .unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("max_input_holdings"), "got: {err}");
+
+        // E: ticket_batch_size == 0 → error
+        unset("TICKET_BATCH_SIZE");
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+enabled = true
+ticket_batch_size = 0
+"#,
+        )
+        .unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("ticket_batch_size"), "got: {err}");
+
+        // F: atomic_quote_valid_secs == 0 → error
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+enabled = true
+atomic_quote_valid_secs = 0
+"#,
+        )
+        .unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("atomic_quote_valid_secs"), "got: {err}");
+
+        // G: enabled without the env key → error (env-only, no keyfile fallback)
+        unset("ATOMIC_QUOTE_PRIVATE_KEY");
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let err = format!("{:#}", BaseConfig::assemble(agent).unwrap_err());
+        assert!(err.contains("ATOMIC_QUOTE_PRIVATE_KEY"), "got: {err}");
+
+        // cleanup
+        for k in [
+            "RFQ_V2_ENABLED",
+            "TICKET_THRESHOLD_USD",
+            "TICKET_BATCH_SIZE",
+            "ATOMIC_QUOTE_PRIVATE_KEY",
+        ] {
+            unset(k);
+        }
     }
 }
