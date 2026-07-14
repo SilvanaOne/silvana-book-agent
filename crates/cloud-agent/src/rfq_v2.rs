@@ -47,6 +47,20 @@ pub struct SettleObserved {
 /// retained before GC.
 const TOMBSTONE_TTL: Duration = Duration::from_secs(300);
 
+/// Poll cadence while a confirm waits for an on-demand denomination split to
+/// land (fine-grained — the historical 1 s step used to overshoot).
+const CONFIRM_SPLIT_POLL: Duration = Duration::from_millis(400);
+/// Slack subtracted from the relay's forwarded `respond_by` so the LP's
+/// envelope/reject reaches the relay before its own confirm timeout fires
+/// (handlers/rfqv2.rs `tokio::time::timeout(timeout_secs, rx)`).
+const CONFIRM_RESPONSE_MARGIN: Duration = Duration::from_millis(1200);
+/// Hard ceiling on the confirm-time split wait — defensive bound against a
+/// bogus/far-future `respond_by` (the relay itself clamps `timeout_secs` to 30).
+const MAX_CONFIRM_SPLIT_WAIT: Duration = Duration::from_secs(28);
+/// Fallback wait when `respond_by` is absent/unparseable (pre-`respond_by`
+/// relay) — preserves the historical bounded 6 s wait.
+const FALLBACK_CONFIRM_SPLIT_WAIT: Duration = Duration::from_secs(6);
+
 /// Per-market instrument resolution for the V2 paths.
 #[derive(Debug, Clone)]
 pub struct MarketInstruments {
@@ -330,6 +344,27 @@ impl RfqV2State {
         }
     }
 
+    /// Deadline for the confirm-time wait on an on-demand split. Honors the
+    /// `respond_by` the relay forwarded in the confirm (minus a response margin
+    /// so our answer beats the relay's own timeout), clamped to
+    /// `MAX_CONFIRM_SPLIT_WAIT`. A `respond_by` already in the past yields a
+    /// zero-length wait (the relay has given up — reject immediately). When the
+    /// field is absent (older relay) we fall back to the historical bounded wait.
+    fn confirm_split_deadline(&self, req: &RfqConfirmRequest) -> Instant {
+        let start = Instant::now();
+        match req.respond_by.as_ref() {
+            Some(ts) => {
+                let remaining_ms = (ts.seconds * 1000 + (ts.nanos as i64) / 1_000_000)
+                    - chrono::Utc::now().timestamp_millis()
+                    - CONFIRM_RESPONSE_MARGIN.as_millis() as i64;
+                let remaining_ms = remaining_ms
+                    .clamp(0, MAX_CONFIRM_SPLIT_WAIT.as_millis() as i64);
+                start + Duration::from_millis(remaining_ms as u64)
+            }
+            None => start + FALLBACK_CONFIRM_SPLIT_WAIT,
+        }
+    }
+
     /// Release everything a failed confirm acquired, and drop the pending
     /// entry. `holding_cids`/`ticket` are whatever the pipeline had acquired
     /// by the failure point.
@@ -523,18 +558,28 @@ impl RfqV2State {
             .cache
             .select_for_disclosure(&lp_pays.0, lp_pays.1, max_inputs, is_cc)
             .await;
-        // An indicative-time on-demand split may still be committing (~8 s on
-        // devnet vs the relay's 10-30 s confirm window): give it a bounded
-        // wait before giving up.
-        if picks.is_none() && self.split_in_flight(&lp_pays.0) {
-            for _ in 0..6 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                picks = self
-                    .cache
-                    .select_for_disclosure(&lp_pays.0, lp_pays.1, max_inputs, is_cc)
-                    .await;
-                if picks.is_some() {
-                    break;
+        // The disclosable rungs this leg needs may still sit in the splitter
+        // reserve (a prior swap consumed the last pre-split rung, or the
+        // maintenance split lagged behind ledger instability). Kick an on-demand
+        // split if one isn't already running — reusing the single-flight
+        // quote-time kicker — then wait for it to land, up to the deadline the
+        // relay forwarded in `respond_by`. We must not sign a quote we cannot
+        // fund, but neither should we reject one whose split is seconds away (the
+        // old fixed 6 s wait missed ~8 s devnet splits by a hair). A no-op kick
+        // (no ladder/reserve configured) leaves `split_in_flight` false, so an
+        // unfundable leg still fast-rejects instead of waiting out the deadline.
+        if picks.is_none() {
+            if !self.split_in_flight(&lp_pays.0) {
+                self.kick_on_demand_split(&lp_pays.0);
+            }
+            if self.split_in_flight(&lp_pays.0) {
+                let deadline = self.confirm_split_deadline(&req);
+                while picks.is_none() && Instant::now() < deadline {
+                    tokio::time::sleep(CONFIRM_SPLIT_POLL).await;
+                    picks = self
+                        .cache
+                        .select_for_disclosure(&lp_pays.0, lp_pays.1, max_inputs, is_cc)
+                        .await;
                 }
             }
         }
@@ -729,6 +774,10 @@ impl RfqV2State {
             quote_id: quote_id.clone(),
             lp_party_id: self.party_id.clone(),
             market_id: market_id.clone(),
+            // Stamped downstream by orderbook-rpc (the LP has no HTTP/ledger
+            // registry access); the per-instrument utility TransferRule lets
+            // the taker build the two-step accept context seedlessly.
+            utility_accept_refs: Vec::new(),
         };
 
         // Soft → hard conversion: the physical HoldingsCache reservation now
