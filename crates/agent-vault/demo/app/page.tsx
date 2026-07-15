@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { LoadKeysTab } from "./components/LoadKeysTab";
 import { BalancesTab } from "./components/BalancesTab";
@@ -9,7 +8,7 @@ import { pemToDer } from "./components/crypto-helpers";
 import type { SecretSlot } from "@/lib/store";
 
 type Me = {
-  kind: "tenant" | "admin" | "anonymous";
+  kind: "tenant" | "admin";
   userId?: string;
   username?: string;
   email?: string;
@@ -18,7 +17,6 @@ type Me = {
 type Tab = "keys" | "balances";
 
 export default function DashboardPage() {
-  const router = useRouter();
   const [me, setMe] = useState<Me | null>(null);
   const [keyId, setKeyId] = useState<string>("");
   const rsaKeyRef = useRef<CryptoKey | null>(null);
@@ -39,10 +37,6 @@ export default function DashboardPage() {
       const meRes = await fetch("/api/vault/auth/me", { cache: "no-store" });
       const meJson = (await meRes.json()) as Me;
       if (cancelled) return;
-      if (meJson.kind === "anonymous" || !meJson.userId) {
-        router.replace("/login");
-        return;
-      }
       setMe(meJson);
 
       const pk = await fetch("/api/vault/pubkey").then((r) => r.json());
@@ -64,16 +58,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
     };
-  }, [loadStatus, router]);
-
-  async function logout() {
-    try {
-      await fetch("/api/vault/auth/logout", { method: "POST" });
-    } catch {
-      /* ignore */
-    }
-    router.push("/login");
-  }
+  }, [loadStatus]);
 
   function copyUid() {
     if (!me?.userId) return;
@@ -107,9 +92,6 @@ export default function DashboardPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
           <ThemeToggle />
-          <button type="button" className="btn-ghost" onClick={logout}>
-            Log out
-          </button>
         </div>
       </header>
 

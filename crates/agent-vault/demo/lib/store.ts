@@ -101,11 +101,6 @@ export function readSession(token: string | undefined): Session | null {
   return sess;
 }
 
-export function dropSession(token: string | undefined): void {
-  if (!token) return;
-  store().sessions.delete(token);
-}
-
 export function findUser(userId: string): User | null {
   return store().users.get(userId) ?? null;
 }
@@ -135,17 +130,6 @@ export function upsertUser(input: {
   if (username) s.usersByLogin.set(username.toLowerCase(), id);
   if (email) s.usersByLogin.set(email.toLowerCase(), id);
   return user;
-}
-
-export function loginOrCreate(loginOrEmail: string): User {
-  const s = store();
-  const key = loginOrEmail.trim().toLowerCase();
-  const existingId = s.usersByLogin.get(key);
-  if (existingId) {
-    const u = s.users.get(existingId);
-    if (u) return u;
-  }
-  return upsertUser(key.includes("@") ? { email: key } : { username: key });
 }
 
 export function addWalletSlot(
