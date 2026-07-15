@@ -138,12 +138,17 @@ impl RfqHandler {
     /// `direction`: 1 = BUY (user buys base, LP sells base), 2 = SELL (user
     /// sells base, LP buys base / sells quote) — the v1 `RfqRequest.direction`
     /// enum values. `rfq_id` is used for logging only.
+    /// The taker sizes the trade in EITHER the base (`quantity_str`) OR the
+    /// quote instrument (`quote_quantity_str`, empty when unused). In quote
+    /// mode the base is derived as `quote_quantity / price` after pricing, and
+    /// the base min/max bounds are checked against that derived value.
     pub(crate) async fn price_rfq(
         &self,
         rfq_id: &str,
         market_id: &str,
         direction: i32,
         quantity_str: &str,
+        quote_quantity_str: &str,
     ) -> Result<PricedQuote, RejectInfo> {
         // Find market config
         let market_config = self.markets.iter().find(|m| m.market_id == market_id);
@@ -170,38 +175,38 @@ impl RfqHandler {
             }
         };
 
-        // Parse quantity
-        let quantity: f64 = match quantity_str.parse() {
-            Ok(q) => q,
-            Err(_) => {
-                return Err(RejectInfo::new(
-                    RfqRejectionReason::Unspecified,
-                    "Invalid quantity",
-                ));
+        // Size mode: the taker gives EITHER a base `quantity` OR a
+        // `quote_quantity` (quote-instrument amount, e.g. "pay 50 USDC"). In
+        // quote mode the base is unknown until price is computed below, so the
+        // base min/max bounds check is deferred until after the inversion.
+        let requested_quote_quantity: Option<f64> = if !quote_quantity_str.trim().is_empty() {
+            match quote_quantity_str.parse::<f64>() {
+                Ok(q) if q > 0.0 && q.is_finite() => Some(q),
+                _ => {
+                    return Err(RejectInfo::new(
+                        RfqRejectionReason::Unspecified,
+                        "Invalid quote_quantity",
+                    ));
+                }
             }
+        } else {
+            None
         };
 
-        // Check quantity bounds
-        let min_qty: f64 = rfq_config.min_quantity.parse().unwrap_or(0.0);
-        let max_qty: f64 = rfq_config.max_quantity.parse().unwrap_or(f64::MAX);
-
-        if quantity < min_qty {
-            return Err(RejectInfo {
-                reason: RfqRejectionReason::AmountTooSmall,
-                reason_detail: Some(format!("Min quantity: {}", min_qty)),
-                min_quantity: Some(rfq_config.min_quantity.clone()),
-                max_quantity: Some(rfq_config.max_quantity.clone()),
-            });
-        }
-
-        if quantity > max_qty {
-            return Err(RejectInfo {
-                reason: RfqRejectionReason::AmountTooLarge,
-                reason_detail: Some(format!("Max quantity: {}", max_qty)),
-                min_quantity: Some(rfq_config.min_quantity.clone()),
-                max_quantity: Some(rfq_config.max_quantity.clone()),
-            });
-        }
+        // Base mode: parse now. Quote mode: derived after pricing (placeholder).
+        let mut quantity: f64 = if requested_quote_quantity.is_none() {
+            match quantity_str.parse() {
+                Ok(q) => q,
+                Err(_) => {
+                    return Err(RejectInfo::new(
+                        RfqRejectionReason::Unspecified,
+                        "Invalid quantity",
+                    ));
+                }
+            }
+        } else {
+            0.0
+        };
 
         // Reject RFQs when ledger submission is failing (sequencer unreachable /
         // SEQUENCER_REQUEST_FAILED). Quoting into an outage reserves inventory that
@@ -287,15 +292,50 @@ impl RfqHandler {
             mid_price * (1.0 - rfq_config.bid_spread_percent * (spread_multiplier + depletion_coeff) / 100.0)
         };
 
-        let quote_quantity = quantity * price;
+        // Derive the missing leg from the (size-independent) price. In
+        // quote-denominated mode the base quantity is set here.
+        let quote_quantity = match requested_quote_quantity {
+            Some(q) => {
+                quantity = q / price;
+                q
+            }
+            None => quantity * price,
+        };
 
-        // Guard against NaN/infinity from misconfigured spreads
-        if !price.is_finite() || !quote_quantity.is_finite() || price <= 0.0 {
+        // Guard against NaN/infinity from misconfigured spreads (or a
+        // non-positive price that would make the quote-mode division blow up).
+        if !price.is_finite()
+            || !quote_quantity.is_finite()
+            || !quantity.is_finite()
+            || price <= 0.0
+        {
             warn!("RFQ {}: computed invalid price {:.6} or quantity {:.6}", rfq_id, price, quote_quantity);
             return Err(RejectInfo::new(
                 RfqRejectionReason::TemporarilyUnavailable,
                 "Price computation error",
             ));
+        }
+
+        // Base min/max bounds — checked against the (possibly derived) base
+        // quantity, so quote-denominated requests are validated too. (Reject
+        // bounds stay base-denominated; the client converts for display.)
+        let min_qty: f64 = rfq_config.min_quantity.parse().unwrap_or(0.0);
+        let max_qty: f64 = rfq_config.max_quantity.parse().unwrap_or(f64::MAX);
+        if quantity < min_qty {
+            return Err(RejectInfo {
+                reason: RfqRejectionReason::AmountTooSmall,
+                reason_detail: Some(format!("Min quantity: {}", min_qty)),
+                min_quantity: Some(rfq_config.min_quantity.clone()),
+                max_quantity: Some(rfq_config.max_quantity.clone()),
+            });
+        }
+        if quantity > max_qty {
+            return Err(RejectInfo {
+                reason: RfqRejectionReason::AmountTooLarge,
+                reason_detail: Some(format!("Max quantity: {}", max_qty)),
+                min_quantity: Some(rfq_config.min_quantity.clone()),
+                max_quantity: Some(rfq_config.max_quantity.clone()),
+            });
         }
 
         // USD reference for the quote leg (feeds the min-notional floor and the
@@ -468,7 +508,8 @@ impl RfqHandler {
         let rfq_id = request.rfq_id.clone();
 
         let priced = match self
-            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity)
+            // v1 RFQ is base-only (no quote-denominated sizing).
+            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity, "")
             .await
         {
             Ok(p) => p,
@@ -510,5 +551,77 @@ impl RfqHandler {
             allocate_before_secs: Some(priced.allocate_before_secs),
             settle_before_secs: Some(priced.settle_before_secs),
         })
+    }
+}
+
+#[cfg(test)]
+mod price_rfq_tests {
+    use super::*;
+
+    const MID: f64 = 0.0136; // EDELx ≈ $0.0136 (the pathological cheap-base case)
+
+    /// Zero-spread EDELx-USDC LP so price == mid, min base bound 50, min
+    /// notional $10. `liquidity_manager: None` skips the balance gate.
+    fn handler() -> RfqHandler {
+        let lp_config: LiquidityProviderConfig =
+            serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
+        let market: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDC","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":0.0,"offer_spread_percent":0.0}}"#,
+        )
+        .unwrap();
+        let mut mids = HashMap::new();
+        mids.insert("EDELx-USDC".to_string(), MID);
+        RfqHandler {
+            lp_config,
+            markets: vec![market],
+            mid_prices: Arc::new(RwLock::new(mids)),
+            party_id: "lp::test".to_string(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
+            liquidity_manager: None,
+        }
+    }
+
+    fn f(s: &str) -> f64 {
+        s.parse().unwrap()
+    }
+
+    /// Quote-denominated buy: "pay 50 USDC" prices at $50 (clears the $10
+    /// floor) and derives base = 50 / price.
+    #[tokio::test]
+    async fn quote_denominated_inverts_and_passes_min_notional() {
+        // direction 1 = buy.
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "", "50").await {
+            Ok(p) => p,
+            Err(e) => panic!("quote-denominated 50 USDC must be quotable (>$10): {:?}", e.reason_detail),
+        };
+        // Quote leg is the exact taker input.
+        assert!((f(&priced.quote_quantity_str) - 50.0).abs() < 1e-6);
+        // Base derived from price (== mid at zero spread).
+        assert!((f(&priced.quantity_str) - 50.0 / MID).abs() < 1e-3, "{}", priced.quantity_str);
+    }
+
+    /// Base-denominated path is unchanged: quote = base * price. 1000 EDELx ≈
+    /// $13.6 clears the $10 floor.
+    #[tokio::test]
+    async fn base_denominated_unchanged() {
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "1000", "").await {
+            Ok(p) => p,
+            Err(e) => panic!("1000 EDELx base ($13.6) is within [50, 10000] and >$10: {:?}", e.reason_detail),
+        };
+        assert!((f(&priced.quantity_str) - 1000.0).abs() < 1e-6);
+        assert!((f(&priced.quote_quantity_str) - 1000.0 * MID).abs() < 1e-6);
+    }
+
+    /// A quote-denominated request that inverts to a base below the base
+    /// min_quantity is rejected on the (moved) base bound, not silently taken.
+    #[tokio::test]
+    async fn quote_denominated_below_base_min_rejected() {
+        // 0.5 USDC / 0.0136 ≈ 36.8 EDELx < min 50.
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "", "0.5").await {
+            Ok(_) => panic!("derived base below min_quantity must reject"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
+        assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min quantity"));
     }
 }

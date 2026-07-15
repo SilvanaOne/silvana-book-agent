@@ -144,6 +144,10 @@ pub enum OperationExpectation {
         venue_cid: String,
         new_key_spki_hex: String,
     },
+    RetireVenue {
+        lp_party: String,
+        venue_cid: String,
+    },
     CancelTickets {
         lp_party: String,
         ticket_count: usize,

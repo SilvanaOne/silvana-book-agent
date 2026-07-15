@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
         max_settlement: args.amount,
         interval_secs: args.poll_period,
         atomic: false,
+        fee_tokens: vec![],
     };
 
     // Keep backend alive so its ACS worker keeps refreshing amulets

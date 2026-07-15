@@ -1329,6 +1329,9 @@ pub fn build_canonical_from_prepare_atomic_request(
             &p.venue_cid,
             &p.new_quote_public_key_spki_hex,
         ),
+        AtomicParams::RetireVenue(p) => {
+            message_signing::canonical_params_retire_venue(&p.venue_cid)
+        }
         AtomicParams::CancelTickets(p) => {
             message_signing::canonical_params_cancel_tickets(&p.ticket_cids)
         }

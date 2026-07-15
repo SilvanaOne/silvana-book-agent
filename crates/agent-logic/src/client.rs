@@ -433,7 +433,9 @@ impl OrderbookClient {
         Ok(response.into_inner())
     }
 
-    /// Request RFQ V2 (AtomicDVP) quotes from V2-connected liquidity providers
+    /// Request RFQ V2 (AtomicDVP) quotes from V2-connected liquidity providers.
+    /// `fee_tokens` is the priority-ordered settlement-fee token preference
+    /// (instruments-table symbols, e.g. ["USDC", "CC"]); empty = CC.
     pub async fn request_quotes_atomic(
         &mut self,
         market_id: &str,
@@ -441,6 +443,7 @@ impl OrderbookClient {
         quantity: &str,
         lp_names: Vec<String>,
         timeout_secs: Option<u32>,
+        fee_tokens: Vec<String>,
     ) -> Result<RequestQuotesV2Response> {
         let request = Request::new(RequestQuotesV2Request {
             market_id: market_id.to_string(),
@@ -448,6 +451,11 @@ impl OrderbookClient {
             quantity: quantity.to_string(),
             lp_names,
             timeout_secs,
+            fee_tokens,
+            // No swap-venue delegation: the agent always acts as its own party.
+            user: None,
+            // This helper always sizes by base quantity.
+            quote_quantity: None,
         });
 
         let response = self
@@ -476,6 +484,8 @@ impl OrderbookClient {
             rfq_id: rfq_id.to_string(),
             quote_id: quote_id.to_string(),
             timeout_secs,
+            // No swap-venue delegation: the agent accepts as its own party.
+            user: None,
         });
 
         let response = self

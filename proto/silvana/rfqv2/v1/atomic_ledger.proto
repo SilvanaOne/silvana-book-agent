@@ -59,7 +59,7 @@ message AtomicDvpSettleParams {
   optional string ticket_cid = 13;
   repeated string lp_input_holding_cids = 14;
   repeated AtomicDisclosedContract envelope_disclosures = 15;
-  // user-side inputs (agent-selected, <= 20):
+  // user-side inputs (agent-selected, <= 100):
   repeated string user_input_holding_cids = 16;
   string synchronizer_id = 17;
   // SIGNED LP-required fee(s), verbatim from the envelope's quote.lp_fees —
@@ -109,6 +109,13 @@ message UpdateVenueKeyParams {
   string new_quote_public_key_spki_hex = 2;
 }
 
+// LP retires (archives) its own venue via AtomicDVP_Retire. Use before
+// re-creating a venue under a changed instrument registrar. In-flight signed
+// envelopes for the pair die (their disclosed venue cid goes stale).
+message RetireVenueParams {
+  string venue_cid = 1;
+}
+
 message CancelTicketsParams {
   reserved 1;
   reserved "ticket_service_cid";       // server discovers the singleton itself
@@ -130,6 +137,7 @@ message PrepareAtomicTransactionRequest {
     CreateAtomicDvpVenueParams create_atomic_dvp_venue = 14;
     UpdateVenueKeyParams update_venue_key = 15;
     CancelTicketsParams cancel_tickets = 16;
+    RetireVenueParams retire_venue = 17;
   }
   AtomicMessageSignature request_signature = 30;
 }
@@ -173,6 +181,19 @@ message GetAtomicContractsRequest {
 message GetAtomicContractsResponse {
   repeated AtomicAcsContract contracts = 1;
   repeated AtomicDisclosedContract disclosures = 2;
+}
+
+// Resolve the registrar-signed utility TransferRule disclosure for one
+// instrument (bridge-internal; used to stamp RFQ V2 envelopes so the taker can
+// build the two-step utility accept context seedlessly). The response is
+// registrar/instrument-static and cached SDK-side.
+message GetUtilityTransferRuleRequest {
+  string instrument_admin = 1;
+  string instrument_id = 2;
+}
+
+message GetUtilityTransferRuleResponse {
+  AtomicDisclosedContract transfer_rule = 1;
 }
 
 service AtomicDvpProviderService {

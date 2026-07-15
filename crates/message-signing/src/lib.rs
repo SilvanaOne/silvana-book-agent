@@ -446,6 +446,10 @@ pub fn canonical_params_update_venue_key(venue_cid: &str, new_quote_public_key_s
     )
 }
 
+pub fn canonical_params_retire_venue(venue_cid: &str) -> String {
+    format!("param_type=RetireVenue\nvenue_cid={}\n", venue_cid)
+}
+
 pub fn canonical_params_cancel_tickets(ticket_cids: &[String]) -> String {
     format!(
         "param_type=CancelTickets\nticket_cids={}\n",

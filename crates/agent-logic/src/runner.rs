@@ -113,6 +113,30 @@ pub struct AgentOptions {
 
 /// Run the agent event loop
 ///
+/// Keep only balance rows the agent can actually spend under the registry it
+/// has configured for each instrument. `GetBalances` returns one row per
+/// (instrument_id, registrar); for a re-issued token (e.g. devnet cETH held
+/// under both an old and a new registrar) only the row whose admin matches
+/// `instruments.registry` is spendable — the others would fail any allocation
+/// with a "Contract group identifier mismatch". Canton Coin is always kept;
+/// an unknown/unconfigured registry is kept too (lenient — never blank
+/// liquidity before `GetInstruments` has populated the registry map).
+fn spendable_under_configured_registry(
+    config: &BaseConfig,
+    balances: Vec<TokenBalance>,
+) -> Vec<TokenBalance> {
+    balances
+        .into_iter()
+        .filter(|b| {
+            if b.is_canton_coin {
+                return true;
+            }
+            let (_, registry) = config.resolve_instrument(&b.instrument_id);
+            registry.is_empty() || registry == b.instrument_admin
+        })
+        .collect()
+}
+
 /// This is the shared main loop for both the local and cloud agents.
 /// It handles:
 /// - Order placement and grid management
@@ -436,6 +460,7 @@ where
 
     match balances_res {
         Ok(Ok(balances)) => {
+            let balances = spendable_under_configured_registry(&config, balances);
             if let Some(lm) = settlement_executor.liquidity_manager() {
                 for b in &balances {
                     if !b.is_canton_coin {
@@ -612,6 +637,7 @@ where
                         balance_provider.fetch_balances(),
                     ).await {
                         Ok(Ok(balances)) => {
+                            let balances = spendable_under_configured_registry(&config, balances);
                             if let Some(lm) = settlement_executor.liquidity_manager() {
                                 for b in &balances {
                                     if !b.is_canton_coin {
@@ -734,8 +760,22 @@ where
                             } else {
                                 format!("{:.1}h", s.hours_to_depletion)
                             };
+                            // RFQ V2 holdings histogram (this token as an LP-pays
+                            // leg): total + reserved + USD-value buckets. Empty
+                            // for non-LP backends; unbucketed if no USD price.
+                            let holdings_str = match settlement_executor.holdings_histogram(&s.token) {
+                                Some(h) if h.priced => format!(
+                                    " | holdings {} ({} rsvd) <10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
+                                    h.total, h.reserved, h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
+                                ),
+                                Some(h) => format!(
+                                    " | holdings {} ({} rsvd) [no USD price]",
+                                    h.total, h.reserved
+                                ),
+                                None => String::new(),
+                            };
                             info!(
-                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({})",
+                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}",
                                 s.token,
                                 fmt_sig4(s.balance),
                                 fmt_sig4(s.committed),
@@ -754,6 +794,7 @@ where
                                 s.net_outflow_per_hour,
                                 s.depletion_coefficient,
                                 depl_str,
+                                holdings_str,
                             );
                         }
                     }
@@ -782,6 +823,7 @@ where
                         balance_provider.fetch_balances(),
                     ).await {
                         Ok(Ok(balances)) => {
+                            let balances = spendable_under_configured_registry(&config, balances);
                             // Update non-CC token balances in liquidity manager
                             if let Some(lm) = settlement_executor.liquidity_manager() {
                                 for b in &balances {
@@ -937,4 +979,51 @@ where
 
     info!("Agent stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod balance_filter_tests {
+    use super::*;
+    use crate::config::BaseConfig;
+
+    fn tb(id: &str, admin: &str, unlocked: &str, is_cc: bool) -> TokenBalance {
+        TokenBalance {
+            instrument_id: id.to_string(),
+            instrument_admin: admin.to_string(),
+            unlocked_amount: unlocked.to_string(),
+            is_canton_coin: is_cc,
+            ..Default::default()
+        }
+    }
+
+    /// Dual-registry cETH: only the row under the configured registry survives;
+    /// CC is always kept; a token with no configured registry stays (lenient).
+    #[test]
+    fn keeps_only_configured_registry_rows() {
+        let mut config = BaseConfig::test_minimal();
+        config.instrument_registries.insert("cETH".into(), "rails-new::12200b6d".into());
+
+        let balances = vec![
+            tb("cETH", "rails-new::12200b6d", "4.0", false), // configured → keep
+            tb("cETH", "ceth-old::122078c9", "0.0537", false), // foreign → drop
+            tb("CC", "dso::whatever", "100", true),          // CC → always keep
+            tb("EDELx", "edel::abc", "5000", false),          // unconfigured → lenient keep
+        ];
+
+        let out = spendable_under_configured_registry(&config, balances);
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|b| (b.instrument_id.as_str(), b.instrument_admin.as_str()))
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("cETH", "rails-new::12200b6d"),
+                ("CC", "dso::whatever"),
+                ("EDELx", "edel::abc"),
+            ],
+            "old-registry cETH must be dropped; CC + unconfigured kept"
+        );
+    }
 }
