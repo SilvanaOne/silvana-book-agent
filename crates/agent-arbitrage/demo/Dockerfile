@@ -28,6 +28,9 @@ COPY --from=build /app/.next        ./.next
 COPY --from=build /app/public       ./public
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
+# `next start` (non-standalone) reads next.config at RUNTIME — it carries basePath.
+# Without this copy the server ignores basePath and serves from root.
+COPY --from=build /app/next.config.mjs ./next.config.mjs
 RUN addgroup --system --gid 1001 nodejs \
  && adduser  --system --uid 1001 nextjs \
  && chown -R nextjs:nodejs /app
