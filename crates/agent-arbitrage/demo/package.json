@@ -2,22 +2,24 @@
   "name": "agent-arbitrage-demo",
   "version": "0.1.0",
   "private": true,
-  "description": "Interactive demo for agent-arbitrage: watch a cross-venue spread scanner surface buy-low / sell-high opportunities on a synthetic multi-venue market.",
+  "type": "module",
+  "description": "Standalone visual demo for agent-arbitrage: the real operator dashboard (Next 15 / React 19) running on synthetic fixtures with no backend, auth, or network.",
   "scripts": {
     "dev": "next dev -p 3090",
     "build": "next build",
     "start": "next start -p 3090",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "next": "14.2.5",
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@types/node": "20.14.10",
-    "@types/react": "18.3.3",
-    "@types/react-dom": "18.3.0",
-    "typescript": "5.5.3"
+    "@types/node": "^20.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
   }
 }
