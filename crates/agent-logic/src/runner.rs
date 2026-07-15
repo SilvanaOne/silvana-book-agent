@@ -760,8 +760,22 @@ where
                             } else {
                                 format!("{:.1}h", s.hours_to_depletion)
                             };
+                            // RFQ V2 holdings histogram (this token as an LP-pays
+                            // leg): total + reserved + USD-value buckets. Empty
+                            // for non-LP backends; unbucketed if no USD price.
+                            let holdings_str = match settlement_executor.holdings_histogram(&s.token) {
+                                Some(h) if h.priced => format!(
+                                    " | holdings {} ({} rsvd) <10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
+                                    h.total, h.reserved, h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
+                                ),
+                                Some(h) => format!(
+                                    " | holdings {} ({} rsvd) [no USD price]",
+                                    h.total, h.reserved
+                                ),
+                                None => String::new(),
+                            };
                             info!(
-                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({})",
+                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}",
                                 s.token,
                                 fmt_sig4(s.balance),
                                 fmt_sig4(s.committed),
@@ -780,6 +794,7 @@ where
                                 s.net_outflow_per_hour,
                                 s.depletion_coefficient,
                                 depl_str,
+                                holdings_str,
                             );
                         }
                     }

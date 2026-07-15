@@ -537,6 +537,41 @@ impl HoldingsCache {
         (avail_count, consumed.len(), reserved.len(), selectable)
     }
 
+    /// Per-holding amounts for one instrument, for the LIQUIDITY histogram log.
+    /// Returns `(total, reserved, [(amount, is_reserved)])` over available −
+    /// consumed holdings (age-agnostic — reserved holdings are still on-ledger
+    /// so they belong in the total, flagged). `is_reserved` = an unexpired
+    /// reservation of any kind holds the cid (mirrors the `stats()` filters).
+    pub async fn holdings_for_instrument(
+        &self,
+        instrument: &str,
+    ) -> (usize, usize, Vec<(Decimal, bool)>) {
+        let now = Instant::now();
+        let available = self.available.read().await;
+        let consumed = self.consumed.read().await;
+        let reserved = self.reserved.read().await;
+
+        let mut out: Vec<(Decimal, bool)> = Vec::new();
+        let mut reserved_count = 0usize;
+        for h in available.values() {
+            if h.instrument != instrument {
+                continue;
+            }
+            if consumed.contains_key(&h.contract_id) {
+                continue;
+            }
+            let is_reserved = matches!(
+                reserved.get(&h.contract_id),
+                Some(entry) if !entry.is_expired(now)
+            );
+            if is_reserved {
+                reserved_count += 1;
+            }
+            out.push((h.amount, is_reserved));
+        }
+        (out.len(), reserved_count, out)
+    }
+
     /// Look up a cached holding by contract id.
     pub async fn get(&self, cid: &str) -> Option<CachedHolding> {
         self.available.read().await.get(cid).cloned()
@@ -956,5 +991,40 @@ mod tests {
             selectable.iter().map(|h| h.contract_id.as_str()).collect();
         assert!(cids.contains("new"));
         assert!(cids.contains("old"));
+    }
+
+    #[tokio::test]
+    async fn holdings_for_instrument_totals_and_reserved_flag() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .add_created(vec![
+                holding("a", USDC, "12", true),
+                holding("b", USDC, "20", true),
+                holding("c", USDC, "60", true),
+                holding("x", "reg::CBTC", "0.0002", true), // different instrument
+            ])
+            .await;
+        // Reserve "b" as a live V2 quote.
+        cache
+            .reserve_v2(
+                &["b".to_string()],
+                "quote-1",
+                Instant::now() + std::time::Duration::from_secs(120),
+            )
+            .await;
+
+        let (total, reserved, holdings) = cache.holdings_for_instrument(USDC).await;
+        assert_eq!(total, 3, "only the 3 USDC holdings");
+        assert_eq!(reserved, 1, "b is reserved");
+        // The reserved flag tracks "b" (amount 20), not a/c.
+        let flag_for = |amt: &str| {
+            holdings
+                .iter()
+                .find(|(a, _)| *a == amt.parse::<Decimal>().unwrap())
+                .map(|(_, r)| *r)
+        };
+        assert_eq!(flag_for("20"), Some(true));
+        assert_eq!(flag_for("12"), Some(false));
+        assert_eq!(flag_for("60"), Some(false));
     }
 }

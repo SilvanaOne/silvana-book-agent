@@ -146,6 +146,14 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
+    /// Per-instrument RFQ V2 holdings histogram for the LIQUIDITY log, keyed by
+    /// LiquidityManager token symbol. Returns None if the backend has no
+    /// holdings cache. Computed in the backend (which owns the cache + USD
+    /// prices) and returned as plain data.
+    fn holdings_histogram(&self, _token: &str) -> Option<HoldingsHistogram> {
+        None
+    }
+
     /// Check if regular fees are paused (sequencer backpressure).
     /// Returns Some(remaining_secs) if paused, None otherwise.
     fn fee_pause_secs(&self) -> Option<u64> {
@@ -166,6 +174,22 @@ pub trait SettlementBackend: Send + Sync {
     fn liquidity_manager(&self) -> Option<Arc<crate::liquidity::LiquidityManager>> {
         None
     }
+}
+
+/// One instrument's RFQ V2 holdings, bucketed by USD value for the LIQUIDITY
+/// heartbeat log. `total`/`reserved` are always meaningful; the USD buckets are
+/// only populated when `priced` (a USD price was available). Buckets are
+/// half-open: `under_10` = [0,10), `b10_20` = [10,20), … `over_100` = [100,∞).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct HoldingsHistogram {
+    pub total: usize,
+    pub reserved: usize,
+    pub under_10: usize,
+    pub b10_20: usize,
+    pub b20_50: usize,
+    pub b50_100: usize,
+    pub over_100: usize,
+    pub priced: bool,
 }
 
 /// Settlement executor handles the DVP workflow
@@ -441,6 +465,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Get per-pool worker utilization (delegated to backend).
     pub fn worker_utilization(&self) -> Option<(u64, usize, u64, usize)> {
         self.backend.worker_utilization()
+    }
+
+    /// Per-instrument RFQ V2 holdings histogram (delegated to backend).
+    pub fn holdings_histogram(&self, token: &str) -> Option<HoldingsHistogram> {
+        self.backend.holdings_histogram(token)
     }
 
     /// Check if regular fees are paused (sequencer backpressure).

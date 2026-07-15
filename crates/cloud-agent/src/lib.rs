@@ -449,9 +449,19 @@ pub enum AtomicVenueCommands {
         #[arg(long)]
         market: String,
     },
+    /// List this LP's AtomicDVP venues as JSON (contract ids + instrument admins)
+    List,
     /// Rotate the venue's quote key to the current ATOMIC_QUOTE_PRIVATE_KEY —
     /// KILLS all live envelopes + old-key signatures
     RotateKey {
+        /// Market ID (pairName)
+        #[arg(long)]
+        market: String,
+    },
+    /// Retire (archive) this LP's AtomicDVP venue for a market pair. Use before
+    /// re-creating a venue under a changed instrument registrar. KILLS every
+    /// live signed envelope for the pair.
+    Retire {
         /// Market ID (pairName)
         #[arg(long)]
         market: String,
@@ -601,12 +611,17 @@ pub async fn run_cloud_agent(
         >,
     > = None;
 
+    // Captured from the RfqHandler (LP mode only) so the LIQUIDITY heartbeat can
+    // bucket the holdings histogram by USD; None when not an LP.
+    let mut lp_mid_prices: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, f64>>>> =
+        None;
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
         let mut rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
         rfq_handler.set_liquidity_manager(liquidity_manager.clone());
         let quoted_trades = rfq_handler.quoted_trades();
         let rfq_handler = Arc::new(rfq_handler);
+        lp_mid_prices = Some(rfq_handler.mid_prices());
 
         info!(
             "LP mode enabled: name={}, starting settlement stream",
@@ -655,10 +670,13 @@ pub async fn run_cloud_agent(
     };
 
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
-    let backend = CloudSettlementBackend::new(
+    let mut backend = CloudSettlementBackend::new(
         config.clone(), verbose, dry_run, force, confirm, confirm_lock,
         liquidity_manager, lp_shutdown.clone(), holdings_cache,
     );
+    if let Some(mp) = lp_mid_prices {
+        backend = backend.with_mid_prices(mp);
+    }
 
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
@@ -1684,7 +1702,13 @@ pub async fn run_lp_atomic_stream(
                                 reject("market not available for atomic RFQ".to_string(), String::new(), String::new())
                             } else {
                                 match rfq_handler
-                                    .price_rfq(&request.rfq_id, &request.market_id, direction, &request.quantity)
+                                    .price_rfq(
+                                        &request.rfq_id,
+                                        &request.market_id,
+                                        direction,
+                                        &request.quantity,
+                                        request.quote_quantity.as_deref().unwrap_or(""),
+                                    )
                                     .await
                                 {
                                     Err(r) => reject(
@@ -4124,7 +4148,7 @@ pub async fn run_atomic(
     use orderbook_proto::rfqv2::{
         prepare_atomic_transaction_request::Params as AtomicParams, CancelTicketsParams,
         CreateAtomicDvpVenueParams, IssueTicketsParams,
-        PrepareAtomicTransactionRequest, UpdateVenueKeyParams,
+        PrepareAtomicTransactionRequest, RetireVenueParams, UpdateVenueKeyParams,
     };
 
     match command {
@@ -4201,6 +4225,31 @@ pub async fn run_atomic(
                     .await?;
                 println!("AtomicDVP venue created for {}, update id: {}", market, resp.update_id);
             }
+            AtomicVenueCommands::List => {
+                let mut client = atomic_swap::create_atomic_client(&config).await?;
+                let venues = atomic_find_venues(&mut client, &config.party_id).await?;
+                let arr: Vec<serde_json::Value> = venues
+                    .iter()
+                    .map(|v| {
+                        serde_json::json!({
+                            "contract_id": v.contract_id,
+                            "pair_name": v.pair_name,
+                            "provider": v.provider,
+                            "base_instrument": { "id": v.base_id, "admin": v.base_admin },
+                            "quote_instrument": { "id": v.quote_id, "admin": v.quote_admin },
+                            "quote_public_key": v.quote_public_key,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "lp_party": config.party_id,
+                        "count": arr.len(),
+                        "venues": arr,
+                    }))?
+                );
+            }
             AtomicVenueCommands::RotateKey { market } => {
                 let kf = quote_key_from_env()?;
                 let mut client = atomic_swap::create_atomic_client(&config).await?;
@@ -4248,6 +4297,50 @@ pub async fn run_atomic(
                     .await?;
                 println!("Venue key rotated for {}, update id: {}", market, resp.update_id);
                 println!("(the venue has a NEW contract id — restart the LP agent to re-validate)");
+            }
+            AtomicVenueCommands::Retire { market } => {
+                let mut client = atomic_swap::create_atomic_client(&config).await?;
+                let venue = atomic_find_venues(&mut client, &config.party_id)
+                    .await?
+                    .into_iter()
+                    .find(|v| v.pair_name == market)
+                    .ok_or_else(|| anyhow!("no AtomicDVP venue for market {}", market))?;
+                println!("############################################################");
+                println!("# WARNING: retiring ARCHIVES the venue contract. EVERY live");
+                println!("# signed envelope for this pair dies instantly (its disclosed");
+                println!("# venue cid goes stale). Retire only with the LP agent drained");
+                println!("# of in-flight V2 quotes for {}.", market);
+                println!("############################################################");
+                println!("Venue: {} (cid {})", venue.pair_name, venue.contract_id);
+                if confirm && !dry_run {
+                    let lock = agent_logic::confirm::new_confirm_lock();
+                    agent_logic::confirm::confirm_transaction(
+                        &lock,
+                        "Retire AtomicDVP venue",
+                        &format!("market: {}, venue: {}", market, venue.contract_id),
+                    )
+                    .await?;
+                }
+                let expectation = OperationExpectation::RetireVenue {
+                    lp_party: config.party_id.clone(),
+                    venue_cid: venue.contract_id.clone(),
+                };
+                let resp = client
+                    .submit_atomic_transaction(
+                        PrepareAtomicTransactionRequest {
+                            params: Some(AtomicParams::RetireVenue(RetireVenueParams {
+                                venue_cid: venue.contract_id,
+                            })),
+                            request_signature: None,
+                        },
+                        &expectation,
+                        verbose,
+                        dry_run,
+                        force,
+                    )
+                    .await?;
+                println!("AtomicDVP venue retired for {}, update id: {}", market, resp.update_id);
+                println!("(re-create under the new registrar with `atomic venue create --market {}`)", market);
             }
         },
 

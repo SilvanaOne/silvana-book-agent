@@ -17,7 +17,7 @@ use tracing::{debug, info};
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::ConfirmLock;
 use agent_logic::liquidity::LiquidityManager;
-use agent_logic::settlement::{DiscoveredContract, SettlementBackend, StepResult};
+use agent_logic::settlement::{DiscoveredContract, HoldingsHistogram, SettlementBackend, StepResult};
 use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, AcceptDvpParams,
@@ -27,9 +27,65 @@ use orderbook_proto::ledger::{
 use tx_verifier::OperationExpectation;
 
 use crate::acs_worker::spawn_acs_worker;
-use crate::holdings_cache::{CcView, HoldingsCache};
+use crate::holdings_cache::{instrument_key, CcView, HoldingsCache, CC_INSTRUMENT};
 use crate::ledger_client::DAppProviderClient;
 use crate::payment_queue::PaymentQueue;
+use rust_decimal::prelude::ToPrimitive;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+
+/// USD price of a token from the shared mid-price map (same logic as
+/// `RfqHandler::token_usd_price`): USDC*/USDCx = $1; else the mid of
+/// `{token}-USDCx` or `{token}-USDC`. `None` when no market mid is loaded.
+async fn token_usd_price(
+    mid_prices: &RwLock<HashMap<String, f64>>,
+    token: &str,
+) -> Option<f64> {
+    if token.starts_with("USDC") {
+        return Some(1.0);
+    }
+    let mids = mid_prices.read().await;
+    for stable in ["USDCx", "USDC"] {
+        if let Some(&p) = mids.get(&format!("{token}-{stable}")) {
+            if p > 0.0 {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Tally per-holding amounts into a `HoldingsHistogram` by USD value. Buckets
+/// are half-open ([0,10), [10,20), [20,50), [50,100), [100,∞)). When
+/// `usd_price` is None (no market mid), only total/reserved are populated and
+/// `priced` stays false.
+fn bucket_by_usd(
+    total: usize,
+    reserved: usize,
+    holdings: &[(rust_decimal::Decimal, bool)],
+    usd_price: Option<f64>,
+) -> HoldingsHistogram {
+    let mut h = HoldingsHistogram { total, reserved, ..Default::default() };
+    let Some(price) = usd_price else {
+        return h;
+    };
+    h.priced = true;
+    for (amount, _reserved) in holdings {
+        let usd = amount.to_f64().unwrap_or(0.0) * price;
+        if usd < 10.0 {
+            h.under_10 += 1;
+        } else if usd < 20.0 {
+            h.b10_20 += 1;
+        } else if usd < 50.0 {
+            h.b20_50 += 1;
+        } else if usd < 100.0 {
+            h.b50_100 += 1;
+        } else {
+            h.over_100 += 1;
+        }
+    }
+    h
+}
 
 /// Settlement backend that uses DAppProviderService gRPC (no direct ledger access)
 pub struct CloudSettlementBackend {
@@ -48,6 +104,10 @@ pub struct CloudSettlementBackend {
     amulet_cache: CcView,
     /// Liquidity manager for balance tracking and commitment gating
     liquidity_manager: Arc<LiquidityManager>,
+    /// Shared market mid-prices (`market_id` → mid), owned by the RfqHandler.
+    /// Used only to bucket the holdings histogram by USD in the LIQUIDITY log.
+    /// `None` when RFQ V2 is disabled (no histogram then).
+    mid_prices: Option<Arc<RwLock<HashMap<String, f64>>>>,
     /// Shared shutdown signal for background tasks (ACS / merge / payment queue).
     /// Cloned from the runner's `Shutdown` so Ctrl-C reaches every worker
     /// the moment it fires, not only after the main loop has exited.
@@ -88,7 +148,14 @@ impl CloudSettlementBackend {
             shutdown.clone(),
         );
         let amulet_cache = cache.cc();
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, shutdown }
+        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, mid_prices: None, shutdown }
+    }
+
+    /// Wire the RfqHandler's shared mid-price map so the LIQUIDITY heartbeat can
+    /// bucket the holdings histogram by USD. Call only when RFQ V2 is enabled.
+    pub fn with_mid_prices(mut self, mid_prices: Arc<RwLock<HashMap<String, f64>>>) -> Self {
+        self.mid_prices = Some(mid_prices);
+        self
     }
 
     /// Create a new DAppProviderClient for this request
@@ -252,6 +319,30 @@ impl SettlementBackend for CloudSettlementBackend {
         }))
     }
 
+    fn holdings_histogram(&self, token: &str) -> Option<HoldingsHistogram> {
+        let mid_prices = self.mid_prices.clone()?;
+        // Map the LiquidityManager token symbol to the HoldingsCache key: "CC"
+        // for Amulet, else instrument_key(registry, on_chain_id).
+        let cache_key = if token == CC_INSTRUMENT {
+            CC_INSTRUMENT.to_string()
+        } else {
+            let (on_chain_id, registry) = self.config.resolve_instrument(token);
+            if registry.is_empty() {
+                return None;
+            }
+            instrument_key(&registry, &on_chain_id)
+        };
+        // block_in_place: the cache reads + price read are async (hold locks).
+        let (total, reserved, holdings, usd_price) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let (t, r, hs) = self.holdings_cache.holdings_for_instrument(&cache_key).await;
+                let price = token_usd_price(&mid_prices, token).await;
+                (t, r, hs, price)
+            })
+        });
+        Some(bucket_by_usd(total, reserved, &holdings, usd_price))
+    }
+
     fn worker_utilization(&self) -> Option<(u64, usize, u64, usize)> {
         Some(self.payment_queue.worker_utilization())
     }
@@ -289,5 +380,58 @@ impl SettlementBackend for CloudSettlementBackend {
 
     fn liquidity_manager(&self) -> Option<Arc<LiquidityManager>> {
         Some(self.liquidity_manager.clone())
+    }
+}
+
+#[cfg(test)]
+mod histogram_tests {
+    use super::bucket_by_usd;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    fn h(amt: &str, reserved: bool) -> (Decimal, bool) {
+        (Decimal::from_str(amt).unwrap(), reserved)
+    }
+
+    #[test]
+    fn buckets_by_usd_value_half_open() {
+        // USDC-like: price $1, amounts land directly in the USD buckets.
+        let holdings = vec![
+            h("9.99", false),  // <10
+            h("10", false),    // 10-20 (lower bound inclusive)
+            h("19.99", true),  // 10-20
+            h("20", false),    // 20-50
+            h("49.99", false), // 20-50
+            h("50", false),    // 50-100
+            h("100", false),   // >100 (100 is not <100)
+        ];
+        let hist = bucket_by_usd(holdings.len(), 1, &holdings, Some(1.0));
+        assert!(hist.priced);
+        assert_eq!(hist.total, 7);
+        assert_eq!(hist.reserved, 1);
+        assert_eq!(hist.under_10, 1);
+        assert_eq!(hist.b10_20, 2);
+        assert_eq!(hist.b20_50, 2);
+        assert_eq!(hist.b50_100, 1);
+        assert_eq!(hist.over_100, 1);
+    }
+
+    #[test]
+    fn applies_the_price_multiplier() {
+        // cETH-like: 0.012 cETH * $1874 = $22.5 -> 20-50 bucket.
+        let holdings = vec![h("0.012", false), h("0.006", false)]; // $22.5, $11.2
+        let hist = bucket_by_usd(2, 0, &holdings, Some(1874.0));
+        assert_eq!(hist.b20_50, 1);
+        assert_eq!(hist.b10_20, 1);
+    }
+
+    #[test]
+    fn no_price_leaves_buckets_empty() {
+        let holdings = vec![h("20", false), h("40", true)];
+        let hist = bucket_by_usd(2, 1, &holdings, None);
+        assert!(!hist.priced);
+        assert_eq!(hist.total, 2);
+        assert_eq!(hist.reserved, 1);
+        assert_eq!(hist.under_10 + hist.b10_20 + hist.b20_50 + hist.b50_100 + hist.over_100, 0);
     }
 }

@@ -454,6 +454,8 @@ impl OrderbookClient {
             fee_tokens,
             // No swap-venue delegation: the agent always acts as its own party.
             user: None,
+            // This helper always sizes by base quantity.
+            quote_quantity: None,
         });
 
         let response = self

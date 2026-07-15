@@ -2269,6 +2269,7 @@ pub fn inspect(
             format!("CreateAtomicDvpVenue({})", pair_name)
         }
         OperationExpectation::UpdateVenueKey { .. } => "UpdateVenueKey".to_string(),
+        OperationExpectation::RetireVenue { .. } => "RetireVenue".to_string(),
         OperationExpectation::CancelTickets { ticket_count, .. } => {
             format!("CancelTickets({} tickets)", ticket_count)
         }
