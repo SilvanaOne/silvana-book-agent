@@ -28,7 +28,7 @@ name      = "Silvana Vault v1"
 language  = "typescript"
 order     = 1
 tags      = ["vault", "keys", "hmac", "multi-tenant", "featured"]
-demo      = "https://vault.spcatcher.cfd"
+demo      = "https://silvana.one/agents/demo/vault/"
 demo_type = "featured"
 
 [template.resources]

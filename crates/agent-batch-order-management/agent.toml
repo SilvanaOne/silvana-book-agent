@@ -28,8 +28,8 @@ name      = "Batch Order Management v1"
 language  = "typescript"
 order     = 1
 tags      = ["batch", "portfolio", "rebalance", "featured"]
-demo      = "https://bamagent.spcatcher.cfd"
+demo      = "https://silvana.one/agents/demo/batch-order-management"
 demo_type = "featured"
 
 [template.resources]
-docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-batch-order-management"
+docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-batch-order-management/doc.md"

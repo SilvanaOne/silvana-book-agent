@@ -28,8 +28,8 @@ name = "Arbitrage Agent v1"
 language = "typescript"
 order = 1
 tags = ["arbitrage", "cross-venue", "scanner", "featured"]
-demo = "https://arbitrage.spcatcher.cfd"
+demo = "https://silvana.one/agents/demo/arbitrage"
 demo_type = "featured"
 
 [template.resources]
-docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage"
+docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-arbitrage/doc.md"
