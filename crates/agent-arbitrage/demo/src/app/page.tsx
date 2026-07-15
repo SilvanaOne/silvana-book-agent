@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
+import { asset } from '@/lib/asset';
 import {
   fetchSpreads,
   fetchConfig,
@@ -158,7 +159,7 @@ export default function HomePage() {
             >
               <span>hosted on</span>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src="/silvana-logo.svg" alt="Silvana" />
+              <img src={asset('/silvana-logo.svg')} alt="Silvana" />
             </a>
           </div>
         </header>

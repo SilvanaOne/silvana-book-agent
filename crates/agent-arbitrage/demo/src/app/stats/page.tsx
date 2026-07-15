@@ -6,6 +6,7 @@ import { useAuth, AUTH_DISABLED } from '@/lib/auth';
 import { Brand, NavTabs } from '@/components/chrome';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { InfoTip } from '@/components/InfoTip';
+import { asset } from '@/lib/asset';
 import { HBarChart, Histogram, Donut, type Datum } from '@/components/charts';
 import { VENUES, venueSortKey } from '@/components/panels';
 import { fetchProfitability, type Profitability } from '@/lib/api';
@@ -106,7 +107,7 @@ export default function StatsPage() {
             <a className="hostbadge" href="https://silvana.one" target="_blank" rel="noreferrer" title="Hosted on Silvana">
               <span>hosted on</span>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src="/silvana-logo.svg" alt="Silvana" />
+              <img src={asset('/silvana-logo.svg')} alt="Silvana" />
             </a>
           </div>
         </header>

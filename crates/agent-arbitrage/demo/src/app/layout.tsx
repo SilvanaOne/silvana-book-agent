@@ -3,6 +3,7 @@ import { Inter, Sora, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
 import { AuthProvider } from '@/lib/auth';
 import { ThemeProvider, THEME_PREPAINT } from '@/lib/theme';
+import { asset } from '@/lib/asset';
 
 const sora = Sora({ subsets: ['latin'], weight: ['500', '600', '700'], variable: '--font-sora' });
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
@@ -12,8 +13,8 @@ export const metadata: Metadata = {
   title: 'Arbitrage Agent',
   description: 'Canton-hosted arbitrage agent — operator dashboard',
   icons: {
-    icon: [{ url: '/favicon.svg', type: 'image/svg+xml' }],
-    shortcut: [{ url: '/favicon.svg', type: 'image/svg+xml' }],
+    icon: [{ url: asset('/favicon.svg'), type: 'image/svg+xml' }],
+    shortcut: [{ url: asset('/favicon.svg'), type: 'image/svg+xml' }],
   },
 };
 

@@ -6,6 +6,7 @@ import { useAuth, AUTH_DISABLED } from '@/lib/auth';
 import { Brand, NavTabs } from '@/components/chrome';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { InfoTip } from '@/components/InfoTip';
+import { asset } from '@/lib/asset';
 import { VENUES } from '@/components/panels';
 import { UI_TOKEN_PAIRS } from '@/lib/tokens';
 import {
@@ -105,7 +106,7 @@ export default function ConfigPage() {
             <a className="hostbadge" href="https://silvana.one" target="_blank" rel="noreferrer" title="Hosted on Silvana">
               <span>hosted on</span>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src="/silvana-logo.svg" alt="Silvana" />
+              <img src={asset('/silvana-logo.svg')} alt="Silvana" />
             </a>
           </div>
         </header>

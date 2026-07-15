@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type ReactNode, type CSSProperties } from 'react';
 import { InfoTip } from './InfoTip';
+import { asset } from '@/lib/asset';
 import {
   fetchVenueHealth,
   fetchStats,
@@ -88,7 +89,7 @@ const STATUS_DOT: Record<VenueHealth['status'], string> = {
 function VenueLogo({ def }: { def: VenueDef }) {
   const style = {
     '--vc': def.color,
-    ...(def.glyph ? { '--glyph': `url(${def.glyph})` } : {}),
+    ...(def.glyph ? { '--glyph': `url(${asset(def.glyph)})` } : {}),
   } as CSSProperties;
   return (
     <span className="venue-logo" style={style}>

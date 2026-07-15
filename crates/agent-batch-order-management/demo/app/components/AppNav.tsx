@@ -3,6 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { withBasePath } from "@/lib/base-path";
 
 const ROUTES = [
   { href: "/", label: "Home" },
@@ -76,7 +77,7 @@ export function AppNav() {
         rel="noopener noreferrer"
         aria-label="Silvana — open website"
       >
-        <Image src="/silvana-logo.svg" alt="Silvana" width={162} height={33} priority />
+        <Image src={withBasePath("/silvana-logo.svg")} alt="Silvana" width={162} height={33} priority />
       </a>
     </nav>
   );
