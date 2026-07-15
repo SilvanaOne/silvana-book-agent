@@ -4,6 +4,9 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
 
+  // Served behind an nginx reverse proxy under this path prefix.
+  basePath: "/agents/demo/batch-order-management",
+
   /**
    * This demo lives inside the monorepo, which has other lockfiles. Pin the tracing root
    * to the demo dir so build-time file tracing is self-contained and warning-free.
@@ -17,6 +20,7 @@ const nextConfig: NextConfig = {
    */
   env: {
     NEXT_PUBLIC_DEMO_TOOLS: "1",
+    NEXT_PUBLIC_BASE_PATH: "/agents/demo/batch-order-management",
   },
 };
 

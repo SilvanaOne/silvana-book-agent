@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 
 import { InfoTip } from "@/app/components/InfoTip";
 import { RebalanceNowModal } from "@/app/portfolio/rebalance-now-modal";
+import { withBasePath } from "@/lib/base-path";
 
 const SUM_TOLERANCE = 0.001;
 
@@ -100,7 +101,7 @@ export function TargetsEditor(props: Props) {
 
     setBusy(true);
     try {
-      const res = await fetch(`/api/backend/portfolio/${encodeURIComponent(props.portfolioId)}/targets`, {
+      const res = await fetch(withBasePath(`/api/backend/portfolio/${encodeURIComponent(props.portfolioId)}/targets`), {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({

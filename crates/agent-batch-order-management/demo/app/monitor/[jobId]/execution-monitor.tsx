@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { InfoTip } from "@/app/components/InfoTip";
+import { withBasePath } from "@/lib/base-path";
 
 type OrderRow = {
   orderId: string;
@@ -74,7 +75,7 @@ export function ExecutionMonitorPanel(props: Readonly<{ jobId: string }>) {
 
     async function tick() {
       try {
-        const res = await fetch(`/api/backend/rebalance/jobs/${encodeURIComponent(props.jobId)}?detail=true`, {
+        const res = await fetch(withBasePath(`/api/backend/rebalance/jobs/${encodeURIComponent(props.jobId)}?detail=true`), {
           cache: "no-store",
         });
         const text = await res.text();

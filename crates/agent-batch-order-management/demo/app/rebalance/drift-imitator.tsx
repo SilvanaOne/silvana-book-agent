@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { InfoTip } from "@/app/components/InfoTip";
+import { withBasePath } from "@/lib/base-path";
 
 type ApplyResult = Readonly<{
   portfolioId: string;
@@ -46,7 +47,7 @@ export function DriftImitator(props: Readonly<{ portfolioId: string }>) {
     setBusy(true);
     try {
       const res = await fetch(
-        `/api/backend/portfolio/${encodeURIComponent(props.portfolioId)}/imitate-drift`,
+        withBasePath(`/api/backend/portfolio/${encodeURIComponent(props.portfolioId)}/imitate-drift`),
         {
           method: "POST",
           headers: { "content-type": "application/json" },

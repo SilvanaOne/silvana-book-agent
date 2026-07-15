@@ -3,6 +3,7 @@
 import { type FormEvent, useState } from "react";
 
 import { InfoTip } from "@/app/components/InfoTip";
+import { withBasePath } from "@/lib/base-path";
 
 type PreviewRisk =
   | { ok: true }
@@ -40,7 +41,7 @@ export function PreviewRouteCard() {
       const ep = execProfile.trim();
       if (ep.length > 0) body.execProfile = ep;
 
-      const res = await fetch("/api/backend/execution/preview-route", {
+      const res = await fetch(withBasePath("/api/backend/execution/preview-route"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { DEV_PORTFOLIO_ID } from "@/lib/dev-portfolio";
+import { withBasePath } from "@/lib/base-path";
 import { InfoTip } from "@/app/components/InfoTip";
 import { PortfolioCharts } from "@/app/portfolio/portfolio-charts";
 import { TargetsEditor } from "@/app/portfolio/targets-editor";
@@ -66,7 +67,7 @@ export function PortfolioLive(props: Readonly<{ initialData: PortfolioOverviewDa
     async function tick() {
       try {
         const res = await fetch(
-          `/api/backend/portfolio/${encodeURIComponent(portfolioIdRef.current)}`,
+          withBasePath(`/api/backend/portfolio/${encodeURIComponent(portfolioIdRef.current)}`),
           { cache: "no-store" },
         );
         if (!res.ok) {

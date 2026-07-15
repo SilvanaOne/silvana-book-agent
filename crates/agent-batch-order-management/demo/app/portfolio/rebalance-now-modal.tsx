@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { InfoTip } from "@/app/components/InfoTip";
+import { withBasePath } from "@/lib/base-path";
 
 type Transfer = Readonly<{
   from: string;
@@ -81,7 +82,7 @@ export function RebalanceNowModal(props: Readonly<{ portfolioId: string; onClose
     async function run() {
       try {
         const res = await fetch(
-          `/api/backend/portfolio/${encodeURIComponent(props.portfolioId)}/rebalance-now`,
+          withBasePath(`/api/backend/portfolio/${encodeURIComponent(props.portfolioId)}/rebalance-now`),
           {
             method: "POST",
             headers: { "content-type": "application/json" },

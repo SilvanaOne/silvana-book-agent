@@ -5,6 +5,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { InfoTip } from "@/app/components/InfoTip";
 import { DriftImitator } from "@/app/rebalance/drift-imitator";
+import { withBasePath } from "@/lib/base-path";
 
 type PreviewOk = Readonly<{
   previewId: string;
@@ -81,7 +82,7 @@ export function RebalanceBuilder(props: Readonly<{ initialPortfolioId: string }>
 
     setBusy(true);
     try {
-      const res = await fetch(`/api/backend/rebalance/preview`, {
+      const res = await fetch(withBasePath(`/api/backend/rebalance/preview`), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(bodyBase.value),
@@ -140,7 +141,7 @@ export function RebalanceBuilder(props: Readonly<{ initialPortfolioId: string }>
         dryRun,
       };
 
-      const res = await fetch(`/api/backend/rebalance/execute`, {
+      const res = await fetch(withBasePath(`/api/backend/rebalance/execute`), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
