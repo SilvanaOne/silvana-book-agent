@@ -50,9 +50,19 @@ pub struct MulticallSettler {
 /// `dvp/commands/multicall.rs::fetch_holdings` — filters by `owner == party_id`
 /// and `lock is null`. Used to supply USDC (or any non-CC) allocation inputs
 /// to the multicall's `holding_cids` pool.
+/// Fetch the party's unlocked CIP-56 Holding cids for ONE instrument under ONE
+/// registrar. The multicall's holding pool must not mix registrars: a re-issued
+/// token (e.g. devnet cETH) can leave the party holding the same `id` under two
+/// registrars, and the allocation's registry rejects foreign cids ("Contract
+/// group identifier mismatch"). `expected_id` is the on-chain instrument id and
+/// `expected_source` the expected registrar (instrument.source); when
+/// `expected_source` is empty (registry not yet resolved) the source filter is
+/// skipped (lenient) but the instrument-id filter always applies.
 async fn fetch_unlocked_cip56_holdings(
     client: &mut DAppProviderClient,
     party_id: &str,
+    expected_id: &str,
+    expected_source: &str,
 ) -> Result<Vec<String>> {
     let contracts = client
         .get_active_contracts(&[TEMPLATE_HOLDING.to_string()])
@@ -62,14 +72,62 @@ async fn fetch_unlocked_cip56_holdings(
         .filter(|c| {
             let Some(ref args) = c.create_arguments else { return false };
             let json = crate::prost_struct_to_json(args);
-            let owner_ok =
-                json.get("owner").and_then(|o| o.as_str()) == Some(party_id);
-            let lock = json.pointer("/lock");
-            let unlocked = lock.is_none() || lock.unwrap().is_null();
-            owner_ok && unlocked
+            holding_matches_pool(&json, party_id, expected_id, expected_source)
         })
         .map(|c| c.contract_id)
         .collect())
+}
+
+/// Whether one decoded Holding may enter the taker's single-registrar multicall
+/// pool: owned by `party_id`, unlocked, of `expected_id`, and (unless
+/// `expected_source` is empty) under registrar `expected_source`.
+fn holding_matches_pool(
+    json: &serde_json::Value,
+    party_id: &str,
+    expected_id: &str,
+    expected_source: &str,
+) -> bool {
+    let owner_ok = json.get("owner").and_then(|o| o.as_str()) == Some(party_id);
+    let lock = json.pointer("/lock");
+    let unlocked = lock.is_none() || lock.unwrap().is_null();
+    let id_ok = json.pointer("/instrument/id").and_then(|v| v.as_str()) == Some(expected_id);
+    let source_ok = expected_source.is_empty()
+        || json.pointer("/instrument/source").and_then(|v| v.as_str()) == Some(expected_source);
+    owner_ok && unlocked && id_ok && source_ok
+}
+
+#[cfg(test)]
+mod holding_pool_tests {
+    use super::holding_matches_pool;
+    use serde_json::json;
+
+    fn holding(id: &str, source: &str, owner: &str, locked: bool) -> serde_json::Value {
+        json!({
+            "owner": owner,
+            "lock": if locked { json!({"lockers": []}) } else { json!(null) },
+            "instrument": { "id": id, "source": source },
+        })
+    }
+
+    #[test]
+    fn keeps_only_same_instrument_and_registrar() {
+        let party = "c2cde443";
+        let new_reg = "rails-cethMain-1-dev::12200b6d";
+        let old_reg = "ceth-validator-dev::122078c9";
+
+        // exact match
+        assert!(holding_matches_pool(&holding("cETH", new_reg, party, false), party, "cETH", new_reg));
+        // foreign registrar (old-registry cETH) → excluded
+        assert!(!holding_matches_pool(&holding("cETH", old_reg, party, false), party, "cETH", new_reg));
+        // wrong instrument → excluded
+        assert!(!holding_matches_pool(&holding("USDC", "test-token-1::x", party, false), party, "cETH", new_reg));
+        // locked → excluded
+        assert!(!holding_matches_pool(&holding("cETH", new_reg, party, true), party, "cETH", new_reg));
+        // not owner → excluded
+        assert!(!holding_matches_pool(&holding("cETH", new_reg, "someone-else", false), party, "cETH", new_reg));
+        // lenient: empty expected_source keeps any registrar of the right id
+        assert!(holding_matches_pool(&holding("cETH", old_reg, party, false), party, "cETH", ""));
+    }
 }
 
 impl MulticallSettler {
@@ -162,12 +220,23 @@ impl MulticallSettler {
             && !allocation_instrument_id.eq_ignore_ascii_case("amulet")
         {
             let mut client = self.create_client().await?;
-            let cip56 = fetch_unlocked_cip56_holdings(&mut client, &self.config.party_id).await?;
+            // Only holdings of THIS instrument under its configured registrar
+            // may enter the pool — mixing registrars fails the on-ledger
+            // allocation. `resolve_instrument` gives the on-chain id + the
+            // GetInstruments/DB registry (same source the atomic path trusts).
+            let (on_chain_id, registry) = self.config.resolve_instrument(allocation_instrument_id);
+            let cip56 = fetch_unlocked_cip56_holdings(
+                &mut client,
+                &self.config.party_id,
+                &on_chain_id,
+                &registry,
+            )
+            .await?;
             if cip56.is_empty() {
                 self.amulet_cache.release_reservations(&holding_cids).await;
                 anyhow::bail!(
-                    "Taker has no unlocked CIP-56 holdings to allocate {} for proposal {}",
-                    allocation_instrument_id, proposal_id
+                    "Taker has no unlocked CIP-56 holdings to allocate {} under registrar '{}' for proposal {}",
+                    allocation_instrument_id, registry, proposal_id
                 );
             }
             tracing::debug!(
