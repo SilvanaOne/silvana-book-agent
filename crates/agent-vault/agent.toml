@@ -1,0 +1,35 @@
+schema_version = 1
+
+[category]
+slug  = "tx_flow"
+order = 4
+
+[agent]
+slug        = "vault"
+name        = "Silvana Vault"
+description = "Multi-tenant secrets vault for Silvana agents — browser-side RSA-OAEP encryption of Canton wallet keys and CEX (Bybit / KuCoin) API keys, HMAC-scoped runtime bundles for per-tenant executors, no plaintext to open-core."
+icon        = "key-round"
+status      = "preview"
+
+required_balance   = "None — hosted SaaS"
+supported_assets   = "Canton Ed25519 wallets, Bybit + KuCoin API keys"
+supported_projects = "Silvana"
+
+[[agent.cta]]
+label = "Order Agent"
+url   = "https://silvana.one/order-agent?ref=vault"
+
+[[agent.cta]]
+label = "Contact Us"
+url   = "https://silvana.one/contact"
+
+[template]
+name      = "Silvana Vault v1"
+language  = "typescript"
+order     = 1
+tags      = ["vault", "keys", "hmac", "multi-tenant", "featured"]
+demo      = "https://vault.spcatcher.cfd"
+demo_type = "featured"
+
+[template.resources]
+docs = "https://github.com/SilvanaOne/silvana-book-agent/tree/new-agents/crates/agent-vault/doc.md"
