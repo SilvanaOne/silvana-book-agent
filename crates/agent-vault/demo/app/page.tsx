@@ -36,7 +36,7 @@ export default function DashboardPage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const meRes = await fetch("/api/auth/me", { cache: "no-store" });
+      const meRes = await fetch("/api/vault/auth/me", { cache: "no-store" });
       const meJson = (await meRes.json()) as Me;
       if (cancelled) return;
       if (meJson.kind === "anonymous" || !meJson.userId) {
@@ -68,7 +68,7 @@ export default function DashboardPage() {
 
   async function logout() {
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      await fetch("/api/vault/auth/logout", { method: "POST" });
     } catch {
       /* ignore */
     }
