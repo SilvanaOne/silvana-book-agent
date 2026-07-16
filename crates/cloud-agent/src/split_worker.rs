@@ -39,6 +39,15 @@ use crate::ledger_client::{AtomicProviderClient, DAppProviderClient};
 use crate::ticket_pool::{TicketAcsInfo, TicketPool};
 use crate::venue_registry::TEMPLATE_SETTLEMENT_TICKET;
 
+/// Max explicit outputs in one split transaction. The Amulet transfer config
+/// caps `transfer.outputs` at `maxNumOutputs` (100 on devnet+mainnet, confirmed
+/// live via scan `/api/scan/v0/dso`; `AmuletRules.daml` `checkTransferConstraints`
+/// rejects `length transfer.outputs > maxNumOutputs` with `maximum-outputs-exceeded`).
+/// Sender-change is computed separately and not counted, but we keep headroom for
+/// any change/fee output the `SplitCc` builder may emit. Deficits above this fill
+/// over successive ticks (the worker recomputes per-rung deficits every tick).
+const MAX_SPLIT_OUTPUTS_PER_TX: u32 = 90;
+
 /// One LP-pays instrument, resolved for splitting.
 #[derive(Debug, Clone)]
 pub struct SplitInstrument {
@@ -82,6 +91,27 @@ pub fn parse_splits(specs: &[String]) -> Result<Vec<(Decimal, u32)>> {
             Ok((amount, count))
         })
         .collect()
+}
+
+/// Truncate `splits` (in order) so the cumulative output count ≤ `max`, keeping
+/// earlier rungs whole and partially truncating the rung that crosses the
+/// boundary (later rungs are dropped). Any remaining deficit is picked up on the
+/// next tick. Pure so it can be unit-tested.
+fn cap_split_outputs(splits: &[(Decimal, u32)], max: u32) -> Vec<(Decimal, u32)> {
+    let mut out: Vec<(Decimal, u32)> = Vec::new();
+    let mut used = 0u32;
+    for (denom, count) in splits {
+        if used >= max {
+            break;
+        }
+        let take = (*count).min(max - used);
+        if take == 0 {
+            continue;
+        }
+        out.push((*denom, take));
+        used += take;
+    }
+    out
 }
 
 /// Spawn the maintenance worker (LP mode with rfq_v2 enabled only).
@@ -253,6 +283,19 @@ pub(crate) async fn ensure_denominations(
         budget -= denom * Decimal::from(count);
         splits.push((denom, count));
     }
+
+    // Cap outputs per transaction under the Amulet `maxNumOutputs` limit. A
+    // deficit larger than the cap fills over successive ticks rather than in one
+    // over-large (and rejected) transfer.
+    let total_out: u32 = splits.iter().map(|(_, c)| c).sum();
+    if total_out > MAX_SPLIT_OUTPUTS_PER_TX {
+        splits = cap_split_outputs(&splits, MAX_SPLIT_OUTPUTS_PER_TX);
+        debug!(
+            "{}: capping split to {} outputs/tx (deficit {} fills over next tick(s))",
+            instrument.key, MAX_SPLIT_OUTPUTS_PER_TX, total_out,
+        );
+    }
+
     if splits.is_empty() {
         debug!(
             "Splitter reserve for {} too small ({}) for the deficits — skipping",
@@ -460,5 +503,28 @@ mod tests {
         assert!(parse_splits(&["0x5".to_string()]).is_err());
         assert!(parse_splits(&["5x0".to_string()]).is_err());
         assert!(parse_splits(&["ax5".to_string()]).is_err());
+    }
+
+    #[test]
+    fn cap_split_outputs_truncates_to_max() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+
+        // single over-cap rung → truncated to `max` (the CC 150x120 case)
+        assert_eq!(cap_split_outputs(&[(d("150"), 120)], 90), vec![(d("150"), 90)]);
+
+        // multi-rung: first rung whole, second partially truncated, rest dropped
+        assert_eq!(
+            cap_split_outputs(&[(d("150"), 50), (d("300"), 60), (d("600"), 10)], 90),
+            vec![(d("150"), 50), (d("300"), 40)],
+        );
+
+        // already under the cap → returned unchanged
+        assert_eq!(
+            cap_split_outputs(&[(d("150"), 40), (d("300"), 20)], 90),
+            vec![(d("150"), 40), (d("300"), 20)],
+        );
+
+        // exactly at the cap → unchanged
+        assert_eq!(cap_split_outputs(&[(d("150"), 90)], 90), vec![(d("150"), 90)]);
     }
 }
