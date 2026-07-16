@@ -17,7 +17,7 @@ supported_projects = "Silvana, Canton"
 
 [[agent.cta]]
 label = "Order Agent"
-url = "https://silvana.one/order-agent?ref=arbitrage"
+url = "https://silvana.one/contact"
 
 [[agent.cta]]
 label = "Contact Us"
