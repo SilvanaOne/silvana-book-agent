@@ -23,6 +23,13 @@ use crate::ledger_client::DAppProviderClient;
 /// ACS refresh interval
 const REFRESH_INTERVAL_SECS: u64 = 30;
 
+/// Minimum request timeout for the streaming ACS snapshot fetch. The
+/// channel-wide request timeout (default 120s) bounds the WHOLE streamed
+/// response, so a large ACS could time out mid-stream on every refresh —
+/// and a truncated snapshot must never drive eviction (it once evicted the
+/// entire denomination ladder every tick: the mainnet split storm).
+const ACS_REQUEST_TIMEOUT_SECS: u64 = 600;
+
 /// Spawn the ACS worker background task
 pub fn spawn_acs_worker(
     config: BaseConfig,
@@ -69,7 +76,9 @@ async fn refresh_holdings(
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
-        Some(config.request_timeout_secs),
+        // Streaming ACS snapshots need headroom beyond the channel default —
+        // this worker's client is only used for the refresh RPCs.
+        Some(config.request_timeout_secs.max(ACS_REQUEST_TIMEOUT_SECS)),
     )
     .await?;
 
@@ -79,13 +88,32 @@ async fn refresh_holdings(
     let snapshot_start = std::time::Instant::now();
 
     match client
-        .get_active_contracts(&[TEMPLATE_AMULET.to_string(), TEMPLATE_HOLDING.to_string()])
+        .get_active_contracts_partial(&[TEMPLATE_AMULET.to_string(), TEMPLATE_HOLDING.to_string()])
         .await
     {
-        Ok(contracts) => {
+        Ok((contracts, complete)) => {
             let holdings = parse_acs_holdings(contracts, &config.party_id);
-            debug!("ACS worker: fetched {} holdings", holdings.len());
-            cache.refresh_from_acs_snapshot(holdings, snapshot_start).await;
+            debug!(
+                "ACS worker: fetched {} holdings (complete={})",
+                holdings.len(),
+                complete
+            );
+            if complete {
+                cache.refresh_from_acs_snapshot(holdings, snapshot_start).await;
+                // A complete snapshot supersedes the optimistic post-split
+                // rungs recorded before it started (they are either in
+                // `available` now or never materialized).
+                cache.clear_pending_splits_before(snapshot_start).await;
+            } else {
+                // Truncated snapshot: the contracts we DID receive exist on
+                // the ledger — merge them additively (backfills blobs and
+                // refreshes TTLs) but never evict from partial data.
+                warn!(
+                    "ACS worker: snapshot incomplete ({} holdings) — merging additively, skipping eviction",
+                    holdings.len()
+                );
+                cache.add_created(holdings).await;
+            }
         }
         Err(e) => {
             // CC fallback: the lightweight GetAmulets RPC (no blobs — CC never
@@ -137,7 +165,7 @@ async fn refresh_holdings(
 /// Holding: `owner == party` and `lock` null; amount = `amount`;
 /// instrument = `instrument.{source,id}` (`InstrumentIdentifier`: admin lives
 /// in `source`).
-pub(crate) fn parse_acs_holdings(
+pub fn parse_acs_holdings(
     contracts: Vec<orderbook_proto::ledger::ActiveContractInfo>,
     party_id: &str,
 ) -> Vec<CachedHolding> {

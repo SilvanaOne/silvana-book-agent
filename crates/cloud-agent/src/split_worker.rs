@@ -15,12 +15,12 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use agent_logic::config::{BaseConfig, RfqV2Config};
 use agent_logic::shutdown::Shutdown;
@@ -47,6 +47,9 @@ use crate::venue_registry::TEMPLATE_SETTLEMENT_TICKET;
 /// any change/fee output the `SplitCc` builder may emit. Deficits above this fill
 /// over successive ticks (the worker recomputes per-rung deficits every tick).
 const MAX_SPLIT_OUTPUTS_PER_TX: u32 = 90;
+
+/// Budget window for the per-instrument fail-stop split cap.
+const SPLIT_BUDGET_WINDOW: Duration = Duration::from_secs(3600);
 
 /// One LP-pays instrument, resolved for splitting.
 #[derive(Debug, Clone)]
@@ -112,6 +115,76 @@ fn cap_split_outputs(splits: &[(Decimal, u32)], max: u32) -> Vec<(Decimal, u32)>
         used += take;
     }
     out
+}
+
+/// Low-water hysteresis (split-storm guard): a rung refills only once it
+/// falls below `max(1, count / divisor)`, and a triggered refill tops the
+/// WHOLE ladder back up to its full counts in one operation — so ops are
+/// rare and big instead of frequent per-settle top-ups. Returns the
+/// per-rung deficits to split, or empty when no rung breached its
+/// low-water mark. Pure so it can be unit-tested.
+fn plan_ladder_refill(
+    rungs: &[(Decimal, u32)],
+    haves: &[u32],
+    low_water_divisor: u32,
+) -> Vec<(Decimal, u32)> {
+    let divisor = low_water_divisor.max(1);
+    let triggered = rungs.iter().zip(haves).any(|((_, count), have)| {
+        *have < (*count / divisor).max(1)
+    });
+    if !triggered {
+        return Vec::new();
+    }
+    rungs
+        .iter()
+        .zip(haves)
+        .filter(|((_, count), have)| **have < *count)
+        .map(|((denom, count), have)| (*denom, count - have))
+        .collect()
+}
+
+/// Fail-stop sanity check: the ladder already holds >= 2x its target count —
+/// the coverage counter and the ledger disagree, so adding MORE rungs can
+/// only feed a runaway. Pure so it can be unit-tested.
+fn ladder_overfull(rungs: &[(Decimal, u32)], haves: &[u32]) -> bool {
+    let target: u32 = rungs.iter().map(|(_, c)| c).sum();
+    let have: u32 = haves.iter().sum();
+    target > 0 && have >= target.saturating_mul(2)
+}
+
+/// Cooldown + hourly budget gate over the recorded split-op times.
+#[derive(Debug, PartialEq, Eq)]
+enum SplitGate {
+    Allow,
+    /// Last op was `secs_since_last` seconds ago, under the minimum interval.
+    Cooldown { secs_since_last: u64 },
+    /// `ops_in_window` ops in the budget window already meet the hourly cap.
+    BudgetExhausted { ops_in_window: usize },
+}
+
+/// Evaluate the per-instrument split gate: hard budget first (loud,
+/// self-stopping), then the minimum-interval cooldown. Pure so it can be
+/// unit-tested.
+fn split_gate(
+    op_times: &[Instant],
+    now: Instant,
+    min_interval: Duration,
+    max_ops_per_window: u32,
+) -> SplitGate {
+    let ops_in_window = op_times
+        .iter()
+        .filter(|t| now.duration_since(**t) < SPLIT_BUDGET_WINDOW)
+        .count();
+    if ops_in_window >= max_ops_per_window as usize {
+        return SplitGate::BudgetExhausted { ops_in_window };
+    }
+    if let Some(last) = op_times.iter().max() {
+        let since = now.duration_since(*last);
+        if since < min_interval {
+            return SplitGate::Cooldown { secs_since_last: since.as_secs() };
+        }
+    }
+    SplitGate::Allow
 }
 
 /// Spawn the maintenance worker (LP mode with rfq_v2 enabled only).
@@ -224,7 +297,7 @@ async fn tick(
         }
 
         if let Err(e) = ensure_denominations(
-            config, cache, &mut atomic_client, &target.instrument, &rungs,
+            config, cache, &mut atomic_client, &target.instrument, &rungs, v2,
         )
         .await
         {
@@ -238,28 +311,80 @@ async fn tick(
 /// Count coverage per rung and split deficits off the splitter reserve.
 /// `pub(crate)` so the RFQ V2 indicative path can trigger an on-demand split
 /// before signing when selection comes up empty.
+///
+/// Split-storm guards (both entry points — the maintenance tick and the
+/// rfq_v2 on-demand kicks — funnel through here, and concurrent calls for
+/// one instrument are serialized by the all-or-nothing splitter-reserve
+/// reservation):
+/// - coverage is EXISTENCE via [`HoldingsCache::count_in_band`] (TTL-stale /
+///   reserved / blob-pending rungs and optimistic post-split rungs count), so
+///   cache invisibility cannot create phantom deficits;
+/// - low-water hysteresis: split only when a rung drops below
+///   `max(1, count / split_low_water_divisor)`, then refill the full ladder;
+/// - fail-stop: refuse (loudly) when the ladder already holds >= 2x its
+///   target or `split_max_ops_per_hour` ops were already submitted;
+/// - cooldown: at most one split op per `split_min_interval_secs`.
 pub(crate) async fn ensure_denominations(
     config: &BaseConfig,
     cache: &Arc<HoldingsCache>,
     atomic_client: &mut AtomicProviderClient,
     instrument: &SplitInstrument,
     rungs: &[(Decimal, u32)],
+    v2: &RfqV2Config,
 ) -> Result<()> {
-    let selectable = cache.get_selectable(&instrument.key, true).await;
-
-    // Deficit per rung: want `count` holdings in [denom, 2*denom)
-    let mut deficits: Vec<(Decimal, u32)> = Vec::new();
-    for (denom, count) in rungs {
-        let have = selectable
-            .iter()
-            .filter(|h| h.amount >= *denom && h.amount < *denom * Decimal::TWO)
-            .count() as u32;
-        if have < *count {
-            deficits.push((*denom, count - have));
-        }
+    // Coverage per rung in [denom, 2*denom): existence, not usability.
+    let mut haves: Vec<u32> = Vec::with_capacity(rungs.len());
+    for (denom, _) in rungs {
+        haves.push(
+            cache
+                .count_in_band(&instrument.key, *denom, *denom * Decimal::TWO)
+                .await,
+        );
     }
+
+    let deficits = plan_ladder_refill(rungs, &haves, v2.split_low_water_divisor);
     if deficits.is_empty() {
         return Ok(());
+    }
+
+    // Fail-stop: some band looks starved while the ladder as a whole holds
+    // >= 2x its target — the runaway signature. Never add more rungs to it.
+    if ladder_overfull(rungs, &haves) {
+        error!(
+            "{}: REFUSING split — {} holdings in-band vs ladder target {} (>= 2x): \
+             coverage counter and ledger disagree (haves={:?}, rungs={:?})",
+            instrument.key,
+            haves.iter().sum::<u32>(),
+            rungs.iter().map(|(_, c)| c).sum::<u32>(),
+            haves,
+            rungs,
+        );
+        return Ok(());
+    }
+
+    // Cooldown + hourly fail-stop budget, shared across both entry points.
+    match split_gate(
+        &cache.split_ops(&instrument.key).await,
+        Instant::now(),
+        Duration::from_secs(v2.split_min_interval_secs),
+        v2.split_max_ops_per_hour,
+    ) {
+        SplitGate::Allow => {}
+        SplitGate::Cooldown { secs_since_last } => {
+            debug!(
+                "{}: split cooldown — last op {}s ago (< {}s), deficits {:?} wait for the next tick",
+                instrument.key, secs_since_last, v2.split_min_interval_secs, deficits,
+            );
+            return Ok(());
+        }
+        SplitGate::BudgetExhausted { ops_in_window } => {
+            error!(
+                "{}: REFUSING split — {} split ops in the last hour >= budget {} \
+                 (haves={:?}, rungs={:?}, deficits={:?}): possible split runaway, halting until the window clears",
+                instrument.key, ops_in_window, v2.split_max_ops_per_hour, haves, rungs, deficits,
+            );
+            return Ok(());
+        }
     }
 
     let Some(reserve) = cache.splitter_reserve(&instrument.key).await else {
@@ -322,6 +447,11 @@ pub(crate) async fn ensure_denominations(
         reserve.amount,
     );
 
+    // The submission ATTEMPT counts toward the cooldown + hourly budget: a
+    // storm of failing (or wrongly-reported-failing) submissions must
+    // self-stop just like a storm of committed ones.
+    cache.record_split_op(&instrument.key).await;
+
     let result: Result<String> = if instrument.is_cc {
         split_cc(config, &input_cids, &splits).await
     } else {
@@ -331,8 +461,11 @@ pub(crate) async fn ensure_denominations(
     match result {
         Ok(update_id) => {
             // Input consumed; outputs enter the cache via the updates watcher /
-            // ACS refresh (the atomic response carries no amounts).
+            // ACS refresh (the atomic response carries no amounts). Until a
+            // complete ACS snapshot confirms them, the created rungs count
+            // optimistically so the next tick sees no phantom deficit.
             cache.mark_consumed(&input_cids, &update_id).await;
+            cache.record_pending_split(&instrument.key, &splits).await;
             info!("Split committed for {} (update {})", instrument.key, update_id);
             Ok(())
         }
@@ -526,5 +659,110 @@ mod tests {
 
         // exactly at the cap → unchanged
         assert_eq!(cap_split_outputs(&[(d("150"), 90)], 90), vec![(d("150"), 90)]);
+    }
+
+    #[test]
+    fn low_water_hysteresis_only_triggers_below_quarter() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        let rungs = vec![(d("25"), 20), (d("100"), 10)];
+
+        // full ladder → nothing
+        assert!(plan_ladder_refill(&rungs, &[20, 10], 4).is_empty());
+
+        // partial but above low-water (low-water: 20/4=5, 10/4=2) → nothing —
+        // this is the per-settle top-up case (count<=10 deficits) that used to
+        // fire an op per settle
+        assert!(plan_ladder_refill(&rungs, &[6, 3], 4).is_empty());
+
+        // exactly AT low-water is not below it → nothing
+        assert!(plan_ladder_refill(&rungs, &[5, 2], 4).is_empty());
+
+        // one rung below low-water → the WHOLE ladder refills to full counts
+        assert_eq!(
+            plan_ladder_refill(&rungs, &[4, 9], 4),
+            vec![(d("25"), 16), (d("100"), 1)],
+        );
+
+        // over-full rungs never produce negative/zero deficits
+        assert_eq!(
+            plan_ladder_refill(&rungs, &[0, 15], 4),
+            vec![(d("25"), 20)],
+        );
+
+        // small counts: low-water = max(1, count/4) = 1, so only have=0 triggers
+        let small = vec![(d("500"), 2)];
+        assert!(plan_ladder_refill(&small, &[1], 4).is_empty());
+        assert_eq!(plan_ladder_refill(&small, &[0], 4), vec![(d("500"), 2)]);
+
+        // divisor 1 restores the old eager behavior (any deficit splits)…
+        assert_eq!(
+            plan_ladder_refill(&rungs, &[19, 10], 1),
+            vec![(d("25"), 1)],
+        );
+        // …and divisor 0 clamps to 1 instead of dividing by zero
+        assert_eq!(
+            plan_ladder_refill(&rungs, &[19, 10], 0),
+            vec![(d("25"), 1)],
+        );
+    }
+
+    #[test]
+    fn overfull_ladder_is_detected() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        let rungs = vec![(d("25"), 20), (d("100"), 10)]; // target 30
+
+        assert!(!ladder_overfull(&rungs, &[20, 10])); // exactly full
+        assert!(!ladder_overfull(&rungs, &[50, 9])); // 59 < 60
+        // the runaway signature: one band starved, total ballooned
+        assert!(ladder_overfull(&rungs, &[60, 0]));
+        assert!(ladder_overfull(&rungs, &[50, 10])); // 60 >= 2x30
+        assert!(!ladder_overfull(&[], &[])); // no ladder → never "overfull"
+    }
+
+    #[test]
+    fn split_gate_budget_and_cooldown() {
+        // Base far in the future so subtracting offsets never underflows the
+        // platform Instant epoch.
+        let now = Instant::now() + Duration::from_secs(7 * 24 * 3600);
+        let ago = |secs: u64| now - Duration::from_secs(secs);
+        let min_interval = Duration::from_secs(120);
+
+        // no history → allowed
+        assert_eq!(split_gate(&[], now, min_interval, 6), SplitGate::Allow);
+
+        // last op 60s ago → cooldown
+        assert_eq!(
+            split_gate(&[ago(60)], now, min_interval, 6),
+            SplitGate::Cooldown { secs_since_last: 60 },
+        );
+
+        // last op exactly at the interval → allowed
+        assert_eq!(split_gate(&[ago(120)], now, min_interval, 6), SplitGate::Allow);
+
+        // 6 ops inside the hour with budget 6 → exhausted (even though the
+        // last one is past the cooldown)
+        let six: Vec<Instant> = (0..6).map(|i| ago(300 + i * 300)).collect();
+        assert_eq!(
+            split_gate(&six, now, min_interval, 6),
+            SplitGate::BudgetExhausted { ops_in_window: 6 },
+        );
+
+        // ops older than the window don't count toward the budget…
+        let old: Vec<Instant> = (0..6).map(|i| ago(3700 + i * 300)).collect();
+        assert_eq!(split_gate(&old, now, min_interval, 6), SplitGate::Allow);
+
+        // …and a mix counts only the in-window ones
+        let mut mixed = old.clone();
+        mixed.push(ago(3599));
+        mixed.push(ago(200));
+        assert_eq!(split_gate(&mixed, now, min_interval, 2), SplitGate::BudgetExhausted { ops_in_window: 2 });
+        assert_eq!(split_gate(&mixed, now, min_interval, 6), SplitGate::Allow);
+
+        // budget outranks cooldown: both tripped → BudgetExhausted (loud)
+        let recent: Vec<Instant> = vec![ago(10), ago(400)];
+        assert_eq!(
+            split_gate(&recent, now, min_interval, 2),
+            SplitGate::BudgetExhausted { ops_in_window: 2 },
+        );
     }
 }

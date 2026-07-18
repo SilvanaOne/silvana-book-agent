@@ -59,7 +59,7 @@ async fn token_usd_price(
 /// are half-open ([0,10), [10,20), [20,50), [50,100), [100,∞)). When
 /// `usd_price` is None (no market mid), only total/reserved are populated and
 /// `priced` stays false.
-fn bucket_by_usd(
+pub fn bucket_by_usd(
     total: usize,
     reserved: usize,
     holdings: &[(rust_decimal::Decimal, bool)],

@@ -204,11 +204,14 @@ impl RfqV2State {
         let cache = self.cache.clone();
         let in_flight = self.splits_in_flight.clone();
         let key = instrument.clone();
+        // ensure_denominations applies the shared cooldown + fail-stop budget,
+        // so on-demand kicks are governed together with the maintenance tick.
+        let v2 = self.v2.clone();
         tokio::spawn(async move {
             let result = async {
                 let mut client = crate::atomic_swap::create_atomic_client(&config).await?;
                 crate::split_worker::ensure_denominations(
-                    &config, &cache, &mut client, &split_instr, &rungs,
+                    &config, &cache, &mut client, &split_instr, &rungs, &v2,
                 )
                 .await
             }

@@ -773,8 +773,12 @@ pub async fn run_cloud_agent(
 /// when at least one venue validates — the atomic RFQ stream.
 ///
 /// Returns the SavedState snapshot provider for the runner's shutdown save.
+/// PUBLIC for library embedders (e.g. a test harness running many agents in
+/// one process): given a programmatically-built `BaseConfig` (see
+/// `BaseConfig::for_party`) plus the shared per-agent objects, this brings up
+/// the entire per-agent RFQ V2 LP stack in one call.
 #[allow(clippy::too_many_arguments)]
-async fn setup_rfq_v2(
+pub async fn setup_rfq_v2(
     config: &BaseConfig,
     v2cfg: &agent_logic::config::RfqV2Config,
     quote_key: &agent_logic::config::AtomicQuoteKey,
@@ -3853,20 +3857,110 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
 // Atomic (RFQ V2 / AtomicDVP) commands
 // ============================================================================
 
-/// An on-ledger AtomicDVP venue owned by this LP (CLI view).
-struct AtomicVenueSummary {
-    contract_id: String,
-    pair_name: String,
-    provider: String,
-    base_admin: String,
-    base_id: String,
-    quote_admin: String,
-    quote_id: String,
-    quote_public_key: String,
+/// An on-ledger AtomicDVP venue owned by this LP (CLI view; also used by
+/// library embedders via [`atomic_find_venues`]).
+pub struct AtomicVenueSummary {
+    pub contract_id: String,
+    pub pair_name: String,
+    pub provider: String,
+    pub base_admin: String,
+    pub base_id: String,
+    pub quote_admin: String,
+    pub quote_id: String,
+    pub quote_public_key: String,
+}
+
+/// One LIQUIDITY-heartbeat-style summary line per instrument for a set of
+/// parsed ACS holdings — `{sym}: {total} bal | holdings N (0 rsvd) <10:…` —
+/// shared by `atomic status` and library embedders (e.g. rfqv2-test status).
+/// USD prices: USDC* = $1, CC = the caller-provided DSO rate, anything else
+/// the `{sym}-USDCx|USDC` market mid (bid/ask mid, else last) fetched via a
+/// lazily-built OrderbookClient. `rsvd` is a runtime-cache concept — offline
+/// ACS reads always show 0.
+pub async fn holdings_status_lines(
+    config: &BaseConfig,
+    holdings: &[holdings_cache::CachedHolding],
+    cc_usd_rate: Option<f64>,
+) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut by_instrument: BTreeMap<String, Vec<rust_decimal::Decimal>> = BTreeMap::new();
+    for h in holdings {
+        by_instrument.entry(h.instrument.clone()).or_default().push(h.amount);
+    }
+
+    let mut price_client: Option<agent_logic::client::OrderbookClient> = None;
+    let mut lines = Vec::with_capacity(by_instrument.len());
+    for (key, amounts) in &by_instrument {
+        // Display symbol: "admin::id" → id; the CC cache key stays "CC".
+        let sym = key.rsplit("::").next().unwrap_or(key).to_string();
+        // Canonicity: instruments can be DUPLICATED under different admins
+        // (e.g. two cETH issuers on devnet). Only the admin the instruments
+        // table lists (config.instrument_registries) is tradable — settle and
+        // split resolve through it. Foreign-admin holdings are shown but
+        // unmistakably labeled so a status never contradicts the split path.
+        let canonical = key == holdings_cache::CC_INSTRUMENT
+            || config
+                .instrument_registries
+                .get(&sym)
+                .is_some_and(|registry| key == &holdings_cache::instrument_key(registry, &sym));
+        let usd_price = if sym.starts_with("USDC") {
+            Some(1.0)
+        } else if key == holdings_cache::CC_INSTRUMENT {
+            cc_usd_rate
+        } else {
+            if price_client.is_none() {
+                price_client = agent_logic::client::OrderbookClient::new(config).await.ok();
+            }
+            let mut found = None;
+            if let Some(client) = price_client.as_mut() {
+                for stable in ["USDCx", "USDC"] {
+                    if let Ok(resp) = client.get_price(&format!("{sym}-{stable}")).await {
+                        let mid = match (resp.bid, resp.ask) {
+                            (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
+                            _ => resp.last,
+                        };
+                        if mid > 0.0 {
+                            found = Some(mid);
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+        let pairs: Vec<(rust_decimal::Decimal, bool)> =
+            amounts.iter().map(|a| (*a, false)).collect();
+        let h = backend::bucket_by_usd(amounts.len(), 0, &pairs, usd_price);
+        let total: rust_decimal::Decimal = amounts.iter().sum();
+        let histogram_str = if h.priced {
+            format!(
+                "<10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
+                h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
+            )
+        } else {
+            "[no USD price]".to_string()
+        };
+        let label = if canonical {
+            sym.clone()
+        } else {
+            let admin = key.strip_suffix(&format!("::{sym}")).unwrap_or(key);
+            let admin_prefix: String = admin.chars().take(24).collect();
+            format!("{sym} [FOREIGN ADMIN {admin_prefix}… — not in instruments, ignored by trading]")
+        };
+        lines.push(format!(
+            "{}: {} bal | holdings {} ({} rsvd) {}",
+            label,
+            total.normalize(),
+            h.total,
+            h.reserved,
+            histogram_str
+        ));
+    }
+    lines
 }
 
 /// This LP's venues from the ACS (via `GetAtomicContracts`).
-async fn atomic_find_venues(
+pub async fn atomic_find_venues(
     client: &mut AtomicProviderClient,
     party_id: &str,
 ) -> Result<Vec<AtomicVenueSummary>> {
@@ -3945,7 +4039,7 @@ fn read_service_file(path: &str) -> Result<String> {
 }
 
 /// Contract ids of this LP's live SettlementTickets.
-async fn atomic_list_live_tickets(
+pub async fn atomic_list_live_tickets(
     client: &mut AtomicProviderClient,
     party_id: &str,
 ) -> Result<Vec<String>> {
@@ -3969,7 +4063,7 @@ async fn atomic_list_live_tickets(
 }
 
 /// Resolve a "BASE-QUOTE" market id to on-chain (id, admin) pairs.
-fn atomic_resolve_market_pair(
+pub fn atomic_resolve_market_pair(
     config: &BaseConfig,
     market_id: &str,
 ) -> Result<((String, String), (String, String))> {
@@ -3995,7 +4089,7 @@ fn atomic_resolve_market_pair(
 /// `TicketService_SplitHoldings`. Returns the update id, or None when there
 /// was nothing to do.
 #[allow(clippy::too_many_arguments)]
-async fn atomic_split_denominations(
+pub async fn atomic_split_denominations(
     config: &BaseConfig,
     on_chain_id: &str,
     admin: &str,
@@ -4045,6 +4139,49 @@ async fn atomic_split_denominations(
     if to_make.is_empty() {
         return Ok(None);
     }
+
+    // Cap the requested rungs to what the balance actually covers (partial
+    // fill). All-or-nothing here meant a party holding 6 rungs' worth of
+    // funds got NO rungs at all ("insufficient holdings for splits"). Walk
+    // the rungs in ladder order taking whole denominations while the budget
+    // lasts; the shortfall is warned about and picked up by a later
+    // setup/maintenance pass once the party is funded.
+    let to_make = {
+        use rust_decimal::prelude::ToPrimitive;
+        let available: Decimal = holdings.iter().map(|h| h.amount).sum();
+        let mut budget = if is_cc {
+            // Reciprocal of the CC fee margin applied below (×1.02 + 1).
+            ((available - Decimal::ONE) / Decimal::new(102, 2)).max(Decimal::ZERO)
+        } else {
+            available
+        };
+        let requested: Decimal = to_make.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
+        let mut capped: Vec<(Decimal, u32)> = Vec::new();
+        for (denom, count) in &to_make {
+            if *denom <= Decimal::ZERO {
+                continue;
+            }
+            let fits = (budget / *denom).floor().to_u32().unwrap_or(0).min(*count);
+            if fits > 0 {
+                capped.push((*denom, fits));
+                budget -= *denom * Decimal::from(fits);
+            }
+        }
+        if capped.is_empty() {
+            return Err(anyhow!(
+                "insufficient {} holdings for splits: have {}, need {}",
+                instr_key, available, requested
+            ));
+        }
+        let capped_total: Decimal = capped.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
+        if capped_total < requested {
+            tracing::warn!(
+                "{}: partial split — balance {} covers {} of the requested {} ladder total",
+                instr_key, available, capped_total, requested
+            );
+        }
+        capped
+    };
 
     let mut total: Decimal = to_make.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
     if is_cc {
@@ -4497,7 +4634,9 @@ pub async fn run_atomic(
             let tickets = atomic_list_live_tickets(&mut client, &config.party_id).await?;
             println!("Live tickets:  {}", tickets.len());
 
-            // Denomination histogram of own unlocked holdings, per instrument
+            // Per-instrument holdings summary in the LIQUIDITY heartbeat
+            // format (one line per instrument — a per-amount dump is huge
+            // with 100+ ladder/change holdings).
             let mut v1_client = atomic_swap::create_v1_client(&config).await?;
             let contracts = v1_client
                 .get_active_contracts(&[
@@ -4506,30 +4645,19 @@ pub async fn run_atomic(
                 ])
                 .await?;
             let holdings = acs_worker::parse_acs_holdings(contracts, &config.party_id);
-            let mut histogram: std::collections::BTreeMap<
-                String,
-                std::collections::BTreeMap<rust_decimal::Decimal, usize>,
-            > = std::collections::BTreeMap::new();
-            for h in &holdings {
-                *histogram
-                    .entry(h.instrument.clone())
-                    .or_default()
-                    .entry(h.amount.normalize())
-                    .or_default() += 1;
-            }
-            println!("\n=== Holdings denomination histogram ===\n");
-            if histogram.is_empty() {
-                println!("(no unlocked holdings)");
-            }
-            for (instrument, buckets) in &histogram {
-                let count: usize = buckets.values().sum();
-                let total: rust_decimal::Decimal = buckets
-                    .iter()
-                    .map(|(amount, n)| *amount * rust_decimal::Decimal::from(*n as u64))
-                    .sum();
-                println!("{} — {} holding(s), total {}:", instrument, count, total);
-                for (amount, n) in buckets {
-                    println!("  {} x{}", amount, n);
+            let dso_rate = v1_client
+                .get_dso_rates()
+                .await
+                .ok()
+                .and_then(|r| r.cc_usd_rate.parse::<f64>().ok())
+                .filter(|p| *p > 0.0);
+            println!("\n=== Holdings (USD-bucketed, LIQUIDITY format) ===\n");
+            match holdings_status_lines(&config, &holdings, dso_rate).await {
+                lines if lines.is_empty() => println!("(no unlocked holdings)"),
+                lines => {
+                    for line in lines {
+                        println!("{line}");
+                    }
                 }
             }
         }
@@ -4543,14 +4671,56 @@ pub async fn run_atomic(
             let kf = quote_key_from_env()?;
             println!("[1/6] Quote key (from ATOMIC_QUOTE_PRIVATE_KEY): {}", kf.pub_spki_hex);
 
-            let mut client = atomic_swap::create_atomic_client(&config).await?;
+            atomic_setup_agent(&config, &kf, Some(&service_file), verbose, dry_run, force).await?;
+            println!("Setup complete. Run `atomic status` to verify, then restart the agent.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Steps 2-6 of the per-LP RFQ V2 setup — AtomicDVPService reference check,
+/// venue per rfq_v2-enabled market, receiving preapprovals, ticket batch,
+/// denomination splits — extracted from the `atomic setup` CLI arm so library
+/// embedders (e.g. a test harness provisioning many agents in one process)
+/// can call it with a programmatically-built `BaseConfig` and a
+/// caller-provided quote key (theirs comes from a DB, not
+/// ATOMIC_QUOTE_PRIVATE_KEY). `service_file: None` skips the disclosure-file
+/// reference check — venue creation is prepared server-side with the server's
+/// own disclosure either way.
+pub async fn atomic_setup_agent(
+    config: &BaseConfig,
+    quote_key: &atomic_quote::QuoteKeyFile,
+    service_file: Option<&str>,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    use orderbook_proto::rfqv2::{
+        prepare_atomic_transaction_request::Params as AtomicParams, CreateAtomicDvpVenueParams,
+        IssueTicketsParams, PrepareAtomicTransactionRequest,
+    };
+    {
+            // Alias so the body below (moved verbatim from the CLI arm) keeps
+            // its original name for the key.
+            let kf = quote_key;
+
+            let mut client = atomic_swap::create_atomic_client(config).await?;
 
             // 2. AtomicDVPService disclosure file check — the singleton is
             // provider-only (invisible in the LP's ACS); the provider exports
             // its blob and the LP keeps a reference copy. Venue creation is
             // prepared server-side with the server's own disclosure.
-            let service_cid = read_service_file(&service_file)?;
-            println!("[2/6] AtomicDVPService (from {service_file}): {service_cid}");
+            match service_file {
+                Some(sf) => {
+                    let service_cid = read_service_file(sf)?;
+                    println!("[2/6] AtomicDVPService (from {sf}): {service_cid}");
+                }
+                None => println!(
+                    "[2/6] AtomicDVPService disclosure file not provided — check skipped \
+                     (the ledger-service discloses the singleton at prepare time)"
+                ),
+            }
 
             // 3. venue per rfq_v2-enabled market (skip existing with matching key)
             let v2_markets: Vec<&agent_logic::config::MarketConfig> = config
@@ -4773,8 +4943,6 @@ pub async fn run_atomic(
                 }
             }
 
-            println!("Setup complete. Run `atomic status` to verify, then restart the agent.");
-        }
     }
 
     Ok(())
