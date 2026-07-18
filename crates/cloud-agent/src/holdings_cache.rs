@@ -30,6 +30,15 @@ const V1_RESERVATION_TTL_SECS: u64 = 60;
 /// TTL for split-job reservations
 const SPLIT_RESERVATION_TTL_SECS: u64 = 300;
 
+/// TTL for optimistic post-split pending rungs: counted by
+/// [`HoldingsCache::count_in_band`] until a COMPLETE ACS snapshot taken after
+/// the split confirms them ([`HoldingsCache::clear_pending_splits_before`]) or
+/// this many seconds pass.
+const PENDING_SPLIT_TTL_SECS: u64 = 300;
+
+/// Window for the per-instrument split-op budget (fail-stop).
+const SPLIT_OP_WINDOW_SECS: u64 = 3600;
+
 /// CIP-56 Holding template as uploaded on this participant (matches the SDK's
 /// `transactions::TEMPLATE_HOLDING`).
 pub const TEMPLATE_HOLDING: &str =
@@ -98,6 +107,22 @@ struct ReservedEntry {
     reserved_at: Instant,
 }
 
+/// Rungs a committed split created but the ACS has not confirmed yet
+/// (the atomic split response carries no output cids/amounts).
+#[derive(Debug, Clone)]
+struct PendingSplit {
+    instrument: InstrumentKey,
+    denom: Decimal,
+    count: u32,
+    recorded_at: Instant,
+}
+
+impl PendingSplit {
+    fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.recorded_at).as_secs() > PENDING_SPLIT_TTL_SECS
+    }
+}
+
 impl ReservedEntry {
     fn is_expired(&self, now: Instant) -> bool {
         match &self.kind {
@@ -125,6 +150,13 @@ pub struct HoldingsCache {
     /// rung). Holdings strictly below it are swept as EXTRA inputs into V2
     /// settles so the settle's change output consolidates them.
     dust_below: RwLock<HashMap<InstrumentKey, Decimal>>,
+    /// Optimistic post-split rungs, counted by [`Self::count_in_band`] until a
+    /// complete ACS snapshot confirms them or they expire (split-storm guard).
+    pending_splits: RwLock<Vec<PendingSplit>>,
+    /// Per-instrument split-op submission times within the budget window —
+    /// shared state for the cooldown + fail-stop budget, so the maintenance
+    /// tick and the on-demand kicks are governed together.
+    split_op_times: RwLock<HashMap<InstrumentKey, Vec<Instant>>>,
 }
 
 impl HoldingsCache {
@@ -135,6 +167,8 @@ impl HoldingsCache {
             reserved: RwLock::new(HashMap::new()),
             splitter_reserve_enabled,
             dust_below: RwLock::new(HashMap::new()),
+            pending_splits: RwLock::new(Vec::new()),
+            split_op_times: RwLock::new(HashMap::new()),
         })
     }
 
@@ -210,7 +244,7 @@ impl HoldingsCache {
         let reserved = self.reserved.read().await;
 
         let splitter_cid = if exclude_splitter_reserve && self.splitter_reserve_enabled {
-            Self::splitter_reserve_cid(&available, instrument)
+            Self::splitter_reserve_cid(&available, &consumed, now, instrument)
         } else {
             None
         };
@@ -244,22 +278,33 @@ impl HoldingsCache {
 
     /// The splitter-reserve holding (largest available, ignoring reservations)
     /// for an instrument, if the reserve is enabled.
+    ///
+    /// Honors consumed + TTL: a consumed or TTL-stale holding is never the
+    /// reserve, so a stale cache HALTS splitting (no funding source) instead
+    /// of funding a split loop off a holding whose true state is unknown.
     pub async fn splitter_reserve(&self, instrument: &str) -> Option<CachedHolding> {
         if !self.splitter_reserve_enabled {
             return None;
         }
+        let now = Instant::now();
         let available = self.available.read().await;
-        let cid = Self::splitter_reserve_cid(&available, instrument)?;
+        let consumed = self.consumed.read().await;
+        let cid = Self::splitter_reserve_cid(&available, &consumed, now, instrument)?;
         available.get(&cid).cloned()
     }
 
+    /// Largest fresh (non-consumed, non-TTL-stale) holding of the instrument.
     fn splitter_reserve_cid(
         available: &HashMap<String, CachedHolding>,
+        consumed: &HashMap<String, ConsumedEntry>,
+        now: Instant,
         instrument: &str,
     ) -> Option<String> {
         available
             .values()
             .filter(|h| h.instrument == instrument)
+            .filter(|h| !consumed.contains_key(&h.contract_id))
+            .filter(|h| now.duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
             .max_by(|a, b| {
                 a.amount
                     .cmp(&b.amount)
@@ -267,6 +312,105 @@ impl HoldingsCache {
                     .then_with(|| a.contract_id.cmp(&b.contract_id))
             })
             .map(|h| h.contract_id.clone())
+    }
+
+    /// EXISTENCE count of holdings with `lo <= amount < hi` for the ladder
+    /// deficit computation: available − consumed, INCLUDING TTL-stale,
+    /// reserved, and blob-pending entries (a rung that exists on the ledger
+    /// but is temporarily unusable still exists — counting only *usable*
+    /// rungs turned invisibility into phantom deficits, the mainnet split
+    /// storm). The splitter reserve is excluded (it funds the ladder, it is
+    /// not part of it). Unexpired [`Self::record_pending_split`] rungs are
+    /// included so a just-committed split satisfies the count before the ACS
+    /// confirms its outputs.
+    pub async fn count_in_band(&self, instrument: &str, lo: Decimal, hi: Decimal) -> u32 {
+        let now = Instant::now();
+        let available = self.available.read().await;
+        let consumed = self.consumed.read().await;
+        let splitter_cid = if self.splitter_reserve_enabled {
+            Self::splitter_reserve_cid(&available, &consumed, now, instrument)
+        } else {
+            None
+        };
+
+        let existing = available
+            .values()
+            .filter(|h| h.instrument == instrument)
+            .filter(|h| !consumed.contains_key(&h.contract_id))
+            .filter(|h| Some(&h.contract_id) != splitter_cid.as_ref())
+            .filter(|h| h.amount >= lo && h.amount < hi)
+            .count() as u32;
+
+        let pending: u32 = self
+            .pending_splits
+            .read()
+            .await
+            .iter()
+            .filter(|p| p.instrument == instrument && !p.is_expired(now))
+            .filter(|p| p.denom >= lo && p.denom < hi)
+            .map(|p| p.count)
+            .sum();
+
+        existing.saturating_add(pending)
+    }
+
+    /// Record the rungs a just-committed split created (optimistic post-split
+    /// accounting): counted by [`Self::count_in_band`] until a complete ACS
+    /// snapshot taken after the split confirms them or they expire.
+    pub async fn record_pending_split(&self, instrument: &str, splits: &[(Decimal, u32)]) {
+        let now = Instant::now();
+        let mut pending = self.pending_splits.write().await;
+        pending.retain(|p| !p.is_expired(now));
+        for (denom, count) in splits {
+            pending.push(PendingSplit {
+                instrument: instrument.to_string(),
+                denom: *denom,
+                count: *count,
+                recorded_at: now,
+            });
+        }
+    }
+
+    /// Drop pending-split entries recorded before `snapshot_start`. Called by
+    /// the ACS worker after a COMPLETE snapshot refresh — that snapshot either
+    /// carries the split outputs (now in `available`) or proves they never
+    /// materialized; either way the optimistic entries are superseded.
+    pub async fn clear_pending_splits_before(&self, snapshot_start: Instant) {
+        let mut pending = self.pending_splits.write().await;
+        let before = pending.len();
+        pending.retain(|p| p.recorded_at >= snapshot_start);
+        let removed = before - pending.len();
+        if removed > 0 {
+            debug!("Cleared {} pending-split entr(ies) confirmed by ACS snapshot", removed);
+        }
+    }
+
+    /// Record a split-op submission for the per-instrument cooldown + hourly
+    /// fail-stop budget (attempts count too — a storm of failing submissions
+    /// must also self-stop).
+    pub async fn record_split_op(&self, instrument: &str) {
+        let now = Instant::now();
+        let mut ops = self.split_op_times.write().await;
+        let entry = ops.entry(instrument.to_string()).or_default();
+        entry.retain(|t| now.duration_since(*t).as_secs() < SPLIT_OP_WINDOW_SECS);
+        entry.push(now);
+    }
+
+    /// Split-op submission times within the budget window (pruned), for the
+    /// pure gate decision in the split worker.
+    pub async fn split_ops(&self, instrument: &str) -> Vec<Instant> {
+        let now = Instant::now();
+        self.split_op_times
+            .read()
+            .await
+            .get(instrument)
+            .map(|ops| {
+                ops.iter()
+                    .filter(|t| now.duration_since(**t).as_secs() < SPLIT_OP_WINDOW_SECS)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// V2 disclosure selection (design §5.1). `target` = `amount` for utility
@@ -755,7 +899,13 @@ impl CcView {
 mod tests {
     use super::*;
 
-    fn holding(cid: &str, instrument: &str, amount: &str, blob: bool) -> CachedHolding {
+    fn holding_at(
+        cid: &str,
+        instrument: &str,
+        amount: &str,
+        blob: bool,
+        discovered_at: Instant,
+    ) -> CachedHolding {
         CachedHolding {
             contract_id: cid.to_string(),
             template_id: if instrument == CC_INSTRUMENT {
@@ -767,8 +917,18 @@ mod tests {
             amount: amount.parse().unwrap(),
             created_event_blob: blob.then(|| format!("blob-{cid}")),
             synchronizer_id: "sync::1".to_string(),
-            discovered_at: Instant::now(),
+            discovered_at,
         }
+    }
+
+    fn holding(cid: &str, instrument: &str, amount: &str, blob: bool) -> CachedHolding {
+        holding_at(cid, instrument, amount, blob, Instant::now())
+    }
+
+    /// An Instant `AVAILABLE_TTL_SECS`+20s in the past, or `None` when the
+    /// platform's monotonic clock is too young (freshly-booted machine).
+    fn stale_instant() -> Option<Instant> {
+        Instant::now().checked_sub(std::time::Duration::from_secs(AVAILABLE_TTL_SECS + 20))
     }
 
     const USDC: &str = "reg::USDC";
@@ -991,6 +1151,122 @@ mod tests {
             selectable.iter().map(|h| h.contract_id.as_str()).collect();
         assert!(cids.contains("new"));
         assert!(cids.contains("old"));
+    }
+
+    #[tokio::test]
+    async fn count_in_band_counts_existence_not_usability() {
+        let Some(stale_at) = stale_instant() else { return };
+        let cache = HoldingsCache::new(true);
+        let lo: Decimal = "100".parse().unwrap();
+        let hi: Decimal = "200".parse().unwrap();
+        cache
+            .add_created(vec![
+                holding("reserve", USDC, "10000", true), // splitter reserve — out of band anyway
+                holding("fresh", USDC, "100", true),
+                holding_at("stale", USDC, "150", true, stale_at), // TTL-stale: still EXISTS
+                holding("quoted", USDC, "120", true),             // gets a live V2 reservation
+                holding("spent", USDC, "110", true),              // marked consumed
+                holding("noblob", USDC, "130", false),            // blob-pending: still exists
+                holding("outband", USDC, "50", true),
+            ])
+            .await;
+        cache
+            .reserve_v2(
+                &["quoted".to_string()],
+                "q1",
+                Instant::now() + std::time::Duration::from_secs(120),
+            )
+            .await;
+        cache.mark_consumed(&["spent".to_string()], "settle").await;
+
+        // stale + reserved + blob-pending count (existence ≠ usability);
+        // consumed and out-of-band don't — the old get_selectable-based count
+        // dropped "stale" and "quoted" here and manufactured phantom deficits.
+        assert_eq!(cache.count_in_band(USDC, lo, hi).await, 4);
+        let selectable_in_band = cache
+            .get_selectable(USDC, true)
+            .await
+            .into_iter()
+            .filter(|h| h.amount >= lo && h.amount < hi)
+            .count();
+        assert_eq!(selectable_in_band, 2, "usability view stays strict (fresh + noblob)");
+
+        // optimistic post-split rungs count until confirmed…
+        let before_split = Instant::now();
+        cache
+            .record_pending_split(USDC, &[("100".parse().unwrap(), 3), ("500".parse().unwrap(), 2)])
+            .await;
+        assert_eq!(cache.count_in_band(USDC, lo, hi).await, 7);
+
+        // …a snapshot started BEFORE the split cannot confirm them…
+        cache.clear_pending_splits_before(before_split).await;
+        assert_eq!(cache.count_in_band(USDC, lo, hi).await, 7);
+
+        // …but a complete snapshot started after the split supersedes them.
+        cache.clear_pending_splits_before(Instant::now()).await;
+        assert_eq!(cache.count_in_band(USDC, lo, hi).await, 4);
+    }
+
+    #[tokio::test]
+    async fn count_in_band_excludes_the_splitter_reserve() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .add_created(vec![
+                holding("a", USDC, "100", true),
+                holding("b", USDC, "150", true), // largest fresh = splitter reserve
+            ])
+            .await;
+        let lo: Decimal = "100".parse().unwrap();
+        let hi: Decimal = "200".parse().unwrap();
+        assert_eq!(cache.count_in_band(USDC, lo, hi).await, 1);
+
+        // splitter reserve disabled → both count
+        let cache = HoldingsCache::new(false);
+        cache
+            .add_created(vec![
+                holding("a", USDC, "100", true),
+                holding("b", USDC, "150", true),
+            ])
+            .await;
+        assert_eq!(cache.count_in_band(USDC, lo, hi).await, 2);
+    }
+
+    #[tokio::test]
+    async fn splitter_reserve_honors_consumed_and_ttl() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .add_created(vec![
+                holding("big", USDC, "1000", true),
+                holding("mid", USDC, "500", true),
+            ])
+            .await;
+        assert_eq!(cache.splitter_reserve(USDC).await.unwrap().contract_id, "big");
+
+        // consumed holdings can no longer be the reserve
+        cache.mark_consumed(&["big".to_string()], "split").await;
+        assert_eq!(cache.splitter_reserve(USDC).await.unwrap().contract_id, "mid");
+
+        // a fully TTL-stale cache HALTS splitting: no reserve at all
+        let Some(stale_at) = stale_instant() else { return };
+        let cache = HoldingsCache::new(true);
+        cache
+            .add_created(vec![
+                holding_at("big", USDC, "1000", true, stale_at),
+                holding_at("mid", USDC, "500", true, stale_at),
+            ])
+            .await;
+        assert!(cache.splitter_reserve(USDC).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn split_op_recording_feeds_the_gate() {
+        let cache = HoldingsCache::new(true);
+        assert!(cache.split_ops(USDC).await.is_empty());
+        cache.record_split_op(USDC).await;
+        cache.record_split_op(USDC).await;
+        assert_eq!(cache.split_ops(USDC).await.len(), 2);
+        // per-instrument isolation
+        assert!(cache.split_ops("reg::CBTC").await.is_empty());
     }
 
     #[tokio::test]

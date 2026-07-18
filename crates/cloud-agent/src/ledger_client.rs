@@ -370,11 +370,35 @@ impl DAppProviderClient {
     // Query RPCs
     // ========================================================================
 
-    /// Get active contracts for the authenticated party (streaming RPC)
+    /// Get active contracts for the authenticated party (streaming RPC).
+    ///
+    /// A mid-stream error is a hard `Err`: a truncated snapshot must never
+    /// masquerade as the full ACS — a partial list returned as `Ok` once drove
+    /// the holdings cache to evict every live rung (the mainnet split storm).
+    /// Callers that can use partial data ADDITIVELY should call
+    /// [`Self::get_active_contracts_partial`] instead.
     pub async fn get_active_contracts(
         &mut self,
         template_filters: &[String],
     ) -> Result<Vec<ActiveContractInfo>> {
+        let (contracts, complete) = self.get_active_contracts_partial(template_filters).await?;
+        if !complete {
+            return Err(anyhow!(
+                "GetActiveContracts stream aborted mid-stream after {} contract(s) — snapshot incomplete",
+                contracts.len()
+            ));
+        }
+        Ok(contracts)
+    }
+
+    /// Streaming ACS fetch that reports completeness instead of failing on a
+    /// mid-stream error. `complete == false` means the stream broke partway:
+    /// the returned contracts exist on the ledger and may be merged
+    /// ADDITIVELY, but the list MUST NOT drive eviction/reconciliation.
+    pub async fn get_active_contracts_partial(
+        &mut self,
+        template_filters: &[String],
+    ) -> Result<(Vec<ActiveContractInfo>, bool)> {
         let resp = self
             .client
             .get_active_contracts(GetActiveContractsRequest {
@@ -385,6 +409,7 @@ impl DAppProviderClient {
 
         let mut stream = resp.into_inner();
         let mut contracts = Vec::new();
+        let mut complete = true;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(response) => {
@@ -393,12 +418,17 @@ impl DAppProviderClient {
                     }
                 }
                 Err(e) => {
-                    warn!("GetActiveContracts stream error: {}", e);
+                    warn!(
+                        "GetActiveContracts stream error after {} contract(s): {}",
+                        contracts.len(),
+                        e
+                    );
+                    complete = false;
                     break;
                 }
             }
         }
-        Ok(contracts)
+        Ok((contracts, complete))
     }
 
     /// Get current ledger end offset

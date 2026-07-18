@@ -296,6 +296,180 @@ impl BaseConfig {
         Self::assemble(agent)
     }
 
+    /// Programmatic constructor for embedding the agent as a LIBRARY — e.g. a
+    /// test harness running MANY agents in one process, where the env-driven
+    /// `load`/`load_or_defaults` path cannot work (process env is global, so
+    /// one agent's `PARTY_AGENT`/keys would clobber another's).
+    ///
+    /// Fills every field not covered by the arguments with the same defaults
+    /// the env path uses (serde defaults + `assemble` literals). All fields
+    /// are `pub`: callers then set `markets`, `liquidity_provider`,
+    /// registries (via [`BaseConfig::populate_instruments_from_rpc`]) and the
+    /// quote key (via [`BaseConfig::set_atomic_quote_scalar`]) directly, and
+    /// SHOULD call [`BaseConfig::validate_v2`] before running RFQ V2 — the
+    /// env path's validation lives in `assemble` and does not run here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_party(
+        party_id: &str,
+        private_key_base58: &str,
+        orderbook_grpc_url: &str,
+        synchronizer_id: &str,
+        settlement_operator: &str,
+        dso_party: &str,
+        node_name: &str,
+        ledger_service_public_key_base58: &str,
+    ) -> Result<Self> {
+        let private_key_bytes = decode_private_key(private_key_base58)?;
+        let public_key_hex = get_public_key_hex(&private_key_bytes);
+        let ledger_service_public_key = decode_public_key(ledger_service_public_key_base58)?;
+        Ok(Self {
+            orderbook_grpc_url: orderbook_grpc_url.to_string(),
+            synchronizer_id: synchronizer_id.to_string(),
+            party_id: party_id.to_string(),
+            private_key_bytes,
+            private_key_base58: private_key_base58.to_string(),
+            public_key_hex,
+            settlement_operator: settlement_operator.to_string(),
+            fee_reserve_cc: 5.0,
+            merge_threshold: None,
+            merge_max_amulets: 100,
+            merge_poll_interval_sec: 600,
+            settlement_thread_count: 25,
+            dso_party: dso_party.to_string(),
+            onboarded_registries: Vec::new(),
+            cc_token_id: None,
+            instrument_registries: HashMap::new(),
+            auto_settle: default_auto_settle(),
+            poll_interval_secs: default_poll_interval_secs(),
+            role: default_role(),
+            token_ttl_secs: default_token_ttl_secs(),
+            connection_timeout_secs: default_connection_timeout_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
+            canton_op_timeout_secs: default_canton_op_timeout_secs(),
+            markets: Vec::new(),
+            node_name: node_name.to_string(),
+            ledger_service_public_key,
+            liquidity_provider: None,
+            max_active_settlements: 10,
+            settle_before_secs: default_rfq_settle_before_secs() as u64,
+            allocate_before_secs: default_rfq_allocate_before_secs() as u64,
+            liquidity_margin: 1.1,
+            flow_ema_window_hours: 4.0,
+            depletion_max_hours: 12.0,
+            depletion_min_hours: 1.0,
+            min_prepaid_traffic_balance_cc: None,
+            prepaid_traffic_topup_cc: None,
+            atomic_quote_key: None,
+        })
+    }
+
+    /// Re-derive the top-level `settle_before_secs` / `allocate_before_secs`
+    /// from the per-market `[markets.rfq]` windows — the same maxima
+    /// `assemble` computes on the env path. [`BaseConfig::for_party`] embedders
+    /// MUST call this after setting `markets`, or the v1 settlement-expiry
+    /// logic will keep judging settlements against the serde defaults
+    /// (1800/900) while quotes advertise the per-market windows.
+    pub fn recompute_deadline_windows(&mut self) {
+        self.settle_before_secs = self
+            .markets
+            .iter()
+            .filter_map(|m| m.rfq.as_ref())
+            .map(|r| r.settle_before_secs as u64)
+            .max()
+            .unwrap_or(default_rfq_settle_before_secs() as u64);
+        self.allocate_before_secs = self
+            .markets
+            .iter()
+            .filter_map(|m| m.rfq.as_ref())
+            .map(|r| r.allocate_before_secs as u64)
+            .max()
+            .unwrap_or(default_rfq_allocate_before_secs() as u64);
+    }
+
+    /// Set the RFQ V2 secp256k1 quote-signing key from a raw 32-byte scalar
+    /// (64-char hex) — the same format `ATOMIC_QUOTE_PRIVATE_KEY` carries on
+    /// the env path (`assemble`). For [`BaseConfig::for_party`] embedders that
+    /// load per-agent keys from their own store instead of process env.
+    pub fn set_atomic_quote_scalar(&mut self, scalar_hex: &str) -> Result<()> {
+        let kf = atomic_quote::keyfile_from_scalar(scalar_hex.trim())
+            .context("quote key is not a valid secp256k1 scalar")?;
+        self.atomic_quote_key = Some(AtomicQuoteKey(kf));
+        Ok(())
+    }
+
+    /// The RFQ V2 / market-window validation `assemble` runs on the env path,
+    /// for configs built programmatically via [`BaseConfig::for_party`]. Call
+    /// after setting `markets` / `liquidity_provider` / the quote key.
+    pub fn validate_v2(&self) -> Result<()> {
+        for market in &self.markets {
+            if let Some(rfq) = &market.rfq {
+                if rfq.allocate_before_secs == 0
+                    || rfq.allocate_before_secs >= rfq.settle_before_secs
+                {
+                    return Err(anyhow!(
+                        "Market {}: invalid [markets.rfq] deadline windows: \
+                         allocate_before_secs={} settle_before_secs={} \
+                         (need 0 < allocate_before_secs < settle_before_secs)",
+                        market.market_id, rfq.allocate_before_secs, rfq.settle_before_secs
+                    ));
+                }
+                if rfq.settle_before_secs as u64 > self.settle_before_secs
+                    || rfq.allocate_before_secs as u64 > self.allocate_before_secs
+                {
+                    return Err(anyhow!(
+                        "Market {}: [markets.rfq] windows exceed the top-level \
+                         settle/allocate_before_secs — call \
+                         BaseConfig::recompute_deadline_windows() after setting markets",
+                        market.market_id
+                    ));
+                }
+            }
+        }
+
+        let rfq_v2_enabled = self
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref())
+            .map(|v2| v2.enabled)
+            .unwrap_or(false);
+
+        for market in &self.markets {
+            if let Some(v2m) = market.rfq.as_ref().and_then(|r| r.v2.as_ref()) {
+                if !(1..=100).contains(&v2m.max_input_holdings) {
+                    return Err(anyhow!(
+                        "Market {}: [markets.rfq.v2] max_input_holdings={} must be 1..=100 \
+                         (relay protocol hard bound)",
+                        market.market_id, v2m.max_input_holdings
+                    ));
+                }
+                if v2m.enabled && !rfq_v2_enabled {
+                    return Err(anyhow!(
+                        "Market {} has [markets.rfq.v2] enabled but \
+                         [liquidity_provider.rfq_v2].enabled is not set",
+                        market.market_id
+                    ));
+                }
+            }
+        }
+
+        if let Some(v2) = self.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()) {
+            if v2.ticket_batch_size == 0 {
+                return Err(anyhow!("[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"));
+            }
+            if v2.atomic_quote_valid_secs == 0 {
+                return Err(anyhow!("[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"));
+            }
+        }
+
+        if rfq_v2_enabled && self.atomic_quote_key.is_none() {
+            return Err(anyhow!(
+                "RFQ V2 is enabled but no quote key is set — call \
+                 BaseConfig::set_atomic_quote_scalar (or set ATOMIC_QUOTE_PRIVATE_KEY on the env path)"
+            ));
+        }
+        Ok(())
+    }
+
     /// Assemble the full BaseConfig from an already-parsed AgentToml +
     /// env vars. Instrument/registry info is populated later by
     /// [`BaseConfig::populate_instruments_from_rpc`]. Shared between
@@ -885,6 +1059,22 @@ pub struct RfqV2Config {
     pub split_poll_interval_secs: u64,
     #[serde(default = "default_updates_poll_interval_secs")]
     pub updates_poll_interval_secs: u64,
+    /// Low-water hysteresis divisor for the denomination ladder: a rung only
+    /// triggers a split when `have < max(1, count / divisor)`, and a triggered
+    /// split refills the whole ladder to its full counts in one operation.
+    /// `1` restores the old eager behavior (any deficit splits); values < 1
+    /// are clamped to 1.
+    #[serde(default = "default_split_low_water_divisor")]
+    pub split_low_water_divisor: u32,
+    /// Minimum seconds between split operations per instrument, enforced
+    /// across BOTH the maintenance tick and the on-demand quote-time kicks.
+    #[serde(default = "default_split_min_interval_secs")]
+    pub split_min_interval_secs: u64,
+    /// Fail-stop budget: hard cap on split operations per instrument per
+    /// hour. Tripping it logs `error!` and refuses to split — a runaway
+    /// split loop must be loud and self-stopping.
+    #[serde(default = "default_split_max_ops_per_hour")]
+    pub split_max_ops_per_hour: u32,
     /// GLOBAL per-instrument denomination ladders: symbol → "AMOUNTxCOUNT"
     /// entries (e.g. `CC = ["100x10", "250x4"]`). One ladder per instrument,
     /// shared by every market that pays that instrument — sized for the
@@ -907,6 +1097,9 @@ impl Default for RfqV2Config {
             ticket_low_water: default_ticket_low_water(),
             split_poll_interval_secs: default_split_poll_interval_secs(),
             updates_poll_interval_secs: default_updates_poll_interval_secs(),
+            split_low_water_divisor: default_split_low_water_divisor(),
+            split_min_interval_secs: default_split_min_interval_secs(),
+            split_max_ops_per_hour: default_split_max_ops_per_hour(),
             denominations: Default::default(),
         }
     }
@@ -1014,6 +1207,18 @@ fn default_ticket_low_water() -> usize {
 
 fn default_split_poll_interval_secs() -> u64 {
     60
+}
+
+fn default_split_low_water_divisor() -> u32 {
+    4
+}
+
+fn default_split_min_interval_secs() -> u64 {
+    120
+}
+
+fn default_split_max_ops_per_hour() -> u32 {
+    6
 }
 
 fn default_updates_poll_interval_secs() -> u64 {
@@ -1143,6 +1348,10 @@ denominations = ["25x20", "100x10"]
         assert_eq!(v2.ticket_low_water, 50);
         assert_eq!(v2.split_poll_interval_secs, 60);
         assert_eq!(v2.updates_poll_interval_secs, 2);
+        // split-storm guards default sensibly when absent from the config
+        assert_eq!(v2.split_low_water_divisor, 4);
+        assert_eq!(v2.split_min_interval_secs, 120);
+        assert_eq!(v2.split_max_ops_per_hour, 6);
         let v2m = agent.markets[0].rfq.as_ref().unwrap().v2.as_ref().unwrap();
         assert!(v2m.enabled);
         assert_eq!(v2m.denominations, vec!["25x20", "100x10"]);
@@ -1166,6 +1375,24 @@ USDC = ["15x10"]
         let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
         assert_eq!(v2.denominations["CC"], vec!["100x10", "250x4"]);
         assert_eq!(v2.denominations["USDC"], vec!["15x10"]);
+
+        // split-storm guard knobs parse when present
+        let agent: AgentToml = toml::from_str(
+            r#"
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+split_low_water_divisor = 2
+split_min_interval_secs = 300
+split_max_ops_per_hour = 3
+"#,
+        )
+        .unwrap();
+        let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        assert_eq!(v2.split_low_water_divisor, 2);
+        assert_eq!(v2.split_min_interval_secs, 300);
+        assert_eq!(v2.split_max_ops_per_hour, 3);
 
         // unquoted numeric threshold also parses
         let agent: AgentToml = toml::from_str(

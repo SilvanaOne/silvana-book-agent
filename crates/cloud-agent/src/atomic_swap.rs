@@ -164,7 +164,7 @@ pub fn envelope_from_proto(env: &AtomicQuoteEnvelope) -> Result<QuoteEnvelope> {
 // Clients
 // ============================================================================
 
-pub(crate) async fn create_atomic_client(config: &BaseConfig) -> Result<AtomicProviderClient> {
+pub async fn create_atomic_client(config: &BaseConfig) -> Result<AtomicProviderClient> {
     AtomicProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -179,7 +179,7 @@ pub(crate) async fn create_atomic_client(config: &BaseConfig) -> Result<AtomicPr
     .await
 }
 
-pub(crate) async fn create_v1_client(config: &BaseConfig) -> Result<DAppProviderClient> {
+pub async fn create_v1_client(config: &BaseConfig) -> Result<DAppProviderClient> {
     DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
