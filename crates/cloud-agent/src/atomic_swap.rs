@@ -82,6 +82,12 @@ pub struct AtomicSwapper {
     pub config: BaseConfig,
     /// Shared holdings cache (populated by the fill backend's ACS worker).
     pub cache: Arc<HoldingsCache>,
+    /// Select the splitter reserve too (a reserve-enabled cache withholds the
+    /// party's LARGEST holding per instrument for the LP ladder). The taker
+    /// spends the user's own funds, so a harness sharing one cache across
+    /// both roles sets this; the production fill backend's cache has the
+    /// reserve off and leaves it false.
+    pub spend_reserve: bool,
     pub verbose: bool,
     pub dry_run: bool,
     pub force: bool,
@@ -454,9 +460,42 @@ impl AtomicSwapper {
             .map(|((_, id), total)| fee_target(id, *total))
             .sum();
         let select_target = amount_needed + pay_fee_extra;
+        // Bounded re-poll (LP confirm-path parity): an empty selection is
+        // often a seconds-long gap — fresh proceeds blob-pending until the
+        // next ACS snapshot, holdings momentarily reserved — not depletion.
+        // Wait inside the signed validity window, keeping the pre-check
+        // margin for prepare+sign+execute — but only when the cache holds
+        // enough in PRINCIPLE (counting stale/blob-pending entries a refresh
+        // can revive): a genuinely underfunded taker must fail fast, not
+        // burn the window.
+        let valid_until_micros: i64 = env.quote.valid_until_micros.parse()?;
+        async fn selection_deadline(
+            cache: &HoldingsCache,
+            key: &str,
+            target: Decimal,
+            valid_until_micros: i64,
+        ) -> Instant {
+            if cache.total_available_amount(key).await < target {
+                return Instant::now();
+            }
+            let usable_micros = (valid_until_micros
+                - PRECHECK_VALIDITY_MARGIN_MICROS
+                - chrono::Utc::now().timestamp_micros())
+            .max(0) as u64;
+            Instant::now()
+                + Duration::from_micros(usable_micros).min(crate::rfq_v2::MAX_CONFIRM_SPLIT_WAIT)
+        }
         let picks = self
             .cache
-            .select_for_disclosure(&pay_key, select_target, max_inputs, is_cc)
+            .select_for_disclosure_until(
+                &pay_key,
+                select_target,
+                max_inputs,
+                is_cc,
+                self.spend_reserve,
+                selection_deadline(&self.cache, &pay_key, select_target, valid_until_micros).await,
+                crate::rfq_v2::CONFIRM_SPLIT_POLL,
+            )
             .await;
         let Some(mut picks) = picks else {
             return Ok(SwapOutcome::Requote {
@@ -485,9 +524,21 @@ impl AtomicSwapper {
                 instrument_key(admin, id)
             };
             let slots = max_inputs.saturating_sub(picks.len()).max(1);
+            // Same bounded wait as the pay leg — fee cids are blob-pending
+            // just as often (the shared pool's change outputs), and the
+            // deadline recomputes off valid_until so the window shrinks by
+            // whatever the pay leg already used.
             let fee_picks = self
                 .cache
-                .select_for_disclosure(&fee_key, target, slots, id == "Amulet")
+                .select_for_disclosure_until(
+                    &fee_key,
+                    target,
+                    slots,
+                    id == "Amulet",
+                    self.spend_reserve,
+                    selection_deadline(&self.cache, &fee_key, target, valid_until_micros).await,
+                    crate::rfq_v2::CONFIRM_SPLIT_POLL,
+                )
                 .await;
             let Some(fee_picks) = fee_picks else {
                 return Ok(SwapOutcome::Requote {
@@ -500,8 +551,11 @@ impl AtomicSwapper {
         }
         let own_cids: Vec<String> = picks.iter().map(|h| h.contract_id.clone()).collect();
 
-        let valid_until_micros: i64 = env.quote.valid_until_micros.parse()?;
-        let remaining_micros = (valid_until_micros - now_micros).max(0) as u64;
+        // Fresh timestamp: now_micros is from the pre-check, and the bounded
+        // selection re-poll may have slept since — anchoring on it would
+        // extend the reservation past valid_until + grace by the waited time.
+        let remaining_micros =
+            (valid_until_micros - chrono::Utc::now().timestamp_micros()).max(0) as u64;
         let expires_at =
             Instant::now() + Duration::from_micros(remaining_micros) + RESERVATION_GRACE;
         if !self

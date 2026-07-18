@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
 use tokio::sync::RwLock;
@@ -417,15 +417,31 @@ impl HoldingsCache {
     /// instruments, `amount * 1.02 + 1` for CC (holding-fee decay margin).
     /// Smallest-single-fit, else greedy largest-first capped at `max_inputs`
     /// with a tighten-last pass. The splitter reserve is NEVER included.
-    /// Every pick must carry a `created_event_blob` — blob-pending picks make
-    /// the combination unavailable (None; the ACS refresh backfills blobs).
-    /// The caller reserves the returned cids via [`Self::reserve_v2`].
+    /// Only blob-ready holdings are candidates — a blob-pending holding (a
+    /// fresh watcher-observed output awaiting ACS backfill) cannot be
+    /// disclosed, and must not poison combinations blob-ready coverage can
+    /// fund. The caller reserves the returned cids via [`Self::reserve_v2`].
     pub async fn select_for_disclosure(
         &self,
         instrument: &InstrumentKey,
         amount: Decimal,
         max_inputs: usize,
         is_cc: bool,
+    ) -> Option<Vec<CachedHolding>> {
+        self.select_for_disclosure_with(instrument, amount, max_inputs, is_cc, false)
+            .await
+    }
+
+    /// [`Self::select_for_disclosure`] with the splitter reserve opted IN
+    /// (`include_reserve`) — the taker path spends the user's own funds, and
+    /// the reserve is just their largest holding, not LP ladder inventory.
+    pub async fn select_for_disclosure_with(
+        &self,
+        instrument: &InstrumentKey,
+        amount: Decimal,
+        max_inputs: usize,
+        is_cc: bool,
+        include_reserve: bool,
     ) -> Option<Vec<CachedHolding>> {
         if amount <= Decimal::ZERO || max_inputs == 0 {
             return None;
@@ -436,15 +452,10 @@ impl HoldingsCache {
             amount
         };
 
-        let selectable = self.get_selectable(instrument, true).await;
+        let mut selectable = self.get_selectable(instrument, !include_reserve).await;
+        selectable.retain(|h| h.created_event_blob.is_some());
 
         let mut picks = select_from(&selectable, target, max_inputs)?;
-        if picks.iter().any(|h| h.created_event_blob.is_none()) {
-            debug!(
-                "select_for_disclosure({instrument}): combination includes blob-pending holdings — unavailable until ACS backfill"
-            );
-            return None;
-        }
 
         // Dust merge: sweep sub-rung holdings into the settle as extra inputs
         // (smallest first) so the change output consolidates them. Only after
@@ -472,6 +483,34 @@ impl HoldingsCache {
             }
         }
         Some(picks)
+    }
+
+    /// [`Self::select_for_disclosure_with`] retried on `poll` cadence until
+    /// `deadline` — an empty selection is often a seconds-long gap (fresh
+    /// proceeds blob-pending until the next ACS snapshot, holdings
+    /// momentarily reserved), not depletion. Shared by the taker pay/fee
+    /// legs; the LP confirm path runs its own loop interleaved with the
+    /// on-demand split kick.
+    pub async fn select_for_disclosure_until(
+        &self,
+        instrument: &InstrumentKey,
+        amount: Decimal,
+        max_inputs: usize,
+        is_cc: bool,
+        include_reserve: bool,
+        deadline: Instant,
+        poll: Duration,
+    ) -> Option<Vec<CachedHolding>> {
+        let mut picks = self
+            .select_for_disclosure_with(instrument, amount, max_inputs, is_cc, include_reserve)
+            .await;
+        while picks.is_none() && Instant::now() < deadline {
+            tokio::time::sleep(poll).await;
+            picks = self
+                .select_for_disclosure_with(instrument, amount, max_inputs, is_cc, include_reserve)
+                .await;
+        }
+        picks
     }
 
     /// Reserve holdings for a V2 quote (all-or-nothing).
@@ -646,6 +685,46 @@ impl HoldingsCache {
             })
             .map(|h| h.amount)
             .sum()
+    }
+
+    /// Total amount [`Self::select_for_disclosure_with`] could actually cover
+    /// right now: selectable (fresh, unconsumed, unreserved, splitter reserve
+    /// per `include_reserve`) AND blob-ready, counting only the largest
+    /// `max_inputs` holdings (selection is input-capped, so a fragmented
+    /// cache must not report coverage the selection cannot assemble). Lets a
+    /// caller size work against the cache's spendable view instead of a
+    /// server-side balance that still counts reserved/blob-pending/stale
+    /// holdings.
+    pub async fn selectable_blob_ready_total(
+        &self,
+        instrument: &str,
+        max_inputs: usize,
+        include_reserve: bool,
+    ) -> Decimal {
+        let now = Instant::now();
+        let available = self.available.read().await;
+        let consumed = self.consumed.read().await;
+        let reserved = self.reserved.read().await;
+        let splitter_cid = if !include_reserve && self.splitter_reserve_enabled {
+            Self::splitter_reserve_cid(&available, &consumed, now, instrument)
+        } else {
+            None
+        };
+        let mut amounts: Vec<Decimal> = available
+            .values()
+            .filter(|h| h.instrument == instrument)
+            .filter(|h| now.duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
+            .filter(|h| !consumed.contains_key(&h.contract_id))
+            .filter(|h| match reserved.get(&h.contract_id) {
+                Some(entry) => entry.is_expired(now),
+                None => true,
+            })
+            .filter(|h| Some(&h.contract_id) != splitter_cid.as_ref())
+            .filter(|h| h.created_event_blob.is_some())
+            .map(|h| h.amount)
+            .collect();
+        amounts.sort_unstable_by(|a, b| b.cmp(a));
+        amounts.into_iter().take(max_inputs).sum()
     }
 
     /// Cache statistics for one instrument: (available, consumed, reserved, selectable).
@@ -1103,6 +1182,44 @@ mod tests {
             .select_for_disclosure(&USDC.to_string(), "50".parse().unwrap(), 20, false)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_pending_pick_falls_back_to_blob_ready_subset() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .add_created(vec![
+                // Smallest single fit for 50 — but blob-pending.
+                holding("fresh", USDC, "100", false),
+                holding("rung", USDC, "200", true),
+                holding("reserve", USDC, "10000", true),
+            ])
+            .await;
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "50".parse().unwrap(), 20, false)
+            .await
+            .expect("blob-ready coverage exists");
+        assert_eq!(
+            picks.iter().map(|h| h.contract_id.as_str()).collect::<Vec<_>>(),
+            vec!["rung"]
+        );
+    }
+
+    #[tokio::test]
+    async fn spend_reserve_selection_includes_the_largest_holding() {
+        let cache = HoldingsCache::new(true);
+        cache.add_created(vec![holding("only", USDC, "100", true)]).await;
+        // Default view: the single holding IS the splitter reserve → None.
+        assert!(cache
+            .select_for_disclosure(&USDC.to_string(), "50".parse().unwrap(), 20, false)
+            .await
+            .is_none());
+        // Taker view (spend_reserve): the party's own largest holding spends.
+        let picks = cache
+            .select_for_disclosure_with(&USDC.to_string(), "50".parse().unwrap(), 20, false, true)
+            .await
+            .expect("reserve included");
+        assert_eq!(picks[0].contract_id, "only");
     }
 
     #[tokio::test]

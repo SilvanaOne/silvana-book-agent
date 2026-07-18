@@ -135,3 +135,10 @@ pub fn forecast_label() -> &'static str {
 pub fn forecast_coefficient() -> Option<String> {
     FORECAST_COEFFICIENT.lock().unwrap().clone()
 }
+
+/// The predicted coefficient as f64. Returns 0.0 when no forecast has been
+/// received yet — callers gating on "coefficient must exceed a threshold"
+/// therefore stay paused until the first real forecast arrives.
+pub fn coefficient_value() -> f64 {
+    *FORECAST_COEFF_VALUE.lock().unwrap()
+}
