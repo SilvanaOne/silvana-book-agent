@@ -225,10 +225,13 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                 }
                 Err(e) => {
                     let msg = format!("{:#}", e);
-                    if msg.contains("CONTRACT_NOT_FOUND") || msg.contains("NOT_FOUND") {
-                        // Already archived elsewhere — success for our purposes.
+                    // Only the archived-contract error ids count as "already
+                    // gone" — a bare NOT_FOUND substring would also swallow
+                    // systemic USER_NOT_FOUND / PACKAGE_NOT_FOUND failures and
+                    // defeat the consecutive-failure breaker. A skip leaves the
+                    // failure counter untouched: neither success nor failure.
+                    if msg.contains("CONTRACT_NOT_FOUND") || msg.contains("CONTRACT_NOT_ACTIVE") {
                         skipped_gone += 1;
-                        consecutive_failures = 0;
                         debug!(
                             "DvpProposal GC: {} already gone: {}",
                             &item.cid[..item.cid.len().min(16)], msg,
@@ -267,6 +270,16 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                 done, skipped_gone,
                 queue.len() as u64 - done - skipped_gone,
             );
+            // A cycle where everything was "already gone" but the scan still
+            // returned it is only plausible when the prepare path is looking
+            // at the wrong participant/user — surface it loudly.
+            if done == 0 && skipped_gone > 1 {
+                warn!(
+                    "DvpProposal GC: entire cycle ({}) skipped as already-gone — \
+                     verify prepare path / participant routing",
+                    skipped_gone,
+                );
+            }
         }
 
         if shutdown.sleep(Duration::from_secs(*GC_REFRESH_SECS)).await {

@@ -850,6 +850,24 @@ where
                 }
 
                 _ = heartbeat_timer.tick() => {
+                    // Keep the issuance forecast fresh in orders-only mode too —
+                    // consumers like the DvpProposal GC coefficient gate would
+                    // otherwise act on the frozen startup value forever.
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        orderbook_client.get_rounds_data(Some(1)),
+                    ).await {
+                        Ok(Ok(resp)) => {
+                            if let Some(prediction) = resp.prediction {
+                                crate::forecast::update_forecast(
+                                    prediction.forecast,
+                                    prediction.forecast_coefficient,
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => debug!("Forecast poll failed: {:#}", e),
+                        Err(_) => debug!("Forecast poll timed out"),
+                    }
                     info!("Heartbeat: orders-only mode");
                 }
             }
