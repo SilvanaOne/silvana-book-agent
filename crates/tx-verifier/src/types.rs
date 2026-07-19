@@ -35,6 +35,18 @@ pub enum OperationExpectation {
         proposal_id: String,
         dvp_cid: String,
     },
+    /// Direct DvpProposal_Cancel (controller proposer) — pure archive of an
+    /// expired proposal, must touch nothing else.
+    CancelDvpProposal {
+        party: String,
+        dvp_proposal_cid: String,
+    },
+    /// Direct DvpProposal_Reject (controller counterparty) — archives the
+    /// proposal, creating a RejectedDvpProposal.
+    RejectDvpProposal {
+        party: String,
+        dvp_proposal_cid: String,
+    },
     TransferCc {
         sender_party: String,
         receiver_party: String,

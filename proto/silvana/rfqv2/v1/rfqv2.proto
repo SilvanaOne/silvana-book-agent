@@ -288,6 +288,12 @@ message AtomicRfqRequest {
   // exactly one of `quantity` / `quote_quantity` is set. The LP derives the
   // other from its price.
   optional string quote_quantity = 8;
+  // Swap-venue slug for on-chain attribution (venue-attribution design VA2):
+  // when present, the LP MUST generate quote_id = "<prefix>-<uuidv7>" so the
+  // venue tag rides the LP-signed canonical message (line 13 quote_nonce) and
+  // the AtomicDVP_Settle exercise arguments. The server enforces the echo and
+  // DROPS quotes whose quote_id does not match the expected prefix.
+  optional string quote_id_prefix = 9;
 }
 
 // Phase 1: LP -> server indicative quote (soft reserve taken).

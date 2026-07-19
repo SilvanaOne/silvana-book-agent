@@ -1768,6 +1768,161 @@ fn inspect_propose_dvp(
 }
 
 // ============================================================================
+// DvpProposal GC inspection (Cancel / Reject)
+// ============================================================================
+
+/// Verify a direct DvpProposal_Cancel / DvpProposal_Reject exercise: exactly
+/// one root, the expected choice on the expected DvpProposal cid, our party
+/// acting. Cancel must create nothing; Reject may create only the
+/// RejectedDvpProposal.
+fn inspect_dvp_proposal_gc(
+    prepared: &PreparedTransaction,
+    party: &str,
+    dvp_proposal_cid: &str,
+    choice: &str, // "DvpProposal_Cancel" | "DvpProposal_Reject"
+) -> Result<InspectionResult> {
+    let op_name = choice;
+    let mut warnings = Vec::new();
+
+    let parts = match extract_root_exercise(prepared, op_name) {
+        Ok(p) => p,
+        Err(rejection) => return Ok(rejection),
+    };
+
+    // --- Single root: nothing may ride along with the archive ---
+    if parts.tx.roots.len() != 1 {
+        return Ok(InspectionResult {
+            accepted: false,
+            summary: format!("{}: expected 1 root, got {}", op_name, parts.tx.roots.len()),
+            warnings,
+            rejection_reason: Some(format!(
+                "Transaction has {} root nodes, expected exactly 1",
+                parts.tx.roots.len()
+            )),
+        });
+    }
+
+    // --- Metadata: act_as ---
+    if !parts.submitter.act_as.contains(&party.to_string()) {
+        return Ok(InspectionResult {
+            accepted: false,
+            summary: format!("{}: party not in act_as", op_name),
+            warnings,
+            rejection_reason: Some(format!(
+                "act_as {:?} does not contain party {}",
+                parts.submitter.act_as, party
+            )),
+        });
+    }
+
+    // --- Metadata: command_id ---
+    let expected_cmd = format!("dvp-proposal-gc-{}", dvp_proposal_cid);
+    if parts.submitter.command_id != expected_cmd {
+        warnings.push(format!(
+            "command_id mismatch: expected={}, got={}",
+            expected_cmd, parts.submitter.command_id
+        ));
+    }
+
+    // --- Root exercise: choice_id ---
+    if parts.root_exercise.choice_id != choice {
+        return Ok(InspectionResult {
+            accepted: false,
+            summary: format!("{}: wrong choice_id: {}", op_name, parts.root_exercise.choice_id),
+            warnings,
+            rejection_reason: Some(format!(
+                "Expected choice_id={}, got={}",
+                choice, parts.root_exercise.choice_id
+            )),
+        });
+    }
+
+    // --- Template: DvpProposal ---
+    if let Some(tid) = &parts.root_exercise.template_id {
+        if !template_matches(tid, "Utility.Settlement.App.V1.Model.Dvp", "DvpProposal") {
+            return Ok(InspectionResult {
+                accepted: false,
+                summary: format!("{}: wrong template: {}.{}", op_name, tid.module_name, tid.entity_name),
+                warnings,
+                rejection_reason: Some(format!(
+                    "Expected DvpProposal template, got {}.{}",
+                    tid.module_name, tid.entity_name
+                )),
+            });
+        }
+    }
+
+    // --- contract_id must match the expected DvpProposal ---
+    if parts.root_exercise.contract_id != dvp_proposal_cid {
+        return Ok(InspectionResult {
+            accepted: false,
+            summary: format!("{}: wrong contract_id", op_name),
+            warnings,
+            rejection_reason: Some(format!(
+                "contract_id={}, expected={}",
+                parts.root_exercise.contract_id, dvp_proposal_cid
+            )),
+        });
+    }
+
+    // --- acting_parties ---
+    if !parts.root_exercise.acting_parties.contains(&party.to_string()) {
+        return Ok(InspectionResult {
+            accepted: false,
+            summary: format!("{}: party not in acting_parties", op_name),
+            warnings,
+            rejection_reason: Some(format!(
+                "acting_parties {:?} does not contain party {}",
+                parts.root_exercise.acting_parties, party
+            )),
+        });
+    }
+
+    // --- Children: Cancel creates nothing; Reject only a RejectedDvpProposal ---
+    for child_id in &parts.root_exercise.children {
+        if let Some(child_node) = parts.nodes_dict.get(child_id) {
+            if let Some(NodeType::Create(create)) = get_node_type(child_node) {
+                let allowed = choice == "DvpProposal_Reject"
+                    && create.template_id.as_ref().is_some_and(|tid| {
+                        template_matches(tid, "Utility.Settlement.App.V1.Model.Dvp", "RejectedDvpProposal")
+                    });
+                if !allowed {
+                    let tname = create.template_id.as_ref()
+                        .map(|t| format!("{}.{}", t.module_name, t.entity_name))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Ok(InspectionResult {
+                        accepted: false,
+                        summary: format!("{}: unexpected Create of {}", op_name, tname),
+                        warnings,
+                        rejection_reason: Some(format!(
+                            "{} must not create {} — only DvpProposal_Reject may create RejectedDvpProposal",
+                            op_name, tname
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
+    let summary = format!(
+        "{} VERIFIED: party {} archives {} | {}",
+        op_name,
+        &party[..party.len().min(8)],
+        &dvp_proposal_cid[..dvp_proposal_cid.len().min(16)],
+        node_summary(parts.tx),
+    );
+
+    debug!("TX INSPECT: {}", summary);
+
+    Ok(InspectionResult {
+        accepted: true,
+        summary,
+        warnings,
+        rejection_reason: None,
+    })
+}
+
+// ============================================================================
 // AcceptDvp inspection (Phase B)
 // ============================================================================
 
@@ -2216,6 +2371,8 @@ pub fn inspect(
         OperationExpectation::ProposeDvp { .. } => "ProposeDvp".to_string(),
         OperationExpectation::AcceptDvp { .. } => "AcceptDvp".to_string(),
         OperationExpectation::Allocate { .. } => "Allocate".to_string(),
+        OperationExpectation::CancelDvpProposal { .. } => "CancelDvpProposal".to_string(),
+        OperationExpectation::RejectDvpProposal { .. } => "RejectDvpProposal".to_string(),
         OperationExpectation::TransferCc { amount, .. } => format!("TransferCc({})", amount),
         OperationExpectation::PrepayTraffic { amount, .. } => format!("PrepayTraffic({})", amount),
         OperationExpectation::RequestPreapproval { .. } => "RequestPreapproval".to_string(),
@@ -2359,6 +2516,16 @@ pub fn inspect(
             let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
                 .context("Failed to decode PreparedTransaction protobuf")?;
             inspect_allocate(&prepared, party, proposal_id, dvp_cid)
+        }
+        OperationExpectation::CancelDvpProposal { party, dvp_proposal_cid } => {
+            let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
+                .context("Failed to decode PreparedTransaction protobuf")?;
+            inspect_dvp_proposal_gc(&prepared, party, dvp_proposal_cid, "DvpProposal_Cancel")
+        }
+        OperationExpectation::RejectDvpProposal { party, dvp_proposal_cid } => {
+            let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
+                .context("Failed to decode PreparedTransaction protobuf")?;
+            inspect_dvp_proposal_gc(&prepared, party, dvp_proposal_cid, "DvpProposal_Reject")
         }
         OperationExpectation::RequestPreapproval { party } => {
             let prepared = PreparedTransaction::decode(prepared_transaction_bytes)

@@ -38,6 +38,7 @@ pub mod acs_worker;
 pub mod atomic_swap;
 pub mod backend;
 pub mod config;
+pub mod dvp_gc_worker;
 pub mod fill_loop;
 pub mod holdings_cache;
 pub mod ledger_client;
@@ -586,6 +587,11 @@ pub async fn run_cloud_agent(
     // a clone wakes immediately.
     let lp_shutdown = Shutdown::new();
 
+    // DvpProposal GC — archives expired legacy-DVP proposals during
+    // high-issuance-coefficient windows (see dvp_gc_worker.rs). Env-gated;
+    // no-op when DVP_GC_ENABLED=false.
+    dvp_gc_worker::spawn_dvp_gc_worker(config.clone(), lp_shutdown.clone());
+
     // RFQ V2 activation: LP-level switch + quote key present (config::assemble
     // validated the pairing already; this is belt-and-braces).
     let rfq_v2_cfg = config
@@ -945,8 +951,9 @@ pub async fn setup_rfq_v2(
         out
     };
 
-    // Dust-merge thresholds: an instrument's smallest ladder rung. Holdings
-    // below it get swept into settles as extra inputs for consolidation.
+    // Dust thresholds: an instrument's smallest ladder rung. Holdings below
+    // it fund settles dust-first when few enough fit, else get swept into
+    // rung-funded settles as extra inputs for consolidation.
     let mut dust_thresholds = std::collections::HashMap::new();
     for t in &split_targets {
         if let Ok(rungs) = split_worker::parse_splits(&t.denominations) {
@@ -1166,6 +1173,9 @@ pub async fn run_fill(
         Arc::new(atomic_swap::AtomicSwapper {
             config: config.clone(),
             cache: backend.holdings_cache().clone(),
+            // The fill backend's cache is reserve-off, so this is inert; it
+            // matters only when a reserve-enabled cache is shared in.
+            spend_reserve: false,
             verbose,
             dry_run,
             force,
@@ -1721,7 +1731,17 @@ pub async fn run_lp_atomic_stream(
                                         r.max_quantity.unwrap_or_default(),
                                     ),
                                     Ok(priced) => {
-                                        let quote_id = uuid::Uuid::now_v7().to_string();
+                                        // Venue-attribution (VA2): when the server supplies a
+                                        // prefix, the quote id becomes "<venue>-<uuidv7>" so the
+                                        // venue slug rides the signed canonical message
+                                        // (quote_nonce) onto the chain. The server DROPS quotes
+                                        // that fail to echo the expected prefix.
+                                        let quote_id = match request.quote_id_prefix.as_deref() {
+                                            Some(prefix) if !prefix.is_empty() => {
+                                                format!("{prefix}-{}", uuid::Uuid::now_v7())
+                                            }
+                                            _ => uuid::Uuid::now_v7().to_string(),
+                                        };
                                         let side = if direction == 1 {
                                             atomic_quote::QuoteSide::Buy
                                         } else {

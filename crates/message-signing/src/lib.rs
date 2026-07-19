@@ -150,6 +150,20 @@ pub fn canonical_params_allocate(proposal_id: &str, dvp_cid: &str) -> String {
     )
 }
 
+pub fn canonical_params_cancel_dvp_proposal(dvp_proposal_cid: &str) -> String {
+    format!(
+        "param_type=CancelDvpProposal\ndvp_proposal_cid={}\n",
+        dvp_proposal_cid
+    )
+}
+
+pub fn canonical_params_reject_dvp_proposal(dvp_proposal_cid: &str, reason: &str) -> String {
+    format!(
+        "param_type=RejectDvpProposal\ndvp_proposal_cid={}\nreason={}\n",
+        dvp_proposal_cid, reason
+    )
+}
+
 pub fn canonical_params_transfer_cc(
     receiver_party: &str,
     amount: &str,

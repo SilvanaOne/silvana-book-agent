@@ -48,15 +48,17 @@ pub struct SettleObserved {
 const TOMBSTONE_TTL: Duration = Duration::from_secs(300);
 
 /// Poll cadence while a confirm waits for an on-demand denomination split to
-/// land (fine-grained — the historical 1 s step used to overshoot).
-const CONFIRM_SPLIT_POLL: Duration = Duration::from_millis(400);
+/// land (fine-grained — the historical 1 s step used to overshoot). Shared
+/// with the taker-side selection re-poll (atomic_swap.rs).
+pub(crate) const CONFIRM_SPLIT_POLL: Duration = Duration::from_millis(400);
 /// Slack subtracted from the relay's forwarded `respond_by` so the LP's
 /// envelope/reject reaches the relay before its own confirm timeout fires
 /// (handlers/rfqv2.rs `tokio::time::timeout(timeout_secs, rx)`).
 const CONFIRM_RESPONSE_MARGIN: Duration = Duration::from_millis(1200);
 /// Hard ceiling on the confirm-time split wait — defensive bound against a
 /// bogus/far-future `respond_by` (the relay itself clamps `timeout_secs` to 30).
-const MAX_CONFIRM_SPLIT_WAIT: Duration = Duration::from_secs(28);
+/// Shared with the taker-side selection re-poll (atomic_swap.rs).
+pub(crate) const MAX_CONFIRM_SPLIT_WAIT: Duration = Duration::from_secs(28);
 /// Fallback wait when `respond_by` is absent/unparseable (pre-`respond_by`
 /// relay) — preserves the historical bounded 6 s wait.
 const FALLBACK_CONFIRM_SPLIT_WAIT: Duration = Duration::from_secs(6);
