@@ -951,8 +951,9 @@ pub async fn setup_rfq_v2(
         out
     };
 
-    // Dust-merge thresholds: an instrument's smallest ladder rung. Holdings
-    // below it get swept into settles as extra inputs for consolidation.
+    // Dust thresholds: an instrument's smallest ladder rung. Holdings below
+    // it fund settles dust-first when few enough fit, else get swept into
+    // rung-funded settles as extra inputs for consolidation.
     let mut dust_thresholds = std::collections::HashMap::new();
     for t in &split_targets {
         if let Ok(rungs) = split_worker::parse_splits(&t.denominations) {

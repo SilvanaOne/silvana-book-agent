@@ -1080,8 +1080,9 @@ pub struct RfqV2Config {
     /// shared by every market that pays that instrument — sized for the
     /// typical $10-20 settlement. Supersedes the per-market
     /// `[markets.rfq.v2].denominations` (which is warn-ignored when this map
-    /// is non-empty). The smallest rung doubles as the dust-merge threshold:
-    /// holdings below it are swept as extra inputs into settles.
+    /// is non-empty). The smallest rung doubles as the dust threshold:
+    /// holdings below it fund settles dust-first (the fewest that fit, no
+    /// rung broken), else are swept as extra inputs into rung-funded settles.
     #[serde(default)]
     pub denominations: std::collections::HashMap<String, Vec<String>>,
 }

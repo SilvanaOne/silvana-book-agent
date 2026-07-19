@@ -39,12 +39,14 @@ const PENDING_SPLIT_TTL_SECS: u64 = 300;
 /// Window for the per-instrument split-op budget (fail-stop).
 const SPLIT_OP_WINDOW_SECS: u64 = 3600;
 
-/// Budget for the opportunistic dust-merge sweep, independent of the funding
-/// cap. Consolidation is a nice-to-have; each disclosed holding costs ~1.9 KB
-/// of request body, so an unbudgeted sweep can pad a one-input settle out to
-/// `max_inputs` and blow the submission size limit. Excess dust drains over
-/// subsequent settles.
-const DUST_MERGE_MAX_INPUTS: usize = 10;
+/// Per-settle dust budget, independent of the funding cap. Caps both the
+/// dust-first coverage attempt (fewest dust holdings that fund the settle
+/// without breaking a rung) and the consolidation sweep appended to a
+/// rung-funded settle. Consolidation is a nice-to-have; each disclosed
+/// holding costs ~1.9 KB of request body, so an unbudgeted sweep can pad a
+/// one-input settle out to `max_inputs` and blow the submission size limit.
+/// Excess dust drains over subsequent settles.
+const DUST_MERGE_MAX_INPUTS: usize = 5;
 
 /// CIP-56 Holding template as uploaded on this participant (matches the SDK's
 /// `transactions::TEMPLATE_HOLDING`).
@@ -422,15 +424,19 @@ impl HoldingsCache {
 
     /// V2 disclosure selection (design §5.1). `target` = `amount` for utility
     /// instruments, `amount * 1.02 + 1` for CC (holding-fee decay margin).
-    /// Smallest-single-fit, else greedy largest-first capped at `max_inputs`
-    /// with a tighten-last pass. The splitter reserve is NEVER included.
-    /// Only blob-ready holdings are candidates — a blob-pending holding (a
-    /// fresh watcher-observed output awaiting ACS backfill) cannot be
-    /// disclosed, and must not poison combinations blob-ready coverage can
-    /// fund. Once coverage is met, up to [`DUST_MERGE_MAX_INPUTS`] sub-rung
-    /// holdings are swept in for consolidation — a budget separate from (and
-    /// bounded by) `max_inputs`, so a one-input settle stays a small request.
-    /// The caller reserves the returned cids via [`Self::reserve_v2`].
+    /// Dust-first: if at most [`DUST_MERGE_MAX_INPUTS`] sub-rung holdings can
+    /// cover the target, the fewest that fit fund the settle outright — no
+    /// rung is broken and nothing extra is swept in. Otherwise coverage is
+    /// smallest-single-fit (the smallest rung with enough balance), else
+    /// greedy largest-first capped at `max_inputs` with a tighten-last pass,
+    /// and then up to [`DUST_MERGE_MAX_INPUTS`] sub-rung holdings are swept
+    /// in for consolidation — a budget separate from (and bounded by)
+    /// `max_inputs`, so a one-input settle stays a small request. The
+    /// splitter reserve is NEVER included. Only blob-ready holdings are
+    /// candidates — a blob-pending holding (a fresh watcher-observed output
+    /// awaiting ACS backfill) cannot be disclosed, and must not poison
+    /// combinations blob-ready coverage can fund. The caller reserves the
+    /// returned cids via [`Self::reserve_v2`].
     pub async fn select_for_disclosure(
         &self,
         instrument: &InstrumentKey,
@@ -465,24 +471,45 @@ impl HoldingsCache {
         let mut selectable = self.get_selectable(instrument, !include_reserve).await;
         selectable.retain(|h| h.created_event_blob.is_some());
 
+        let dust_below = self.dust_below.read().await.get(instrument).copied();
+
+        // Dust-first: fund the settle from sub-rung holdings alone when the
+        // fewest that fit stay within the dust budget — the settle's change
+        // output consolidates them and no rung is broken. Minimal count by
+        // construction (single-fit, else greedy + tighten), no sweep on top.
+        if let Some(threshold) = dust_below {
+            let dust_pool: Vec<CachedHolding> =
+                selectable.iter().filter(|h| h.amount < threshold).cloned().collect();
+            if let Some(picks) =
+                select_from(&dust_pool, target, DUST_MERGE_MAX_INPUTS.min(max_inputs))
+            {
+                debug!(
+                    "select_for_disclosure({instrument}): funding from {} dust holding(s) (< {threshold}), no rung",
+                    picks.len()
+                );
+                return Some(picks);
+            }
+        }
+
         let mut picks = select_from(&selectable, target, max_inputs)?;
 
-        // Dust merge: sweep sub-rung holdings into the settle as extra inputs
-        // (smallest first) so the change output consolidates them. Only after
-        // coverage is met, only blob-ready holdings, never past max_inputs and
-        // never more than DUST_MERGE_MAX_INPUTS in one settle.
-        let dust_below = self.dust_below.read().await.get(instrument).copied();
+        // Dust merge: sweep sub-rung holdings into the rung-funded settle as
+        // extra inputs (smallest first) so the change output consolidates
+        // them. Only after coverage is met, never past max_inputs and never
+        // more than DUST_MERGE_MAX_INPUTS dust inputs in one settle (coverage
+        // picks below the threshold count against that budget too).
         if let Some(threshold) = dust_below {
             let picked: std::collections::HashSet<&str> =
                 picks.iter().map(|h| h.contract_id.as_str()).collect();
+            let dust_in_picks = picks.iter().filter(|h| h.amount < threshold).count();
             let dust: Vec<CachedHolding> = selectable
                 .iter() // ascending by amount
-                .filter(|h| {
-                    h.amount < threshold
-                        && h.created_event_blob.is_some()
-                        && !picked.contains(h.contract_id.as_str())
-                })
-                .take(DUST_MERGE_MAX_INPUTS.min(max_inputs.saturating_sub(picks.len())))
+                .filter(|h| h.amount < threshold && !picked.contains(h.contract_id.as_str()))
+                .take(
+                    DUST_MERGE_MAX_INPUTS
+                        .saturating_sub(dust_in_picks)
+                        .min(max_inputs.saturating_sub(picks.len())),
+                )
                 .cloned()
                 .collect();
             if !dust.is_empty() {
@@ -1179,7 +1206,7 @@ mod tests {
         assert_eq!(picks.len(), 1 + DUST_MERGE_MAX_INPUTS);
         let cids: Vec<&str> = picks.iter().map(|h| h.contract_id.as_str()).collect();
         assert_eq!(cids[0], "rung");
-        // The 10 smallest dust, ascending.
+        // The budget's worth of smallest dust, ascending.
         let expected: Vec<String> =
             (1..=DUST_MERGE_MAX_INPUTS).map(|i| format!("dust{i:02}")).collect();
         assert_eq!(&cids[1..], expected.as_slice());
@@ -1190,6 +1217,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(picks.len(), 4);
+    }
+
+    /// Dust that can cover the target within the dust budget funds the settle
+    /// outright: fewest dust holdings that fit, no rung broken, and remaining
+    /// dust is NOT padded in on top.
+    #[tokio::test]
+    async fn dust_only_coverage_skips_rung() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .set_dust_thresholds(
+                [(USDC.to_string(), "15".parse().unwrap())].into_iter().collect(),
+            )
+            .await;
+        cache
+            .add_created(vec![
+                holding("reserve", USDC, "1000", true), // splitter reserve — excluded
+                holding("rung", USDC, "25", true),      // would cover alone — must NOT be used
+                holding("d9", USDC, "9", true),
+                holding("d8", USDC, "8", true),
+                holding("d7", USDC, "7", true),
+                holding("d1", USDC, "1", true),
+            ])
+            .await;
+
+        // Greedy largest-first over dust: 9 + 8 + 7 = 24 >= 20. Three dust
+        // holdings, no rung, and d1 is not swept in (minimal count).
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "20".parse().unwrap(), 10, false)
+            .await
+            .unwrap();
+        let cids: Vec<&str> = picks.iter().map(|h| h.contract_id.as_str()).collect();
+        assert_eq!(cids, vec!["d9", "d8", "d7"]);
+    }
+
+    /// A single dust holding covering the target is the whole selection —
+    /// one input, no consolidation sweep appended.
+    #[tokio::test]
+    async fn dust_only_single_fit_is_minimal() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .set_dust_thresholds(
+                [(USDC.to_string(), "15".parse().unwrap())].into_iter().collect(),
+            )
+            .await;
+        cache
+            .add_created(vec![
+                holding("reserve", USDC, "1000", true), // splitter reserve — excluded
+                holding("rung", USDC, "25", true),
+                holding("d05", USDC, "0.5", true),
+                holding("d3", USDC, "3", true),
+                holding("d7", USDC, "7", true),
+            ])
+            .await;
+
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "5".parse().unwrap(), 10, false)
+            .await
+            .unwrap();
+        let cids: Vec<&str> = picks.iter().map(|h| h.contract_id.as_str()).collect();
+        assert_eq!(cids, vec!["d7"]);
+    }
+
+    /// max_inputs binds the dust-first attempt too: when dust can't cover
+    /// within min(budget, max_inputs), selection falls back to the smallest
+    /// covering rung plus a sweep within the remaining headroom.
+    #[tokio::test]
+    async fn dust_only_respects_max_inputs() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .set_dust_thresholds(
+                [(USDC.to_string(), "15".parse().unwrap())].into_iter().collect(),
+            )
+            .await;
+        cache
+            .add_created(vec![
+                holding("reserve", USDC, "1000", true), // splitter reserve — excluded
+                holding("rung", USDC, "25", true),
+                holding("d9", USDC, "9", true),
+                holding("d8", USDC, "8", true),
+                holding("d7", USDC, "7", true),
+                holding("d1", USDC, "1", true),
+            ])
+            .await;
+
+        // Dust cap min(budget, 2) = 2 → 9 + 8 = 17 < 20 → rung path, with
+        // one sweep slot left for the smallest dust.
+        let picks = cache
+            .select_for_disclosure(&USDC.to_string(), "20".parse().unwrap(), 2, false)
+            .await
+            .unwrap();
+        let cids: Vec<&str> = picks.iter().map(|h| h.contract_id.as_str()).collect();
+        assert_eq!(cids, vec!["rung", "d1"]);
     }
 
     #[tokio::test]
