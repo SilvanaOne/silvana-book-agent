@@ -6,32 +6,29 @@
 
 use anyhow::{Context, Result};
 use orderbook_proto::{
-    pricing::{pricing_service_client::PricingServiceClient, GetPriceRequest, GetPriceResponse},
     orderbook::{
-        orderbook_service_client::OrderbookServiceClient, CancelOrderRequest, CancelOrderResponse,
-        GetInstrumentsRequest, GetMarketsRequest, GetOrdersRequest, Instrument, Market, Order, OrderStatus, OrderType,
-        SubmitOrderRequest, SubmitOrderResponse, TimeInForce,
-        SubscribeSettlementsRequest, SettlementUpdate,
-        GetSettlementProposalsRequest, SettlementProposal, SettlementStatus,
-        RequestQuotesRequest, RequestQuotesResponse,
-        AcceptQuoteRequest, AcceptQuoteResponse,
-        GetRoundsDataRequest, GetRoundsDataResponse,
+        AcceptQuoteRequest, AcceptQuoteResponse, CancelOrderRequest, CancelOrderResponse,
+        GetInstrumentsRequest, GetMarketsRequest, GetOrdersRequest, GetRoundsDataRequest,
+        GetRoundsDataResponse, GetSettlementProposalsRequest, Instrument, Market, Order,
+        OrderStatus, OrderType, RequestQuotesRequest, RequestQuotesResponse, SettlementProposal,
+        SettlementStatus, SettlementUpdate, SubmitOrderRequest, SubmitOrderResponse,
+        SubscribeSettlementsRequest, TimeInForce, orderbook_service_client::OrderbookServiceClient,
     },
+    pricing::{GetPriceRequest, GetPriceResponse, pricing_service_client::PricingServiceClient},
     rfqv2::{
-        rfq_v2_service_client::RfqV2ServiceClient,
-        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, RfqConfirmRejectReason,
-        RequestQuotesV2Request, RequestQuotesV2Response,
+        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, RequestQuotesV2Request,
+        RequestQuotesV2Response, RfqConfirmRejectReason, rfq_v2_service_client::RfqV2ServiceClient,
     },
 };
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tonic::transport::{Channel, ClientTlsConfig};
-use tonic::Request;
 use tokio_stream::Stream;
-use std::pin::Pin;
+use tonic::Request;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tracing::debug;
 
-use crate::auth::generate_jwt;
+use crate::auth::{generate_jwt, generate_jwt_with_branch};
 use crate::config::BaseConfig;
 
 /// External account authentication data
@@ -43,14 +40,23 @@ struct ExternalAuthData {
     role: String,
     ttl_secs: u64,
     node_name: String,
+    /// RFQ V2 analytics branch stamped into every minted token (VA13);
+    /// None = the server default ("main").
+    venue_branch: Option<String>,
 }
 
 /// Unified client for orderbook and pricing services
 pub struct OrderbookClient {
-    pricing_client: PricingServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
-    orderbook_client: OrderbookServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
+    pricing_client: PricingServiceClient<
+        tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>,
+    >,
+    orderbook_client: OrderbookServiceClient<
+        tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>,
+    >,
     /// RFQ V2 (AtomicDVP) user-facing service — same channel/auth as v1
-    rfqv2_client: RfqV2ServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
+    rfqv2_client: RfqV2ServiceClient<
+        tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>,
+    >,
     // Raw client for streaming (interceptors don't work well with streaming)
     raw_orderbook_client: OrderbookServiceClient<Channel>,
     auth_data: ExternalAuthData,
@@ -62,15 +68,19 @@ impl OrderbookClient {
         let channel = Self::create_channel(&config.orderbook_grpc_url).await?;
 
         // Generate initial JWT for interceptor
-        let jwt = generate_jwt(
+        let jwt = generate_jwt_with_branch(
             &config.party_id,
             &config.role,
             &config.private_key_bytes,
             config.token_ttl_secs,
             Some(config.node_name.as_str()),
+            config.venue_branch.as_deref(),
         )?;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let token_arc = Arc::new(RwLock::new(jwt));
         let expires_at = Arc::new(RwLock::new(now + config.token_ttl_secs));
 
@@ -81,6 +91,7 @@ impl OrderbookClient {
             role: config.role.clone(),
             ttl_secs: config.token_ttl_secs,
             node_name: config.node_name.clone(),
+            venue_branch: config.venue_branch.clone(),
         };
 
         let auth_interceptor = AuthInterceptor {
@@ -89,26 +100,19 @@ impl OrderbookClient {
             auth_data: auth_data.clone(),
         };
 
-        let pricing_client = PricingServiceClient::with_interceptor(
-            channel.clone(),
-            auth_interceptor.clone(),
-        )
-        .max_decoding_message_size(16 * 1024 * 1024);
+        let pricing_client =
+            PricingServiceClient::with_interceptor(channel.clone(), auth_interceptor.clone())
+                .max_decoding_message_size(16 * 1024 * 1024);
 
-        let orderbook_client = OrderbookServiceClient::with_interceptor(
-            channel.clone(),
-            auth_interceptor.clone(),
-        )
-        .max_decoding_message_size(16 * 1024 * 1024);
+        let orderbook_client =
+            OrderbookServiceClient::with_interceptor(channel.clone(), auth_interceptor.clone())
+                .max_decoding_message_size(16 * 1024 * 1024);
 
-        let rfqv2_client = RfqV2ServiceClient::with_interceptor(
-            channel.clone(),
-            auth_interceptor,
-        )
-        .max_decoding_message_size(16 * 1024 * 1024);
-
-        let raw_orderbook_client = OrderbookServiceClient::new(channel)
+        let rfqv2_client = RfqV2ServiceClient::with_interceptor(channel.clone(), auth_interceptor)
             .max_decoding_message_size(16 * 1024 * 1024);
+
+        let raw_orderbook_client =
+            OrderbookServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
 
         Ok(Self {
             pricing_client,
@@ -126,16 +130,14 @@ impl OrderbookClient {
 
         if grpc_url.starts_with("https://") {
             // Use embedded webpki-roots (Mozilla root certificates compiled into binary)
-            let tls_config = ClientTlsConfig::new()
-                .with_webpki_roots()
-                .domain_name(
-                    grpc_url
-                        .trim_start_matches("https://")
-                        .trim_start_matches("http://")
-                        .split(':')
-                        .next()
-                        .unwrap_or("localhost"),
-                );
+            let tls_config = ClientTlsConfig::new().with_webpki_roots().domain_name(
+                grpc_url
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost"),
+            );
 
             Channel::from_shared(grpc_url.to_string())
                 .context("Invalid gRPC URL")?
@@ -254,9 +256,7 @@ impl OrderbookClient {
 
     /// Cancel an existing order
     pub async fn cancel_order(&mut self, order_id: u64) -> Result<CancelOrderResponse> {
-        let request = Request::new(CancelOrderRequest {
-            order_id,
-        });
+        let request = Request::new(CancelOrderRequest { order_id });
 
         let response = self
             .orderbook_client
@@ -361,9 +361,7 @@ impl OrderbookClient {
         &mut self,
         market_id: Option<String>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<SettlementUpdate, tonic::Status>> + Send>>> {
-        let mut request = Request::new(SubscribeSettlementsRequest {
-            market_id,
-        });
+        let mut request = Request::new(SubscribeSettlementsRequest { market_id });
 
         // Add authorization header
         let jwt = generate_jwt(
@@ -375,7 +373,9 @@ impl OrderbookClient {
         )?;
         request.metadata_mut().insert(
             "authorization",
-            format!("Bearer {}", jwt).parse().context("Failed to parse JWT")?,
+            format!("Bearer {}", jwt)
+                .parse()
+                .context("Failed to parse JWT")?,
         );
 
         let response = self
@@ -492,7 +492,9 @@ impl OrderbookClient {
             .rfqv2_client
             .accept_quote_atomic(request)
             .await
-            .map_err(|e| anyhow::anyhow!("accept_quote_atomic failed ({}): {}", e.code(), e.message()))?;
+            .map_err(|e| {
+                anyhow::anyhow!("accept_quote_atomic failed ({}): {}", e.code(), e.message())
+            })?;
 
         Ok(response.into_inner())
     }
@@ -514,9 +516,7 @@ impl OrderbookClient {
 
     /// Get rounds data including issuance forecast
     pub async fn get_rounds_data(&mut self, limit: Option<u32>) -> Result<GetRoundsDataResponse> {
-        let request = Request::new(GetRoundsDataRequest {
-            limit,
-        });
+        let request = Request::new(GetRoundsDataRequest { limit });
         let response = self
             .orderbook_client
             .get_rounds_data(request)
@@ -547,19 +547,26 @@ const REFRESH_BEFORE_EXPIRY_SECS: u64 = 300;
 
 impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let expires_at = *self.expires_at.read().unwrap();
 
         if now + REFRESH_BEFORE_EXPIRY_SECS >= expires_at {
-            match generate_jwt(
+            match generate_jwt_with_branch(
                 &self.auth_data.party_id,
                 &self.auth_data.role,
                 &self.auth_data.private_key_bytes,
                 self.auth_data.ttl_secs,
                 Some(self.auth_data.node_name.as_str()),
+                self.auth_data.venue_branch.as_deref(),
             ) {
                 Ok(new_jwt) => {
-                    debug!("JWT token refreshed (was expiring in {}s)", expires_at.saturating_sub(now));
+                    debug!(
+                        "JWT token refreshed (was expiring in {}s)",
+                        expires_at.saturating_sub(now)
+                    );
                     *self.token.write().unwrap() = new_jwt;
                     *self.expires_at.write().unwrap() = now + self.auth_data.ttl_secs;
                 }

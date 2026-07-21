@@ -3,8 +3,11 @@
 //! Generates self-describing Ed25519-signed JWT tokens for authenticating with the orderbook service.
 //! The public key is embedded in the JWT header's `jwk` field per RFC 8037.
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use anyhow::{Context, Result, anyhow};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +29,22 @@ pub fn generate_jwt(
     ttl_secs: u64,
     node_name: Option<&str>,
 ) -> Result<String> {
+    generate_jwt_with_branch(party_id, role, private_key_bytes, ttl_secs, node_name, None)
+}
+
+/// [`generate_jwt`] plus the RFQ V2 swap-venue BRANCH claim.
+///
+/// The branch labels this client's V2 traffic
+/// Must be a slug `^[a-z0-9][a-z0-9-]{1,19}$` or orderbook-rpc warns and
+/// falls back to the default.
+pub fn generate_jwt_with_branch(
+    party_id: &str,
+    role: &str,
+    private_key_bytes: &[u8; 32],
+    ttl_secs: u64,
+    node_name: Option<&str>,
+    venue_branch: Option<&str>,
+) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System time error")?
@@ -40,6 +59,9 @@ pub fn generate_jwt(
     });
     if let Some(nn) = node_name {
         claims["node_name"] = serde_json::Value::String(nn.to_string());
+    }
+    if let Some(branch) = venue_branch.filter(|b| !b.is_empty()) {
+        claims["venue_branch"] = serde_json::Value::String(branch.to_string());
     }
 
     let signing_key = SigningKey::from_bytes(private_key_bytes);
@@ -174,20 +196,13 @@ mod tests {
     fn test_generate_jwt() {
         // Test with raw bytes (simulating decoded base58 key)
         let private_key_bytes: [u8; 32] = [
-            0x0f, 0xe6, 0x65, 0xf7, 0xed, 0xb1, 0x93, 0xdb,
-            0x35, 0xcc, 0x37, 0xd7, 0xd7, 0x03, 0xe1, 0x2a,
-            0xe9, 0x4e, 0x9e, 0x1c, 0x5f, 0x5b, 0x88, 0x57,
-            0xae, 0x1b, 0x6a, 0xca, 0x00, 0x5d, 0xf1, 0x5b,
+            0x0f, 0xe6, 0x65, 0xf7, 0xed, 0xb1, 0x93, 0xdb, 0x35, 0xcc, 0x37, 0xd7, 0xd7, 0x03,
+            0xe1, 0x2a, 0xe9, 0x4e, 0x9e, 0x1c, 0x5f, 0x5b, 0x88, 0x57, 0xae, 0x1b, 0x6a, 0xca,
+            0x00, 0x5d, 0xf1, 0x5b,
         ];
 
-        let jwt = generate_jwt(
-            "test_party",
-            "trader",
-            &private_key_bytes,
-            3600,
-            None,
-        )
-        .expect("Failed to generate JWT");
+        let jwt = generate_jwt("test_party", "trader", &private_key_bytes, 3600, None)
+            .expect("Failed to generate JWT");
 
         assert!(jwt.contains('.'));
         let parts: Vec<&str> = jwt.split('.').collect();

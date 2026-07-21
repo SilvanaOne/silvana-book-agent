@@ -8,7 +8,7 @@
 //! This is the shared `BaseConfig` used by both the local agent and the cloud agent.
 //! The local agent wraps this with a `Config` that adds ledger API URLs.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use orderbook_proto::orderbook::Instrument;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -158,6 +158,11 @@ pub struct BaseConfig {
     // Multi-node routing
     pub node_name: String,
 
+    /// RFQ V2 swap-venue
+    /// (^[a-z0-9][a-z0-9-]{1,19}$); it never affects auth, fees, the on-chain
+    /// quote_id prefix, or the venue name.
+    pub venue_branch: Option<String>,
+
     // Message signing
     pub ledger_service_public_key: [u8; 32],
 
@@ -252,6 +257,7 @@ impl BaseConfig {
             canton_op_timeout_secs: 60,
             markets: Vec::new(),
             node_name: String::new(),
+            venue_branch: None,
             ledger_service_public_key: [0u8; 32],
             liquidity_provider: None,
             max_active_settlements: 1000,
@@ -285,10 +291,12 @@ impl BaseConfig {
     /// Use from commands that don't need market/LP config (faucet, transfer, etc.).
     pub fn load_or_defaults<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
         let agent: AgentToml = if agent_toml_path.as_ref().exists() {
-            let s = fs::read_to_string(agent_toml_path.as_ref())
-                .with_context(|| format!("Failed to read {}", agent_toml_path.as_ref().display()))?;
-            toml::from_str(&s)
-                .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?
+            let s = fs::read_to_string(agent_toml_path.as_ref()).with_context(|| {
+                format!("Failed to read {}", agent_toml_path.as_ref().display())
+            })?;
+            toml::from_str(&s).with_context(|| {
+                format!("Failed to parse {}", agent_toml_path.as_ref().display())
+            })?
         } else {
             // Empty string round-trips to AgentToml with all serde defaults.
             toml::from_str("").expect("AgentToml serde defaults must parse")
@@ -348,6 +356,7 @@ impl BaseConfig {
             canton_op_timeout_secs: default_canton_op_timeout_secs(),
             markets: Vec::new(),
             node_name: node_name.to_string(),
+            venue_branch: std::env::var("VENUE_BRANCH").ok().filter(|v| !v.is_empty()),
             ledger_service_public_key,
             liquidity_provider: None,
             max_active_settlements: 10,
@@ -410,7 +419,9 @@ impl BaseConfig {
                         "Market {}: invalid [markets.rfq] deadline windows: \
                          allocate_before_secs={} settle_before_secs={} \
                          (need 0 < allocate_before_secs < settle_before_secs)",
-                        market.market_id, rfq.allocate_before_secs, rfq.settle_before_secs
+                        market.market_id,
+                        rfq.allocate_before_secs,
+                        rfq.settle_before_secs
                     ));
                 }
                 if rfq.settle_before_secs as u64 > self.settle_before_secs
@@ -439,7 +450,8 @@ impl BaseConfig {
                     return Err(anyhow!(
                         "Market {}: [markets.rfq.v2] max_input_holdings={} must be 1..=100 \
                          (relay protocol hard bound)",
-                        market.market_id, v2m.max_input_holdings
+                        market.market_id,
+                        v2m.max_input_holdings
                     ));
                 }
                 if v2m.enabled && !rfq_v2_enabled {
@@ -452,12 +464,20 @@ impl BaseConfig {
             }
         }
 
-        if let Some(v2) = self.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()) {
+        if let Some(v2) = self
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref())
+        {
             if v2.ticket_batch_size == 0 {
-                return Err(anyhow!("[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"));
+                return Err(anyhow!(
+                    "[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"
+                ));
             }
             if v2.atomic_quote_valid_secs == 0 {
-                return Err(anyhow!("[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"));
+                return Err(anyhow!(
+                    "[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"
+                ));
             }
         }
 
@@ -482,11 +502,10 @@ impl BaseConfig {
         let instrument_registries: HashMap<String, String> = HashMap::new();
 
         // Read env vars
-        let dso_party = std::env::var("DSO")
-            .map_err(|_| anyhow!("DSO env var is required"))?;
+        let dso_party = std::env::var("DSO").map_err(|_| anyhow!("DSO env var is required"))?;
 
-        let party_id = std::env::var("PARTY_AGENT")
-            .map_err(|_| anyhow!("PARTY_AGENT env var is required"))?;
+        let party_id =
+            std::env::var("PARTY_AGENT").map_err(|_| anyhow!("PARTY_AGENT env var is required"))?;
 
         let private_key_base58 = std::env::var("PARTY_AGENT_PRIVATE_KEY")
             .map_err(|_| anyhow!("PARTY_AGENT_PRIVATE_KEY env var is required"))?;
@@ -523,9 +542,17 @@ impl BaseConfig {
         // issues these fees as a server-signed schedule that the cloud-agent
         // authorizes via `fees_authorization` on ExecuteTransactionRequest.
 
-        let merge_threshold = std::env::var("MERGE_THRESHOLD").ok().and_then(|v| v.parse().ok());
-        let merge_max_amulets = std::env::var("MERGE_MAX_AMULETS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-        let merge_poll_interval_sec = std::env::var("MERGE_POLL_INTERVAL_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+        let merge_threshold = std::env::var("MERGE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let merge_max_amulets = std::env::var("MERGE_MAX_AMULETS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let merge_poll_interval_sec = std::env::var("MERGE_POLL_INTERVAL_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
 
         let settlement_thread_count = std::env::var("SETTLEMENT_THREAD_COUNT")
             .ok()
@@ -537,8 +564,8 @@ impl BaseConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
 
-        let node_name = std::env::var("NODE_NAME")
-            .map_err(|_| anyhow!("NODE_NAME env var is required"))?;
+        let node_name =
+            std::env::var("NODE_NAME").map_err(|_| anyhow!("NODE_NAME env var is required"))?;
 
         let ledger_service_public_key_b58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
             .map_err(|_| anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
@@ -557,19 +584,25 @@ impl BaseConfig {
                         "Market {}: invalid [markets.rfq] deadline windows: \
                          allocate_before_secs={} settle_before_secs={} \
                          (need 0 < allocate_before_secs < settle_before_secs)",
-                        market.market_id, rfq.allocate_before_secs, rfq.settle_before_secs
+                        market.market_id,
+                        rfq.allocate_before_secs,
+                        rfq.settle_before_secs
                     ));
                 }
             }
         }
 
-        let settle_before_secs = agent.markets.iter()
+        let settle_before_secs = agent
+            .markets
+            .iter()
             .filter_map(|m| m.rfq.as_ref())
             .map(|r| r.settle_before_secs as u64)
             .max()
             .unwrap_or(default_rfq_settle_before_secs() as u64);
 
-        let allocate_before_secs = agent.markets.iter()
+        let allocate_before_secs = agent
+            .markets
+            .iter()
             .filter_map(|m| m.rfq.as_ref())
             .map(|r| r.allocate_before_secs as u64)
             .max()
@@ -600,29 +633,43 @@ impl BaseConfig {
         // silently disabling the feature.
         let min_prepaid = std::env::var("MIN_PREPAID_TRAFFIC_BALANCE_CC").ok();
         let topup_prepaid = std::env::var("PREPAID_TRAFFIC_TOPUP_CC").ok();
-        let (min_prepaid_traffic_balance_cc, prepaid_traffic_topup_cc) =
-            match (min_prepaid, topup_prepaid) {
-                (Some(min_str), Some(topup_str)) => {
-                    let min: rust_decimal::Decimal = min_str.parse()
-                        .with_context(|| format!("MIN_PREPAID_TRAFFIC_BALANCE_CC must be a decimal, got '{}'", min_str))?;
-                    let topup: rust_decimal::Decimal = topup_str.parse()
-                        .with_context(|| format!("PREPAID_TRAFFIC_TOPUP_CC must be a decimal, got '{}'", topup_str))?;
-                    if topup <= rust_decimal::Decimal::ZERO {
-                        return Err(anyhow!(
-                            "PREPAID_TRAFFIC_TOPUP_CC must be > 0, got {}",
-                            topup
-                        ));
-                    }
-                    (Some(min), Some(topup))
+        let (min_prepaid_traffic_balance_cc, prepaid_traffic_topup_cc) = match (
+            min_prepaid,
+            topup_prepaid,
+        ) {
+            (Some(min_str), Some(topup_str)) => {
+                let min: rust_decimal::Decimal = min_str.parse().with_context(|| {
+                    format!(
+                        "MIN_PREPAID_TRAFFIC_BALANCE_CC must be a decimal, got '{}'",
+                        min_str
+                    )
+                })?;
+                let topup: rust_decimal::Decimal = topup_str.parse().with_context(|| {
+                    format!(
+                        "PREPAID_TRAFFIC_TOPUP_CC must be a decimal, got '{}'",
+                        topup_str
+                    )
+                })?;
+                if topup <= rust_decimal::Decimal::ZERO {
+                    return Err(anyhow!(
+                        "PREPAID_TRAFFIC_TOPUP_CC must be > 0, got {}",
+                        topup
+                    ));
                 }
-                (None, None) => (None, None),
-                (Some(_), None) => return Err(anyhow!(
+                (Some(min), Some(topup))
+            }
+            (None, None) => (None, None),
+            (Some(_), None) => {
+                return Err(anyhow!(
                     "MIN_PREPAID_TRAFFIC_BALANCE_CC is set but PREPAID_TRAFFIC_TOPUP_CC is not — both required for auto-topup"
-                )),
-                (None, Some(_)) => return Err(anyhow!(
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(anyhow!(
                     "PREPAID_TRAFFIC_TOPUP_CC is set but MIN_PREPAID_TRAFFIC_BALANCE_CC is not — both required for auto-topup"
-                )),
-            };
+                ));
+            }
+        };
 
         // --- RFQ V2 env overrides (MERGE_* idiom) ---
         if let Some(ref mut lp) = agent.liquidity_provider {
@@ -635,7 +682,8 @@ impl BaseConfig {
             let ticket_batch_env: Option<usize> = std::env::var("TICKET_BATCH_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok());
-            if rfq_v2_env.is_some() || ticket_threshold_env.is_some() || ticket_batch_env.is_some() {
+            if rfq_v2_env.is_some() || ticket_threshold_env.is_some() || ticket_batch_env.is_some()
+            {
                 let v2 = lp.rfq_v2.get_or_insert_with(RfqV2Config::default);
                 if let Some(enabled) = rfq_v2_env {
                     v2.enabled = enabled;
@@ -669,7 +717,8 @@ impl BaseConfig {
                     return Err(anyhow!(
                         "Market {}: [markets.rfq.v2] max_input_holdings={} must be 1..=100 \
                          (relay protocol hard bound)",
-                        market.market_id, v2m.max_input_holdings
+                        market.market_id,
+                        v2m.max_input_holdings
                     ));
                 }
                 if global_ladders && !v2m.denominations.is_empty() {
@@ -690,12 +739,20 @@ impl BaseConfig {
             }
         }
 
-        if let Some(v2) = agent.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()) {
+        if let Some(v2) = agent
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref())
+        {
             if v2.ticket_batch_size == 0 {
-                return Err(anyhow!("[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"));
+                return Err(anyhow!(
+                    "[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"
+                ));
             }
             if v2.atomic_quote_valid_secs == 0 {
-                return Err(anyhow!("[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"));
+                return Err(anyhow!(
+                    "[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"
+                ));
             }
         }
 
@@ -704,7 +761,8 @@ impl BaseConfig {
         // source for the runtime AND the atomic CLI, so the venue key and the
         // signing key can never diverge.
         let atomic_quote_key = if rfq_v2_enabled {
-            let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY").ok()
+            let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
+                .ok()
                 .filter(|s| !s.trim().is_empty())
                 .context(
                     "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
@@ -743,6 +801,8 @@ impl BaseConfig {
             canton_op_timeout_secs: agent.canton_op_timeout_secs,
             markets: agent.markets,
             node_name,
+            // Production cloud-agent deployments set VENUE_BRANCH=agent (VA13).
+            venue_branch: std::env::var("VENUE_BRANCH").ok().filter(|v| !v.is_empty()),
             ledger_service_public_key,
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
@@ -902,11 +962,7 @@ pub fn load_shared_configuration(
 
     match toml::from_str::<SharedConfiguration>(&contents) {
         Ok(config) => {
-            tracing::info!(
-                "Loaded {} registries from {}",
-                config.registry.len(),
-                path
-            );
+            tracing::info!("Loaded {} registries from {}", config.registry.len(), path);
             let registries = config.registry.into_iter().map(|r| r.party).collect();
             let cc_id = config.canton_coin.into_iter().next().map(|cc| {
                 tracing::info!("Canton Coin: {} ({})", cc.token_id, cc.dso_party);
@@ -1272,8 +1328,14 @@ max_quantity = "1000"
 "#,
         )
         .unwrap();
-        assert_eq!(agent.liquidity_provider.as_ref().unwrap().min_notional_usd, 0.0);
-        assert_eq!(agent.markets[0].rfq.as_ref().unwrap().min_notional_usd, None);
+        assert_eq!(
+            agent.liquidity_provider.as_ref().unwrap().min_notional_usd,
+            0.0
+        );
+        assert_eq!(
+            agent.markets[0].rfq.as_ref().unwrap().min_notional_usd,
+            None
+        );
 
         // Global set with an integer literal (as written in the deployed tomls)
         // must coerce to f64; the per-market value overrides the global.
@@ -1293,8 +1355,14 @@ min_notional_usd = 25.0
 "#,
         )
         .unwrap();
-        assert_eq!(agent.liquidity_provider.as_ref().unwrap().min_notional_usd, 10.0);
-        assert_eq!(agent.markets[0].rfq.as_ref().unwrap().min_notional_usd, Some(25.0));
+        assert_eq!(
+            agent.liquidity_provider.as_ref().unwrap().min_notional_usd,
+            10.0
+        );
+        assert_eq!(
+            agent.markets[0].rfq.as_ref().unwrap().min_notional_usd,
+            Some(25.0)
+        );
     }
 
     #[test]
@@ -1340,7 +1408,13 @@ denominations = ["25x20", "100x10"]
 "#,
         )
         .unwrap();
-        let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        let v2 = agent
+            .liquidity_provider
+            .as_ref()
+            .unwrap()
+            .rfq_v2
+            .as_ref()
+            .unwrap();
         assert!(v2.enabled);
         assert_eq!(v2.atomic_quote_valid_secs, 120);
         assert_eq!(v2.settle_grace_secs, 30);
@@ -1373,7 +1447,13 @@ USDC = ["15x10"]
 "#,
         )
         .unwrap();
-        let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        let v2 = agent
+            .liquidity_provider
+            .as_ref()
+            .unwrap()
+            .rfq_v2
+            .as_ref()
+            .unwrap();
         assert_eq!(v2.denominations["CC"], vec!["100x10", "250x4"]);
         assert_eq!(v2.denominations["USDC"], vec!["15x10"]);
 
@@ -1390,7 +1470,13 @@ split_max_ops_per_hour = 3
 "#,
         )
         .unwrap();
-        let v2 = agent.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        let v2 = agent
+            .liquidity_provider
+            .as_ref()
+            .unwrap()
+            .rfq_v2
+            .as_ref()
+            .unwrap();
         assert_eq!(v2.split_low_water_divisor, 2);
         assert_eq!(v2.split_min_interval_secs, 300);
         assert_eq!(v2.split_max_ops_per_hour, 3);
@@ -1407,7 +1493,12 @@ ticket_threshold_usd = 250.5
         )
         .unwrap();
         assert_eq!(
-            agent.liquidity_provider.unwrap().rfq_v2.unwrap().ticket_threshold_usd,
+            agent
+                .liquidity_provider
+                .unwrap()
+                .rfq_v2
+                .unwrap()
+                .ticket_threshold_usd,
             Some(250.5)
         );
     }
@@ -1434,8 +1525,16 @@ ticket_threshold_usd = 250.5
         set("SYNCHRONIZER_ID", "sync::1220cc");
         set("PARTY_SETTLEMENT_OPERATOR", "op::1220dd");
         set("NODE_NAME", "test-node");
-        set("LEDGER_SERVICE_PUBLIC_KEY", &bs58::encode([7u8; 32]).into_string());
-        for k in ["RFQ_V2_ENABLED", "TICKET_THRESHOLD_USD", "TICKET_BATCH_SIZE", "ATOMIC_QUOTE_PRIVATE_KEY"] {
+        set(
+            "LEDGER_SERVICE_PUBLIC_KEY",
+            &bs58::encode([7u8; 32]).into_string(),
+        );
+        for k in [
+            "RFQ_V2_ENABLED",
+            "TICKET_THRESHOLD_USD",
+            "TICKET_BATCH_SIZE",
+            "ATOMIC_QUOTE_PRIVATE_KEY",
+        ] {
             unset(k);
         }
 
@@ -1468,7 +1567,13 @@ enabled = true
         set("TICKET_BATCH_SIZE", "77");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
         let cfg = BaseConfig::assemble(agent).unwrap();
-        let v2 = cfg.liquidity_provider.as_ref().unwrap().rfq_v2.as_ref().unwrap();
+        let v2 = cfg
+            .liquidity_provider
+            .as_ref()
+            .unwrap()
+            .rfq_v2
+            .as_ref()
+            .unwrap();
         assert!(v2.enabled);
         assert_eq!(v2.ticket_threshold_usd, Some(250.0));
         assert_eq!(v2.ticket_batch_size, 77);
