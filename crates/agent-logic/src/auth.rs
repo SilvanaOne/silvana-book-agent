@@ -98,6 +98,39 @@ pub fn generate_jwt_with_branch(
     Ok(jwt)
 }
 
+/// Is `s` a valid swap-venue slug (`^[a-z0-9][a-z0-9-]{1,19}$`)?
+///
+/// Mirrors orderbook-rpc's server-side rule. Kept here so a misconfigured
+/// branch is caught in the OPERATOR's own logs at startup instead of only in
+/// a server-side warn they never read — the server silently falls back to
+/// "main", which is precisely the indistinguishable attribution VA13 exists
+/// to remove.
+pub fn is_valid_venue_branch(s: &str) -> bool {
+    let b = s.as_bytes();
+    (2..=20).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// Read a venue-branch env var: trimmed, empty treated as unset, and WARNed
+/// (then dropped) when it is not a valid slug — a bad value must not be minted
+/// into tokens only to be silently discarded server-side.
+pub fn venue_branch_from_env(var: &str) -> Option<String> {
+    let raw = std::env::var(var).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !is_valid_venue_branch(trimmed) {
+        tracing::warn!(
+            "{var}='{raw}' is not a valid venue branch (^[a-z0-9][a-z0-9-]{{1,19}}$) —              ignoring it; this agent's RFQ V2 traffic will be attributed to the server default"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Decode Base58 Solana-style Ed25519 private key to 32-byte seed
 ///
 /// Solana keys can be:
@@ -207,5 +240,26 @@ mod tests {
         assert!(jwt.contains('.'));
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
+    }
+
+    /// VA13: the client-side slug rule must match the server's, so a bad
+    /// value is caught in the operator's own logs rather than silently
+    /// degrading attribution to "main".
+    #[test]
+    fn test_is_valid_venue_branch() {
+        for ok in ["agent", "rfqv2-agent", "main", "site", "a1", "abcdefghijklmnopqrst"] {
+            assert!(is_valid_venue_branch(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "a",                       // too short
+            "abcdefghijklmnopqrstu",   // 21 chars
+            "agent ",                  // trailing space (the .env trap)
+            "cloud_agent",             // underscore
+            "Agent",                   // uppercase
+            "-agent",                  // leading dash
+        ] {
+            assert!(!is_valid_venue_branch(bad), "{bad:?} should be invalid");
+        }
     }
 }

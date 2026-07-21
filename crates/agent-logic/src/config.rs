@@ -356,7 +356,7 @@ impl BaseConfig {
             canton_op_timeout_secs: default_canton_op_timeout_secs(),
             markets: Vec::new(),
             node_name: node_name.to_string(),
-            venue_branch: std::env::var("VENUE_BRANCH").ok().filter(|v| !v.is_empty()),
+            venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
             ledger_service_public_key,
             liquidity_provider: None,
             max_active_settlements: 10,
@@ -802,7 +802,7 @@ impl BaseConfig {
             markets: agent.markets,
             node_name,
             // Production cloud-agent deployments set VENUE_BRANCH=agent (VA13).
-            venue_branch: std::env::var("VENUE_BRANCH").ok().filter(|v| !v.is_empty()),
+            venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
             ledger_service_public_key,
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,

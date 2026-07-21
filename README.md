@@ -250,6 +250,7 @@ Flags:
 | `CANTON_CHAIN`                   | `devnet` \| `testnet` \| `mainnet`                                     |         yes          |
 | `SYNCHRONIZER_ID`                | Canton synchronizer ID                                                 |         yes          |
 | `NODE_NAME`                      | Canton node name for routing                                           |         yes          |
+| `VENUE_BRANCH`                   | RFQ V2 analytics branch stamped into this agent's JWT; slug `^[a-z0-9][a-z0-9-]{1,19}$`. Unset = server default `main`. Production cloud-agents: `agent` |          no          |
 | `LEDGER_SERVICE_PUBLIC_KEY`      | Base58 public key of the ledger service (for verifying responses)      |         yes          |
 | `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
 | `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
