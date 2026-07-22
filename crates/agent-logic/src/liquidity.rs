@@ -360,9 +360,10 @@ impl LiquidityManager {
     /// Returns the number of orphaned reservations dropped (for logging).
     pub async fn retain_commitments(&self, live_ids: &HashSet<String>) -> usize {
         let mut s = self.state.write().await;
-        // RFQ V2 soft reserves ("rfqv2:<quote_id>") are NOT settlement proposals
+        // RFQ V2 confirm-time commitments ("rfqv2:<quote_id>", held from
+        // confirm until settle-observed/expiry) are NOT settlement proposals
         // and never appear in the runner's live set — they are released by the
-        // V2 sweep / confirm path, so the reconciler must not reap them.
+        // V2 settle/sweep path, so the reconciler must not reap them.
         let keep = |pid: &String| live_ids.contains(pid) || pid.starts_with("rfqv2:");
         // Count the UNION of orphaned proposal_ids across both maps, so the
         // returned count (and the runner's warn!) can't silently undercount if
@@ -802,6 +803,31 @@ mod tests {
 
         // Empty live set → p_live is also reclaimed (full reset, as on reboot).
         assert_eq!(lm.retain_commitments(&HashSet::new()).await, 1);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+    }
+
+    #[tokio::test]
+    async fn test_retain_commitments_keeps_rfqv2_keys() {
+        // RFQ V2 confirm-time commitments ("rfqv2:<quote_id>") never appear in
+        // the runner's live set (they are not settlement proposals) — the
+        // reconciler must not reap them; the V2 settle/sweep path releases
+        // them. Reaping here would silently un-reserve a signed quote's funds.
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+
+        lm.try_commit("rfqv2:q1", "USDCx", Decimal::from(1500), Decimal::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lm.available("USDCx").await, Decimal::from(3500));
+
+        // Empty live set: an ordinary proposal would be reaped; the rfqv2 key
+        // survives.
+        assert_eq!(lm.retain_commitments(&HashSet::new()).await, 0);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(3500));
+
+        // The V2 path's own release is what frees it.
+        lm.release("rfqv2:q1").await;
         assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
     }
 }

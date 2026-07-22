@@ -225,12 +225,15 @@ impl std::ops::Deref for AtomicQuoteKey {
     }
 }
 
-#[cfg(test)]
 impl BaseConfig {
     /// Minimal config for unit tests. Only the fields a test actually reads
     /// matter; everything else is a zero/empty placeholder. Centralized here so
     /// adding a `BaseConfig` field breaks one place, not every executor test.
-    pub(crate) fn test_minimal() -> Self {
+    /// `pub` (not `cfg(test)`) so dependent crates' test modules (cloud-agent's
+    /// rfq_v2 tests) can build a state harness; hidden from docs — never use
+    /// outside tests.
+    #[doc(hidden)]
+    pub fn test_minimal() -> Self {
         Self {
             orderbook_grpc_url: String::new(),
             synchronizer_id: String::new(),

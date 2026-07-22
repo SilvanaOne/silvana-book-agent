@@ -64,7 +64,7 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 static GC_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag("DVP_GC_ENABLED", true));
 static GC_MIN_COEFFICIENT: LazyLock<f64> =
     LazyLock::new(|| env_parse("DVP_GC_MIN_COEFFICIENT", 0.72));
-static GC_DELAY_SECS: LazyLock<u64> = LazyLock::new(|| env_parse("DVP_GC_DELAY_SECS", 10));
+static GC_DELAY_SECS: LazyLock<u64> = LazyLock::new(|| env_parse("DVP_GC_DELAY_SECS", 5));
 static GC_REJECT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag("DVP_GC_REJECT_ENABLED", true));
 static GC_REFRESH_SECS: LazyLock<u64> = LazyLock::new(|| env_parse("DVP_GC_REFRESH_SECS", 3600));
