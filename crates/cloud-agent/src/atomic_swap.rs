@@ -40,7 +40,9 @@ use crate::ledger_client::{is_ambiguous_execute_error, AtomicProviderClient, DAp
 
 /// H14 safety margin: the signed window must exceed this at pre-check time
 /// (the reference CLI uses 0; agents leave room for prepare+sign+execute).
-const PRECHECK_VALIDITY_MARGIN_MICROS: i64 = 10_000_000;
+/// Shared with `ledger_client`'s submit-retry loop, which uses the same budget
+/// to decide whether re-preparing can still land inside the signed window.
+pub(crate) const PRECHECK_VALIDITY_MARGIN_MICROS: i64 = 10_000_000;
 
 /// Grace beyond the signed `valid_until` for the taker's own input
 /// reservations (mirrors the LP's `settle_grace_secs` default).
