@@ -765,6 +765,39 @@ impl HoldingsCache {
         amounts.into_iter().take(max_inputs).sum()
     }
 
+    /// Contract-ids that WOULD be selectable for disclosure (fresh, unconsumed,
+    /// no unexpired reservation, splitter reserve honored per `include_reserve`)
+    /// EXCEPT their `created_event_blob` is still `None` — watcher-/own-tx-
+    /// discovered outputs awaiting blob backfill. The atomic layer re-fetches
+    /// these via a targeted GetAtomicContracts so a cold cache self-heals
+    /// instead of waiting for the 30s ACS cycle. Largest-first, capped at 100
+    /// (the settle-side input cap) to bound the fetch body.
+    pub async fn blob_pending_cids(&self, instrument: &str, include_reserve: bool) -> Vec<String> {
+        let now = Instant::now();
+        let available = self.available.read().await;
+        let consumed = self.consumed.read().await;
+        let reserved = self.reserved.read().await;
+        let splitter_cid = if !include_reserve && self.splitter_reserve_enabled {
+            Self::splitter_reserve_cid(&available, &consumed, now, instrument)
+        } else {
+            None
+        };
+        let mut pending: Vec<&CachedHolding> = available
+            .values()
+            .filter(|h| h.instrument == instrument)
+            .filter(|h| now.duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
+            .filter(|h| !consumed.contains_key(&h.contract_id))
+            .filter(|h| match reserved.get(&h.contract_id) {
+                Some(entry) => entry.is_expired(now),
+                None => true,
+            })
+            .filter(|h| Some(&h.contract_id) != splitter_cid.as_ref())
+            .filter(|h| h.created_event_blob.is_none())
+            .collect();
+        pending.sort_unstable_by(|a, b| b.amount.cmp(&a.amount));
+        pending.into_iter().take(100).map(|h| h.contract_id.clone()).collect()
+    }
+
     /// Cache statistics for one instrument: (available, consumed, reserved, selectable).
     pub async fn stats(&self, instrument: &str) -> (usize, usize, usize, usize) {
         let now = Instant::now();
@@ -1551,6 +1584,61 @@ mod tests {
             ])
             .await;
         assert!(cache.splitter_reserve(USDC).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_pending_cids_returns_only_backfillable_holdings() {
+        let cache = HoldingsCache::new(true);
+        cache
+            .add_created(vec![
+                holding("pending-big", USDC, "80", false),
+                holding("pending-small", USDC, "20", false),
+                holding("ready", USDC, "50", true),
+                holding("pending-consumed", USDC, "30", false),
+                holding("pending-reserved", USDC, "40", false),
+                // largest AVAILABLE holding = splitter reserve (blob-pending on
+                // purpose: the reserve exclusion must still apply to it)
+                holding("pending-reserve", USDC, "1000", false),
+                holding("other-instr", "reg::CBTC", "60", false),
+            ])
+            .await;
+        cache.mark_consumed(&["pending-consumed".to_string()], "settle").await;
+        assert!(
+            cache
+                .reserve_v2(
+                    &["pending-reserved".to_string()],
+                    "q1",
+                    Instant::now() + std::time::Duration::from_secs(60),
+                )
+                .await
+        );
+
+        // Reserve-excluding view (LP confirm; include_reserve=false): the
+        // splitter reserve, consumed, reserved, blob-ready, and foreign-
+        // instrument entries all drop out. Largest-first order.
+        let cids = cache.blob_pending_cids(USDC, false).await;
+        assert_eq!(cids, vec!["pending-big".to_string(), "pending-small".to_string()]);
+
+        // spend_reserve view (taker): the splitter reserve is fetchable too.
+        let cids = cache.blob_pending_cids(USDC, true).await;
+        assert_eq!(
+            cids,
+            vec![
+                "pending-reserve".to_string(),
+                "pending-big".to_string(),
+                "pending-small".to_string()
+            ]
+        );
+
+        // TTL-stale blob-pending entries are not worth fetching: even with a
+        // backfilled blob get_selectable would still drop them.
+        if let Some(stale_at) = stale_instant() {
+            let cache = HoldingsCache::new(true);
+            cache
+                .add_created(vec![holding_at("stale-pending", USDC, "70", false, stale_at)])
+                .await;
+            assert!(cache.blob_pending_cids(USDC, true).await.is_empty());
+        }
     }
 
     #[tokio::test]
