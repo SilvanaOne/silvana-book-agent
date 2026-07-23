@@ -1,12 +1,17 @@
 //! RFQ V2 (AtomicDVP) LP-side quote state machine (design §5.5, §5.7).
 //!
 //! Transitions per quote_id:
-//! `Indicative{soft reserve}` → (confirm) → `Confirmed{holdings, ticket, envelope}`
-//! → (SettleObserved) → `Settled`, and → `Expired` from either live state via
-//! the sweep.
+//! `Indicative{availability check only}` → (confirm) → `Confirmed{LM
+//! commitment, holdings, ticket, envelope}` → (SettleObserved) → `Settled`,
+//! and → `Expired` from either live state via the sweep.
+//!
+//! Indicative quotes are non-binding and hold NO LiquidityManager commitment
+//! (reserving the full LP-pays leg per ~90s indicative quote saturated the
+//! whole balance under concurrent RFQ load); the atomic check-and-reserve is
+//! confirm-phase Step 1.5, held until settle/expiry.
 //!
 //! Reject-path invariant: EVERY confirm reject releases everything the
-//! pipeline acquired before returning — the phase-1 soft LiquidityManager
+//! pipeline acquired before returning — the Step-1.5 LiquidityManager
 //! commitment (`"rfqv2:"+quote_id`), any hard-reserved holdings, and any
 //! assigned ticket — and drops the pending entry. The sweep is the backstop,
 //! not the mechanism.
@@ -245,6 +250,17 @@ impl RfqV2State {
         format!("rfqv2:{quote_id}")
     }
 
+    /// Test-only visibility into the per-quote state machine.
+    #[cfg(test)]
+    pub(crate) fn pending_kind(&self, quote_id: &str) -> Option<&'static str> {
+        self.pending.lock().unwrap().get(quote_id).map(|e| match e {
+            PendingV2::Indicative { .. } => "Indicative",
+            PendingV2::Confirmed { .. } => "Confirmed",
+            PendingV2::Settled { .. } => "Settled",
+            PendingV2::Expired { .. } => "Expired",
+        })
+    }
+
     /// Is this market quotable over the atomic stream right now?
     pub fn quotable(&self, market_id: &str) -> bool {
         self.market_v2.contains_key(market_id)
@@ -257,12 +273,13 @@ impl RfqV2State {
     }
 
     // ------------------------------------------------------------------
-    // Phase 1 — indicative quote + soft reserve
+    // Phase 1 — indicative quote + availability check
     // ------------------------------------------------------------------
 
-    /// Soft-reserve the LP-pays amount for the indicative validity window and
-    /// record the Indicative entry. `side` is the USER side (Buy = user buys
-    /// base ⇒ LP pays base).
+    /// Check the LP-pays amount is available (advisory — no commitment) and
+    /// record the Indicative entry; the LiquidityManager commitment happens at
+    /// confirm (Step 1.5). `side` is the USER side (Buy = user buys base ⇒ LP
+    /// pays base).
     pub(crate) async fn register_indicative(
         &self,
         quote_id: &str,
@@ -281,11 +298,21 @@ impl RfqV2State {
         };
         let (lp_pays_token, lp_pays_amount) = priced.lp_pays.clone();
 
-        // fee_cc = 0: the LP pays no on-chain fee on a V2 settle (the user
-        // submits the transaction).
-        self.liquidity_manager
-            .try_commit(&Self::lm_key(quote_id), &lp_pays_token, lp_pays_amount, Decimal::ZERO)
-            .await?;
+        // Advisory availability check ONLY — no commitment. Indicative quotes
+        // are non-binding; reserving the full LP-pays leg per quote saturated
+        // the whole balance under concurrent RFQ load (mainnet 2026-07-22:
+        // 999.9 bal / 999.3 committed) while most quotes never confirmed. The
+        // atomic check-and-reserve happens at confirm (`handle_confirm` Step
+        // 1.5) — over-quoting across concurrent indicatives is by design
+        // (last-look), with the confirm-time try_commit as the backstop.
+        // (No CC-fee term: the LP pays no on-chain fee on a V2 settle — the
+        // user submits the transaction.)
+        let avail = self.liquidity_manager.available(&lp_pays_token).await;
+        if avail < lp_pays_amount {
+            return Err(format!(
+                "insufficient {lp_pays_token} ({avail:.4} available, {lp_pays_amount:.4} needed)"
+            ));
+        }
 
         let valid_until = Instant::now() + Duration::from_secs(priced.valid_for_secs as u64);
         self.pending.lock().unwrap().insert(
@@ -488,7 +515,8 @@ impl RfqV2State {
                     ));
                 }
                 Lookup::ExpiredIndicative => {
-                    // eager release of the soft reserve + entry drop
+                    // eager entry drop (no LM commitment exists at indicative;
+                    // release_on_reject's LM part is an idempotent no-op)
                     self.release_on_reject(&quote_id, &[], false).await;
                     return Err(self.reject(
                         &req,
@@ -524,6 +552,29 @@ impl RfqV2State {
                 &req,
                 RfqConfirmRejectReason::InternalError,
                 "confirm settlement_fee does not match the RFQ-time fee",
+            ));
+        }
+
+        // Step 1.5 — funds commitment. Indicative quotes only CHECK
+        // availability (register_indicative); the atomic check-and-reserve
+        // happens here, first — try_commit re-checks under the LM write lock,
+        // failing fast on the contended resource before any expensive work
+        // (venue, cid selection, split wait, ticket, signing). Held through
+        // Confirmed until settle-observed or the expiry sweep releases it.
+        // Every later failure exit goes through release_on_reject, whose
+        // first act is the LM release. (CC legs are conservatively excluded
+        // twice — cache totals feed update_cc_balance AND this commitment —
+        // for the bounded confirm→settle window; accepted.)
+        if let Err(e) = self
+            .liquidity_manager
+            .try_commit(&Self::lm_key(&quote_id), &lp_pays_token, lp_pays.1, Decimal::ZERO)
+            .await
+        {
+            self.release_on_reject(&quote_id, &[], false).await;
+            return Err(self.reject(
+                &req,
+                RfqConfirmRejectReason::InsufficientHoldings,
+                format!("liquidity commit failed: {e}"),
             ));
         }
 
@@ -785,10 +836,12 @@ impl RfqV2State {
             utility_accept_refs: Vec::new(),
         };
 
-        // Soft → hard conversion: the physical HoldingsCache reservation now
-        // carries the exclusion (its totals feed the LiquidityManager), so the
-        // phase-1 amount commitment is released — excluded exactly once.
-        self.liquidity_manager.release(&Self::lm_key(&quote_id)).await;
+        // The Step-1.5 LM commitment persists into Confirmed: cache cid
+        // reservations feed the LiquidityManager only for CC (the ACS worker's
+        // update_cc_balance) — non-CC balances come from GetBalances unlocked,
+        // blind to cache reservations — so the commitment is the ONLY thing
+        // excluding a confirmed non-CC leg from the balance gate. Released by
+        // settle-observed or the Confirmed-expiry sweep.
 
         let ticket_cid = ticket.as_ref().map(|(_, e)| e.contract_id.clone());
         {
@@ -884,16 +937,17 @@ impl RfqV2State {
                     pool.mark_spent(quote_id);
                 }
             }
-            // Belt-and-braces: the soft commitment was already released at
-            // confirm; an idempotent release here is harmless.
+            // Primary release of the Step-1.5 confirm-time commitment: the
+            // settle landed, the funds have physically left.
             self.liquidity_manager.release(&Self::lm_key(quote_id)).await;
         }
     }
 
-    /// Expire stale entries: Indicative past validity (release soft reserve),
-    /// Confirmed past valid_until+grace (release holdings + ticket), GC
-    /// tombstones + correlation entries. Called every ~10 s from the stream
-    /// task; the caches' own TTLs are the backstop when the stream is down.
+    /// Expire stale entries: Indicative past validity (drop entry — no LM
+    /// commitment to release), Confirmed past valid_until+grace (release the
+    /// confirm-time LM commitment + holdings + ticket), GC tombstones +
+    /// correlation entries. Called every ~10 s from the stream task; the
+    /// caches' own TTLs are the backstop when the stream is down.
     pub async fn sweep(&self, now: Instant) {
         struct Release {
             quote_id: String,
@@ -912,7 +966,9 @@ impl RfqV2State {
                     PendingV2::Indicative { valid_until, .. } if now >= *valid_until => {
                         releases.push(Release {
                             quote_id: quote_id.clone(),
-                            lm: true,
+                            // Indicative quotes hold no LM commitment (advisory
+                            // check only) — nothing to release.
+                            lm: false,
                             holding_cids: Vec::new(),
                             ticket: false,
                         });
@@ -927,7 +983,7 @@ impl RfqV2State {
                     } if now >= *expires_at => {
                         releases.push(Release {
                             quote_id: quote_id.clone(),
-                            lm: true, // idempotent; already released at confirm
+                            lm: true, // releases the confirm-time commitment on expiry
                             holding_cids: holding_cids.clone(),
                             ticket: !ticket_id.is_empty(),
                         });
@@ -1055,5 +1111,182 @@ impl RfqV2State {
     /// updates watcher as a fallback to the cache's reservation kind).
     pub fn quote_for_cid(&self, cid: &str) -> Option<String> {
         self.correlation.lock().unwrap().get(cid).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rfq_handler::PricedQuote;
+    use crate::venue_registry::VenueRegistry;
+    use orderbook_proto::rfqv2::RfqConfirmRequest;
+    use std::str::FromStr;
+
+    const MARKET: &str = "EDELx-USDCx";
+    const USDCX_KEY: &str = "reg::USDCx";
+
+    /// State harness: one market, empty venue registry (confirm's Step 2
+    /// venue lookup fails — deliberate: everything up to and including the
+    /// Step-1.5 funds commitment is exercisable without a signable venue).
+    fn state_with(lm: Arc<LiquidityManager>) -> RfqV2State {
+        let mut market_instruments = HashMap::new();
+        market_instruments.insert(
+            MARKET.to_string(),
+            MarketInstruments {
+                base_key: "reg::EDELx".to_string(),
+                base_is_cc: false,
+                quote_key: USDCX_KEY.to_string(),
+                quote_is_cc: false,
+            },
+        );
+        RfqV2State::new(
+            "lp-party::1220test".to_string(),
+            "LP Test".to_string(),
+            "sync::test".to_string(),
+            String::new(),
+            RfqV2Config::default(),
+            HashMap::new(),
+            market_instruments,
+            crate::holdings_cache::HoldingsCache::new(false),
+            None,
+            Arc::new(VenueRegistry::new(
+                "lp-party::1220test".to_string(),
+                String::new(),
+                HashMap::new(),
+            )),
+            lm,
+            agent_logic::config::BaseConfig::test_minimal(),
+            &[],
+        )
+    }
+
+    async fn lm_with_usdcx(balance: u32) -> Arc<LiquidityManager> {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(balance)).await;
+        lm
+    }
+
+    /// User Sell ⇒ LP pays the quote leg (USDCx).
+    fn priced_sell(lp_pays_usdcx: u32, valid_for_secs: u32) -> PricedQuote {
+        let amount = Decimal::from(lp_pays_usdcx);
+        PricedQuote {
+            market_id: MARKET.to_string(),
+            price: Decimal::from_str("0.01").unwrap(),
+            quantity: amount * Decimal::from(100),
+            quote_quantity: amount,
+            price_str: "0.0100000000".to_string(),
+            quantity_str: format!("{:.10}", lp_pays_usdcx as f64 * 100.0),
+            quote_quantity_str: format!("{:.10}", lp_pays_usdcx as f64),
+            lp_pays: ("USDCx".to_string(), amount),
+            notional_usd: Some(lp_pays_usdcx as f64),
+            valid_for_secs,
+            allocate_before_secs: 0,
+            settle_before_secs: 0,
+        }
+    }
+
+    fn confirm_req(quote_id: &str) -> RfqConfirmRequest {
+        RfqConfirmRequest {
+            rfq_id: "rfq-1".to_string(),
+            quote_id: quote_id.to_string(),
+            user_party: "user::1220test".to_string(),
+            market_id: MARKET.to_string(),
+            direction: "sell".to_string(),
+            quantity: String::new(),
+            quote_quantity: String::new(),
+            price: String::new(),
+            respond_by: None,
+            settlement_fee: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn indicative_checks_availability_without_committing() {
+        let lm = lm_with_usdcx(1000).await;
+        let state = state_with(lm.clone());
+
+        state
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None)
+            .await
+            .unwrap();
+
+        // Advisory check only: nothing committed, full balance still available.
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+        assert_eq!(state.pending_kind("q1"), Some("Indicative"));
+
+        // Over-quoting across concurrent indicatives is allowed by design:
+        // a second 800 quote passes the check even though 500 + 800 > 1000.
+        state
+            .register_indicative("q2", MARKET, QuoteSide::Sell, &priced_sell(800, 90), None)
+            .await
+            .unwrap();
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+    }
+
+    #[tokio::test]
+    async fn indicative_rejects_when_insufficient() {
+        let lm = lm_with_usdcx(1000).await;
+        let state = state_with(lm.clone());
+
+        let err = state
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(1500, 90), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("insufficient"), "unexpected error: {err}");
+        assert_eq!(state.pending_kind("q1"), None);
+    }
+
+    #[tokio::test]
+    async fn confirm_commits_and_rejects_when_overcommitted() {
+        let lm = lm_with_usdcx(1000).await;
+        let state = state_with(lm.clone());
+
+        state
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None)
+            .await
+            .unwrap();
+
+        // A competing commitment (e.g. another quote's confirm) shrinks
+        // availability below the LP-pays leg: Step 1.5 must reject with
+        // InsufficientHoldings and drop the entry, leaving the competitor's
+        // commitment untouched.
+        lm.try_commit("competitor", "USDCx", Decimal::from(600), Decimal::ZERO)
+            .await
+            .unwrap();
+        let reject = state.handle_confirm(confirm_req("q1")).await.unwrap_err();
+        assert_eq!(reject.reason, RfqConfirmRejectReason::InsufficientHoldings as i32);
+        assert_eq!(state.pending_kind("q1"), None);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(400)); // competitor only
+
+        // With headroom, Step 1.5 commits — the pipeline then fails at the
+        // Step-2 venue lookup (empty registry) and release_on_reject must
+        // restore the commitment (commit-then-release ordering).
+        lm.release("competitor").await;
+        state
+            .register_indicative("q3", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None)
+            .await
+            .unwrap();
+        let reject = state.handle_confirm(confirm_req("q3")).await.unwrap_err();
+        assert_eq!(reject.reason, RfqConfirmRejectReason::VenueUnavailable as i32);
+        assert_eq!(state.pending_kind("q3"), None);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_indicative_no_underflow() {
+        let lm = lm_with_usdcx(1000).await;
+        let state = state_with(lm.clone());
+
+        // valid_for_secs = 0: expired the moment it is registered.
+        state
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 0), None)
+            .await
+            .unwrap();
+        state.sweep(Instant::now()).await;
+
+        assert_eq!(state.pending_kind("q1"), Some("Expired"));
+        // No commitment existed; the sweep must not underflow availability.
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
     }
 }

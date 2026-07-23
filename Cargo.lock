@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-logic"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-quote"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "hex",
@@ -432,7 +432,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "cli"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "agent-logic",
  "anyhow",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "cloud-agent"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "agent-logic",
  "anyhow",
@@ -1326,7 +1326,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "message-signing"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -1407,7 +1407,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "orderbook-proto"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "message-signing",
  "once_cell",
@@ -2556,7 +2556,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tx-verifier"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64",

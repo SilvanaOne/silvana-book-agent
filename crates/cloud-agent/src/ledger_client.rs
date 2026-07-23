@@ -1292,6 +1292,36 @@ pub fn is_ambiguous_execute_error(err: &anyhow::Error) -> bool {
     format!("{:#}", err).contains(ATOMIC_EXECUTE_AMBIGUOUS)
 }
 
+/// Marker for "the signed quote window closed before we could retry". NOT
+/// ambiguous: the execute was rejected, so nothing committed and the caller can
+/// re-quote immediately. Distinct from a bare deadline-exceeded DAML_FAILURE,
+/// which is what we get if we re-submit into a dead window instead of stopping.
+pub const QUOTE_WINDOW_CLOSED: &str = "QUOTE_WINDOW_CLOSED";
+
+/// The signed deadline an operation must settle within, if it has one. Only an
+/// AtomicDVP settle carries one — every other operation is deadline-free, so
+/// `None` leaves the retry loop's behavior unchanged.
+fn quote_deadline_of(expectation: &OperationExpectation) -> Option<i64> {
+    match expectation {
+        OperationExpectation::AtomicDvpSettle {
+            valid_until_micros, ..
+        } => Some(*valid_until_micros),
+        _ => None,
+    }
+}
+
+/// Whether re-preparing is pointless because the signed window no longer has
+/// room for a full prepare→sign→execute round. Reuses the taker-side pre-check
+/// margin so the two agree on what "enough time left" means.
+fn quote_window_closed(deadline_micros: Option<i64>, now_micros: i64) -> bool {
+    match deadline_micros {
+        Some(valid_until) => {
+            now_micros + crate::atomic_swap::PRECHECK_VALIDITY_MARGIN_MICROS >= valid_until
+        }
+        None => false,
+    }
+}
+
 /// Build the canonical payload for a PrepareAtomicTransactionRequest.
 /// V2 operation identity = the params oneof arm (no operation int); field
 /// order per arm matches the message-signing canonical builders exactly —
@@ -1599,7 +1629,26 @@ impl AtomicProviderClient {
     ) -> Result<AtomicExecuteResponse> {
         let max_retries = *MAX_RETRIES;
 
+        // An AtomicDVP settle carries a SIGNED deadline: the on-ledger choice
+        // aborts with `deadline-exceeded` once ledger time passes it. Every
+        // `continue` below re-prepares from scratch, so without this a slow
+        // failure (notably MEDIATOR_SAYS_TX_TIMED_OUT, which can surface later
+        // than the whole validity window) burns its retries re-submitting into
+        // a window that has already closed — turning a clean re-quote into a
+        // DAML_FAILURE. `None` for every other operation: they have no
+        // deadline and keep the previous behavior exactly.
+        let quote_deadline_micros = quote_deadline_of(expectation);
+        let window_closed =
+            || quote_window_closed(quote_deadline_micros, chrono::Utc::now().timestamp_micros());
+
         for attempt in 0..max_retries {
+            // Re-check after the backoff sleep, not just before it: the delay
+            // grows as 1000 * 2^attempt ms, so a late retry can outlive the
+            // window it was cleared against.
+            if attempt > 0 && window_closed() {
+                anyhow::bail!("{QUOTE_WINDOW_CLOSED}: window closed during retry backoff");
+            }
+
             // 1. Prepare (fresh contracts each attempt — contracts may become stale)
             let prepared = match self.prepare_atomic(req.clone()).await {
                 Ok(p) => p,
@@ -1716,7 +1765,7 @@ impl AtomicProviderClient {
 
                 // INACTIVE_CONTRACTS: safe to re-prepare (nothing committed)
                 if error_msg.contains("INACTIVE_CONTRACTS") {
-                    if attempt < max_retries - 1 {
+                    if attempt < max_retries - 1 && !window_closed() {
                         warn!(
                             "INACTIVE_CONTRACTS on atomic tx (attempt {}/{}), re-preparing in 2s [{}]",
                             attempt + 1, max_retries, prepared.command_id
@@ -1724,7 +1773,16 @@ impl AtomicProviderClient {
                         tokio::time::sleep(Duration::from_millis(2000)).await;
                         continue;
                     }
+                    if window_closed() {
+                        anyhow::bail!("{QUOTE_WINDOW_CLOSED}: {error_msg}");
+                    }
                     anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
+                }
+
+                if window_closed() {
+                    // Nothing committed (the execute was rejected), so this is a
+                    // clean re-quote — not an ambiguous outcome.
+                    anyhow::bail!("{QUOTE_WINDOW_CLOSED}: {error_msg}");
                 }
 
                 if attempt < max_retries - 1 {
@@ -1751,3 +1809,71 @@ impl AtomicProviderClient {
     }
 }
 
+#[cfg(test)]
+mod quote_window_tests {
+    use super::*;
+    use crate::atomic_swap::PRECHECK_VALIDITY_MARGIN_MICROS as MARGIN;
+
+    fn atomic_settle(valid_until_micros: i64) -> OperationExpectation {
+        OperationExpectation::AtomicDvpSettle {
+            user_party: "user::1220aa".into(),
+            venue_cid: "00venue".into(),
+            template_id: "#atomic-dvp-v2:AtomicDVP:AtomicDVP".into(),
+            quote_id: "q-1".into(),
+            ticket_id: String::new(),
+            ticket_cid: None,
+            side: "Buy".into(),
+            base_amount: "5.0".into(),
+            quote_amount: "25.0".into(),
+            lp_party: "lp::1220bb".into(),
+            base_instrument_id: "EDELx".into(),
+            base_instrument_admin: "admin::1220cc".into(),
+            quote_instrument_id: "cETH".into(),
+            quote_instrument_admin: "admin::1220dd".into(),
+            valid_until_micros,
+            lp_input_holding_cids: vec!["00lp1".into()],
+            user_input_holding_cids: vec!["00u1".into()],
+        }
+    }
+
+    #[test]
+    fn only_atomic_settle_carries_a_deadline() {
+        assert_eq!(quote_deadline_of(&atomic_settle(1_234)), Some(1_234));
+        // Every other operation stays deadline-free, so the retry loop is
+        // unchanged for it.
+        assert_eq!(
+            quote_deadline_of(&OperationExpectation::IssueTickets {
+                lp_party: "lp::1220bb".into(),
+                ticket_count: 4,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn deadline_free_operations_never_stop_retrying() {
+        assert!(!quote_window_closed(None, i64::MAX));
+    }
+
+    #[test]
+    fn window_closes_once_less_than_the_margin_remains() {
+        let now = 1_000_000_000;
+        // Comfortably open: a full margin plus a second to spare.
+        assert!(!quote_window_closed(Some(now + MARGIN + 1_000_000), now));
+        // Exactly the margin left is NOT enough — prepare+sign+execute needs it.
+        assert!(quote_window_closed(Some(now + MARGIN), now));
+        // Already expired (the W10 case: the mediator timeout surfaced ~5 s
+        // after the quote died, and the old code re-prepared 1 s later).
+        assert!(quote_window_closed(Some(now - 5_000_000), now));
+    }
+
+    #[test]
+    fn guard_agrees_with_the_taker_side_precheck_margin() {
+        // Both sides must call the same window "closed" — otherwise the retry
+        // loop re-prepares something settle_envelope would have rejected.
+        let now = 1_000_000_000;
+        let valid_until = now + MARGIN;
+        assert!(quote_window_closed(Some(valid_until), now));
+        assert!(now + MARGIN >= valid_until, "pre_submit_check bails here too");
+    }
+}

@@ -3,8 +3,11 @@
 //! Generates self-describing Ed25519-signed JWT tokens for authenticating with the orderbook service.
 //! The public key is embedded in the JWT header's `jwk` field per RFC 8037.
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use anyhow::{Context, Result, anyhow};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +29,22 @@ pub fn generate_jwt(
     ttl_secs: u64,
     node_name: Option<&str>,
 ) -> Result<String> {
+    generate_jwt_with_branch(party_id, role, private_key_bytes, ttl_secs, node_name, None)
+}
+
+/// [`generate_jwt`] plus the RFQ V2 swap-venue BRANCH claim.
+///
+/// The branch labels this client's V2 traffic
+/// Must be a slug `^[a-z0-9][a-z0-9-]{1,19}$` or orderbook-rpc warns and
+/// falls back to the default.
+pub fn generate_jwt_with_branch(
+    party_id: &str,
+    role: &str,
+    private_key_bytes: &[u8; 32],
+    ttl_secs: u64,
+    node_name: Option<&str>,
+    venue_branch: Option<&str>,
+) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System time error")?
@@ -40,6 +59,9 @@ pub fn generate_jwt(
     });
     if let Some(nn) = node_name {
         claims["node_name"] = serde_json::Value::String(nn.to_string());
+    }
+    if let Some(branch) = venue_branch.filter(|b| !b.is_empty()) {
+        claims["venue_branch"] = serde_json::Value::String(branch.to_string());
     }
 
     let signing_key = SigningKey::from_bytes(private_key_bytes);
@@ -74,6 +96,39 @@ pub fn generate_jwt(
     let jwt = format!("{}.{}.{}", header_b64, claims_b64, signature_b64);
 
     Ok(jwt)
+}
+
+/// Is `s` a valid swap-venue slug (`^[a-z0-9][a-z0-9-]{1,19}$`)?
+///
+/// Mirrors orderbook-rpc's server-side rule. Kept here so a misconfigured
+/// branch is caught in the OPERATOR's own logs at startup instead of only in
+/// a server-side warn they never read — the server silently falls back to
+/// "main", which is precisely the indistinguishable attribution VA13 exists
+/// to remove.
+pub fn is_valid_venue_branch(s: &str) -> bool {
+    let b = s.as_bytes();
+    (2..=20).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// Read a venue-branch env var: trimmed, empty treated as unset, and WARNed
+/// (then dropped) when it is not a valid slug — a bad value must not be minted
+/// into tokens only to be silently discarded server-side.
+pub fn venue_branch_from_env(var: &str) -> Option<String> {
+    let raw = std::env::var(var).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !is_valid_venue_branch(trimmed) {
+        tracing::warn!(
+            "{var}='{raw}' is not a valid venue branch (^[a-z0-9][a-z0-9-]{{1,19}}$) —              ignoring it; this agent's RFQ V2 traffic will be attributed to the server default"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Decode Base58 Solana-style Ed25519 private key to 32-byte seed
@@ -174,23 +229,37 @@ mod tests {
     fn test_generate_jwt() {
         // Test with raw bytes (simulating decoded base58 key)
         let private_key_bytes: [u8; 32] = [
-            0x0f, 0xe6, 0x65, 0xf7, 0xed, 0xb1, 0x93, 0xdb,
-            0x35, 0xcc, 0x37, 0xd7, 0xd7, 0x03, 0xe1, 0x2a,
-            0xe9, 0x4e, 0x9e, 0x1c, 0x5f, 0x5b, 0x88, 0x57,
-            0xae, 0x1b, 0x6a, 0xca, 0x00, 0x5d, 0xf1, 0x5b,
+            0x0f, 0xe6, 0x65, 0xf7, 0xed, 0xb1, 0x93, 0xdb, 0x35, 0xcc, 0x37, 0xd7, 0xd7, 0x03,
+            0xe1, 0x2a, 0xe9, 0x4e, 0x9e, 0x1c, 0x5f, 0x5b, 0x88, 0x57, 0xae, 0x1b, 0x6a, 0xca,
+            0x00, 0x5d, 0xf1, 0x5b,
         ];
 
-        let jwt = generate_jwt(
-            "test_party",
-            "trader",
-            &private_key_bytes,
-            3600,
-            None,
-        )
-        .expect("Failed to generate JWT");
+        let jwt = generate_jwt("test_party", "trader", &private_key_bytes, 3600, None)
+            .expect("Failed to generate JWT");
 
         assert!(jwt.contains('.'));
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
+    }
+
+    /// VA13: the client-side slug rule must match the server's, so a bad
+    /// value is caught in the operator's own logs rather than silently
+    /// degrading attribution to "main".
+    #[test]
+    fn test_is_valid_venue_branch() {
+        for ok in ["agent", "rfqv2-agent", "main", "site", "a1", "abcdefghijklmnopqrst"] {
+            assert!(is_valid_venue_branch(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "a",                       // too short
+            "abcdefghijklmnopqrstu",   // 21 chars
+            "agent ",                  // trailing space (the .env trap)
+            "cloud_agent",             // underscore
+            "Agent",                   // uppercase
+            "-agent",                  // leading dash
+        ] {
+            assert!(!is_valid_venue_branch(bad), "{bad:?} should be invalid");
+        }
     }
 }

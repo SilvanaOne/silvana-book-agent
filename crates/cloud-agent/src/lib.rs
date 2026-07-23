@@ -1487,8 +1487,9 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
 
 /// Run the RFQ V2 atomic stream (design §5.5): a second bidi stream parallel
 /// to the v1 settlement stream. Phase 1 (AtomicRfqRequest) prices through the
-/// SHARED v1 pipeline and soft-reserves; phase 2 (RfqConfirmRequest) hard
-/// reserves, signs, and returns the disclosure envelope.
+/// SHARED v1 pipeline with an advisory availability check (no reserve); phase
+/// 2 (RfqConfirmRequest) commits the LiquidityManager funds, hard-reserves
+/// holdings, signs, and returns the disclosure envelope.
 pub async fn run_lp_atomic_stream(
     config: BaseConfig,
     rfq_handler: Arc<rfq_handler::RfqHandler>,
@@ -1657,8 +1658,8 @@ pub async fn run_lp_atomic_stream(
                     }
                 }
                 _ = sweep_interval.tick() => {
-                    // Releases expired soft reserves / hard reserves / ticket
-                    // assignments (traceability row 9)
+                    // Releases expired confirm-time LM commitments / hard
+                    // reserves / ticket assignments (traceability row 9)
                     state.sweep(std::time::Instant::now()).await;
                 }
                 msg_result = inbound.next() => {

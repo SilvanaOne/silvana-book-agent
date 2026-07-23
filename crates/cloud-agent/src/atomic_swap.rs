@@ -40,7 +40,9 @@ use crate::ledger_client::{is_ambiguous_execute_error, AtomicProviderClient, DAp
 
 /// H14 safety margin: the signed window must exceed this at pre-check time
 /// (the reference CLI uses 0; agents leave room for prepare+sign+execute).
-const PRECHECK_VALIDITY_MARGIN_MICROS: i64 = 10_000_000;
+/// Shared with `ledger_client`'s submit-retry loop, which uses the same budget
+/// to decide whether re-preparing can still land inside the signed window.
+pub(crate) const PRECHECK_VALIDITY_MARGIN_MICROS: i64 = 10_000_000;
 
 /// Grace beyond the signed `valid_until` for the taker's own input
 /// reservations (mirrors the LP's `settle_grace_secs` default).
@@ -54,6 +56,15 @@ const RECONCILE_POLL: Duration = Duration::from_secs(10);
 /// Prepare-stage transient errors are retried within the validity window,
 /// bounded by this (nothing has reached the ledger yet — safe).
 const MAX_PREPARE_RETRIES: u32 = 5;
+
+/// Hard budget for the cold-cache blob backfill (client creation + targeted
+/// `GetAtomicContracts`) in [`AtomicSwapper::select_leg_with_backfill`].
+/// Healthy-path cost is well under a second; without this cap a degraded
+/// ledger service holds the round for the channel timeouts (~30 s connect +
+/// ~120 s request) where the pre-backfill path was ceilinged at the 28 s
+/// passive wait. On timeout the round falls through to the passive re-poll,
+/// whose deadline stays anchored on the signed window.
+const BACKFILL_BUDGET: Duration = Duration::from_secs(10);
 
 /// A committed atomic fill.
 #[derive(Debug, Clone)]
@@ -293,6 +304,29 @@ enum ReconcileStatus {
     Unknown,
 }
 
+/// Passive-wait deadline for a leg selection (LP confirm-path parity): an
+/// empty selection is often a seconds-long gap — fresh proceeds blob-pending
+/// until the next ACS snapshot, holdings momentarily reserved — not
+/// depletion. Wait inside the signed validity window, keeping the pre-check
+/// margin for prepare+sign+execute — but only when the cache holds enough in
+/// PRINCIPLE (counting stale/blob-pending entries a refresh can revive): a
+/// genuinely underfunded taker must fail fast, not burn the window.
+async fn selection_deadline(
+    cache: &HoldingsCache,
+    key: &str,
+    target: Decimal,
+    valid_until_micros: i64,
+) -> Instant {
+    if cache.total_available_amount(key).await < target {
+        return Instant::now();
+    }
+    let usable_micros = (valid_until_micros
+        - PRECHECK_VALIDITY_MARGIN_MICROS
+        - chrono::Utc::now().timestamp_micros())
+    .max(0) as u64;
+    Instant::now() + Duration::from_micros(usable_micros).min(crate::rfq_v2::MAX_CONFIRM_SPLIT_WAIT)
+}
+
 impl AtomicSwapper {
     /// One accepted-envelope round: H14 pre-check → select+reserve own inputs
     /// → prepare/verify/sign/execute → confirm or classify the failure.
@@ -460,41 +494,20 @@ impl AtomicSwapper {
             .map(|((_, id), total)| fee_target(id, *total))
             .sum();
         let select_target = amount_needed + pay_fee_extra;
-        // Bounded re-poll (LP confirm-path parity): an empty selection is
-        // often a seconds-long gap — fresh proceeds blob-pending until the
-        // next ACS snapshot, holdings momentarily reserved — not depletion.
-        // Wait inside the signed validity window, keeping the pre-check
-        // margin for prepare+sign+execute — but only when the cache holds
-        // enough in PRINCIPLE (counting stale/blob-pending entries a refresh
-        // can revive): a genuinely underfunded taker must fail fast, not
-        // burn the window.
+        // Selection is backfill-aware ([`Self::select_leg_with_backfill`]):
+        // immediate try, then an on-demand blob backfill for the cold-cache
+        // case, then the bounded passive re-poll. The client opened for the
+        // backfill is reused for the fee leg and the submit loop.
         let valid_until_micros: i64 = env.quote.valid_until_micros.parse()?;
-        async fn selection_deadline(
-            cache: &HoldingsCache,
-            key: &str,
-            target: Decimal,
-            valid_until_micros: i64,
-        ) -> Instant {
-            if cache.total_available_amount(key).await < target {
-                return Instant::now();
-            }
-            let usable_micros = (valid_until_micros
-                - PRECHECK_VALIDITY_MARGIN_MICROS
-                - chrono::Utc::now().timestamp_micros())
-            .max(0) as u64;
-            Instant::now()
-                + Duration::from_micros(usable_micros).min(crate::rfq_v2::MAX_CONFIRM_SPLIT_WAIT)
-        }
+        let mut client_slot: Option<AtomicProviderClient> = None;
         let picks = self
-            .cache
-            .select_for_disclosure_until(
+            .select_leg_with_backfill(
+                &mut client_slot,
                 &pay_key,
                 select_target,
                 max_inputs,
                 is_cc,
-                self.spend_reserve,
-                selection_deadline(&self.cache, &pay_key, select_target, valid_until_micros).await,
-                crate::rfq_v2::CONFIRM_SPLIT_POLL,
+                valid_until_micros,
             )
             .await;
         let Some(mut picks) = picks else {
@@ -524,20 +537,18 @@ impl AtomicSwapper {
                 instrument_key(admin, id)
             };
             let slots = max_inputs.saturating_sub(picks.len()).max(1);
-            // Same bounded wait as the pay leg — fee cids are blob-pending
-            // just as often (the shared pool's change outputs), and the
-            // deadline recomputes off valid_until so the window shrinks by
-            // whatever the pay leg already used.
+            // Same backfill-aware selection as the pay leg — fee cids are
+            // blob-pending just as often (the shared pool's change outputs),
+            // and the passive-wait deadline recomputes off valid_until so the
+            // window shrinks by whatever the pay leg already used.
             let fee_picks = self
-                .cache
-                .select_for_disclosure_until(
+                .select_leg_with_backfill(
+                    &mut client_slot,
                     &fee_key,
                     target,
                     slots,
                     id == "Amulet",
-                    self.spend_reserve,
-                    selection_deadline(&self.cache, &fee_key, target, valid_until_micros).await,
-                    crate::rfq_v2::CONFIRM_SPLIT_POLL,
+                    valid_until_micros,
                 )
                 .await;
             let Some(fee_picks) = fee_picks else {
@@ -635,12 +646,16 @@ impl AtomicSwapper {
         let filled_base = base_amount.try_into().unwrap_or(0.0_f64);
 
         // ---- VERIFY + SIGN + EXEC (with FAIL classification) -------------
-        let mut atomic_client = match create_atomic_client(&self.config).await {
-            Ok(c) => c,
-            Err(e) => {
-                self.cache.release_reservations(&own_cids).await;
-                return Err(e);
-            }
+        // Reuse the client the cold-cache backfill may have opened.
+        let mut atomic_client = match client_slot.take() {
+            Some(c) => c,
+            None => match create_atomic_client(&self.config).await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.cache.release_reservations(&own_cids).await;
+                    return Err(e);
+                }
+            },
         };
 
         let mut prepare_retries = 0u32;
@@ -770,6 +785,98 @@ impl AtomicSwapper {
         }
     }
 
+    /// Own-holdings selection for one leg (pay or fee) with cold-cache
+    /// self-heal. A blob-pending cache entry is a purely LOCAL artifact — the
+    /// contract already exists on-ledger with its blob (only the fast
+    /// updates-watcher path dropped it), so ONE targeted `GetAtomicContracts`
+    /// resolves it deterministically. Without this, a back-to-back taker's
+    /// change output could stay unselectable through the whole passive wait:
+    /// the 30 s ACS cycle EXCEEDS the 28 s `MAX_CONFIRM_SPLIT_WAIT` ceiling.
+    ///
+    /// 1. Immediate try — happy path, zero added latency.
+    /// 2. Backfill — only when the cache holds enough in PRINCIPLE (the same
+    ///    gate [`selection_deadline`] uses to wait rather than fail fast) and
+    ///    the signed window still has the pre-check margin: fetch blobs for
+    ///    the leg's otherwise-selectable blob-pending cids, retry once.
+    /// 3. Passive bounded re-poll — reservations clearing, racing ACS
+    ///    refreshes. Genuine insufficiency keeps deadline == now ⇒ fail fast.
+    ///
+    /// The client opened for the backfill stays in `client_slot` for reuse
+    /// (fee leg, submit loop). All of this runs BEFORE `reserve_v2`.
+    async fn select_leg_with_backfill(
+        &self,
+        client_slot: &mut Option<AtomicProviderClient>,
+        key: &crate::holdings_cache::InstrumentKey,
+        target: Decimal,
+        max_inputs: usize,
+        is_cc: bool,
+        valid_until_micros: i64,
+    ) -> Option<Vec<CachedHolding>> {
+        if let Some(picks) = self
+            .cache
+            .select_for_disclosure_with(key, target, max_inputs, is_cc, self.spend_reserve)
+            .await
+        {
+            return Some(picks);
+        }
+
+        let now = chrono::Utc::now().timestamp_micros();
+        if self.cache.total_available_amount(key).await >= target
+            && now + PRECHECK_VALIDITY_MARGIN_MICROS < valid_until_micros
+        {
+            let pending = self.cache.blob_pending_cids(key, self.spend_reserve).await;
+            if !pending.is_empty() {
+                // Time-boxed: the channel timeouts (30 s connect / 120 s
+                // request) must not hold the round — on expiry the passive
+                // wait below takes over (window-anchored deadline).
+                let window_micros =
+                    (valid_until_micros - PRECHECK_VALIDITY_MARGIN_MICROS - now).max(0) as u64;
+                let budget = Duration::from_micros(window_micros).min(BACKFILL_BUDGET);
+                info!(
+                    "Cold cache for {}: backfilling blobs for {} pending holding(s)",
+                    key,
+                    pending.len()
+                );
+                let backfill = async {
+                    if client_slot.is_none() {
+                        match create_atomic_client(&self.config).await {
+                            Ok(c) => *client_slot = Some(c),
+                            Err(e) => warn!("Cold-cache backfill client unavailable: {e:#}"),
+                        }
+                    }
+                    if let Some(client) = client_slot.as_mut() {
+                        self.fetch_and_adopt(client, &pending).await;
+                    }
+                };
+                if tokio::time::timeout(budget, backfill).await.is_err() {
+                    warn!(
+                        "Cold-cache backfill for {} timed out after {budget:?} — falling back to the passive wait",
+                        key
+                    );
+                }
+                if let Some(picks) = self
+                    .cache
+                    .select_for_disclosure_with(key, target, max_inputs, is_cc, self.spend_reserve)
+                    .await
+                {
+                    return Some(picks);
+                }
+            }
+        }
+
+        self.cache
+            .select_for_disclosure_until(
+                key,
+                target,
+                max_inputs,
+                is_cc,
+                self.spend_reserve,
+                selection_deadline(&self.cache, key, target, valid_until_micros).await,
+                crate::rfq_v2::CONFIRM_SPLIT_POLL,
+            )
+            .await
+    }
+
     /// Poll the ledger for the user's own input cids: consumed ⇒ the settle
     /// landed; live ⇒ it did not; unknown ⇒ every poll failed (conservative).
     async fn poll_own_inputs(&self, own_cids: &[String]) -> ReconcileStatus {
@@ -834,11 +941,20 @@ impl AtomicSwapper {
                 e.get("contract_id")?.as_str().map(str::to_string)
             })
             .collect();
+        self.fetch_and_adopt(client, &cids).await;
+    }
+
+    /// Targeted `GetAtomicContracts` blob backfill: fetch `cids`, parse
+    /// Amulet / Utility Holding payloads, and `add_created` them into the
+    /// cache (blob-ready, fresh `discovered_at`). Best-effort. Shared by
+    /// [`Self::adopt_created`] (own settle outputs) and the cold-cache
+    /// selection backfill in [`Self::select_leg_with_backfill`].
+    async fn fetch_and_adopt(&self, client: &mut AtomicProviderClient, cids: &[String]) {
         if cids.is_empty() {
             return;
         }
 
-        let resp = match client.get_atomic_contracts(&[], &cids).await {
+        let resp = match client.get_atomic_contracts(&[], cids).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("Created-holdings backfill fetch failed (ACS refresh will catch up): {e:#}");
