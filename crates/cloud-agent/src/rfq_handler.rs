@@ -86,6 +86,24 @@ impl RejectInfo {
     }
 }
 
+/// The overload+depletion stress coefficient may only WIDEN the LP's edge, never
+/// shrink it. A protective spread (`>= 0`, quote on the LP-favourable side of
+/// mid) receives the full `multiplier`; a negative spread — an intentional
+/// aggressive quote on the same side of mid as the opposite leg (e.g. an offer
+/// below mid to offload inventory) — is honoured raw (`1.0`) so overload/
+/// depletion can never push it further against the LP into a fire-sale.
+///
+/// Relies on `multiplier >= 1` (spread_multiplier ∈ {1,2,3}, depletion ≥ 0): for
+/// a protective spread the coefficient can only move the quote further onto the
+/// favourable side, so no clamp is needed there.
+fn stress_coefficient(spread_percent: f64, multiplier: f64) -> f64 {
+    if spread_percent >= 0.0 {
+        multiplier
+    } else {
+        1.0
+    }
+}
+
 impl RfqHandler {
     pub fn new(config: &BaseConfig) -> Option<Self> {
         let lp_config = config.liquidity_provider.clone()?;
@@ -284,12 +302,23 @@ impl RfqHandler {
             0.0
         };
 
+        // The active side's configured spread (offer for a buy, bid for a sell).
+        let side_spread = if direction == 1 {
+            rfq_config.offer_spread_percent
+        } else {
+            rfq_config.bid_spread_percent
+        };
+        // Stress-widening may only improve the LP's price: apply the multiplier to
+        // a protective (>= 0) spread; honour a negative (aggressive) spread raw so
+        // overload/depletion never deepens it. See `stress_coefficient`.
+        let stress = stress_coefficient(side_spread, spread_multiplier + depletion_coeff);
+        let effective_spread = side_spread * stress;
         let price = if direction == 1 {
             // User is buying → LP offers at mid + spread
-            mid_price * (1.0 + rfq_config.offer_spread_percent * (spread_multiplier + depletion_coeff) / 100.0)
+            mid_price * (1.0 + effective_spread / 100.0)
         } else {
             // User is selling → LP bids at mid - spread
-            mid_price * (1.0 - rfq_config.bid_spread_percent * (spread_multiplier + depletion_coeff) / 100.0)
+            mid_price * (1.0 - effective_spread / 100.0)
         };
 
         // Derive the missing leg from the (size-independent) price. In
@@ -438,11 +467,10 @@ impl RfqHandler {
             .quote_valid_secs
             .unwrap_or(self.lp_config.default_quote_valid_secs);
 
-        let effective_spread = if direction == 1 {
-            rfq_config.offer_spread_percent * (spread_multiplier + depletion_coeff)
-        } else {
-            rfq_config.bid_spread_percent * (spread_multiplier + depletion_coeff)
-        };
+        // `effective_spread` (side_spread × applied coefficient) was computed with
+        // the price above. Annotations reflect only the multiplier that was
+        // actually applied — a stress-capped aggressive quote (side_spread < 0)
+        // must not falsely advertise OVERLOAD/depletion widening.
         info!(
             "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{})",
             rfq_id,
@@ -451,8 +479,8 @@ impl RfqHandler {
             price,
             mid_price,
             effective_spread,
-            if spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" },
-            if depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() }
+            if side_spread >= 0.0 && spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if side_spread >= 0.0 && spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" },
+            if side_spread >= 0.0 && depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() }
         );
 
         // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
@@ -623,5 +651,54 @@ mod price_rfq_tests {
         };
         assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
         assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min quantity"));
+    }
+
+    /// The stress coefficient widens a protective (>= 0) spread by the full
+    /// multiplier but leaves a negative (aggressive) spread raw, so overload/
+    /// depletion can only ever move the LP quote in its favour, never worsen it.
+    #[test]
+    fn stress_coefficient_only_widens_protective_spreads() {
+        // Protective spread: full multiplier applied (e.g. overload 3 + depl 10).
+        assert_eq!(stress_coefficient(2.5, 13.0), 13.0);
+        assert_eq!(stress_coefficient(0.5, 3.0), 3.0);
+        // Zero spread: multiplier returned but effect is nil (0 * m == 0).
+        assert_eq!(stress_coefficient(0.0, 5.0), 5.0);
+        // Aggressive (below-mid) spread: honoured raw — NOT amplified (no fire-sale).
+        assert_eq!(stress_coefficient(-2.4, 13.0), 1.0);
+        assert_eq!(stress_coefficient(-0.1, 3.0), 1.0);
+    }
+
+    /// A negative offer_spread (aggressive below-mid sell to offload inventory)
+    /// is accepted — not rejected by the `price <= 0` guard — and prices exactly
+    /// `mid * (1 + offer_spread/100)`, i.e. below mid. With `liquidity_manager:
+    /// None` and no overload the coefficient is 1, pinning down that the negative
+    /// spread is honoured at its raw configured value.
+    #[tokio::test]
+    async fn negative_offer_spread_sells_below_mid() {
+        let lp_config: LiquidityProviderConfig =
+            serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
+        // bid 2.5 + offer -2.4 → the EDELx/cETH 0.1%-spread offload config.
+        let market: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDC","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":-2.4}}"#,
+        )
+        .unwrap();
+        let mut mids = HashMap::new();
+        mids.insert("EDELx-USDC".to_string(), MID);
+        let handler = RfqHandler {
+            lp_config,
+            markets: vec![market],
+            mid_prices: Arc::new(RwLock::new(mids)),
+            party_id: "lp::test".to_string(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
+            liquidity_manager: None,
+        };
+        // direction 1 = buy (LP sells base); 1000 EDELx ≈ $13.3 clears the $10 floor.
+        let priced = match handler.price_rfq("t", "EDELx-USDC", 1, "1000", "").await {
+            Ok(p) => p,
+            Err(e) => panic!("negative offer_spread must be quotable, not rejected: {:?}", e.reason_detail),
+        };
+        let expected = MID * (1.0 - 0.024);
+        assert!((f(&priced.price_str) - expected).abs() < 1e-9, "price {} vs expected {}", priced.price_str, expected);
+        assert!(f(&priced.price_str) < MID, "aggressive offer must be below mid");
     }
 }
