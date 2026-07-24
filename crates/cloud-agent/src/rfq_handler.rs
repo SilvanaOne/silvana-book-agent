@@ -281,7 +281,11 @@ impl RfqHandler {
         //   1x otherwise
         // direction 1 = BUY (user buys, LP sells base → offer price = mid + spread)
         // direction 2 = SELL (user sells, LP buys base/sells quote → bid price = mid - spread)
-        let spread_multiplier = if agent_logic::forecast::is_fees_paused_by_overload() {
+        // Per-market opt-out: `disable_overload_spread_widening` pins this factor
+        // at 1x so the market always quotes its raw configured spread.
+        let spread_multiplier = if rfq_config.disable_overload_spread_widening {
+            1.0
+        } else if agent_logic::forecast::is_fees_paused_by_overload() {
             3.0
         } else if agent_logic::forecast::is_traffic_paused_by_forecast() {
             2.0
@@ -289,8 +293,12 @@ impl RfqHandler {
             1.0
         };
 
-        // Depletion coefficient: widen spread on the side that depletes a scarce token
-        let depletion_coeff = if let Some(ref lm) = self.liquidity_manager {
+        // Depletion coefficient: widen spread on the side that depletes a scarce
+        // token. Per-market opt-out: `disable_depletion_spread_widening` pins it
+        // at 0 (and skips the liquidity lookup entirely).
+        let depletion_coeff = if rfq_config.disable_depletion_spread_widening {
+            0.0
+        } else if let Some(ref lm) = self.liquidity_manager {
             // The token being sold by the LP is the one that depletes
             let depleting_token = if direction == 1 {
                 base_token // LP sells base (e.g. CC)
@@ -700,5 +708,64 @@ mod price_rfq_tests {
         let expected = MID * (1.0 - 0.024);
         assert!((f(&priced.price_str) - expected).abs() < 1e-9, "price {} vs expected {}", priced.price_str, expected);
         assert!(f(&priced.price_str) < MID, "aggressive offer must be below mid");
+    }
+
+    /// `disable_overload_spread_widening` pins the spread at its raw configured
+    /// value under real sequencer overload, while an unflagged market still
+    /// widens 3x. Coefficient 0.45 ∈ [0.4, 0.5) triggers fee-overload (3x
+    /// multiplier) WITHOUT tripping the RFQ-reject threshold (0.4). Safe with
+    /// concurrent tests: they use zero spreads (0 × 3 = 0) or a negative spread
+    /// (stress-gated to raw), so a transient global overload cannot move them.
+    #[tokio::test]
+    async fn disable_overload_widening_pins_raw_spread() {
+        let lp_config: LiquidityProviderConfig =
+            serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
+        // Same bid spread on both markets; only the flag differs. The absent
+        // flag on the second market also proves the serde default is `false`.
+        let pinned: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDC","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":-2.4,"disable_overload_spread_widening":true,"disable_depletion_spread_widening":true}}"#,
+        )
+        .unwrap();
+        let widening: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDCx","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":-2.4}}"#,
+        )
+        .unwrap();
+        let mut mids = HashMap::new();
+        mids.insert("EDELx-USDC".to_string(), MID);
+        mids.insert("EDELx-USDCx".to_string(), MID);
+        let handler = RfqHandler {
+            lp_config,
+            markets: vec![pinned, widening],
+            mid_prices: Arc::new(RwLock::new(mids)),
+            party_id: "lp::test".to_string(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
+            liquidity_manager: None,
+        };
+
+        agent_logic::forecast::update_forecast(0, Some("0.45".to_string()));
+        assert!(agent_logic::forecast::is_fees_paused_by_overload(), "0.45 < 0.5 must count as overload");
+        assert!(!agent_logic::forecast::is_rfq_rejected_by_overload(), "0.45 >= 0.4 must still quote");
+
+        // direction 2 = user sells → LP bids mid - bid_spread. 1000 EDELx ≈ $13 clears the floor.
+        let pinned_bid = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "").await;
+        let widened_bid = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "").await;
+        // Reset global overload state BEFORE asserting so a failure cannot leak it.
+        agent_logic::forecast::update_forecast(0, None);
+        assert!(!agent_logic::forecast::is_fees_paused_by_overload());
+
+        let pinned_bid = match pinned_bid {
+            Ok(p) => p,
+            Err(e) => panic!("pinned market must quote under overload: {:?}", e.reason_detail),
+        };
+        let widened_bid = match widened_bid {
+            Ok(p) => p,
+            Err(e) => panic!("widening market must quote under overload: {:?}", e.reason_detail),
+        };
+        // Flagged market: raw 2.5% regardless of overload.
+        let expected_raw = MID * (1.0 - 0.025);
+        assert!((f(&pinned_bid.price_str) - expected_raw).abs() < 1e-9, "pinned {} vs {}", pinned_bid.price_str, expected_raw);
+        // Unflagged market: 2.5% × 3 = 7.5% under overload (also proves flag default = false).
+        let expected_widened = MID * (1.0 - 0.075);
+        assert!((f(&widened_bid.price_str) - expected_widened).abs() < 1e-9, "widened {} vs {}", widened_bid.price_str, expected_widened);
     }
 }
