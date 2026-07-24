@@ -18,7 +18,7 @@ use orderbook_proto::ledger::{
 };
 use tx_verifier::OperationExpectation;
 
-use crate::holdings_cache::CcView;
+use crate::holdings_cache::{CachedAmulet, CcView};
 use crate::ledger_client::DAppProviderClient;
 use crate::payment_queue::{process_tx_result, handle_inactive_contracts};
 
@@ -65,29 +65,66 @@ pub fn spawn_merge_worker(
     });
 }
 
+/// Decide which CC amulets to consolidate this cycle.
+///
+/// `floor` is the CC dust-merge threshold (smallest ladder rung). When present,
+/// only sub-`floor` **dust** is eligible — the `>= floor` holdings are the ladder
+/// rungs the split worker maintains, and merging them is the split/merge
+/// oscillation this guards against. The merge fires only when the dust count
+/// exceeds `threshold` (independent of how many rungs exist), then takes the
+/// `max_amulets` smallest dust amulets. With no ladder configured (`floor =
+/// None`) it falls back to the legacy total-count behavior.
+///
+/// Returns the amulets to merge (already ascending by amount); empty = no-op.
+fn plan_merge(
+    selectable: Vec<CachedAmulet>,
+    floor: Option<Decimal>,
+    threshold: usize,
+    max_amulets: usize,
+) -> Vec<CachedAmulet> {
+    let dust: Vec<CachedAmulet> = match floor {
+        Some(f) => selectable.into_iter().filter(|a| a.amount < f).collect(),
+        None => selectable,
+    };
+    if dust.len() <= threshold {
+        return Vec::new();
+    }
+    dust.into_iter().take(max_amulets).collect()
+}
+
 async fn check_and_merge(
     config: &BaseConfig,
     cache: &CcView,
     threshold: usize,
     max_amulets: usize,
 ) -> anyhow::Result<Option<String>> {
-    let selectable = cache.get_selectable_amulets().await;
-    let count = selectable.len();
+    let selectable = cache.get_selectable_amulets().await; // asc by amount, reserve excluded
+    let floor = cache.dust_threshold().await; // smallest CC ladder rung, from shared ladder config
+    let dust_count = match floor {
+        Some(f) => selectable.iter().filter(|a| a.amount < f).count(),
+        None => selectable.len(),
+    };
 
-    if count <= threshold {
+    let to_merge = plan_merge(selectable, floor, threshold, max_amulets);
+    let merge_count = to_merge.len();
+    if merge_count < 2 {
+        // Only ladder rungs above threshold (or a single dust amulet): a 1-input
+        // "merge" would be a pointless tx — leave the rungs for the split worker.
         return Ok(None);
     }
-
-    // Take smallest amulets (already sorted ascending by amount)
-    let to_merge: Vec<_> = selectable.into_iter().take(max_amulets).collect();
-    let merge_count = to_merge.len();
     let total_amount: Decimal = to_merge.iter().map(|a| a.amount).sum();
     let cids: Vec<String> = to_merge.iter().map(|a| a.contract_id.clone()).collect();
 
-    info!(
-        "Merge: {} amulets above threshold ({}), merging {} smallest ({:.4} CC total)",
-        count, threshold, merge_count, total_amount
-    );
+    match floor {
+        Some(f) => info!(
+            "Dust sweep: {} dust amulets above threshold ({}), merging {} smallest below {} CC ({:.4} CC total)",
+            dust_count, threshold, merge_count, f, total_amount
+        ),
+        None => info!(
+            "Merge: {} amulets above threshold ({}), merging {} smallest ({:.4} CC total)",
+            dust_count, threshold, merge_count, total_amount
+        ),
+    }
 
     // Reserve in cache
     let payment_id = format!("merge-{}", now_millis());
@@ -165,4 +202,80 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn amulets(amounts: &[&str]) -> Vec<CachedAmulet> {
+        amounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| CachedAmulet {
+                contract_id: format!("cid-{i}"),
+                amount: a.parse().unwrap(),
+                discovered_at: Instant::now(),
+            })
+            .collect()
+    }
+
+    fn cc(n: usize) -> Vec<String> {
+        (0..n).map(|_| "150".to_string()).collect() // exactly on the rung floor (not dust)
+    }
+    fn dust(n: usize) -> Vec<String> {
+        (0..n).map(|_| "50".to_string()).collect() // below the 150 floor
+    }
+    fn floor() -> Option<Decimal> {
+        Some("150".parse().unwrap())
+    }
+
+    // Core regression: ladder rungs (>= floor) are never counted or merged, no
+    // matter how many there are — the merge worker must not fight the split worker.
+    #[test]
+    fn rungs_never_merged() {
+        let rungs: Vec<String> = cc(200);
+        let refs: Vec<&str> = rungs.iter().map(|s| s.as_str()).collect();
+        let picked = plan_merge(amulets(&refs), floor(), 100, 10);
+        assert!(picked.is_empty());
+    }
+
+    // Dust at/below the threshold ⇒ no-op ("merge only when dust > 100").
+    #[test]
+    fn dust_below_threshold_is_noop() {
+        let mut all: Vec<String> = cc(100);
+        all.extend(dust(12));
+        let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let picked = plan_merge(amulets(&refs), floor(), 100, 10);
+        assert!(picked.is_empty());
+    }
+
+    // Dust above the threshold ⇒ sweep only dust, up to max_amulets, rungs untouched.
+    #[test]
+    fn dust_above_threshold_sweeps_dust_only() {
+        let mut all: Vec<String> = cc(100);
+        all.extend(dust(120));
+        let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let picked = plan_merge(amulets(&refs), floor(), 100, 10);
+        assert_eq!(picked.len(), 10);
+        let f: Decimal = "150".parse().unwrap();
+        assert!(picked.iter().all(|a| a.amount < f), "only sub-floor dust merged");
+    }
+
+    // No ladder configured ⇒ legacy total-count trigger + smallest-N selection.
+    #[test]
+    fn no_ladder_falls_back_to_legacy() {
+        let all: Vec<String> = (0..150).map(|i| (i + 1).to_string()).collect(); // 1..=150
+        let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let picked = plan_merge(amulets(&refs), None, 100, 10);
+        assert_eq!(picked.len(), 10);
+        // 150 amulets > threshold 100; nothing filtered, first 10 taken.
+        assert_eq!(picked.len(), 10);
+
+        // Below threshold with no ladder ⇒ no-op.
+        let few: Vec<String> = (0..80).map(|i| (i + 1).to_string()).collect();
+        let refs: Vec<&str> = few.iter().map(|s| s.as_str()).collect();
+        assert!(plan_merge(amulets(&refs), None, 100, 10).is_empty());
+    }
 }

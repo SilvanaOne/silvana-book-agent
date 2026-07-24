@@ -187,6 +187,13 @@ impl HoldingsCache {
         *self.dust_below.write().await = thresholds;
     }
 
+    /// The dust-merge threshold for an instrument (its smallest ladder rung), or
+    /// `None` if no ladder is configured for it. Holdings below it are sub-rung
+    /// dust; holdings at/above it are ladder rungs the split worker maintains.
+    pub async fn dust_threshold(&self, instrument: &str) -> Option<Decimal> {
+        self.dust_below.read().await.get(instrument).copied()
+    }
+
     /// The exact legacy `AmuletCache` method surface, scoped to CC.
     pub fn cc(self: &Arc<Self>) -> CcView {
         CcView(self.clone())
@@ -993,6 +1000,14 @@ impl CcView {
             .into_iter()
             .map(Self::holding_to_amulet)
             .collect()
+    }
+
+    /// The CC dust-merge threshold (smallest CC ladder rung), or `None` when no
+    /// CC ladder is configured. CC amulets below it are sub-rung dust the merge
+    /// worker may consolidate; those at/above it are ladder rungs it must not
+    /// touch (see `merge_worker`).
+    pub async fn dust_threshold(&self) -> Option<Decimal> {
+        self.0.dust_threshold(CC_INSTRUMENT).await
     }
 
     /// Selectable CC amulets INCLUDING the splitter reserve. v1 fail-open: if
