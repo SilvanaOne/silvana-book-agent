@@ -1041,6 +1041,15 @@ pub struct RfqMarketConfig {
     pub bid_spread_percent: f64,
     #[serde(default = "default_rfq_spread")]
     pub offer_spread_percent: f64,
+    /// Disable the sequencer-load spread multiplier (3x overload / 2x LOW
+    /// forecast) for this market: quotes always use the raw configured spread
+    /// regardless of load.
+    #[serde(default)]
+    pub disable_overload_spread_widening: bool,
+    /// Disable the one-sided depletion spread widening for this market: the
+    /// depletion coefficient of the LP-pays token is ignored when pricing.
+    #[serde(default)]
+    pub disable_depletion_spread_widening: bool,
     #[serde(default)]
     pub quote_valid_secs: Option<u32>,
     /// DVP allocation deadline in seconds from DVP creation (default 15 minutes)
