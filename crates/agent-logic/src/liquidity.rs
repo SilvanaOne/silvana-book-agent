@@ -264,6 +264,80 @@ impl LiquidityManager {
         raw * margin
     }
 
+    /// Shared availability check for `try_commit` / `can_commit`.
+    ///
+    /// Read-only: absent token entries count as zero balance (identical to the
+    /// `TokenState::new()` a commit would insert) so both callers see the same
+    /// verdict without mutating state.
+    fn check_commit(
+        &self,
+        s: &LiquidityState,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fee_cc: Decimal,
+    ) -> Result<(), String> {
+        // --- Check allocation token availability ---
+        let token_available = s
+            .tokens
+            .get(allocation_token)
+            .map_or(Decimal::ZERO, |t| t.available());
+
+        if token_available < allocation_amount {
+            return Err(format!(
+                "insufficient {} ({:.4} available, {:.4} needed for allocation)",
+                allocation_token, token_available, allocation_amount
+            ));
+        }
+
+        // --- Check CC for fees (may overlap if allocation_token == CC) ---
+        let cc_available = s
+            .tokens
+            .get(CC_TOKEN)
+            .map_or(Decimal::ZERO, |t| t.available());
+        let cc_available_for_fees = cc_available - self.fee_reserve_cc - s.fee_commitments.total();
+        // If allocation_token is CC, the allocation also consumes CC
+        let cc_after_alloc = if allocation_token == CC_TOKEN {
+            cc_available_for_fees - allocation_amount
+        } else {
+            cc_available_for_fees
+        };
+
+        if cc_after_alloc < fee_cc {
+            return Err(format!(
+                "insufficient CC for fees ({:.4} available after allocation + reserve, {:.4} needed)",
+                cc_after_alloc.max(Decimal::ZERO),
+                fee_cc
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Advisory availability check — same rules as `try_commit`, no mutation.
+    ///
+    /// Used by the adoption gate: the agent verifies it *could* fund the
+    /// settlement before preconfirming, but the actual reservation is deferred
+    /// until the counterparty has preconfirmed (see `ensure_reserved` in
+    /// settlement.rs), mirroring the RFQ V2 indicative/confirm split.
+    pub async fn can_commit(
+        &self,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fee_cc: Decimal,
+    ) -> Result<(), String> {
+        let s = self.state.read().await;
+        self.check_commit(&s, allocation_token, allocation_amount, fee_cc)
+    }
+
+    /// True if a commitment (allocation or fee) exists for this proposal.
+    pub async fn has_commitment(&self, proposal_id: &str) -> bool {
+        let s = self.state.read().await;
+        s.fee_commitments.entries.contains_key(proposal_id)
+            || s.tokens
+                .values()
+                .any(|t| t.allocation_commitments.contains_key(proposal_id))
+    }
+
     /// Try to commit resources for a settlement.
     ///
     /// Checks **both** the allocation token balance **and** CC for fees.
@@ -282,34 +356,9 @@ impl LiquidityManager {
     ) -> Result<(), String> {
         let mut s = self.state.write().await;
 
-        // --- Check allocation token availability ---
-        let token_state = s.tokens.entry(allocation_token.to_string()).or_insert_with(TokenState::new);
-        let token_available = token_state.available();
-
-        if token_available < allocation_amount {
-            return Err(format!(
-                "insufficient {} ({:.4} available, {:.4} needed for allocation)",
-                allocation_token, token_available, allocation_amount
-            ));
-        }
-
-        // --- Check CC for fees (may overlap if allocation_token == CC) ---
-        let cc_state = s.tokens.entry(CC_TOKEN.to_string()).or_insert_with(TokenState::new);
-        let cc_available_for_fees = cc_state.available() - self.fee_reserve_cc - s.fee_commitments.total();
-        // If allocation_token is CC, the allocation also consumes CC
-        let cc_after_alloc = if allocation_token == CC_TOKEN {
-            cc_available_for_fees - allocation_amount
-        } else {
-            cc_available_for_fees
-        };
-
-        if cc_after_alloc < fee_cc {
-            return Err(format!(
-                "insufficient CC for fees ({:.4} available after allocation + reserve, {:.4} needed)",
-                cc_after_alloc.max(Decimal::ZERO),
-                fee_cc
-            ));
-        }
+        // Atomic check-and-reserve: same check as `can_commit`, but under the
+        // write lock so no other committer can slip in between check and insert.
+        self.check_commit(&s, allocation_token, allocation_amount, fee_cc)?;
 
         // --- Commit ---
         // Re-borrow token_state (may be same as cc_state if CC)
@@ -658,6 +707,40 @@ mod tests {
         // Release p2
         lm.release("p2").await;
         assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+    }
+
+    // can_commit must give the same verdict as try_commit on identical inputs,
+    // without creating any commitment or mutating balances.
+    #[tokio::test]
+    async fn test_can_commit_parity_and_readonly() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+
+        // Pass case: advisory says yes, commit then succeeds
+        assert!(lm.can_commit("USDCx", Decimal::from(2000), fee_cc).await.is_ok());
+        // Advisory made no reservation
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+        assert!(lm.try_commit("p1", "USDCx", Decimal::from(2000), fee_cc).await.is_ok());
+        assert!(lm.has_commitment("p1").await);
+
+        // Fail cases mirror try_commit: token shortfall...
+        assert!(lm.can_commit("USDCx", Decimal::from(3001), fee_cc).await.is_err());
+        assert!(lm.try_commit("px", "USDCx", Decimal::from(3001), fee_cc).await.is_err());
+        // ...and CC-for-fees shortfall (incl. CC allocation overlap)
+        assert!(lm.can_commit(CC_TOKEN, Decimal::from(95), Decimal::ONE).await.is_err());
+        assert!(lm.try_commit("py", CC_TOKEN, Decimal::from(95), Decimal::ONE).await.is_err());
+        // Unknown token = zero balance on both paths
+        assert!(lm.can_commit("NOPE", Decimal::ONE, Decimal::ZERO).await.is_err());
+        assert!(lm.try_commit("pz", "NOPE", Decimal::ONE, Decimal::ZERO).await.is_err());
+
+        // No stray commitments from any of the advisory/failed calls
+        assert!(!lm.has_commitment("px").await);
+        assert!(!lm.has_commitment("py").await);
+        assert!(!lm.has_commitment("pz").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(3000)); // only p1 held
     }
 
     #[tokio::test]

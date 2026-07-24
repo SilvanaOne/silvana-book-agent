@@ -106,6 +106,15 @@ pub struct SavedSettlementOrder {
     pub order_id: u64,
     /// Decimal quantity as string
     pub quantity: String,
+    /// Whether the order's pending_quantity reservation was applied.
+    /// Defaults to true for legacy state files, which predate deferred
+    /// reservation and always had pending_quantity applied at adoption.
+    #[serde(default = "default_reserved")]
+    pub reserved: bool,
+}
+
+fn default_reserved() -> bool {
+    true
 }
 
 /// Serializable mirror of `AcceptedRfqTrade` from runner.rs
@@ -372,6 +381,7 @@ mod tests {
             proposal_id: "prop-4".to_string(),
             order_id: 42,
             quantity: "1.0".to_string(),
+            reserved: true,
         });
         state.accepted_rfq_trades.push(SavedAcceptedRfqTrade {
             proposal_id: "rfq-1".to_string(),
@@ -531,6 +541,7 @@ mod tests {
             proposal_id: "prop-active".to_string(),
             order_id: 2,
             quantity: "0.5".to_string(),
+            reserved: true,
         });
 
         // Completed proposals: 1500 items (should be capped to 1000)
@@ -593,5 +604,31 @@ mod tests {
         // Accepted RFQ trades: only active one kept
         assert_eq!(state.accepted_rfq_trades.len(), 1);
         assert_eq!(state.accepted_rfq_trades[0].proposal_id, "prop-active");
+    }
+
+    // Legacy state files predate the `reserved` flag: those entries all had
+    // pending_quantity applied at adoption, so the serde default must be true
+    // to preserve their accounting through the upgrade. New unreserved entries
+    // must round-trip as false.
+    #[test]
+    fn test_saved_settlement_order_reserved_default_and_roundtrip() {
+        // Legacy JSON without the field → reserved = true
+        let legacy: SavedSettlementOrder = serde_json::from_str(
+            r#"{"proposal_id":"p1","order_id":42,"quantity":"2.0"}"#,
+        )
+        .unwrap();
+        assert!(legacy.reserved);
+
+        // New unreserved entry round-trips as false
+        let entry = SavedSettlementOrder {
+            proposal_id: "p2".to_string(),
+            order_id: 7,
+            quantity: "1.5".to_string(),
+            reserved: false,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SavedSettlementOrder = serde_json::from_str(&json).unwrap();
+        assert!(!back.reserved);
+        assert_eq!(back.order_id, 7);
     }
 }

@@ -172,6 +172,12 @@ pub struct BaseConfig {
     // Settlement throttle
     pub max_active_settlements: usize,
 
+    /// Max active (pending) settlements per counterparty. New proposals from a
+    /// counterparty already at the cap are refused (preconfirmation reject) —
+    /// prevents a broken/spamming counterparty from piling up one-sided
+    /// settlements that would otherwise sit until the server timeout.
+    pub max_pending_per_counterparty: usize,
+
     // Settlement expiry (max lifetime before considering expired)
     pub settle_before_secs: u64,
 
@@ -264,6 +270,7 @@ impl BaseConfig {
             ledger_service_public_key: [0u8; 32],
             liquidity_provider: None,
             max_active_settlements: 1000,
+            max_pending_per_counterparty: 1000,
             settle_before_secs: 1800,
             allocate_before_secs: 900,
             liquidity_margin: 1.1,
@@ -363,6 +370,7 @@ impl BaseConfig {
             ledger_service_public_key,
             liquidity_provider: None,
             max_active_settlements: 10,
+            max_pending_per_counterparty: 10,
             settle_before_secs: default_rfq_settle_before_secs() as u64,
             allocate_before_secs: default_rfq_allocate_before_secs() as u64,
             liquidity_margin: 1.1,
@@ -563,6 +571,11 @@ impl BaseConfig {
             .unwrap_or(25);
 
         let max_active_settlements = std::env::var("AGENT_MAX_SETTLEMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let max_pending_per_counterparty = std::env::var("AGENT_MAX_PENDING_PER_COUNTERPARTY")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
@@ -809,6 +822,7 @@ impl BaseConfig {
             ledger_service_public_key,
             liquidity_provider: agent.liquidity_provider,
             max_active_settlements,
+            max_pending_per_counterparty,
             settle_before_secs,
             allocate_before_secs,
             liquidity_margin,
