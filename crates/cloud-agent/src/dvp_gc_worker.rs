@@ -50,7 +50,12 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -63,7 +68,7 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 static GC_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag("DVP_GC_ENABLED", true));
 static GC_MIN_COEFFICIENT: LazyLock<f64> =
-    LazyLock::new(|| env_parse("DVP_GC_MIN_COEFFICIENT", 0.72));
+    LazyLock::new(|| env_parse("DVP_GC_MIN_COEFFICIENT", 0.7));
 static GC_DELAY_SECS: LazyLock<u64> = LazyLock::new(|| env_parse("DVP_GC_DELAY_SECS", 5));
 static GC_REJECT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_flag("DVP_GC_REJECT_ENABLED", true));
@@ -140,8 +145,11 @@ pub fn spawn_dvp_gc_worker(config: BaseConfig, shutdown: Shutdown) {
         info!(
             "DvpProposal GC started: min_coefficient={:.2}, delay={}s, refresh={}s, \
              safety_margin={}s, reject_enabled={}",
-            *GC_MIN_COEFFICIENT, *GC_DELAY_SECS, *GC_REFRESH_SECS,
-            *GC_SAFETY_MARGIN_SECS, *GC_REJECT_ENABLED,
+            *GC_MIN_COEFFICIENT,
+            *GC_DELAY_SECS,
+            *GC_REFRESH_SECS,
+            *GC_SAFETY_MARGIN_SECS,
+            *GC_REJECT_ENABLED,
         );
         run(config, shutdown).await;
     });
@@ -179,11 +187,17 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
             }
         };
 
-        let cancels = queue.iter().filter(|i| i.action == GcAction::Cancel).count();
+        let cancels = queue
+            .iter()
+            .filter(|i| i.action == GcAction::Cancel)
+            .count();
         let rejects = queue.len() - cancels;
         info!(
             "DvpProposal GC cycle: scanned={}, eligible={} (cancel={}, reject={}), coefficient={:.4}",
-            scanned, queue.len(), cancels, rejects,
+            scanned,
+            queue.len(),
+            cancels,
+            rejects,
             agent_logic::forecast::coefficient_value(),
         );
 
@@ -218,9 +232,14 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                     consecutive_failures = 0;
                     info!(
                         "DvpProposal GC: {} {} ({}/{})",
-                        if item.action == GcAction::Cancel { "cancelled" } else { "rejected" },
+                        if item.action == GcAction::Cancel {
+                            "cancelled"
+                        } else {
+                            "rejected"
+                        },
                         &item.cid[..item.cid.len().min(16)],
-                        done, queue.len(),
+                        done,
+                        queue.len(),
                     );
                 }
                 Err(e) => {
@@ -234,7 +253,8 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                         skipped_gone += 1;
                         debug!(
                             "DvpProposal GC: {} already gone: {}",
-                            &item.cid[..item.cid.len().min(16)], msg,
+                            &item.cid[..item.cid.len().min(16)],
+                            msg,
                         );
                     } else {
                         consecutive_failures += 1;
@@ -267,7 +287,8 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
         if !queue.is_empty() {
             info!(
                 "DvpProposal GC cycle done: archived={}, already_gone={}, remaining={}",
-                done, skipped_gone,
+                done,
+                skipped_gone,
                 queue.len() as u64 - done - skipped_gone,
             );
             // A cycle where everything was "already gone" but the scan still
@@ -322,10 +343,13 @@ async fn scan(
         .into_iter()
         .filter_map(|c| {
             let args = prost_struct_to_json(c.create_arguments.as_ref()?);
-            let (action, settle_before_micros) = classify_proposal(
-                &args, &config.party_id, now, margin, *GC_REJECT_ENABLED,
-            )?;
-            Some(GcItem { cid: c.contract_id, action, settle_before_micros })
+            let (action, settle_before_micros) =
+                classify_proposal(&args, &config.party_id, now, margin, *GC_REJECT_ENABLED)?;
+            Some(GcItem {
+                cid: c.contract_id,
+                action,
+                settle_before_micros,
+            })
         })
         .collect();
 
