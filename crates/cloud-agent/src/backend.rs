@@ -130,12 +130,10 @@ impl CloudSettlementBackend {
         // Spawn ACS worker to refresh the holdings cache and update liquidity manager
         spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown.clone());
 
-        // Spawn merge worker if threshold is configured
-        if config.merge_threshold.is_some() {
-            crate::merge_worker::spawn_merge_worker(
-                config.clone(), cache.cc(), shutdown.clone(),
-            );
-        }
+        // NOTE: the merge worker is spawned by the caller (lib.rs), not here — it
+        // needs the per-instrument SplitInstrument set (CC + the utility ladders),
+        // which is only built after this constructor runs. The LP/RFQ-v2 path
+        // spawns an all-instrument merge; the fill path spawns a CC-only merge.
 
         let payment_queue = PaymentQueue::new(
             config.clone(),
