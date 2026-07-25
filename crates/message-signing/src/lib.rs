@@ -262,6 +262,7 @@ pub fn canonical_params_transfer_cip56(
     receiver_party: &str,
     amount: &str,
     reference: Option<&str>,
+    input_holding_cids: &[String],
 ) -> String {
     let mut s = format!(
         "param_type=TransferCip56\ninstrument_id={}\ninstrument_admin={}\nreceiver_party={}\namount={}\n",
@@ -269,6 +270,13 @@ pub fn canonical_params_transfer_cip56(
     );
     if let Some(r) = reference {
         s.push_str(&format!("reference={}\n", r));
+    }
+    // Appended only when explicit input cids are supplied, so legacy auto-select
+    // transfers (empty) keep a byte-identical canonical string across a rolling
+    // agent/ledger-service deploy. When present, the server re-derivation must
+    // append it identically (see ledger-service server canonical path).
+    if !input_holding_cids.is_empty() {
+        s.push_str(&format!("input_holding_cids={}\n", input_holding_cids.join(",")));
     }
     s
 }
@@ -1261,7 +1269,16 @@ mod tests {
         assert!(!canonical_params_request_recurring_prepaid("app", "10", "5", 30, None, None).is_empty());
         assert!(!canonical_params_request_recurring_payasyougo("app", "10", None, None).is_empty());
         assert!(!canonical_params_request_user_service(None, None).is_empty());
-        assert!(!canonical_params_transfer_cip56("USDC", "admin", "recv", "100", None).is_empty());
+        assert!(!canonical_params_transfer_cip56("USDC", "admin", "recv", "100", None, &[]).is_empty());
+        // Empty cids ⇒ legacy byte-identical canonical (no input_holding_cids line);
+        // non-empty ⇒ the extra line is appended (self-transfer merge path).
+        let legacy = canonical_params_transfer_cip56("USDC", "a", "r", "100", None, &[]);
+        assert!(!legacy.contains("input_holding_cids"));
+        let merge = canonical_params_transfer_cip56(
+            "USDC", "a", "r", "100", None, &["c1".to_string(), "c2".to_string()],
+        );
+        assert!(merge.contains("input_holding_cids=c1,c2\n"));
+        assert!(merge.starts_with(&legacy));
         assert!(!canonical_params_accept_cip56("cid").is_empty());
     }
 

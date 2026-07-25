@@ -164,7 +164,7 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
         ),
         Params::TransferCip56(p) => canonical_params_transfer_cip56(
             &p.instrument_id, &p.instrument_admin, &p.receiver_party,
-            &p.amount, p.reference.as_deref(),
+            &p.amount, p.reference.as_deref(), &p.input_holding_cids,
         ),
         Params::AcceptCip56(p) => canonical_params_accept_cip56(&p.contract_id),
         Params::SplitCc(p) => canonical_params_split_cc(&p.output_amounts),

@@ -41,13 +41,27 @@ pub enum VerifyResult {
     NeedServerLookup { order_id: u64 },
 }
 
+/// Local record of an adopted settlement: which order it maps to, how much
+/// it will consume, and whether that capacity has actually been reserved.
+///
+/// `reserved == false` between adoption (agent verified + preconfirmed its own
+/// side) and the counterparty's preconfirmation; the capacity effect on
+/// `pending_quantity` is applied only by `try_reserve_pending` once the
+/// counterparty has committed. This keeps one-sided proposals from tying up
+/// inventory for the full server timeout window.
+pub struct SettlementOrderEntry {
+    pub order_id: u64,
+    pub quantity: Decimal,
+    pub reserved: bool,
+}
+
 /// Order tracker with immutable start_time and Ed25519 key
 pub struct OrderTracker {
     start_time_ms: u64,
     private_key_bytes: [u8; 32],
     orders: HashMap<u64, TrackedOrder>,
-    /// Maps proposal_id → (order_id, pending_quantity) for active settlements
-    settlement_orders: HashMap<String, (u64, Decimal)>,
+    /// Maps proposal_id → adoption record for active settlements
+    settlement_orders: HashMap<String, SettlementOrderEntry>,
 }
 
 impl OrderTracker {
@@ -290,8 +304,54 @@ impl OrderTracker {
         VerifyResult::Accepted { order_id }
     }
 
-    /// Mark settlement as pending (after preconfirmation)
-    pub fn mark_pending(&mut self, proposal_id: &str, order_id: u64, quantity: Decimal) {
+    /// Record the local adoption decision for a settlement (at adoption time,
+    /// after verification). Does NOT touch `pending_quantity` — the capacity
+    /// reservation is deferred to `try_reserve_pending` once the counterparty
+    /// has preconfirmed. Idempotent: an existing entry (e.g. restored from
+    /// saved state) is left untouched, preserving its `reserved` flag.
+    pub fn record_settlement_order(&mut self, proposal_id: &str, order_id: u64, quantity: Decimal) {
+        if self.settlement_orders.contains_key(proposal_id) {
+            return;
+        }
+        debug!(
+            "[{}] Recorded settlement order mapping: order={}, qty={} (unreserved)",
+            proposal_id, order_id, quantity
+        );
+        self.settlement_orders.insert(
+            proposal_id.to_string(),
+            SettlementOrderEntry { order_id, quantity, reserved: false },
+        );
+    }
+
+    /// Reserve the order capacity for an adopted settlement — called on the
+    /// first post-preconfirm action (i.e. once the counterparty has committed).
+    ///
+    /// Returns `Ok(true)` if newly reserved, `Ok(false)` if already reserved
+    /// (idempotent re-entry, incl. entries restored as reserved from saved
+    /// state), `Err` if the proposal was never adopted or the order no longer
+    /// has capacity. The capacity re-check is the atomic backstop for
+    /// adoption-time checks that overlapped while nothing was reserved.
+    pub fn try_reserve_pending(&mut self, proposal_id: &str) -> Result<bool, String> {
+        let entry = self
+            .settlement_orders
+            .get_mut(proposal_id)
+            .ok_or_else(|| "settlement not adopted (no local settlement order record)".to_string())?;
+        if entry.reserved {
+            return Ok(false);
+        }
+        if entry.order_id != 0 {
+            if let Some(order) = self.orders.get(&entry.order_id) {
+                let remaining = order.quantity - order.settled_quantity - order.pending_quantity;
+                if remaining < entry.quantity {
+                    return Err(format!(
+                        "order {} insufficient capacity at reservation: remaining={}, requested={}",
+                        entry.order_id, remaining, entry.quantity
+                    ));
+                }
+            }
+        }
+        entry.reserved = true;
+        let (order_id, quantity) = (entry.order_id, entry.quantity);
         if let Some(order) = self.orders.get_mut(&order_id) {
             order.pending_quantity += quantity;
             info!(
@@ -299,32 +359,40 @@ impl OrderTracker {
                 order_id, quantity, order.pending_quantity, order.settled_quantity
             );
         }
-        self.settlement_orders
-            .insert(proposal_id.to_string(), (order_id, quantity));
+        Ok(true)
     }
 
     /// Mark settlement as completed — move pending → settled
     pub fn mark_settled(&mut self, proposal_id: &str) {
-        if let Some((order_id, quantity)) = self.settlement_orders.remove(proposal_id) {
-            if let Some(order) = self.orders.get_mut(&order_id) {
-                order.pending_quantity = (order.pending_quantity - quantity).max(Decimal::ZERO);
-                order.settled_quantity += quantity;
+        if let Some(entry) = self.settlement_orders.remove(proposal_id) {
+            // A settlement only reaches Settled after reservation; the guard
+            // protects the accounting if a terminal ever arrives earlier.
+            if !entry.reserved {
+                return;
+            }
+            if let Some(order) = self.orders.get_mut(&entry.order_id) {
+                order.pending_quantity = (order.pending_quantity - entry.quantity).max(Decimal::ZERO);
+                order.settled_quantity += entry.quantity;
                 info!(
                     "[{}] Order {} settled: {} (pending={}, settled={})",
-                    proposal_id, order_id, quantity, order.pending_quantity, order.settled_quantity
+                    proposal_id, entry.order_id, entry.quantity, order.pending_quantity, order.settled_quantity
                 );
             }
         }
     }
 
-    /// Mark settlement as failed — release pending quantity
+    /// Mark settlement as failed — release pending quantity (if it was reserved)
     pub fn mark_failed(&mut self, proposal_id: &str) {
-        if let Some((order_id, quantity)) = self.settlement_orders.remove(proposal_id) {
-            if let Some(order) = self.orders.get_mut(&order_id) {
-                order.pending_quantity = (order.pending_quantity - quantity).max(Decimal::ZERO);
+        if let Some(entry) = self.settlement_orders.remove(proposal_id) {
+            if !entry.reserved {
+                debug!("[{}] Settlement failed before reservation — nothing to release", proposal_id);
+                return;
+            }
+            if let Some(order) = self.orders.get_mut(&entry.order_id) {
+                order.pending_quantity = (order.pending_quantity - entry.quantity).max(Decimal::ZERO);
                 warn!(
                     "[{}] Order {} settlement failed: released {} pending (now pending={}, settled={})",
-                    proposal_id, order_id, quantity, order.pending_quantity, order.settled_quantity
+                    proposal_id, entry.order_id, entry.quantity, order.pending_quantity, order.settled_quantity
                 );
             }
         }
@@ -356,10 +424,11 @@ impl OrderTracker {
         let settlement_orders: Vec<SavedSettlementOrder> = self
             .settlement_orders
             .iter()
-            .map(|(proposal_id, (order_id, quantity))| SavedSettlementOrder {
+            .map(|(proposal_id, entry)| SavedSettlementOrder {
                 proposal_id: proposal_id.clone(),
-                order_id: *order_id,
-                quantity: quantity.to_string(),
+                order_id: entry.order_id,
+                quantity: entry.quantity.to_string(),
+                reserved: entry.reserved,
             })
             .collect();
 
@@ -397,8 +466,17 @@ impl OrderTracker {
 
         for saved in settlement_orders {
             let quantity = Decimal::from_str(&saved.quantity).unwrap_or_default();
-            self.settlement_orders
-                .insert(saved.proposal_id, (saved.order_id, quantity));
+            self.settlement_orders.insert(
+                saved.proposal_id,
+                SettlementOrderEntry {
+                    order_id: saved.order_id,
+                    quantity,
+                    // Legacy state files predate the reserved flag; their
+                    // entries all had pending_quantity applied (serde default
+                    // = true preserves that accounting through the upgrade).
+                    reserved: saved.reserved,
+                },
+            );
         }
 
         info!(
@@ -531,13 +609,15 @@ mod tests {
         // First settlement: 2.0
         let proposal1 = make_proposal("our-party", "counterparty", "2.0", 42, 99);
         assert!(matches!(tracker.verify_settlement(&proposal1, "our-party"), VerifyResult::Accepted { .. }));
-        tracker.mark_pending("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        assert!(tracker.try_reserve_pending("proposal-1").unwrap());
 
         // Second settlement: 2.0 (total pending = 4.0, remaining = 1.0)
         let mut proposal2 = make_proposal("our-party", "counterparty", "2.0", 42, 99);
         proposal2.proposal_id = "test-proposal-2".to_string();
         assert!(matches!(tracker.verify_settlement(&proposal2, "our-party"), VerifyResult::Accepted { .. }));
-        tracker.mark_pending("proposal-2", 42, Decimal::from_str("2.0").unwrap());
+        tracker.record_settlement_order("proposal-2", 42, Decimal::from_str("2.0").unwrap());
+        assert!(tracker.try_reserve_pending("proposal-2").unwrap());
 
         // Third settlement: 2.0 should fail (remaining = 1.0)
         let mut proposal3 = make_proposal("our-party", "counterparty", "2.0", 42, 99);
@@ -630,7 +710,8 @@ mod tests {
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
 
         // Pending 2.0
-        tracker.mark_pending("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        assert!(tracker.try_reserve_pending("proposal-1").unwrap());
 
         // Can't fit another 2.0 (remaining = 1.0)
         let proposal2 = make_proposal("our-party", "counterparty", "2.0", 42, 99);
@@ -641,5 +722,72 @@ mod tests {
 
         // Now 2.0 fits again (remaining = 3.0)
         assert!(matches!(tracker.verify_settlement(&proposal2, "our-party"), VerifyResult::Accepted { .. }));
+    }
+
+    // Deferred reservation: recording the adoption decision must not consume
+    // order capacity; only try_reserve_pending (counterparty committed) does.
+    #[test]
+    fn test_record_does_not_consume_capacity() {
+        let key = test_private_key();
+        let mut tracker = OrderTracker::new(1000, key);
+
+        let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0");
+        tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
+
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        assert!(tracker.has_settlement_order("proposal-1"));
+
+        // Capacity untouched: another 2.0 still verifies (remaining = 3.0)
+        let proposal2 = make_proposal("our-party", "counterparty", "2.0", 42, 99);
+        assert!(matches!(tracker.verify_settlement(&proposal2, "our-party"), VerifyResult::Accepted { .. }));
+
+        // Unreserved failure releases nothing and removes the record
+        tracker.mark_failed("proposal-1");
+        assert!(!tracker.has_settlement_order("proposal-1"));
+        assert!(matches!(tracker.verify_settlement(&proposal2, "our-party"), VerifyResult::Accepted { .. }));
+    }
+
+    #[test]
+    fn test_try_reserve_pending_idempotent_and_missing() {
+        let key = test_private_key();
+        let mut tracker = OrderTracker::new(1000, key);
+
+        let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0");
+        tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5.0", nonce, &signature, &signed_data);
+
+        // Missing entry → invariant error
+        assert!(tracker.try_reserve_pending("nope").is_err());
+
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        assert!(tracker.try_reserve_pending("proposal-1").unwrap()); // newly reserved
+        assert!(!tracker.try_reserve_pending("proposal-1").unwrap()); // idempotent re-entry
+
+        // pending applied exactly once: a 3.0 proposal fits (remaining = 3.0),
+        // a 4.0 proposal would not.
+        let fits = make_proposal("our-party", "counterparty", "3.0", 42, 99);
+        assert!(matches!(tracker.verify_settlement(&fits, "our-party"), VerifyResult::Accepted { .. }));
+    }
+
+    // The reservation-time capacity re-check is the atomic backstop for
+    // adoption-time advisory checks that overlapped while nothing was reserved.
+    #[test]
+    fn test_reserve_capacity_backstop() {
+        let key = test_private_key();
+        let mut tracker = OrderTracker::new(1000, key);
+
+        let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0");
+        tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
+
+        // Both adopted while capacity looked fine (nothing reserved yet)
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        tracker.record_settlement_order("proposal-2", 42, Decimal::from_str("2.0").unwrap());
+
+        assert!(tracker.try_reserve_pending("proposal-1").unwrap());
+        // Second reservation exceeds remaining (1.0 < 2.0) → rejected
+        assert!(tracker.try_reserve_pending("proposal-2").is_err());
+
+        // RFQ-style entries (order_id = 0) skip the capacity check
+        tracker.record_settlement_order("rfq-1", 0, Decimal::from_str("9.9").unwrap());
+        assert!(tracker.try_reserve_pending("rfq-1").unwrap());
     }
 }

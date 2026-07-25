@@ -482,11 +482,22 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         self.backend.forecast_paused()
     }
 
-    /// Return (in_progress, max_threads, in_backoff, waiting) for thread utilization logging
+    /// Return (in_progress, max_threads, in_backoff, waiting) for thread utilization logging.
+    ///
+    /// `in_progress`, `in_backoff` and `waiting` partition the active set: a
+    /// backoff entry is counted only when its proposal is still active AND not
+    /// currently in-progress. Without those guards the counts would overlap (a
+    /// cut-short proposal spawned while still holding a future `next_retry` is
+    /// both in-progress and in backoff) or count stale `failed_settlements`
+    /// entries for already-removed proposals — either of which understates
+    /// `waiting` and could hide genuine permit starvation.
     pub fn thread_utilization(&self) -> (usize, usize, usize, usize) {
+        let now = Instant::now();
         let in_progress = self.in_progress.len();
-        let in_backoff = self.failed_settlements.values()
-            .filter(|f| Instant::now() < f.next_retry)
+        let in_backoff = self.failed_settlements.iter()
+            .filter(|(pid, f)| now < f.next_retry
+                && self.active_settlements.contains_key(*pid)
+                && !self.in_progress.contains_key(*pid))
             .count();
         let total = self.active_settlements.len();
         let waiting = total.saturating_sub(in_progress).saturating_sub(in_backoff);
@@ -794,7 +805,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             {
                 let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
                 let mut tracker = self.tracker.lock().await;
-                tracker.mark_pending(&proposal_id, order_id, base_quantity);
+                tracker.record_settlement_order(&proposal_id, order_id, base_quantity);
             }
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
@@ -823,37 +834,59 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             return Ok(());
         }
 
-        // Liquidity gate: reject if agent lacks balance for allocation + fees
+        // Per-counterparty cap: refuse new proposals from a counterparty that
+        // already has too many pending settlements. Prevents a broken or
+        // spamming counterparty (one that never preconfirms its side) from
+        // piling up one-sided settlements that would otherwise sit until the
+        // server's allocation-window timeout. Dedup above guarantees a live
+        // already-adopted proposal is never re-checked here.
+        let counterparty = if is_buyer { &proposal.seller } else { &proposal.buyer };
+        let cp_pending = self
+            .active_settlements
+            .values()
+            .filter(|s| {
+                let cp = if s.is_buyer { &s.proposal.seller } else { &s.proposal.buyer };
+                cp == counterparty
+            })
+            .count();
+        if cp_pending >= self.config.max_pending_per_counterparty {
+            warn!(
+                "[{}] Rejecting proposal: counterparty {} has {} pending settlements (cap {})",
+                proposal_id, counterparty, cp_pending, self.config.max_pending_per_counterparty
+            );
+            // Mirror the liquidity-gate reject below (incl. the RFQ feedback
+            // insert — a cap-rejected buyer-RFQ proposal must revert the fill
+            // loop's optimistic accounting).
+            let state = SettlementState::new(proposal, is_buyer);
+            self.active_settlements.insert(proposal_id.clone(), state);
+            if let Err(e) = self.reject_proposal(&proposal_id).await {
+                warn!("[{}] Failed to reject: {}", proposal_id, e);
+                self.active_settlements.shift_remove(&proposal_id);
+            }
+            if let Some(ref rejected) = self.rejected_rfq_trades {
+                rejected.lock().await.insert(proposal_id.clone());
+            }
+            return Ok(());
+        }
+
+        // Liquidity gate (advisory): reject if agent lacks balance for
+        // allocation + fees. Mirrors RFQ V2's indicative-phase availability
+        // check — no commitment is made here. The actual reservation (LM
+        // commitment + order pending_quantity + depletion outflow) is deferred
+        // to `ensure_reserved`, which runs on the first post-preconfirm action,
+        // i.e. once the counterparty has preconfirmed. One-sided proposals from
+        // a counterparty that never commits therefore reserve nothing.
         // Don't reject based on zero balances at startup — wait for ACS worker to load them
         if let Some(ref lm) = self.liquidity_manager {
             if !lm.is_ready().await {
                 info!("[{}] Balances not loaded yet, deferring preconfirmation", proposal_id);
                 return Ok(());
             }
-            let my_instrument = if is_buyer {
-                &proposal.quote_instrument // buyer allocates quote
-            } else {
-                &proposal.base_instrument // seller allocates base
-            };
-            let allocation_amount = Decimal::from_str(
-                if is_buyer { &proposal.quote_quantity } else { &proposal.base_quantity }
-            ).unwrap_or(Decimal::ONE);
-
-            let allocation_token = match &self.config.cc_token_id {
-                Some(cc_id) if my_instrument == cc_id => liquidity::CC_TOKEN.to_string(),
-                _ => my_instrument.clone(),
-            };
-
-            let my_fees_usd = if is_buyer {
-                Decimal::from_str(&proposal.dvp_processing_fee_buyer).unwrap_or_default()
-                    + Decimal::from_str(&proposal.allocation_processing_fee_buyer).unwrap_or_default()
-            } else {
-                Decimal::from_str(&proposal.dvp_processing_fee_seller).unwrap_or_default()
-                    + Decimal::from_str(&proposal.allocation_processing_fee_seller).unwrap_or_default()
-            };
+            let (allocation_token, allocation_amount, my_fees_usd) =
+                reservation_inputs(&proposal, is_buyer, &self.config.cc_token_id);
             let fee_cc = lm.estimate_fee_cc(my_fees_usd).await;
 
-            if let Err(reason) = lm.try_commit(&proposal_id, &allocation_token, allocation_amount, fee_cc).await {
+            if let Err(reason) = lm.can_commit(&allocation_token, allocation_amount, fee_cc).await {
                 warn!("[{}] Rejecting proposal: {}", proposal_id, reason);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
@@ -866,12 +899,6 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 }
                 return Ok(());
             }
-
-            // Record outflow for depletion tracking
-            lm.record_outflow(
-                &allocation_token,
-                allocation_amount.to_f64().unwrap_or(0.0),
-            ).await;
         }
 
         // RFQ proposals (no order_match) — verify against agent's in-memory state
@@ -879,7 +906,6 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let rfq_verified = self.verify_rfq_proposal(&proposal).await;
             if !rfq_verified {
                 warn!("[{}] RFQ proposal rejected: not in agent's tracked RFQ state", proposal_id);
-                self.release_commitment(&proposal_id);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -896,7 +922,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             {
                 let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
                 let mut tracker = self.tracker.lock().await;
-                tracker.mark_pending(&proposal_id, order_id, base_quantity);
+                tracker.record_settlement_order(&proposal_id, order_id, base_quantity);
             }
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
@@ -917,7 +943,6 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             VerifyResult::Accepted { order_id } => order_id,
             VerifyResult::Rejected { reason } => {
                 warn!("[{}] Settlement rejected: {}", proposal_id, reason);
-                self.release_commitment(&proposal_id);
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -934,7 +959,6 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     Ok(oid) => oid,
                     Err(reason) => {
                         warn!("[{}] User order verification failed: {}", proposal_id, reason);
-                        self.release_commitment(&proposal_id);
                         let state = SettlementState::new(proposal, is_buyer);
                         self.active_settlements.insert(proposal_id.clone(), state);
                         if let Err(e) = self.reject_proposal(&proposal_id).await {
@@ -947,11 +971,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             }
         };
 
-        // Order verified — mark pending and proceed
+        // Order verified — record the local adoption decision and proceed.
+        // (Capacity reservation is deferred to the counterparty's preconfirm.)
         {
             let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
             let mut tracker = self.tracker.lock().await;
-            tracker.mark_pending(&proposal_id, order_id, base_quantity);
+            tracker.record_settlement_order(&proposal_id, order_id, base_quantity);
         }
 
         let state = SettlementState::new(proposal, is_buyer);
@@ -1066,13 +1091,18 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let permit = match self.semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    let total = self.active_settlements.len();
-                    let in_progress = self.in_progress.len();
+                    // Report waiting (runnable, blocked only on a permit) and
+                    // backoff (cooling down, not runnable yet) separately —
+                    // lumping them together made a burst of cooldown wake-ups
+                    // read as a huge runnable queue. Reaching here always means
+                    // the current proposal is runnable (it passed the
+                    // in-progress and backoff skips above) yet no permit was
+                    // free, so there is genuine permit contention → warn.
+                    let (in_progress, max_threads, in_backoff, waiting) =
+                        self.thread_utilization();
                     warn!(
-                        "All {} settlement threads busy ({} in-progress, {} waiting), will retry next cycle",
-                        self.config.settlement_thread_count,
-                        in_progress,
-                        total.saturating_sub(in_progress),
+                        "All {} settlement threads busy ({} in-progress, {} waiting, {} in backoff), will retry next cycle",
+                        max_threads, in_progress, waiting, in_backoff,
                     );
                     break;
                 }
@@ -1138,6 +1168,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let config = self.config.clone();
         let backend = Arc::clone(&self.backend);
         let tracker = Arc::clone(&self.tracker);
+        let liquidity_manager = self.liquidity_manager.clone();
         let shutdown = self.shutdown.clone();
         let action_log = Arc::clone(&self.action_log);
         let pid = proposal_id.clone();
@@ -1167,6 +1198,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         config.clone(),
                         backend.clone(),
                         tracker.clone(),
+                        liquidity_manager.clone(),
                         is_shutting_down,
                         action_log.clone(),
                     )
@@ -1276,6 +1308,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let mut completed = Vec::new();
         let mut readvance_ids = Vec::new();
 
+        let mut orphaned: Vec<String> = Vec::new();
         for (proposal_id, mut rx) in self.pending_results.drain(..) {
             match rx.try_recv() {
                 Ok((result, final_state)) => {
@@ -1283,6 +1316,16 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     // Update active_settlements with accumulated state from the task
                     if let Some(state) = self.active_settlements.get_mut(&proposal_id) {
                         *state = final_state;
+                    } else {
+                        // Stream-terminal race: a Settled/Cancelled stream event
+                        // removed this settlement while its task was mid-advance.
+                        // The task may have made the reservation (ensure_reserved)
+                        // AFTER the terminal handler's release ran against nothing.
+                        // Release both halves — the LM half would self-heal via
+                        // retain_commitments, but the tracker's pending_quantity
+                        // has no reconciler and would leak permanently (and be
+                        // persisted across restarts).
+                        orphaned.push(proposal_id.clone());
                     }
                     completed.push(result);
                 }
@@ -1299,6 +1342,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         self.pending_results = still_pending;
+
+        // Release reservations for results that raced a stream terminal
+        for proposal_id in orphaned {
+            {
+                let mut t = self.tracker.lock().await;
+                t.mark_failed(&proposal_id);
+            }
+            self.release_commitment(&proposal_id);
+        }
 
         // Emit consolidated NextAction summary
         let actions: Vec<(String, &'static str)> = self.action_log.lock().await.drain(..).collect();
@@ -1977,6 +2029,115 @@ async fn record_step_submitted(
 // Free function: advance a single settlement (runs in spawned task)
 // ============================================================================
 
+/// Compute this side's reservation inputs from locally-stored proposal terms:
+/// `(allocation_token, allocation_amount, my_fees_usd)`.
+///
+/// Shared by the adoption-time advisory check (`can_commit`) and the
+/// post-preconfirm reservation (`ensure_reserved` → `try_commit`) so the two
+/// can never drift. The buyer allocates the quote leg, the seller the base leg.
+fn reservation_inputs(
+    proposal: &SettlementProposal,
+    is_buyer: bool,
+    cc_token_id: &Option<String>,
+) -> (String, Decimal, Decimal) {
+    let my_instrument = if is_buyer {
+        &proposal.quote_instrument // buyer allocates quote
+    } else {
+        &proposal.base_instrument // seller allocates base
+    };
+    let allocation_amount = Decimal::from_str(
+        if is_buyer { &proposal.quote_quantity } else { &proposal.base_quantity }
+    ).unwrap_or(Decimal::ONE);
+
+    let allocation_token = match cc_token_id {
+        Some(cc_id) if my_instrument == cc_id => liquidity::CC_TOKEN.to_string(),
+        _ => my_instrument.clone(),
+    };
+
+    let my_fees_usd = if is_buyer {
+        Decimal::from_str(&proposal.dvp_processing_fee_buyer).unwrap_or_default()
+            + Decimal::from_str(&proposal.allocation_processing_fee_buyer).unwrap_or_default()
+    } else {
+        Decimal::from_str(&proposal.dvp_processing_fee_seller).unwrap_or_default()
+            + Decimal::from_str(&proposal.allocation_processing_fee_seller).unwrap_or_default()
+    };
+
+    (allocation_token, allocation_amount, my_fees_usd)
+}
+
+/// Reserve the resources for a settlement whose counterparty has committed
+/// (server returned a post-preconfirm action). Idempotent; strictly on
+/// locally-stored terms (`state.proposal` + the tracker's adoption record).
+///
+/// Two halves, each independently idempotent:
+/// - Tracker: `try_reserve_pending` applies the order's `pending_quantity`
+///   once (capacity re-checked — the atomic backstop for adoption-time
+///   advisory checks that overlapped).
+/// - LiquidityManager: `try_commit` — SKIPPED entirely when a commitment
+///   already exists: `try_commit`'s availability check counts this proposal's
+///   own commitment, so a bare re-commit under tight inventory would
+///   spuriously fail a healthy, fully-reserved settlement. Restored-reserved
+///   proposals (flag persisted, in-memory commitment lost with the process)
+///   lazily re-commit here.
+///
+/// Depletion outflow is recorded only when the tracker reservation is NEW —
+/// never per-step, never again after a restart restore.
+async fn ensure_reserved(
+    state: &SettlementState,
+    config: &BaseConfig,
+    liquidity_manager: &Option<Arc<LiquidityManager>>,
+    tracker: &Arc<Mutex<OrderTracker>>,
+    proposal_id: &str,
+) -> Result<(), String> {
+    // Precompute reservation inputs once (used for both the LM commit and the
+    // depletion outflow) so the two can never diverge.
+    let inputs = liquidity_manager
+        .as_ref()
+        .map(|_| reservation_inputs(&state.proposal, state.is_buyer, &config.cc_token_id));
+
+    // LM commitment FIRST — before latching the tracker reservation. If the
+    // commit fails (balance dipped since the adoption-time advisory check), we
+    // return Err with NOTHING half-applied, so the Error-backoff retry re-runs
+    // cleanly. Skipped when a commitment already exists (its own commitment
+    // counts against availability, so a bare re-commit would spuriously fail;
+    // and this is the restart lazy-recommit path). Idempotent.
+    if let Some(lm) = liquidity_manager {
+        if !lm.has_commitment(proposal_id).await {
+            let (allocation_token, allocation_amount, my_fees_usd) = inputs.as_ref().unwrap();
+            let fee_cc = lm.estimate_fee_cc(*my_fees_usd).await;
+            lm.try_commit(proposal_id, allocation_token, *allocation_amount, fee_cc)
+                .await?;
+            info!(
+                "[{}] Reserved {} {} + {:.4} CC fees (counterparty committed)",
+                proposal_id, allocation_amount, allocation_token, fee_cc
+            );
+        }
+    }
+
+    // Tracker latch LAST. `try_reserve_pending` is the idempotent
+    // once-per-settlement latch (Ok(true) exactly once ever; Ok(false) for a
+    // restart-restored reserved entry). Because it runs only after the LM
+    // commit succeeded, gating the depletion outflow on `newly_reserved` books
+    // the outflow exactly once — never lost on a partial-failure retry (LM
+    // failed first → tracker never latched → clean retry) and never
+    // double-booked on a restart re-commit (restored entry → Ok(false)).
+    let newly_reserved = {
+        let mut t = tracker.lock().await;
+        t.try_reserve_pending(proposal_id)?
+    };
+
+    if newly_reserved {
+        if let (Some(lm), Some((allocation_token, allocation_amount, _))) =
+            (liquidity_manager, &inputs)
+        {
+            lm.record_outflow(allocation_token, allocation_amount.to_f64().unwrap_or(0.0))
+                .await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Deadline windows for orderbook-origin settlements. These proposals carry no
 /// LP-quoted windows — the server's env defaults (ALLOCATE_DEADLINE_SECS /
 /// SETTLE_DEADLINE_SECS, 6h/12h) are stamped into their on-chain DVP terms —
@@ -2058,6 +2219,7 @@ async fn advance_single<B: SettlementBackend>(
     config: BaseConfig,
     backend: Arc<B>,
     tracker: Arc<Mutex<OrderTracker>>,
+    liquidity_manager: Option<Arc<LiquidityManager>>,
     shutting_down: bool,
     action_log: Arc<Mutex<Vec<(String, &'static str)>>>,
 ) -> AdvanceResult {
@@ -2135,6 +2297,27 @@ async fn advance_single<B: SettlementBackend>(
             settle_window,
         ) {
             return AdvanceResult::Error { proposal_id, error };
+        }
+    }
+
+    // Reserve on the first post-preconfirm action: any action other than
+    // Preconfirm/Wait/None means the counterparty has committed its side
+    // (the server only emits progress actions after both preconfirmations,
+    // or — for the DVP acceptor — after the counterparty's on-chain DVP).
+    // Until then nothing is reserved, so one-sided proposals cost no
+    // inventory. Idempotent; a failure (balance dropped since the adoption
+    // advisory check) routes through the Error backoff/retry path.
+    if !matches!(
+        my_action,
+        NextAction::Preconfirm | NextAction::Wait | NextAction::None
+    ) {
+        if let Err(e) =
+            ensure_reserved(&state, &config, &liquidity_manager, &tracker, &proposal_id).await
+        {
+            return AdvanceResult::Error {
+                proposal_id,
+                error: format!("reservation failed: {}", e),
+            };
         }
     }
 
@@ -2678,5 +2861,271 @@ mod tests {
             expiry_windows("", 900, 1800),
             (ORDERBOOK_ALLOCATE_BEFORE_SECS, ORDERBOOK_SETTLE_BEFORE_SECS)
         );
+    }
+
+    /// Fresh LM: 100 CC + 5000 USDCx, rate 0.10, ready.
+    async fn ready_lm() -> Arc<LiquidityManager> {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        lm
+    }
+
+    fn created_update(proposal: SettlementProposal) -> SettlementUpdate {
+        SettlementUpdate {
+            event_type: EventType::ProposalCreated as i32,
+            proposal: Some(proposal),
+            ..Default::default()
+        }
+    }
+
+    // Per-counterparty cap: a counterparty at the cap gets refused; a different
+    // counterparty (or the same one under the cap) still adopts.
+    #[tokio::test]
+    async fn test_per_counterparty_cap() {
+        let mut config = BaseConfig::test_minimal();
+        config.max_pending_per_counterparty = 2;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+
+        // Two active settlements with counterparty "cp-x" (we are the seller,
+        // so the counterparty is the buyer).
+        for pid in ["p1", "p2"] {
+            let mut p = test_proposal(pid);
+            p.buyer = "cp-x".to_string();
+            p.seller = "test-party".to_string();
+            exec.active_settlements
+                .insert(pid.to_string(), SettlementState::new(p, false));
+        }
+
+        // Third proposal from cp-x: hits the cap → refused. (reject_proposal's
+        // RPC fails in tests — empty URL — so the entry is removed instead of
+        // landing in rejected_proposals; either way it is NOT adopted.)
+        let mut p3 = test_proposal("p3");
+        p3.buyer = "cp-x".to_string();
+        p3.seller = "test-party".to_string();
+        exec.handle_settlement_update(created_update(p3)).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p3"));
+        assert!(!exec.tracker.lock().await.has_settlement_order("p3"));
+
+        // Proposal from cp-y passes the cap and adopts via the quoted-RFQ path.
+        let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
+            market_id: String::new(),
+            price: String::new(),
+            base_quantity: "1000".to_string(),
+            quote_quantity: "500".to_string(),
+        }]));
+        exec.set_quoted_rfq_trades(quoted);
+        let mut p4 = test_proposal("p4");
+        p4.buyer = "cp-y".to_string();
+        p4.seller = "test-party".to_string();
+        exec.handle_settlement_update(created_update(p4)).await.unwrap();
+        assert!(exec.active_settlements.contains_key("p4"));
+        assert!(exec.tracker.lock().await.has_settlement_order("p4"));
+    }
+
+    // Deferred reservation: adoption records the local decision but commits
+    // nothing; ensure_reserved (counterparty committed) reserves exactly once
+    // and is safe to re-enter even under tight inventory.
+    #[tokio::test]
+    async fn test_adoption_defers_reservation_until_counterparty_commits() {
+        let config = BaseConfig::test_minimal();
+        let lm = ready_lm().await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        exec.set_liquidity_manager(lm.clone());
+        let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
+            market_id: String::new(),
+            price: String::new(),
+            base_quantity: "1000".to_string(),
+            quote_quantity: "500".to_string(),
+        }]));
+        exec.set_quoted_rfq_trades(quoted);
+
+        let mut p1 = test_proposal("p1");
+        p1.seller = "test-party".to_string();
+        p1.buyer = "cp-x".to_string();
+        exec.handle_settlement_update(created_update(p1)).await.unwrap();
+
+        // Adopted — but NOTHING reserved: no LM commitment, full availability.
+        assert!(exec.active_settlements.contains_key("p1"));
+        assert!(exec.tracker.lock().await.has_settlement_order("p1"));
+        assert!(!lm.has_commitment("p1").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+
+        // Counterparty commits (server would now return a progress action):
+        // ensure_reserved commits both halves.
+        let state = exec.active_settlements.get("p1").unwrap().clone();
+        let lm_opt = Some(lm.clone());
+        ensure_reserved(&state, &exec.config, &lm_opt, &tracker, "p1")
+            .await
+            .unwrap();
+        assert!(lm.has_commitment("p1").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
+
+        // Idempotent re-entry — nothing double-reserved.
+        ensure_reserved(&state, &exec.config, &lm_opt, &tracker, "p1")
+            .await
+            .unwrap();
+        assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
+
+        // Terminal releases both halves.
+        exec.handle_settlement_update(SettlementUpdate {
+            event_type: EventType::Settled as i32,
+            proposal: Some(test_proposal("p1")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drain_spawned().await;
+        assert!(!lm.has_commitment("p1").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+    }
+
+    // Tight-inventory re-entry: once this proposal's own commitment consumes
+    // the remaining balance, a re-entered ensure_reserved must NOT fail (the
+    // has_commitment gate skips try_commit, whose availability check counts
+    // the proposal's own commitment).
+    #[tokio::test]
+    async fn test_ensure_reserved_reentry_under_tight_inventory() {
+        let config = BaseConfig::test_minimal();
+        let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(10)).await;
+        lm.update_token_balance("USDCx", Decimal::from(1000)).await; // exactly the leg
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        tracker
+            .lock()
+            .await
+            .record_settlement_order("p1", 0, Decimal::from(1000));
+
+        let state = SettlementState::new(test_proposal("p1"), false);
+        let lm_opt = Some(lm.clone());
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        assert_eq!(lm.available("USDCx").await, Decimal::ZERO);
+
+        // Re-entry with zero remaining availability must still succeed.
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+
+        // Unadopted proposal → invariant error, nothing reserved.
+        let state2 = SettlementState::new(test_proposal("p2"), false);
+        assert!(ensure_reserved(&state2, &config, &lm_opt, &tracker, "p2").await.is_err());
+        assert!(!lm.has_commitment("p2").await);
+    }
+
+    // Stream-terminal race: a task result arriving for a proposal that a
+    // Settled/Cancelled stream event already removed must release both the
+    // tracker reservation and the LM commitment (the collect_results orphan
+    // reconciler).
+    #[tokio::test]
+    async fn test_collect_results_releases_orphaned_reservation() {
+        let config = BaseConfig::test_minimal();
+        let lm = ready_lm().await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        exec.set_liquidity_manager(lm.clone());
+
+        // Task reserved both halves, then the stream terminal removed the
+        // settlement (not in active_settlements) before the result landed.
+        {
+            let mut t = tracker.lock().await;
+            t.record_settlement_order("p1", 0, Decimal::from(1000));
+            t.try_reserve_pending("p1").unwrap();
+        }
+        lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::ZERO)
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
+        assert!(tx
+            .send((
+                AdvanceResult::Wait { proposal_id: "p1".to_string() },
+                SettlementState::new(test_proposal("p1"), false),
+            ))
+            .is_ok());
+        exec.in_progress.insert("p1".to_string(), Instant::now());
+        exec.pending_results.push(("p1".to_string(), rx));
+
+        exec.collect_results().await;
+        drain_spawned().await;
+
+        assert!(!exec.tracker.lock().await.has_settlement_order("p1"));
+        assert!(!lm.has_commitment("p1").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+    }
+
+    // Review finding 1: a partial-failure re-entry must still reserve exactly
+    // once. With the LM commit ordered BEFORE the tracker latch, a first
+    // attempt that fails the LM commit latches NOTHING (no tracker reservation,
+    // no commitment), so the retry runs cleanly — and the once-only outflow,
+    // gated on the same tracker latch, is neither lost nor double-booked.
+    #[tokio::test]
+    async fn test_ensure_reserved_partial_failure_then_retry_reserves_once() {
+        let config = BaseConfig::test_minimal();
+        let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(50)).await;
+        lm.update_token_balance("USDCx", Decimal::from(500)).await; // < the 1000 leg
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [7u8; 32])));
+        tracker
+            .lock()
+            .await
+            .record_settlement_order("p1", 0, Decimal::from(1000));
+        // Seller allocates base = USDCx 1000.
+        let mut proposal = test_proposal("p1");
+        proposal.base_instrument = "USDCx".to_string();
+        proposal.base_quantity = "1000".to_string();
+        let state = SettlementState::new(proposal, false);
+        let lm_opt = Some(lm.clone());
+
+        // First attempt: LM commit fails (500 < 1000) → Err, NOTHING latched
+        // (LM ordered first, so the tracker was never reached).
+        assert!(ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.is_err());
+        assert!(!lm.has_commitment("p1").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(500));
+
+        // Balance recovers; retry succeeds and commits exactly the leg once.
+        lm.update_token_balance("USDCx", Decimal::from(2000)).await;
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        assert!(lm.has_commitment("p1").await);
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000)); // 2000 − 1000, once
+
+        // Idempotent re-entry: no second commit, availability unchanged.
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+    }
+
+    // Review finding 2: thread_utilization must partition the active set —
+    // a backoff entry that is also in-progress (cut-short spawn) or references
+    // a no-longer-active proposal must NOT be subtracted from `waiting`, else a
+    // genuinely runnable-but-blocked proposal is hidden.
+    #[tokio::test]
+    async fn test_thread_utilization_partitions_active_set() {
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+
+        // active: a1 (in-progress + stale backoff entry), a2 (runnable/waiting)
+        exec.active_settlements.insert("a1".to_string(), SettlementState::new(test_proposal("a1"), false));
+        exec.active_settlements.insert("a2".to_string(), SettlementState::new(test_proposal("a2"), false));
+        exec.in_progress.insert("a1".to_string(), Instant::now());
+        // a1 also carries a future-dated backoff entry (cut-short case)...
+        let future = Instant::now() + Duration::from_secs(300);
+        exec.failed_settlements.insert("a1".to_string(), FailedSettlement {
+            retry_count: 0, wait_count: 1, next_retry: future,
+            first_transient_at: None, cid_waiting: None,
+        });
+        // ...and a stale backoff entry for a proposal no longer active.
+        exec.failed_settlements.insert("ghost".to_string(), FailedSettlement {
+            retry_count: 0, wait_count: 1, next_retry: future,
+            first_transient_at: None, cid_waiting: None,
+        });
+
+        let (in_progress, _max, in_backoff, waiting) = exec.thread_utilization();
+        assert_eq!(in_progress, 1);
+        assert_eq!(in_backoff, 0); // a1 excluded (in-progress); ghost excluded (not active)
+        assert_eq!(waiting, 1);    // a2 is genuinely runnable — must not be hidden
     }
 }

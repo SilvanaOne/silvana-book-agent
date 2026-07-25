@@ -62,6 +62,20 @@ pub struct SplitInstrument {
     pub admin: String,
 }
 
+impl SplitInstrument {
+    /// The Canton Coin instrument descriptor. Used to run a CC-only merge worker
+    /// on paths that have no ladder config (fill loop, non-RFQ-v2 LP), where the
+    /// merge falls back to legacy total-count consolidation.
+    pub fn cc() -> Self {
+        Self {
+            key: crate::holdings_cache::CC_INSTRUMENT.to_string(),
+            is_cc: true,
+            on_chain_id: "Amulet".to_string(),
+            admin: String::new(),
+        }
+    }
+}
+
 /// Per-INSTRUMENT split policy: one global ladder per instrument, shared by
 /// every market that pays it (from `[liquidity_provider.rfq_v2.denominations]`,
 /// with a legacy per-market fallback derived at startup).

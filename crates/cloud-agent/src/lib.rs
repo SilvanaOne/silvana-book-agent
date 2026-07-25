@@ -684,6 +684,20 @@ pub async fn run_cloud_agent(
         backend = backend.with_mid_prices(mp);
     }
 
+    // When RFQ v2 is active, setup_rfq_v2 (above) already spawned an
+    // all-instrument merge worker. Otherwise (plain v1 LP or non-LP settlement
+    // agent) spawn the CC-only merge here — this restores the merge that used to
+    // run unconditionally from CloudSettlementBackend::new. Mutually exclusive
+    // with the RFQ-v2 spawn, so CC is never merged by two workers at once.
+    if config.merge_threshold.is_some() && !rfq_v2_active {
+        crate::merge_worker::spawn_merge_worker(
+            config.clone(),
+            backend.holdings_cache().clone(),
+            vec![split_worker::SplitInstrument::cc()],
+            lp_shutdown.clone(),
+        );
+    }
+
     let ledger_client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -964,6 +978,26 @@ pub async fn setup_rfq_v2(
     }
     holdings_cache.set_dust_thresholds(dust_thresholds).await;
 
+    // Dust-merge worker across all ladder instruments (CC + utility). Shares the
+    // cache + dust thresholds set above; per instrument it consolidates only
+    // sub-rung dust (CC via SplitCc, utility via a CIP-56 self-transfer) and
+    // never the rungs the split worker maintains.
+    if config.merge_threshold.is_some() {
+        let mut merge_instruments: Vec<split_worker::SplitInstrument> =
+            split_targets.iter().map(|t| t.instrument.clone()).collect();
+        // CC accumulates dust from fee payments even without a CC ladder, so
+        // always merge it (legacy total-count fallback when no CC dust threshold).
+        if !merge_instruments.iter().any(|i| i.is_cc) {
+            merge_instruments.push(split_worker::SplitInstrument::cc());
+        }
+        crate::merge_worker::spawn_merge_worker(
+            config.clone(),
+            holdings_cache.clone(),
+            merge_instruments,
+            lp_shutdown.clone(),
+        );
+    }
+
     if market_v2.is_empty() {
         return Err(anyhow!(
             "liquidity_provider.rfq_v2 is enabled but no enabled market has [markets.rfq.v2] enabled"
@@ -1154,6 +1188,19 @@ pub async fn run_fill(
         fill_backend_shutdown.clone(),
         holdings_cache::HoldingsCache::new(false),
     );
+
+    // CC-only dust merge for the fill path (no ladders here → this cache has no
+    // dust thresholds, so the merge worker falls back to legacy total-count
+    // consolidation on CC). Preserves the merge that previously ran via the
+    // backend constructor.
+    if config.merge_threshold.is_some() {
+        crate::merge_worker::spawn_merge_worker(
+            config.clone(),
+            backend.holdings_cache().clone(),
+            vec![split_worker::SplitInstrument::cc()],
+            fill_backend_shutdown.clone(),
+        );
+    }
 
     // The fill loop doesn't use the settlement-machine / payment-queue paths.
     // It settles each accepted quote atomically via MulticallSettler.
@@ -2372,6 +2419,9 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                             receiver_party: receiver,
                             amount,
                             reference,
+                            // CLI send: auto-select inputs (empty) — the merge
+                            // worker is the only caller that passes explicit cids.
+                            input_holding_cids: Vec::new(),
                         })),
                         request_signature: None,
                     },
