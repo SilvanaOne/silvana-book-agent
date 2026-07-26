@@ -46,7 +46,7 @@ use crate::venue_registry::TEMPLATE_SETTLEMENT_TICKET;
 /// Sender-change is computed separately and not counted, but we keep headroom for
 /// any change/fee output the `SplitCc` builder may emit. Deficits above this fill
 /// over successive ticks (the worker recomputes per-rung deficits every tick).
-const MAX_SPLIT_OUTPUTS_PER_TX: u32 = 90;
+pub(crate) const MAX_SPLIT_OUTPUTS_PER_TX: u32 = 90;
 
 /// Budget window for the per-instrument fail-stop split cap.
 const SPLIT_BUDGET_WINDOW: Duration = Duration::from_secs(3600);
@@ -114,7 +114,7 @@ pub fn parse_splits(specs: &[String]) -> Result<Vec<(Decimal, u32)>> {
 /// earlier rungs whole and partially truncating the rung that crosses the
 /// boundary (later rungs are dropped). Any remaining deficit is picked up on the
 /// next tick. Pure so it can be unit-tested.
-fn cap_split_outputs(splits: &[(Decimal, u32)], max: u32) -> Vec<(Decimal, u32)> {
+pub(crate) fn cap_split_outputs(splits: &[(Decimal, u32)], max: u32) -> Vec<(Decimal, u32)> {
     let mut out: Vec<(Decimal, u32)> = Vec::new();
     let mut used = 0u32;
     for (denom, count) in splits {
@@ -129,6 +129,51 @@ fn cap_split_outputs(splits: &[(Decimal, u32)], max: u32) -> Vec<(Decimal, u32)>
         used += take;
     }
     out
+}
+
+/// Subtract a submitted split chunk from the remaining full-ladder request,
+/// per denomination (saturating). Exhausted rungs are dropped; rung order is
+/// preserved. Used by the non-deficit (manual `atomic split`) chunk loop,
+/// which must not recompute deficits from the ACS between transactions —
+/// that would count pre-existing holdings. Pure so it can be unit-tested.
+pub(crate) fn subtract_split_chunk(
+    remaining: &[(Decimal, u32)],
+    chunk: &[(Decimal, u32)],
+) -> Vec<(Decimal, u32)> {
+    let mut spent: std::collections::HashMap<Decimal, u32> = std::collections::HashMap::new();
+    for (denom, count) in chunk {
+        *spent.entry(*denom).or_default() += *count;
+    }
+    remaining
+        .iter()
+        .filter_map(|(denom, count)| {
+            let used = spent.get_mut(denom).map_or(0, |avail| {
+                let take = (*count).min(*avail);
+                *avail -= take;
+                take
+            });
+            (*count > used).then(|| (*denom, count - used))
+        })
+        .collect()
+}
+
+/// Per-rung deficit against the coverage window `[denom, 2*denom)`: how many
+/// more holdings each rung needs given the current holding amounts. Pure so it
+/// can be unit-tested.
+pub(crate) fn rung_deficits(
+    rungs: &[(Decimal, u32)],
+    holding_amounts: &[Decimal],
+) -> Vec<(Decimal, u32)> {
+    rungs
+        .iter()
+        .filter_map(|(denom, count)| {
+            let have = holding_amounts
+                .iter()
+                .filter(|a| **a >= *denom && **a < *denom * Decimal::TWO)
+                .count() as u32;
+            (have < *count).then(|| (*denom, count - have))
+        })
+        .collect()
 }
 
 /// Low-water hysteresis (split-storm guard): a rung refills only once it
@@ -673,6 +718,83 @@ mod tests {
 
         // exactly at the cap → unchanged
         assert_eq!(cap_split_outputs(&[(d("150"), 90)], 90), vec![(d("150"), 90)]);
+    }
+
+    #[test]
+    fn subtract_split_chunk_saturates_per_denom() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+
+        // the CC 150x120 case: 90 committed → 30 remain
+        assert_eq!(
+            subtract_split_chunk(&[(d("150"), 120)], &[(d("150"), 90)]),
+            vec![(d("150"), 30)],
+        );
+
+        // multi-rung chunk boundary: first rung exhausted (dropped), second partial
+        assert_eq!(
+            subtract_split_chunk(
+                &[(d("150"), 50), (d("300"), 60), (d("600"), 10)],
+                &[(d("150"), 50), (d("300"), 40)],
+            ),
+            vec![(d("300"), 20), (d("600"), 10)],
+        );
+
+        // chunk == remaining → nothing left
+        assert!(subtract_split_chunk(&[(d("150"), 90)], &[(d("150"), 90)]).is_empty());
+
+        // empty chunk → unchanged
+        assert_eq!(
+            subtract_split_chunk(&[(d("150"), 120)], &[]),
+            vec![(d("150"), 120)],
+        );
+
+        // duplicate denoms in the ladder consume the chunk in order
+        assert_eq!(
+            subtract_split_chunk(&[(d("150"), 40), (d("150"), 20)], &[(d("150"), 50)]),
+            vec![(d("150"), 10)],
+        );
+    }
+
+    #[test]
+    fn rung_deficits_use_half_open_window() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        let rungs = vec![(d("150"), 2), (d("600"), 1)];
+
+        // empty holdings → full ladder
+        assert_eq!(rung_deficits(&rungs, &[]), rungs);
+
+        // exactly `denom` counts; exactly `2*denom` does not (it belongs to the
+        // next band up — here 300 counts toward neither rung)
+        assert_eq!(
+            rung_deficits(&rungs, &[d("150"), d("300")]),
+            vec![(d("150"), 1), (d("600"), 1)],
+        );
+
+        // fully covered → empty (299.99 still inside [150, 300))
+        assert!(rung_deficits(&rungs, &[d("150"), d("299.99"), d("600")]).is_empty());
+
+        // overfull rung never goes negative, other rungs still reported
+        assert_eq!(
+            rung_deficits(&rungs, &[d("150"), d("150"), d("150")]),
+            vec![(d("600"), 1)],
+        );
+    }
+
+    #[test]
+    fn chunked_ladder_converges() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+
+        // Simulate the chunk loop on the LP's exact case: 150x120 at 90/tx →
+        // exactly two txs of 90 and 30 outputs.
+        let mut remaining = vec![(d("150"), 120)];
+        let mut chunks: Vec<u32> = Vec::new();
+        while !remaining.is_empty() {
+            let chunk = cap_split_outputs(&remaining, MAX_SPLIT_OUTPUTS_PER_TX);
+            chunks.push(chunk.iter().map(|(_, c)| c).sum());
+            remaining = subtract_split_chunk(&remaining, &chunk);
+            assert!(chunks.len() <= 3, "loop failed to converge");
+        }
+        assert_eq!(chunks, vec![90, 30]);
     }
 
     #[test]

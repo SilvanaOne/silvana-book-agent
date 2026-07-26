@@ -436,11 +436,18 @@ impl OrderbookClient {
     /// Request RFQ V2 (AtomicDVP) quotes from V2-connected liquidity providers.
     /// `fee_tokens` is the priority-ordered settlement-fee token preference
     /// (instruments-table symbols, e.g. ["USDC", "CC"]); empty = CC.
+    ///
+    /// The RFQ is sized in EXACTLY ONE leg (the server rejects both-set and
+    /// neither-set): base `quantity`, or quote `quote_quantity` (pass
+    /// `Some(..)` with an empty `quantity`). Quote sizing pins the taker's
+    /// PAY leg on a buy — the LP's spread then moves the base received, so a
+    /// pool-capped buyer can never be pushed over its pool by the spread.
     pub async fn request_quotes_atomic(
         &mut self,
         market_id: &str,
         direction: &str,
         quantity: &str,
+        quote_quantity: Option<&str>,
         lp_names: Vec<String>,
         timeout_secs: Option<u32>,
         fee_tokens: Vec<String>,
@@ -454,8 +461,7 @@ impl OrderbookClient {
             fee_tokens,
             // No swap-venue delegation: the agent always acts as its own party.
             user: None,
-            // This helper always sizes by base quantity.
-            quote_quantity: None,
+            quote_quantity: quote_quantity.map(str::to_string),
         });
 
         let response = self
