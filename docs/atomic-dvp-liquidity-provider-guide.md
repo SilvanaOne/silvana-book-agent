@@ -666,6 +666,10 @@ keeps `COUNT` holdings sized in `[AMOUNT, 2×AMOUNT)`. Each in‑flight quote re
 the token the LP pays, so **your concurrency per token = its ready rungs**. Provide one entry for
 every token that appears in your markets.
 
+Canton caps a split at ~100 outputs per transaction (Canton Coin rejects more with
+`maximum-outputs-exceeded`). Ladders that need more — e.g. `150x120` — are filled across multiple
+transactions automatically, both by `atomic setup` and by the runtime split worker.
+
 ### `[[markets]]` and `[markets.rfq]` / `[markets.rfq.v2]`
 
 | Key | Default | Meaning |

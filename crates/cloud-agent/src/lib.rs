@@ -4160,26 +4160,12 @@ pub fn atomic_resolve_market_pair(
 /// `TicketService_SplitHoldings`. Returns the update id, or None when there
 /// was nothing to do.
 #[allow(clippy::too_many_arguments)]
-pub async fn atomic_split_denominations(
+/// Query, filter, and descending-sort the party's holdings for one instrument.
+async fn fetch_split_holdings(
+    v1_client: &mut DAppProviderClient,
     config: &BaseConfig,
-    on_chain_id: &str,
-    admin: &str,
-    rungs: &[(rust_decimal::Decimal, u32)],
-    only_deficit: bool,
-    verbose: bool,
-    dry_run: bool,
-    force: bool,
-) -> Result<Option<String>> {
-    use rust_decimal::Decimal;
-
-    let is_cc = on_chain_id == "Amulet";
-    let instr_key = if is_cc {
-        holdings_cache::CC_INSTRUMENT.to_string()
-    } else {
-        holdings_cache::instrument_key(admin, on_chain_id)
-    };
-
-    let mut v1_client = atomic_swap::create_v1_client(config).await?;
+    instr_key: &str,
+) -> Result<Vec<holdings_cache::CachedHolding>> {
     let contracts = v1_client
         .get_active_contracts(&[
             holdings_cache::TEMPLATE_AMULET.to_string(),
@@ -4192,157 +4178,342 @@ pub async fn atomic_split_denominations(
             .filter(|h| h.instrument == instr_key)
             .collect();
     holdings.sort_by(|a, b| b.amount.cmp(&a.amount)); // descending
+    Ok(holdings)
+}
 
-    let to_make: Vec<(Decimal, u32)> = if only_deficit {
-        rungs
-            .iter()
-            .filter_map(|(denom, count)| {
-                let have = holdings
-                    .iter()
-                    .filter(|h| h.amount >= *denom && h.amount < *denom * Decimal::TWO)
-                    .count() as u32;
-                (have < *count).then(|| (*denom, count - have))
-            })
-            .collect()
-    } else {
-        rungs.to_vec()
+/// Re-fetch holdings after a committed split until none of the inputs that tx
+/// spent is still visible — a snapshot that still shows them predates the
+/// commit, and submitting from it would reference already-spent contracts.
+/// Returns the freshest snapshot and whether it is clean.
+async fn refetch_after_split(
+    v1_client: &mut DAppProviderClient,
+    config: &BaseConfig,
+    instr_key: &str,
+    spent_cids: &[String],
+) -> Result<(Vec<holdings_cache::CachedHolding>, bool)> {
+    const ATTEMPTS: u32 = 5;
+    const DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    let is_stale = |holdings: &[holdings_cache::CachedHolding]| {
+        holdings.iter().any(|h| spent_cids.contains(&h.contract_id))
     };
-    if to_make.is_empty() {
+    let mut holdings = fetch_split_holdings(v1_client, config, instr_key).await?;
+    for _ in 1..ATTEMPTS {
+        if !is_stale(&holdings) {
+            return Ok((holdings, true));
+        }
+        tokio::time::sleep(DELAY).await;
+        holdings = fetch_split_holdings(v1_client, config, instr_key).await?;
+    }
+    let clean = !is_stale(&holdings);
+    Ok((holdings, clean))
+}
+
+pub async fn atomic_split_denominations(
+    config: &BaseConfig,
+    on_chain_id: &str,
+    admin: &str,
+    rungs: &[(rust_decimal::Decimal, u32)],
+    only_deficit: bool,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+) -> Result<Option<String>> {
+    use orderbook_proto::rfqv2::{
+        prepare_atomic_transaction_request::Params as AtomicParams,
+        PrepareAtomicTransactionRequest, SplitHoldingsParams, SplitSpec,
+    };
+    use rust_decimal::Decimal;
+
+    let is_cc = on_chain_id == "Amulet";
+    let instr_key = if is_cc {
+        holdings_cache::CC_INSTRUMENT.to_string()
+    } else {
+        holdings_cache::instrument_key(admin, on_chain_id)
+    };
+
+    let mut v1_client = atomic_swap::create_v1_client(config).await?;
+    let mut atomic_client: Option<AtomicProviderClient> = None;
+    let mut holdings = fetch_split_holdings(&mut v1_client, config, &instr_key).await?;
+
+    // Full-ladder tracker for the non-deficit (manual `atomic split`) mode:
+    // between chunks it must NOT recompute deficits from the ACS — earlier
+    // chunks and pre-existing holdings would be double-counted — so the
+    // submitted chunk is subtracted instead.
+    let mut remaining: Vec<(Decimal, u32)> = rungs.to_vec();
+
+    let initial_want: Vec<(Decimal, u32)> = if only_deficit {
+        let amounts: Vec<Decimal> = holdings.iter().map(|h| h.amount).collect();
+        split_worker::rung_deficits(rungs, &amounts)
+    } else {
+        remaining.clone()
+    };
+    if initial_want.is_empty() {
         return Ok(None);
     }
+    let total_outputs: u32 = initial_want.iter().map(|(_, c)| *c).sum();
+    // Both split mechanisms are capped per transaction (Amulet rejects >100
+    // outputs in one AmuletRules_Transfer with maximum-outputs-exceeded; the
+    // CIP-56 SplitHoldings path is chunked identically), so an over-cap ladder
+    // is filled across several sequential transactions: submit a capped chunk,
+    // re-check, submit the next.
+    let max_iters = total_outputs.div_ceil(split_worker::MAX_SPLIT_OUTPUTS_PER_TX) + 2;
+    let multi_tx = total_outputs > split_worker::MAX_SPLIT_OUTPUTS_PER_TX;
 
-    // Cap the requested rungs to what the balance actually covers (partial
-    // fill). All-or-nothing here meant a party holding 6 rungs' worth of
-    // funds got NO rungs at all ("insufficient holdings for splits"). Walk
-    // the rungs in ladder order taking whole denominations while the budget
-    // lasts; the shortfall is warned about and picked up by a later
-    // setup/maintenance pass once the party is funded.
-    let to_make = {
-        use rust_decimal::prelude::ToPrimitive;
-        let available: Decimal = holdings.iter().map(|h| h.amount).sum();
-        let mut budget = if is_cc {
-            // Reciprocal of the CC fee margin applied below (×1.02 + 1).
-            ((available - Decimal::ONE) / Decimal::new(102, 2)).max(Decimal::ZERO)
+    let mut last_update: Option<String> = None;
+    let mut spent_inputs: Vec<String> = Vec::new();
+    let mut committed_txs: u32 = 0;
+    let mut prev_outstanding: Option<u32> = None;
+    let mut ladder_covered = false;
+
+    for iter in 0..max_iters {
+        if iter > 0 {
+            let (fresh, clean) =
+                refetch_after_split(&mut v1_client, config, &instr_key, &spent_inputs).await?;
+            holdings = fresh;
+            if !clean {
+                tracing::warn!(
+                    "{}: ACS still shows inputs spent by the previous split tx — stopping; \
+                     the remaining rungs fill via the split worker or the next setup run",
+                    instr_key
+                );
+                break;
+            }
+        }
+
+        let want: Vec<(Decimal, u32)> = if only_deficit {
+            let amounts: Vec<Decimal> = holdings.iter().map(|h| h.amount).collect();
+            split_worker::rung_deficits(rungs, &amounts)
         } else {
-            available
+            remaining.clone()
         };
-        let requested: Decimal = to_make.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
-        let mut capped: Vec<(Decimal, u32)> = Vec::new();
-        for (denom, count) in &to_make {
-            if *denom <= Decimal::ZERO {
-                continue;
-            }
-            let fits = (budget / *denom).floor().to_u32().unwrap_or(0).min(*count);
-            if fits > 0 {
-                capped.push((*denom, fits));
-                budget -= *denom * Decimal::from(fits);
-            }
-        }
-        if capped.is_empty() {
-            return Err(anyhow!(
-                "insufficient {} holdings for splits: have {}, need {}",
-                instr_key, available, requested
-            ));
-        }
-        let capped_total: Decimal = capped.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
-        if capped_total < requested {
-            tracing::warn!(
-                "{}: partial split — balance {} covers {} of the requested {} ladder total",
-                instr_key, available, capped_total, requested
-            );
-        }
-        capped
-    };
-
-    let mut total: Decimal = to_make.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
-    if is_cc {
-        // CC fee margin (holding-fee decay + transfer fees)
-        total = total * Decimal::new(102, 2) + Decimal::ONE;
-    }
-
-    // Largest-first input selection until the total is covered (cap 100).
-    let mut input_cids: Vec<String> = Vec::new();
-    let mut covered = Decimal::ZERO;
-    for h in &holdings {
-        if input_cids.len() >= 100 || covered >= total {
+        let outstanding: u32 = want.iter().map(|(_, c)| *c).sum();
+        if outstanding == 0 {
+            ladder_covered = true;
             break;
         }
-        input_cids.push(h.contract_id.clone());
-        covered += h.amount;
-    }
-    if covered < total {
-        return Err(anyhow!(
-            "insufficient {} holdings for splits: have {}, need {}",
-            instr_key, covered, total
-        ));
-    }
+        if only_deficit {
+            if let Some(prev) = prev_outstanding {
+                if outstanding >= prev {
+                    tracing::warn!(
+                        "{}: split made no progress ({} output(s) outstanding, was {}) — stopping",
+                        instr_key, outstanding, prev
+                    );
+                    break;
+                }
+            }
+            prev_outstanding = Some(outstanding);
+        }
 
-    if is_cc {
-        let mut output_amounts: Vec<String> = Vec::new();
-        for (denom, count) in &to_make {
-            for _ in 0..*count {
-                output_amounts.push(denom.to_string());
+        // Cap the requested rungs to what the balance actually covers (partial
+        // fill). All-or-nothing here meant a party holding 6 rungs' worth of
+        // funds got NO rungs at all ("insufficient holdings for splits"). Walk
+        // the rungs in ladder order taking whole denominations while the budget
+        // lasts; the shortfall is warned about and picked up by a later
+        // setup/maintenance pass once the party is funded.
+        let affordable = {
+            use rust_decimal::prelude::ToPrimitive;
+            let available: Decimal = holdings.iter().map(|h| h.amount).sum();
+            let mut budget = if is_cc {
+                // Reciprocal of the CC fee margin applied below (×1.02 + 1).
+                ((available - Decimal::ONE) / Decimal::new(102, 2)).max(Decimal::ZERO)
+            } else {
+                available
+            };
+            let requested: Decimal = want.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
+            let mut capped: Vec<(Decimal, u32)> = Vec::new();
+            for (denom, count) in &want {
+                if *denom <= Decimal::ZERO {
+                    continue;
+                }
+                let fits = (budget / *denom).floor().to_u32().unwrap_or(0).min(*count);
+                if fits > 0 {
+                    capped.push((*denom, fits));
+                    budget -= *denom * Decimal::from(fits);
+                }
+            }
+            if capped.is_empty() {
+                if committed_txs == 0 {
+                    return Err(anyhow!(
+                        "insufficient {} holdings for splits: have {}, need {}",
+                        instr_key, available, requested
+                    ));
+                }
+                tracing::warn!(
+                    "{}: balance exhausted with {} output(s) outstanding — stopping after {} committed split tx(s)",
+                    instr_key, outstanding, committed_txs
+                );
+                break;
+            }
+            let capped_total: Decimal = capped.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
+            if capped_total < requested {
+                tracing::warn!(
+                    "{}: partial split — balance {} covers {} of the requested {} ladder total",
+                    instr_key, available, capped_total, requested
+                );
+            }
+            capped
+        };
+
+        // Never exceed the per-tx output cap; the remainder goes in the next
+        // chunk once the change from this tx is back in the ACS.
+        let chunk =
+            split_worker::cap_split_outputs(&affordable, split_worker::MAX_SPLIT_OUTPUTS_PER_TX);
+        let chunk_outputs: u32 = chunk.iter().map(|(_, c)| *c).sum();
+
+        let mut total: Decimal = chunk.iter().map(|(d, c)| *d * Decimal::from(*c)).sum();
+        if is_cc {
+            // CC fee margin (holding-fee decay + transfer fees)
+            total = total * Decimal::new(102, 2) + Decimal::ONE;
+        }
+
+        // Largest-first input selection until the total is covered (cap 100).
+        let mut input_cids: Vec<String> = Vec::new();
+        let mut covered = Decimal::ZERO;
+        for h in &holdings {
+            if input_cids.len() >= 100 || covered >= total {
+                break;
+            }
+            input_cids.push(h.contract_id.clone());
+            covered += h.amount;
+        }
+        if covered < total {
+            if committed_txs == 0 {
+                return Err(anyhow!(
+                    "insufficient {} holdings for splits: have {}, need {}",
+                    instr_key, covered, total
+                ));
+            }
+            tracing::warn!(
+                "{}: inputs cover {} of the {} needed for the next chunk — stopping after {} committed split tx(s)",
+                instr_key, covered, total, committed_txs
+            );
+            break;
+        }
+
+        let update_id = if is_cc {
+            let mut output_amounts: Vec<String> = Vec::new();
+            for (denom, count) in &chunk {
+                for _ in 0..*count {
+                    output_amounts.push(denom.to_string());
+                }
+            }
+            let expectation = OperationExpectation::SplitCc {
+                party: config.party_id.clone(),
+                output_amounts: output_amounts.clone(),
+            };
+            v1_client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::SplitCc as i32,
+                        params: Some(Params::SplitCc(SplitCcParams {
+                            output_amounts,
+                            amulet_cids: input_cids.clone(),
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "split tx {} for {} ({} tx(s) already committed)",
+                        iter + 1, instr_key, committed_txs
+                    )
+                })?
+                .update_id
+        } else {
+            if atomic_client.is_none() {
+                atomic_client = Some(atomic_swap::create_atomic_client(config).await?);
+            }
+            let splits: Vec<SplitSpec> = chunk
+                .iter()
+                .map(|(denom, count)| SplitSpec {
+                    amount: denom.to_string(),
+                    count: *count,
+                })
+                .collect();
+            let expectation = OperationExpectation::SplitHoldings {
+                lp_party: config.party_id.clone(),
+                instrument_id: on_chain_id.to_string(),
+                split_count: splits.len(),
+                input_cids: input_cids.clone(),
+            };
+            atomic_client
+                .as_mut()
+                .expect("atomic client initialized above")
+                .submit_atomic_transaction(
+                    PrepareAtomicTransactionRequest {
+                        params: Some(AtomicParams::SplitHoldings(SplitHoldingsParams {
+                            instrument_id: on_chain_id.to_string(),
+                            instrument_admin: admin.to_string(),
+                            input_holding_cids: input_cids.clone(),
+                            splits,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "split tx {} for {} ({} tx(s) already committed)",
+                        iter + 1, instr_key, committed_txs
+                    )
+                })?
+                .update_id
+        };
+
+        if dry_run {
+            // Nothing executes in dry-run, so the loop would never converge —
+            // show the first capped tx and report what would follow.
+            if outstanding > chunk_outputs {
+                let rest = outstanding - chunk_outputs;
+                println!(
+                    "DRY RUN: showed the first {}-output split tx for {}; {} more output(s) would follow in ~{} further tx(s)",
+                    chunk_outputs,
+                    instr_key,
+                    rest,
+                    rest.div_ceil(split_worker::MAX_SPLIT_OUTPUTS_PER_TX)
+                );
+            }
+            return Ok(Some(update_id));
+        }
+
+        committed_txs += 1;
+        last_update = Some(update_id.clone());
+        spent_inputs = input_cids;
+        if multi_tx {
+            println!(
+                "Split tx {} for {}: {} output(s) committed (update {}), {} outstanding",
+                committed_txs,
+                instr_key,
+                chunk_outputs,
+                update_id,
+                outstanding - chunk_outputs
+            );
+        }
+        if !only_deficit {
+            remaining = split_worker::subtract_split_chunk(&remaining, &chunk);
+            if remaining.is_empty() {
+                ladder_covered = true;
+                break;
             }
         }
-        let expectation = OperationExpectation::SplitCc {
-            party: config.party_id.clone(),
-            output_amounts: output_amounts.clone(),
-        };
-        let resp = v1_client
-            .submit_transaction(
-                PrepareTransactionRequest {
-                    operation: TransactionOperation::SplitCc as i32,
-                    params: Some(Params::SplitCc(SplitCcParams {
-                        output_amounts,
-                        amulet_cids: input_cids,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                verbose,
-                dry_run,
-                force,
-            )
-            .await?;
-        Ok(Some(resp.update_id))
-    } else {
-        use orderbook_proto::rfqv2::{
-            prepare_atomic_transaction_request::Params as AtomicParams,
-            PrepareAtomicTransactionRequest, SplitHoldingsParams, SplitSpec,
-        };
-        let mut atomic_client = atomic_swap::create_atomic_client(config).await?;
-        let splits: Vec<SplitSpec> = to_make
-            .iter()
-            .map(|(denom, count)| SplitSpec {
-                amount: denom.to_string(),
-                count: *count,
-            })
-            .collect();
-        let expectation = OperationExpectation::SplitHoldings {
-            lp_party: config.party_id.clone(),
-            instrument_id: on_chain_id.to_string(),
-            split_count: splits.len(),
-            input_cids: input_cids.clone(),
-        };
-        let resp = atomic_client
-            .submit_atomic_transaction(
-                PrepareAtomicTransactionRequest {
-                    params: Some(AtomicParams::SplitHoldings(SplitHoldingsParams {
-                        instrument_id: on_chain_id.to_string(),
-                        instrument_admin: admin.to_string(),
-                        input_holding_cids: input_cids,
-                        splits,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                verbose,
-                dry_run,
-                force,
-            )
-            .await?;
-        Ok(Some(resp.update_id))
     }
+
+    if !ladder_covered && committed_txs == max_iters {
+        tracing::warn!(
+            "{}: split iteration bound ({}) reached — remaining rungs fill via the split worker or the next setup run",
+            instr_key, max_iters
+        );
+    }
+    Ok(last_update)
 }
 
 pub async fn run_atomic(
@@ -4742,8 +4913,17 @@ pub async fn run_atomic(
             let kf = quote_key_from_env()?;
             println!("[1/6] Quote key (from ATOMIC_QUOTE_PRIVATE_KEY): {}", kf.pub_spki_hex);
 
-            atomic_setup_agent(&config, &kf, Some(&service_file), verbose, dry_run, force).await?;
-            println!("Setup complete. Run `atomic status` to verify, then restart the agent.");
+            let warnings =
+                atomic_setup_agent(&config, &kf, Some(&service_file), verbose, dry_run, force)
+                    .await?;
+            if warnings == 0 {
+                println!("Setup complete. Run `atomic status` to verify, then restart the agent.");
+            } else {
+                println!(
+                    "Setup completed with {warnings} warning(s) — review the [x/6] warnings above, \
+                     then run `atomic status` to verify."
+                );
+            }
         }
     }
 
@@ -4759,6 +4939,10 @@ pub async fn run_atomic(
 /// ATOMIC_QUOTE_PRIVATE_KEY). `service_file: None` skips the disclosure-file
 /// reference check — venue creation is prepared server-side with the server's
 /// own disclosure either way.
+///
+/// Setup stays best-effort (every step warns and continues), but the number of
+/// step warnings is returned so callers can report an honest summary instead
+/// of an unconditional "Setup complete.".
 pub async fn atomic_setup_agent(
     config: &BaseConfig,
     quote_key: &atomic_quote::QuoteKeyFile,
@@ -4766,11 +4950,12 @@ pub async fn atomic_setup_agent(
     verbose: bool,
     dry_run: bool,
     force: bool,
-) -> Result<()> {
+) -> Result<u32> {
     use orderbook_proto::rfqv2::{
         prepare_atomic_transaction_request::Params as AtomicParams, CreateAtomicDvpVenueParams,
         IssueTicketsParams, PrepareAtomicTransactionRequest,
     };
+    let mut warnings: u32 = 0;
     {
             // Alias so the body below (moved verbatim from the CLI arm) keeps
             // its original name for the key.
@@ -4816,6 +5001,7 @@ pub async fn atomic_setup_agent(
                     if v.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) {
                         println!("[3/6] Venue for {} exists with matching key — skipped", m.market_id);
                     } else {
+                        warnings += 1;
                         tracing::warn!(
                             "[3/6] Venue for {} exists with a DIFFERENT key ({}) — \
                              run `atomic venue rotate-key --market {}`",
@@ -4857,13 +5043,19 @@ pub async fn atomic_setup_agent(
                                 "[3/6] Venue created for {} (update {})",
                                 m.market_id, resp.update_id
                             ),
-                            Err(e) => tracing::warn!(
-                                "[3/6] Venue creation for {} failed: {:#}",
-                                m.market_id, e
-                            ),
+                            Err(e) => {
+                                warnings += 1;
+                                tracing::warn!(
+                                    "[3/6] Venue creation for {} failed: {:#}",
+                                    m.market_id, e
+                                );
+                            }
                         }
                     }
-                    Err(e) => tracing::warn!("[3/6] {} skipped: {:#}", m.market_id, e),
+                    Err(e) => {
+                        warnings += 1;
+                        tracing::warn!("[3/6] {} skipped: {:#}", m.market_id, e);
+                    }
                 }
             }
 
@@ -4891,7 +5083,10 @@ pub async fn atomic_setup_agent(
                         "[4/6] Receiving preapproval for {} already present / not needed",
                         instr
                     ),
-                    Err(e) => tracing::warn!("[4/6] Preapproval for {} failed: {:#}", instr, e),
+                    Err(e) => {
+                        warnings += 1;
+                        tracing::warn!("[4/6] Preapproval for {} failed: {:#}", instr, e);
+                    }
                 }
             }
 
@@ -4937,7 +5132,10 @@ pub async fn atomic_setup_agent(
                                 "[5/6] Issued {} tickets (update {})",
                                 v2.ticket_batch_size, resp.update_id
                             ),
-                            Err(e) => tracing::warn!("[5/6] Ticket issue failed: {:#}", e),
+                            Err(e) => {
+                                warnings += 1;
+                                tracing::warn!("[5/6] Ticket issue failed: {:#}", e);
+                            }
                         }
                     }
                 }
@@ -4992,6 +5190,7 @@ pub async fn atomic_setup_agent(
                     match split_worker::parse_splits(&ladder) {
                         Ok(r) => r,
                         Err(e) => {
+                            warnings += 1;
                             tracing::warn!("[6/6] {}: bad denominations: {:#}", symbol, e);
                             continue;
                         }
@@ -5010,11 +5209,14 @@ pub async fn atomic_setup_agent(
                         symbol, update_id
                     ),
                     Ok(None) => println!("[6/6] Denomination coverage OK for {}", symbol),
-                    Err(e) => tracing::warn!("[6/6] Split for {} failed: {:#}", symbol, e),
+                    Err(e) => {
+                        warnings += 1;
+                        tracing::warn!("[6/6] Split for {} failed: {:#}", symbol, e);
+                    }
                 }
             }
 
     }
 
-    Ok(())
+    Ok(warnings)
 }

@@ -513,8 +513,10 @@ impl AtomicSwapper {
         let Some(mut picks) = picks else {
             return Ok(SwapOutcome::Requote {
                 reason: format!(
-                    "own holdings selection failed for {} (need {}; cache cold or insufficient)",
-                    pay_key, select_target
+                    "own holdings selection failed for {} (need {}; {})",
+                    pay_key,
+                    select_target,
+                    self.selection_failure_detail(&pay_key, select_target).await
                 ),
             });
         };
@@ -554,7 +556,8 @@ impl AtomicSwapper {
             let Some(fee_picks) = fee_picks else {
                 return Ok(SwapOutcome::Requote {
                     reason: format!(
-                        "{id} fee-funding selection failed (need {target} {id} for the settlement fee)"
+                        "{id} fee-funding selection failed (need {target} {id} for the settlement fee; {})",
+                        self.selection_failure_detail(&fee_key, target).await
                     ),
                 });
             };
@@ -782,6 +785,26 @@ impl AtomicSwapper {
                     return Ok(SwapOutcome::Requote { reason: msg });
                 }
             }
+        }
+    }
+
+    /// Post-mortem detail for a failed leg selection, splitting the two very
+    /// different failures that used to share one "cache cold or insufficient"
+    /// message. The discriminator is the one [`selection_deadline`] and the
+    /// backfill gate already use: `total_available_amount` counts holdings a
+    /// refresh could revive (blob-pending, TTL-stale), so below-target there
+    /// means genuinely underfunded, while at-or-above-target means the pool
+    /// exists but nothing was selectable (cold cache / reservations).
+    async fn selection_failure_detail(
+        &self,
+        key: &crate::holdings_cache::InstrumentKey,
+        target: Decimal,
+    ) -> String {
+        let in_principle = self.cache.total_available_amount(key).await;
+        if in_principle < target {
+            format!("insufficient: {in_principle} available in principle")
+        } else {
+            format!("cache cold: {in_principle} available in principle, none selectable in time")
         }
     }
 
