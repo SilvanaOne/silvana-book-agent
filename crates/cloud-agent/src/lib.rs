@@ -587,6 +587,13 @@ pub async fn run_cloud_agent(
     // a clone wakes immediately.
     let lp_shutdown = Shutdown::new();
 
+    // Issuance forecast poller — keeps the process-global coefficient fresh for
+    // the RFQ overload gates, the fee-dispatch pause and the DvpProposal GC.
+    // Spawned BEFORE the GC so the GC's first cycle (~2s later) reads a real
+    // coefficient rather than the 0.0 default. Idempotent, so the runner may
+    // call it again for embedders that bypass this function.
+    agent_logic::forecast::spawn_forecast_poller(config.clone(), lp_shutdown.clone());
+
     // DvpProposal GC — archives expired legacy-DVP proposals during
     // high-issuance-coefficient windows (see dvp_gc_worker.rs). Env-gated;
     // no-op when DVP_GC_ENABLED=false.
