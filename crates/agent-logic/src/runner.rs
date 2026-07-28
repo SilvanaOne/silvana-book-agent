@@ -14,7 +14,7 @@ use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use orderbook_proto::ledger::TokenBalance;
 
@@ -420,6 +420,13 @@ where
     // jitter sleeps inside `spawn_settlement_task` wake instantly on Ctrl-C.
     settlement_executor.set_shutdown(shutdown.clone());
 
+    // Keep the issuance coefficient fresh from a task of its own. It must NOT
+    // ride the main loop below: that `select!` is `biased`, so any arm rarer
+    // than the loop's iteration period is unreachable under load. Idempotent —
+    // `run_cloud_agent` already spawns this, and the guard makes the second
+    // call free; the point of calling it here is embedders that bypass it.
+    crate::forecast::spawn_forecast_poller(config.clone(), shutdown.clone());
+
     // Backstop timeout for any single Canton-touching await — generous, but
     // bounded so a stuck connection cannot trap the loop forever.
     let canton_op_timeout = Duration::from_secs(config.canton_op_timeout_secs);
@@ -493,10 +500,137 @@ where
                 // any tie with a ready timer arm — gives deterministic ~1s
                 // shutdown latency. Once a non-shutdown arm has been chosen,
                 // its body runs to completion (in-flight Canton tx finishes).
+                //
+                // ORDER THE ARMS (priority, then rarity). Under `biased` an arm
+                // only runs when every arm above it is pending, so an arm that
+                // fires less often than one loop iteration takes is unreachable.
+                // The 60s heartbeat used to sit last, below the 2s/5s/7s timers:
+                // once iteration bodies grew past 2s under mainnet load it
+                // stopped firing entirely for days. Promoting it costs the busy
+                // arms at most one deferred poll per minute.
                 biased;
                 _ = shutdown.wait() => {
                     break;
                 }
+
+                _ = heartbeat_timer.tick() => {
+                    heartbeat_count += 1;
+
+                    let active_settlements = settlement_executor.active_settlements();
+                    let n = active_settlements.len();
+                    let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
+                    let pct = if max > 0 { used * 100 / max } else { 0 };
+                    let (alloc, fees) = settlement_executor.queue_depth();
+                    let cache_str = if let Some((avail, consumed, reserved, selectable)) = settlement_executor.cache_stats() {
+                        format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
+                    } else {
+                        String::new()
+                    };
+                    let worker_str = if let Some((aa, am, fa, fm)) = settlement_executor.worker_utilization() {
+                        format!(", workers alloc {}/{} fee {}/{}", aa, am, fa, fm)
+                    } else {
+                        String::new()
+                    };
+                    let pause_str = {
+                        let mut parts = Vec::new();
+                        if let Some(secs) = settlement_executor.fee_pause_secs() {
+                            parts.push(format!("FEES PAUSED {}s", secs));
+                        }
+                        if crate::forecast::is_fees_paused_by_overload() {
+                            parts.push("FEES PAUSED (sequencer overload)".to_string());
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", parts.join(", "))
+                        }
+                    };
+                    let forecast_str = {
+                        let label = crate::forecast::forecast_label();
+                        if label != "unknown" {
+                            let coeff = crate::forecast::forecast_coefficient()
+                                .unwrap_or_default();
+                            // Age exposes a dead poller: without it a frozen
+                            // coefficient is indistinguishable from a steady one.
+                            let age = match crate::forecast::forecast_age_secs() {
+                                Some(a) => format!(" {}s ago", a),
+                                None => " never".to_string(),
+                            };
+                            format!(", forecast {} ({}){}", label, coeff, age)
+                        } else {
+                            String::new()
+                        }
+                    };
+                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees{}{}{}{}",
+                        n, used, max, pct, in_backoff, waiting, alloc, fees, cache_str, worker_str, pause_str, forecast_str);
+                    settlement_executor.log_cid_waiting_summary();
+                    // Liquidity stats
+                    if let Some(lm) = settlement_executor.liquidity_manager() {
+                        // Reconcile CC reservations against the authoritative
+                        // active set: a missed terminal event would otherwise
+                        // leak a per-proposal reservation forever, decaying
+                        // available CC to 0 over ~2 days. Self-heals each cycle.
+                        let live: std::collections::HashSet<String> =
+                            active_settlements.keys().cloned().collect();
+                        let dropped = lm.retain_commitments(&live).await;
+                        if dropped > 0 {
+                            warn!(
+                                "Liquidity reconcile: released {} orphaned CC reservation(s) (missed terminal event)",
+                                dropped
+                            );
+                        }
+                        let stats = lm.stats().await;
+                        for s in &stats {
+                            let depl_str = if s.hours_to_depletion.is_infinite() {
+                                ">12h".to_string()
+                            } else {
+                                format!("{:.1}h", s.hours_to_depletion)
+                            };
+                            // RFQ V2 holdings histogram (this token as an LP-pays
+                            // leg): total + reserved + USD-value buckets. Empty
+                            // for non-LP backends; unbucketed if no USD price.
+                            let holdings_str = match settlement_executor.holdings_histogram(&s.token) {
+                                Some(h) if h.priced => format!(
+                                    " | holdings {} ({} rsvd) <10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
+                                    h.total, h.reserved, h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
+                                ),
+                                Some(h) => format!(
+                                    " | holdings {} ({} rsvd) [no USD price]",
+                                    h.total, h.reserved
+                                ),
+                                None => String::new(),
+                            };
+                            info!(
+                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}",
+                                s.token,
+                                fmt_sig4(s.balance),
+                                fmt_sig4(s.committed),
+                                if s.fee_committed > rust_decimal::Decimal::ZERO {
+                                    format!(" + {} fees", fmt_sig4(s.fee_committed))
+                                } else {
+                                    String::new()
+                                },
+                                if s.fee_reserve > rust_decimal::Decimal::ZERO {
+                                    format!(" + {} reserve", fmt_sig4(s.fee_reserve))
+                                } else {
+                                    String::new()
+                                },
+                                fmt_sig4(s.available),
+                                s.num_commitments,
+                                s.net_outflow_per_hour,
+                                s.depletion_coefficient,
+                                depl_str,
+                                holdings_str,
+                            );
+                        }
+                    }
+                    // Every 5 minutes, also list individual settlement IDs
+                    if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
+                        let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
+                        info!("Active settlements: {}", ids.join(", "));
+                    }
+                }
+
                 result = async {
                     match &mut settlement_stream {
                         Some(s) => s.next().await,
@@ -675,135 +809,6 @@ where
                         warn!("collect_and_readvance timed out after {}s", canton_op_timeout.as_secs());
                     }
                 }
-
-                _ = heartbeat_timer.tick() => {
-                    heartbeat_count += 1;
-
-                    // Poll issuance forecast from orderbook RPC (non-blocking, ignore errors)
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        orderbook_client.get_rounds_data(Some(1)),
-                    ).await {
-                        Ok(Ok(resp)) => {
-                            if let Some(prediction) = resp.prediction {
-                                crate::forecast::update_forecast(
-                                    prediction.forecast,
-                                    prediction.forecast_coefficient,
-                                );
-                            }
-                        }
-                        Ok(Err(e)) => debug!("Forecast poll failed: {:#}", e),
-                        Err(_) => debug!("Forecast poll timed out"),
-                    }
-
-                    let active_settlements = settlement_executor.active_settlements();
-                    let n = active_settlements.len();
-                    let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
-                    let pct = if max > 0 { used * 100 / max } else { 0 };
-                    let (alloc, fees) = settlement_executor.queue_depth();
-                    let cache_str = if let Some((avail, consumed, reserved, selectable)) = settlement_executor.cache_stats() {
-                        format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
-                    } else {
-                        String::new()
-                    };
-                    let worker_str = if let Some((aa, am, fa, fm)) = settlement_executor.worker_utilization() {
-                        format!(", workers alloc {}/{} fee {}/{}", aa, am, fa, fm)
-                    } else {
-                        String::new()
-                    };
-                    let pause_str = {
-                        let mut parts = Vec::new();
-                        if let Some(secs) = settlement_executor.fee_pause_secs() {
-                            parts.push(format!("FEES PAUSED {}s", secs));
-                        }
-                        if crate::forecast::is_fees_paused_by_overload() {
-                            parts.push("FEES PAUSED (sequencer overload)".to_string());
-                        }
-                        if parts.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {}", parts.join(", "))
-                        }
-                    };
-                    let forecast_str = {
-                        let label = crate::forecast::forecast_label();
-                        if label != "unknown" {
-                            let coeff = crate::forecast::forecast_coefficient()
-                                .unwrap_or_default();
-                            format!(", forecast {} ({})", label, coeff)
-                        } else {
-                            String::new()
-                        }
-                    };
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees{}{}{}{}",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, cache_str, worker_str, pause_str, forecast_str);
-                    settlement_executor.log_cid_waiting_summary();
-                    // Liquidity stats
-                    if let Some(lm) = settlement_executor.liquidity_manager() {
-                        // Reconcile CC reservations against the authoritative
-                        // active set: a missed terminal event would otherwise
-                        // leak a per-proposal reservation forever, decaying
-                        // available CC to 0 over ~2 days. Self-heals each cycle.
-                        let live: std::collections::HashSet<String> =
-                            active_settlements.keys().cloned().collect();
-                        let dropped = lm.retain_commitments(&live).await;
-                        if dropped > 0 {
-                            warn!(
-                                "Liquidity reconcile: released {} orphaned CC reservation(s) (missed terminal event)",
-                                dropped
-                            );
-                        }
-                        let stats = lm.stats().await;
-                        for s in &stats {
-                            let depl_str = if s.hours_to_depletion.is_infinite() {
-                                ">12h".to_string()
-                            } else {
-                                format!("{:.1}h", s.hours_to_depletion)
-                            };
-                            // RFQ V2 holdings histogram (this token as an LP-pays
-                            // leg): total + reserved + USD-value buckets. Empty
-                            // for non-LP backends; unbucketed if no USD price.
-                            let holdings_str = match settlement_executor.holdings_histogram(&s.token) {
-                                Some(h) if h.priced => format!(
-                                    " | holdings {} ({} rsvd) <10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
-                                    h.total, h.reserved, h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
-                                ),
-                                Some(h) => format!(
-                                    " | holdings {} ({} rsvd) [no USD price]",
-                                    h.total, h.reserved
-                                ),
-                                None => String::new(),
-                            };
-                            info!(
-                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}",
-                                s.token,
-                                fmt_sig4(s.balance),
-                                fmt_sig4(s.committed),
-                                if s.fee_committed > rust_decimal::Decimal::ZERO {
-                                    format!(" + {} fees", fmt_sig4(s.fee_committed))
-                                } else {
-                                    String::new()
-                                },
-                                if s.fee_reserve > rust_decimal::Decimal::ZERO {
-                                    format!(" + {} reserve", fmt_sig4(s.fee_reserve))
-                                } else {
-                                    String::new()
-                                },
-                                fmt_sig4(s.available),
-                                s.num_commitments,
-                                s.net_outflow_per_hour,
-                                s.depletion_coefficient,
-                                depl_str,
-                                holdings_str,
-                            );
-                        }
-                    }
-                    // Every 5 minutes, also list individual settlement IDs
-                    if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
-                        let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
-                        info!("Active settlements: {}", ids.join(", "));
-                    }
-                }
             }
         }
     } else {
@@ -813,10 +818,17 @@ where
                 break;
             }
             tokio::select! {
+                // Same ordering rule as the main loop: rarest arm first, or it
+                // never runs once the busy arm's body outlasts its own period.
                 biased;
                 _ = shutdown.wait() => {
                     break;
                 }
+
+                _ = heartbeat_timer.tick() => {
+                    info!("Heartbeat: orders-only mode");
+                }
+
                 _ = order_update_timer.tick(), if has_markets => {
                     match tokio::time::timeout(
                         Duration::from_secs(10),
@@ -847,28 +859,6 @@ where
                         Err(_) => warn!("Order update cycle timed out after {}s", canton_op_timeout.as_secs()),
                         Ok(Ok(())) => {}
                     }
-                }
-
-                _ = heartbeat_timer.tick() => {
-                    // Keep the issuance forecast fresh in orders-only mode too —
-                    // consumers like the DvpProposal GC coefficient gate would
-                    // otherwise act on the frozen startup value forever.
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        orderbook_client.get_rounds_data(Some(1)),
-                    ).await {
-                        Ok(Ok(resp)) => {
-                            if let Some(prediction) = resp.prediction {
-                                crate::forecast::update_forecast(
-                                    prediction.forecast,
-                                    prediction.forecast_coefficient,
-                                );
-                            }
-                        }
-                        Ok(Err(e)) => debug!("Forecast poll failed: {:#}", e),
-                        Err(_) => debug!("Forecast poll timed out"),
-                    }
-                    info!("Heartbeat: orders-only mode");
                 }
             }
         }

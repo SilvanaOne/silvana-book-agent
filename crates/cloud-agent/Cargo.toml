@@ -45,3 +45,8 @@ prost-types.workspace = true
 uuid = { version = "1", features = ["v7"] }
 once_cell = "1"
 csv = "1"
+
+[dev-dependencies]
+# `test-util` (not part of tokio's "full") gives tests a pausable clock, so the
+# DvpProposal GC gate's 15-minute timeout is reachable without waiting for it.
+tokio = { workspace = true, features = ["test-util"] }
