@@ -38,6 +38,11 @@ pub struct OrderManager {
     /// down after 2 strikes, so a single blip (server negative-cache window,
     /// one flaky upstream response) doesn't churn N cancels + N re-places.
     price_fail_streak: HashMap<String, u32>,
+    /// Consecutive successful fetches while a market is priceless — resuming
+    /// also takes 2 strikes, so a feed flapping around its upstream timeout
+    /// doesn't re-grid on every lucky fetch (2026-07-29 devnet EDELx flap:
+    /// 5 cancel/re-grid cycles in 25 min).
+    price_restore_streak: HashMap<String, u32>,
 }
 
 impl OrderManager {
@@ -52,6 +57,7 @@ impl OrderManager {
             tick_sizes: HashMap::new(),
             priceless: HashSet::new(),
             price_fail_streak: HashMap::new(),
+            price_restore_streak: HashMap::new(),
         }
     }
 
@@ -548,18 +554,37 @@ impl OrderManager {
             let (current_price, restored) = match self.get_price(market_id).await {
                 Ok(p) if p.is_finite() && p > 0.0 => {
                     self.price_fail_streak.remove(market_id);
-                    let restored = self.priceless.remove(market_id);
-                    if restored {
+                    if self.priceless.contains(market_id) {
+                        // Restore-side two-strike (mirror of the teardown
+                        // debounce): a feed oscillating around its timeout
+                        // must not re-grid on every lucky fetch — require two
+                        // consecutive successes before resuming (+5s latency).
+                        let streak =
+                            self.price_restore_streak.entry(market_id.clone()).or_insert(0);
+                        *streak += 1;
+                        if *streak < 2 {
+                            debug!(
+                                "Market {} price back ({}); awaiting a second consecutive \
+                                 success before resuming",
+                                market_id, p
+                            );
+                            continue;
+                        }
+                        self.price_restore_streak.remove(market_id);
+                        self.priceless.remove(market_id);
                         info!("Market {} price restored ({}); resuming quoting", market_id, p);
+                        (p, true)
+                    } else {
+                        debug!("Market {} price: {}", market_id, p);
+                        (p, false)
                     }
-                    debug!("Market {} price: {}", market_id, p);
-                    (p, restored)
                 }
                 other => {
                     let reason = match other {
                         Ok(p) => format!("non-positive price {p}"),
                         Err(e) => e.to_string(),
                     };
+                    self.price_restore_streak.remove(market_id);
                     let streak = self.price_fail_streak.entry(market_id.clone()).or_insert(0);
                     *streak += 1;
                     if *streak >= 2 || self.priceless.contains(market_id) {
