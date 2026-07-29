@@ -1021,21 +1021,24 @@ pub async fn setup_rfq_v2(
         expected_venues,
     ));
 
-    let state = Arc::new(rfq_v2::RfqV2State::new(
-        config.party_id.clone(),
-        lp_config.name.clone(),
-        config.synchronizer_id.clone(),
-        quote_key.priv_scalar_hex.clone(),
-        v2cfg.clone(),
-        market_v2,
-        market_instruments,
-        holdings_cache.clone(),
-        ticket_pool.clone(),
-        venue_registry.clone(),
-        liquidity_manager,
-        config.clone(),
-        &split_targets,
-    ));
+    let state = Arc::new(
+        rfq_v2::RfqV2State::new(
+            config.party_id.clone(),
+            lp_config.name.clone(),
+            config.synchronizer_id.clone(),
+            quote_key.priv_scalar_hex.clone(),
+            v2cfg.clone(),
+            market_v2,
+            market_instruments,
+            holdings_cache.clone(),
+            ticket_pool.clone(),
+            venue_registry.clone(),
+            liquidity_manager,
+            config.clone(),
+            &split_targets,
+        )
+        .with_mid_prices(rfq_handler.mid_prices()),
+    );
 
     // RESTORE saved V2 state BEFORE any worker starts: an already-delivered
     // envelope is self-contained (the ledger verifies it), so the reservations
@@ -1302,11 +1305,25 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
                 return Err(());
             }
 
-            let mut client = match OrderbookClient::new(&price_config).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Mid-price poller: failed to create client: {}", e);
-                    return Ok(());
+            // Retry client creation forever (backoff capped at 60s): a one-off
+            // connect failure at startup must not permanently kill the poller —
+            // without it mid_prices stays empty and the LP never quotes RFQs.
+            let mut client = {
+                let mut backoff = std::time::Duration::from_secs(5);
+                loop {
+                    match OrderbookClient::new(&price_config).await {
+                        Ok(c) => break c,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Mid-price poller: failed to create client ({}); retrying in {:?}",
+                                e, backoff
+                            );
+                            if price_shutdown.sleep(backoff).await {
+                                return Err(());
+                            }
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                        }
+                    }
                 }
             };
 
@@ -1321,12 +1338,41 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
                                 (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
                                 _ => resp.last,
                             };
-                            if mid > 0.0 {
-                                mid_prices.write().await.insert(market_id.clone(), mid);
+                            if mid > 0.0 && mid.is_finite() {
+                                if mid_prices.write().await.insert(market_id.clone(), mid).is_none()
+                                {
+                                    tracing::info!(
+                                        "Mid-price poller: {} price available ({}); RFQ quoting enabled",
+                                        market_id, mid
+                                    );
+                                }
+                            } else {
+                                // NO PRICE = NO QUOTES: evict so price_rfq
+                                // rejects (TemporarilyUnavailable) instead of
+                                // quoting off a stale mid.
+                                if mid_prices.write().await.remove(market_id).is_some() {
+                                    tracing::warn!(
+                                        "Mid-price poller: {} returned non-positive mid ({}); \
+                                         evicting — RFQ quoting paused",
+                                        market_id, mid
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("Mid-price poller: {} error: {}", market_id, e);
+                            // NO PRICE = NO QUOTES: a market whose price the
+                            // server no longer serves (feed outage, oracle
+                            // out-of-bounds) must not keep quoting off the
+                            // last-known mid. Evict; warn on the transition.
+                            if mid_prices.write().await.remove(market_id).is_some() {
+                                tracing::warn!(
+                                    "Mid-price poller: {} has NO price ({}); evicting stale mid — \
+                                     RFQ quoting paused until the price returns",
+                                    market_id, e
+                                );
+                            } else {
+                                tracing::debug!("Mid-price poller: {} error: {}", market_id, e);
+                            }
                         }
                     }
                 }

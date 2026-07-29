@@ -128,6 +128,20 @@ impl OrderbookClient {
         // Initialize Rustls crypto provider
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+        // Per-RPC deadline + HTTP/2 keepalive: the whole no-price safety
+        // (grid teardown, RFQ mid eviction) keys off calls RETURNING — a
+        // server that accepts connections but never responds (the
+        // 2026-07-19 silent-freeze failure mode) must convert into an error,
+        // never an indefinite hang that leaves stale quotes standing.
+        let builder = |endpoint: tonic::transport::Endpoint| {
+            endpoint
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .keep_alive_timeout(std::time::Duration::from_secs(10))
+                .keep_alive_while_idle(true)
+        };
+
         if grpc_url.starts_with("https://") {
             // Use embedded webpki-roots (Mozilla root certificates compiled into binary)
             let tls_config = ClientTlsConfig::new().with_webpki_roots().domain_name(
@@ -139,20 +153,23 @@ impl OrderbookClient {
                     .unwrap_or("localhost"),
             );
 
-            Channel::from_shared(grpc_url.to_string())
-                .context("Invalid gRPC URL")?
-                .tls_config(tls_config)
-                .context("Failed to configure TLS")?
-                .connect()
-                .await
-                .context("Failed to connect to gRPC service")
+            builder(
+                Channel::from_shared(grpc_url.to_string())
+                    .context("Invalid gRPC URL")?
+                    .tls_config(tls_config)
+                    .context("Failed to configure TLS")?,
+            )
+            .connect()
+            .await
+            .context("Failed to connect to gRPC service")
         } else {
             // Plain HTTP connection for local testing
-            Channel::from_shared(grpc_url.to_string())
-                .context("Invalid gRPC URL")?
-                .connect()
-                .await
-                .context("Failed to connect to gRPC service")
+            builder(
+                Channel::from_shared(grpc_url.to_string()).context("Invalid gRPC URL")?,
+            )
+            .connect()
+            .await
+            .context("Failed to connect to gRPC service")
         }
     }
 

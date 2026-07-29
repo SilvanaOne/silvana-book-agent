@@ -142,6 +142,10 @@ pub struct RfqV2State {
     base_config: agent_logic::config::BaseConfig,
     split_rungs: HashMap<InstrumentKey, (crate::split_worker::SplitInstrument, Vec<(Decimal, u32)>)>,
     splits_in_flight: Arc<Mutex<std::collections::HashSet<InstrumentKey>>>,
+    /// Live mid-price map shared with the RFQ poller (None in tests). An
+    /// indicative quote priced BEFORE a feed outage must not be signed into a
+    /// binding envelope after it: confirm re-checks that a mid still exists.
+    mid_prices: Option<Arc<tokio::sync::RwLock<HashMap<String, f64>>>>,
 }
 
 impl RfqV2State {
@@ -186,7 +190,18 @@ impl RfqV2State {
             base_config,
             split_rungs,
             splits_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            mid_prices: None,
         }
+    }
+
+    /// Attach the poller's shared mid-price map so confirm can refuse to sign
+    /// when the market has gone priceless since the indicative quote.
+    pub fn with_mid_prices(
+        mut self,
+        mid_prices: Arc<tokio::sync::RwLock<HashMap<String, f64>>>,
+    ) -> Self {
+        self.mid_prices = Some(mid_prices);
+        self
     }
 
     /// Kick a single-flight background denomination split for `instrument`
@@ -553,6 +568,31 @@ impl RfqV2State {
                 RfqConfirmRejectReason::InternalError,
                 "confirm settlement_fee does not match the RFQ-time fee",
             ));
+        }
+
+        // No-price safety: the indicative quote was priced off a mid that may
+        // have vanished since (oracle out-of-bounds, feed outage — the poller
+        // evicts the entry within ~15s). Signing would bind the LP to a price
+        // nobody can currently stand behind, so reject and drop the entry
+        // (nothing is acquired yet — same eager drop as ExpiredIndicative).
+        if let Some(mids) = &self.mid_prices {
+            let mid_ok = mids
+                .read()
+                .await
+                .get(&market_id)
+                .is_some_and(|m| m.is_finite() && *m > 0.0);
+            if !mid_ok {
+                warn!(
+                    "Confirm {}: refusing to sign — no reliable mid for {}",
+                    quote_id, market_id
+                );
+                self.release_on_reject(&quote_id, &[], false).await;
+                return Err(self.reject(
+                    &req,
+                    RfqConfirmRejectReason::QuoteExpired,
+                    format!("no reliable price for {market_id} — quote withdrawn"),
+                ));
+            }
         }
 
         // Step 1.5 — funds commitment. Indicative quotes only CHECK
