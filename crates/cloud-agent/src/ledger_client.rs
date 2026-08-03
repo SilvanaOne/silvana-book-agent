@@ -37,22 +37,29 @@ static FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
         .unwrap_or(10)
 });
 
-/// Duration in seconds to pause traffic fee dispatch after SEQUENCER_BACKPRESSURE.
-static TRAFFIC_FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
-    std::env::var("TRAFFIC_FEE_PAUSE_SECS")
+/// Duration in seconds to pause background housekeeping after
+/// SEQUENCER_BACKPRESSURE.
+///
+/// Deliberately much longer than `FEE_PAUSE_SECS`: background work (today, the
+/// DvpProposal GC) has no deadline whatsoever, so it should be the last thing to
+/// resume competing for sequencer slots. This is the same deadline the on-chain
+/// CC traffic fees used before traffic billing moved off-chain — a low-priority
+/// class of transaction that yields to settlements under congestion.
+static BACKGROUND_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("BACKGROUND_PAUSE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30)
+        .unwrap_or(60)
 });
 
 /// Epoch millis after which regular fee dispatch may resume.
 static FEE_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Epoch millis after which traffic fee dispatch may resume.
-static TRAFFIC_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// Epoch millis after which background housekeeping may resume.
+static BACKGROUND_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Record a backpressure event — pauses regular fees for FEE_PAUSE_SECS
-/// and traffic fees for TRAFFIC_FEE_PAUSE_SECS.
+/// and background housekeeping for BACKGROUND_PAUSE_SECS.
 pub fn signal_sequencer_backpressure() {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -62,8 +69,8 @@ pub fn signal_sequencer_backpressure() {
     let fee_resume_at = now_ms + *FEE_PAUSE_SECS * 1000;
     FEE_PAUSE_UNTIL_MS.fetch_max(fee_resume_at, AtomicOrdering::Relaxed);
 
-    let traffic_resume_at = now_ms + *TRAFFIC_FEE_PAUSE_SECS * 1000;
-    TRAFFIC_PAUSE_UNTIL_MS.fetch_max(traffic_resume_at, AtomicOrdering::Relaxed);
+    let background_resume_at = now_ms + *BACKGROUND_PAUSE_SECS * 1000;
+    BACKGROUND_PAUSE_UNTIL_MS.fetch_max(background_resume_at, AtomicOrdering::Relaxed);
 }
 
 /// Check whether regular fees are currently paused due to sequencer backpressure.
@@ -84,10 +91,10 @@ pub fn fee_pause_remaining() -> Option<u64> {
     }
 }
 
-/// Check whether traffic fees are currently paused due to sequencer backpressure.
-/// Returns Some(remaining_secs) if paused, None if not.
-pub fn traffic_fee_pause_remaining() -> Option<u64> {
-    let resume_at = TRAFFIC_PAUSE_UNTIL_MS.load(AtomicOrdering::Relaxed);
+/// Check whether background housekeeping is currently paused due to sequencer
+/// backpressure. Returns Some(remaining_secs) if paused, None if not.
+pub fn background_pause_remaining() -> Option<u64> {
+    let resume_at = BACKGROUND_PAUSE_UNTIL_MS.load(AtomicOrdering::Relaxed);
     if resume_at == 0 {
         return None;
     }
@@ -135,7 +142,24 @@ use orderbook_proto::ledger::{
     FaucetInstrument, ListFaucetInstrumentsRequest,
     PreparePayFeeRequest, PreparePayFeeResponse,
     ExecutePayFeeRequest, ExecutePayFeeResponse,
+    TransactionOperation,
 };
+
+/// Whether an operation is background housekeeping — work with no deadline that
+/// exists only to keep the ACS tidy.
+///
+/// Such a transaction must not be retried into a congested sequencer: the retries
+/// are exactly the load we are trying to shed, and nothing is lost by giving up.
+/// The contract stays active and the next scan re-queues it, by which time the
+/// caller's pause gate has waited the congestion out.
+///
+/// Both variants here are emitted only by [`crate::dvp_gc_worker`]. Anything
+/// added to this list must be similarly deadline-free — a transaction a user or
+/// a settlement is waiting on does not belong here.
+fn is_background_op(operation: i32) -> bool {
+    operation == TransactionOperation::CancelDvpProposal as i32
+        || operation == TransactionOperation::RejectDvpProposal as i32
+}
 
 /// Build canonical payload from a PrepareTransactionRequest for signing
 fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Result<Vec<u8>> {
@@ -927,10 +951,19 @@ impl DAppProviderClient {
                 // SEQUENCER_BACKPRESSURE: signal fee pause regardless of retry outcome
                 if error_msg.contains("SEQUENCER_BACKPRESSURE") {
                     warn!(
-                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing fees {}s / traffic {}s [{}]",
-                        attempt + 1, max_retries, *FEE_PAUSE_SECS, *TRAFFIC_FEE_PAUSE_SECS, prepared.command_id
+                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing fees {}s / background {}s [{}]",
+                        attempt + 1, max_retries, *FEE_PAUSE_SECS, *BACKGROUND_PAUSE_SECS, prepared.command_id
                     );
                     signal_sequencer_backpressure();
+
+                    // Background housekeeping gives up on the first push-back
+                    // instead of spending MAX_RETRIES more prepare/execute
+                    // round-trips on a sequencer that just said it is full. The
+                    // error text (SEQUENCER_BACKPRESSURE) reaches the caller
+                    // intact so it can classify this as "try later", not a fault.
+                    if is_background_op(req.operation) {
+                        anyhow::bail!("Transaction failed: {}", error_msg);
+                    }
                 }
 
                 // DUPLICATE_COMMAND: check ledger updates before giving up
@@ -1875,5 +1908,52 @@ mod quote_window_tests {
         let valid_until = now + MARGIN;
         assert!(quote_window_closed(Some(valid_until), now));
         assert!(now + MARGIN >= valid_until, "pre_submit_check bails here too");
+    }
+}
+
+#[cfg(test)]
+mod backpressure_pause_tests {
+    use super::*;
+
+    #[test]
+    fn only_deadline_free_housekeeping_counts_as_background() {
+        // These two are emitted solely by the DvpProposal GC, and skipping one
+        // costs nothing — the contract stays active and the next scan re-queues
+        // it.
+        assert!(is_background_op(TransactionOperation::CancelDvpProposal as i32));
+        assert!(is_background_op(TransactionOperation::RejectDvpProposal as i32));
+
+        // Everything a user, a counterparty or a settlement is waiting on must
+        // keep its retries: giving up on these turns congestion into a failed
+        // trade rather than a deferred cleanup.
+        assert!(!is_background_op(TransactionOperation::Allocate as i32));
+        assert!(!is_background_op(TransactionOperation::PayDvpFee as i32));
+        assert!(!is_background_op(TransactionOperation::PayAllocFee as i32));
+        assert!(!is_background_op(TransactionOperation::ProposeDvp as i32));
+        assert!(!is_background_op(TransactionOperation::AcceptDvp as i32));
+        assert!(!is_background_op(TransactionOperation::Unspecified as i32));
+    }
+
+    /// One test, not several: the two deadlines are process-global, so separate
+    /// tests would race each other through `signal_sequencer_backpressure`.
+    #[test]
+    fn backpressure_arms_both_pauses_and_background_outlasts_fees() {
+        assert_eq!(
+            background_pause_remaining(),
+            None,
+            "nothing should be paused before the first backpressure event",
+        );
+
+        signal_sequencer_backpressure();
+
+        let fee = fee_pause_remaining().expect("fee pause armed");
+        let background = background_pause_remaining().expect("background pause armed");
+        assert!(
+            background >= fee,
+            "deadline-free work must be the last to resume competing for \
+             sequencer slots: background {}s < fees {}s",
+            background,
+            fee,
+        );
     }
 }

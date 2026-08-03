@@ -160,6 +160,16 @@ pub trait SettlementBackend: Send + Sync {
         None
     }
 
+    /// Check if background housekeeping (DvpProposal GC) is paused by sequencer
+    /// backpressure. Returns Some(remaining_secs) if paused, None otherwise.
+    ///
+    /// Separate from [`Self::fee_pause_secs`] because it runs several times
+    /// longer: deadline-free work is the last thing that should resume
+    /// competing for sequencer slots.
+    fn background_pause_secs(&self) -> Option<u64> {
+        None
+    }
+
     /// Check if fees are paused due to low issuance forecast.
     /// LOW coefficient means heavy sequencer load — txs would hit
     /// SEQUENCER_BACKPRESSURE errors.
@@ -475,6 +485,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Check if regular fees are paused (sequencer backpressure).
     pub fn fee_pause_secs(&self) -> Option<u64> {
         self.backend.fee_pause_secs()
+    }
+
+    /// Check if background housekeeping is paused (sequencer backpressure).
+    pub fn background_pause_secs(&self) -> Option<u64> {
+        self.backend.background_pause_secs()
     }
 
     /// Check if fees are paused due to low issuance forecast.

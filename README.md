@@ -264,6 +264,35 @@ Flags:
 | `SETTLEMENT_THREAD_COUNT`        | Concurrent settlement threads (default used when unset)                |          no          |
 | `AGENT_MAX_SETTLEMENTS`          | Max active settlements (default used when unset)                       |          no          |
 
+#### Sequencer congestion (advanced)
+
+None of these are written by `onboard`; the defaults are what production runs. They tune how the agent yields sequencer capacity when the Global Synchronizer is busy. Work is shed in priority order — RFQ quoting first, then fees, then background housekeeping — so that settlements already in flight keep their slots.
+
+| Variable                            | Default | Description                                                                                                       |
+| ----------------------------------- | :-----: | ----------------------------------------------------------------------------------------------------------------- |
+| `FEE_PAUSE_SECS`                    |  `10`   | How long fee dispatch pauses after a `SEQUENCER_BACKPRESSURE` reply                                                 |
+| `BACKGROUND_PAUSE_SECS`             |  `60`   | How long deadline-free background work (DvpProposal GC) pauses after the same reply. Longer on purpose: it is the last thing that should resume competing for slots |
+| `SEQUENCER_OVERLOAD_THRESHOLD`      |  `0.5`  | Predicted issuance coefficient below which fees pause. RFQs are rejected 0.1 below this                             |
+| `FORECAST_POLL_SECS`                |  `30`   | Issuance-forecast poll interval. A dead poller freezes every gate above, so this doubles as its liveness signal     |
+| `LEDGER_UNHEALTHY_FAILURE_THRESHOLD`|   `3`   | Consecutive sequencer-unreachable failures that dark quoting. Backpressure is deliberately excluded — the ledger is up, just congested |
+| `LEDGER_UNHEALTHY_COOLDOWN_SECS`    |  `60`   | How long quoting stays dark after the breaker trips                                                                 |
+| `MAX_RETRIES`                       |   `5`   | Retries per transaction submission. Background operations ignore this and give up on the first backpressure reply   |
+
+#### DvpProposal GC (advanced)
+
+Archives expired legacy-DVP proposals from the party's ACS. Also unwritten by `onboard`.
+
+| Variable                     | Default | Description                                                                                    |
+| ---------------------------- | :-----: | ---------------------------------------------------------------------------------------------- |
+| `DVP_GC_ENABLED`             | `true`  | Master switch                                                                                   |
+| `DVP_GC_REFRESH_SECS`        | `3600`  | Interval between full ACS scans                                                                 |
+| `DVP_GC_DELAY_SECS`          |   `2`   | Delay between archival transactions, and the gate's poll period                                 |
+| `DVP_GC_SAFETY_MARGIN_SECS`  | `3600`  | Only proposals whose `settleBefore` is at least this far in the past are touched                |
+| `DVP_GC_REJECT_ENABLED`      | `true`  | Also reject expired proposals where this party is the counterparty                              |
+| `DVP_GC_MIN_COEFFICIENT`     | `0.68`  | Archival pauses while the predicted coefficient is below this                                   |
+| `DVP_GC_MAX_PAUSE_SECS`      |  `900`  | Abandon the cycle and rescan after the gate has been shut this long (floored at 60; raise it, never set 0, to effectively disable) |
+| `DVP_GC_STALE_FORECAST_SECS` |  `300`  | Warn when the gate is deciding on a coefficient older than this                                 |
+
 #### `agent.toml` — Agent Settings
 
 Full example for an LP with grid orders and RFQ:

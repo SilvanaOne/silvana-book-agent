@@ -539,6 +539,9 @@ where
                         if crate::forecast::is_fees_paused_by_overload() {
                             parts.push("FEES PAUSED (sequencer overload)".to_string());
                         }
+                        if let Some(secs) = settlement_executor.background_pause_secs() {
+                            parts.push(format!("CANCELS PAUSED {}s", secs));
+                        }
                         if parts.is_empty() {
                             String::new()
                         } else {
