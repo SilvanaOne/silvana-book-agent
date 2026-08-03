@@ -349,6 +349,10 @@ impl SettlementBackend for CloudSettlementBackend {
         self.payment_queue.fee_pause_secs()
     }
 
+    fn background_pause_secs(&self) -> Option<u64> {
+        crate::ledger_client::background_pause_remaining()
+    }
+
     async fn sync_contracts(
         &self,
         settlement_ids: &[String],

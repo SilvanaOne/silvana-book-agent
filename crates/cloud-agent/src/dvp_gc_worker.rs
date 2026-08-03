@@ -15,12 +15,23 @@
 //! was already impossible at `allocateBefore` (`DvpProposal_Accept` asserts
 //! `assertWithinDeadline terms.allocateBefore`).
 //!
-//! Cost control: archival only proceeds while the predicted issuance
-//! coefficient is above `DVP_GC_MIN_COEFFICIENT` (high coefficient = light
-//! sequencer load = cheap window), one proposal per transaction with
-//! `DVP_GC_DELAY_SECS` between submissions.
+//! Cost control: one proposal per transaction with `DVP_GC_DELAY_SECS` between
+//! submissions, behind a two-condition gate. Archival proceeds only while
 //!
-//! That gate makes this worker wholly dependent on
+//!   1. no `SEQUENCER_BACKPRESSURE` pause is in effect
+//!      (`crate::ledger_client::background_pause_remaining`, set for
+//!      `BACKGROUND_PAUSE_SECS` by any submission the sequencer pushed back on),
+//!      and
+//!   2. the predicted issuance coefficient is above `DVP_GC_MIN_COEFFICIENT`
+//!      (high coefficient = light sequencer load = cheap window).
+//!
+//! The two are complements, not duplicates: (2) is a forecast that avoids the
+//! congestion, (1) is the observed fact that we are already in it. Cancelling an
+//! expired proposal has no deadline of any kind, so it is the first work that
+//! should yield its sequencer slot to settlements and the last to resume — which
+//! is why the background pause is several times longer than the fee pause.
+//!
+//! The coefficient half makes this worker dependent on
 //! `agent_logic::forecast::spawn_forecast_poller` keeping the coefficient
 //! fresh. If the poller dies the coefficient freezes, and a frozen low value is
 //! indistinguishable from a real one at the gate — so the gate warns on a stale
@@ -221,7 +232,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
             agent_logic::forecast::coefficient_value(),
         );
 
-        // --- Drain: one archival tx per proposal, coefficient-gated, throttled ---
+        // --- Drain: one archival tx per proposal, gated, throttled ---
         let mut done: u64 = 0;
         let mut skipped_gone: u64 = 0;
         let mut backpressured: u64 = 0;
@@ -234,6 +245,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                 done,
                 queue.len(),
                 agent_logic::forecast::coefficient_value,
+                crate::ledger_client::background_pause_remaining,
             )
             .await
             {
@@ -293,6 +305,11 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                         // stays active in the ACS and the next scan re-queues
                         // it. Like the already-gone skip, the failure counter is
                         // left untouched — neither success nor failure.
+                        //
+                        // Nor is a retry needed here: the same reply armed the
+                        // background pause, so the next `await_gate` parks the
+                        // drain until the sequencer has drained instead of
+                        // walking straight into the next proposal.
                         backpressured += 1;
                         debug!(
                             "DvpProposal GC: {} deferred by sequencer backpressure",
@@ -356,7 +373,8 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
 
         // A gate timeout abandoned a queue that is still (mostly) live — rescan
         // promptly instead of idling out the refresh interval: the coefficient
-        // may have recovered seconds after the cutoff. No busy-spin is
+        // may have recovered, or the pause expired, seconds after the cutoff.
+        // No busy-spin is
         // possible: if the gate is still shut, the next cycle's first
         // await_gate blocks another GC_MAX_PAUSE_SECS, so the worst case is
         // one ~2s scan per pause window.
@@ -377,7 +395,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateResult {
-    /// The coefficient cleared the threshold — archive the next proposal.
+    /// Every gate condition is clear — archive the next proposal.
     Proceed,
     /// Shutdown fired while waiting.
     Shutdown,
@@ -385,7 +403,34 @@ enum GateResult {
     Timeout,
 }
 
-/// Block until the issuance coefficient clears `DVP_GC_MIN_COEFFICIENT`.
+/// Why the gate is shut. Not `Eq` — it carries an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GateBlock {
+    /// A submission was pushed back by the sequencer recently; this many
+    /// seconds remain on the pause.
+    Backpressure(u64),
+    /// The predicted issuance coefficient is below `DVP_GC_MIN_COEFFICIENT`.
+    Coefficient(f64),
+}
+
+/// The single decision the gate makes, shared by the entry check and the wait
+/// loop so the two cannot drift apart.
+///
+/// Backpressure outranks the coefficient because it is a fact and the
+/// coefficient is a prediction: the sequencer has just told us it is full, and a
+/// stale or optimistic coefficient must not talk us past that.
+fn gate_block(coeff: f64, pause_secs: Option<u64>) -> Option<GateBlock> {
+    if let Some(secs) = pause_secs {
+        return Some(GateBlock::Backpressure(secs));
+    }
+    if coeff < *GC_MIN_COEFFICIENT {
+        return Some(GateBlock::Coefficient(coeff));
+    }
+    None
+}
+
+/// Block until no backpressure pause is in effect AND the issuance coefficient
+/// clears `DVP_GC_MIN_COEFFICIENT`.
 ///
 /// Logs on the shut->open *edges* only. The predecessor logged one `debug!` per
 /// poll, which the default `cloud_agent=info` filter drops — so a worker parked
@@ -397,31 +442,45 @@ enum GateResult {
 /// only about every 10 minutes, so the gate cannot flap faster than that no
 /// matter how quickly the drain loop cycles.
 ///
-/// `coefficient` is injected rather than read directly so the gate can be
-/// tested against a scripted sequence instead of the process-global forecast.
-async fn await_gate<F: Fn() -> f64>(
+/// `coefficient` and `pause_remaining` are injected rather than read directly so
+/// the gate can be tested against a scripted sequence instead of the
+/// process-global forecast and backpressure deadline.
+async fn await_gate<C: Fn() -> f64, P: Fn() -> Option<u64>>(
     shutdown: &Shutdown,
     delay: Duration,
     done: u64,
     total: usize,
-    coefficient: F,
+    coefficient: C,
+    pause_remaining: P,
 ) -> GateResult {
-    // Shutdown wins over a clear coefficient — checked FIRST so no new
-    // archival starts after the flag is set (a SIGTERM landing during the
-    // multi-second ACS scan must not be followed by one more prepare/execute).
+    // Shutdown wins over an open gate — checked FIRST so no new archival starts
+    // after the flag is set (a SIGTERM landing during the multi-second ACS scan
+    // must not be followed by one more prepare/execute).
     if shutdown.is_shutting_down() {
         return GateResult::Shutdown;
     }
-    let coeff = coefficient();
-    if coeff >= *GC_MIN_COEFFICIENT {
+    let Some(block) = gate_block(coefficient(), pause_remaining()) else {
         return GateResult::Proceed;
-    }
+    };
 
-    info!(
-        "DvpProposal GC gate shut: coefficient {:.4} < {:.2} — pausing drain ({}/{} archived)",
-        coeff, *GC_MIN_COEFFICIENT, done, total,
-    );
-    warn_if_forecast_stale(coeff);
+    match block {
+        GateBlock::Backpressure(secs) => info!(
+            "DvpProposal GC gate shut: sequencer backpressure ({}s remaining) — pausing drain \
+             ({}/{} archived)",
+            secs, done, total,
+        ),
+        GateBlock::Coefficient(coeff) => {
+            info!(
+                "DvpProposal GC gate shut: coefficient {:.4} < {:.2} — pausing drain \
+                 ({}/{} archived)",
+                coeff, *GC_MIN_COEFFICIENT, done, total,
+            );
+            // Only the coefficient can be silently frozen by a dead poller; a
+            // backpressure pause is self-expiring, so warning about forecast
+            // freshness there would point at the wrong thing.
+            warn_if_forecast_stale(coeff);
+        }
+    }
 
     // `tokio::time::Instant`, not `std::time::Instant`: it honours a paused
     // clock, so the timeout is reachable in tests without waiting 15 real
@@ -433,9 +492,10 @@ async fn await_gate<F: Fn() -> f64>(
             return GateResult::Shutdown;
         }
         let coeff = coefficient();
-        if coeff >= *GC_MIN_COEFFICIENT {
+        if gate_block(coeff, pause_remaining()).is_none() {
             info!(
-                "DvpProposal GC gate open: coefficient {:.4} >= {:.2} — resuming after {}s paused",
+                "DvpProposal GC gate open: coefficient {:.4} >= {:.2}, backpressure clear — \
+                 resuming after {}s paused",
                 coeff,
                 *GC_MIN_COEFFICIENT,
                 started.elapsed().as_secs(),
@@ -632,8 +692,9 @@ mod tests {
 
     // --- gate ---
     //
-    // The coefficient is injected, so these are independent of the
-    // process-global forecast and of each other.
+    // Both the coefficient and the backpressure pause are injected, so these are
+    // independent of the process-global forecast, of the process-global pause
+    // deadline, and of each other.
 
     const TEST_DELAY: Duration = Duration::from_secs(1);
 
@@ -643,24 +704,85 @@ mod tests {
     fn below() -> f64 {
         *GC_MIN_COEFFICIENT - 0.05
     }
+    /// No backpressure pause in effect.
+    fn clear() -> Option<u64> {
+        None
+    }
+    /// A backpressure pause with 60s left on it.
+    fn paused() -> Option<u64> {
+        Some(60)
+    }
+
+    #[test]
+    fn gate_block_ranks_backpressure_above_the_coefficient() {
+        // A live rejection outranks a clear prediction — the whole point of
+        // adding the reactive condition. If this inverts, a stale-high
+        // coefficient talks the drain straight into a congested sequencer.
+        assert_eq!(
+            gate_block(above(), paused()),
+            Some(GateBlock::Backpressure(60)),
+        );
+        assert_eq!(
+            gate_block(below(), paused()),
+            Some(GateBlock::Backpressure(60)),
+        );
+        assert_eq!(
+            gate_block(below(), clear()),
+            Some(GateBlock::Coefficient(below())),
+        );
+        assert_eq!(gate_block(above(), clear()), None);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn gate_proceeds_immediately_when_coefficient_clears() {
         let shutdown = Shutdown::new();
         assert_eq!(
-            await_gate(&shutdown, TEST_DELAY, 0, 10, above).await,
+            await_gate(&shutdown, TEST_DELAY, 0, 10, above, clear).await,
             GateResult::Proceed,
+        );
+    }
+
+    /// The behaviour this change exists for: the sequencer has pushed back, so
+    /// the drain waits even though the forecast says the window is cheap.
+    #[tokio::test(start_paused = true)]
+    async fn gate_shuts_on_backpressure_even_when_coefficient_clears() {
+        let shutdown = Shutdown::new();
+        assert_eq!(
+            await_gate(&shutdown, TEST_DELAY, 0, 10, above, paused).await,
+            GateResult::Timeout,
+            "a clear coefficient must not override an active backpressure pause",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_resumes_when_the_backpressure_pause_expires() {
+        let shutdown = Shutdown::new();
+        let polls = std::sync::atomic::AtomicU32::new(0);
+        let result = await_gate(&shutdown, TEST_DELAY, 0, 10, above, || {
+            if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                paused()
+            } else {
+                clear()
+            }
+        })
+        .await;
+        assert_eq!(result, GateResult::Proceed);
+        assert!(
+            polls.load(std::sync::atomic::Ordering::Relaxed) >= 4,
+            "gate must re-read the pause while waiting, not latch the first value",
         );
     }
 
     /// Regression for the failure this replaced: the old gate had no timeout, so
     /// a coefficient that stayed below the threshold parked the worker forever
-    /// on a queue of contract IDs that kept aging, and it never rescanned.
+    /// on a queue of contract IDs that kept aging, and it never rescanned. The
+    /// cap has to bound a sustained backpressure pause for the same reason,
+    /// which `gate_shuts_on_backpressure_even_when_coefficient_clears` covers.
     #[tokio::test(start_paused = true)]
     async fn gate_times_out_instead_of_parking_forever() {
         let shutdown = Shutdown::new();
         assert_eq!(
-            await_gate(&shutdown, TEST_DELAY, 0, 10, below).await,
+            await_gate(&shutdown, TEST_DELAY, 0, 10, below, clear).await,
             GateResult::Timeout,
         );
     }
@@ -669,13 +791,20 @@ mod tests {
     async fn gate_resumes_when_the_coefficient_recovers() {
         let shutdown = Shutdown::new();
         let polls = std::sync::atomic::AtomicU32::new(0);
-        let result = await_gate(&shutdown, TEST_DELAY, 0, 10, || {
-            if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-                below()
-            } else {
-                above()
-            }
-        })
+        let result = await_gate(
+            &shutdown,
+            TEST_DELAY,
+            0,
+            10,
+            || {
+                if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                    below()
+                } else {
+                    above()
+                }
+            },
+            clear,
+        )
         .await;
         assert_eq!(result, GateResult::Proceed);
         assert!(
@@ -689,14 +818,20 @@ mod tests {
         let shutdown = Shutdown::new();
         shutdown.signal();
         assert_eq!(
-            await_gate(&shutdown, TEST_DELAY, 0, 10, below).await,
+            await_gate(&shutdown, TEST_DELAY, 0, 10, below, clear).await,
             GateResult::Shutdown,
         );
-        // Pins the check ORDERING: even a clear coefficient must not win over
-        // an already-signalled shutdown — otherwise one more archival tx
-        // starts after SIGTERM. (With `below` alone, either ordering passes.)
+        // Pins the check ORDERING: even a fully open gate must not win over an
+        // already-signalled shutdown — otherwise one more archival tx starts
+        // after SIGTERM. (With `below` alone, either ordering passes.)
         assert_eq!(
-            await_gate(&shutdown, TEST_DELAY, 0, 10, above).await,
+            await_gate(&shutdown, TEST_DELAY, 0, 10, above, clear).await,
+            GateResult::Shutdown,
+        );
+        // ...and shutdown also outranks a backpressure pause, so SIGTERM during
+        // congestion returns immediately instead of waiting out the pause.
+        assert_eq!(
+            await_gate(&shutdown, TEST_DELAY, 0, 10, above, paused).await,
             GateResult::Shutdown,
         );
     }
@@ -712,7 +847,23 @@ mod tests {
             waker.signal();
         });
         assert_eq!(
-            await_gate(&shutdown, TEST_DELAY, 0, 10, below).await,
+            await_gate(&shutdown, TEST_DELAY, 0, 10, below, clear).await,
+            GateResult::Shutdown,
+        );
+    }
+
+    /// Same, but blocked on backpressure rather than the coefficient — the
+    /// wait loop is shared, so this pins that the shared loop is what runs.
+    #[tokio::test(start_paused = true)]
+    async fn gate_wakes_on_shutdown_signalled_mid_backpressure_wait() {
+        let shutdown = Shutdown::new();
+        let waker = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            waker.signal();
+        });
+        assert_eq!(
+            await_gate(&shutdown, TEST_DELAY, 0, 10, above, paused).await,
             GateResult::Shutdown,
         );
     }

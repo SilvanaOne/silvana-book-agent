@@ -140,6 +140,10 @@ pub struct BaseConfig {
     pub cc_token_id: Option<String>,
     /// Instrument ID → registry party mapping (from [[instrument]] + [[canton_coin]])
     pub instrument_registries: HashMap<String, String>,
+    /// Instrument ID → ON-CHAIN wire id (`instruments.symbol`). Identical to
+    /// the id for legacy tokens; diverges when an issuer mints an instrument
+    /// under an opaque id (e.g. a UUID). Populated by `populate_instruments_from_rpc`.
+    pub instrument_wire_ids: HashMap<String, String>,
 
     // From agent.toml
     pub auto_settle: bool,
@@ -257,6 +261,7 @@ impl BaseConfig {
             onboarded_registries: Vec::new(),
             cc_token_id: None,
             instrument_registries: HashMap::new(),
+            instrument_wire_ids: HashMap::new(),
             auto_settle: false,
             poll_interval_secs: 0,
             role: "agent".to_string(),
@@ -357,6 +362,7 @@ impl BaseConfig {
             onboarded_registries: Vec::new(),
             cc_token_id: None,
             instrument_registries: HashMap::new(),
+            instrument_wire_ids: HashMap::new(),
             auto_settle: default_auto_settle(),
             poll_interval_secs: default_poll_interval_secs(),
             role: default_role(),
@@ -511,6 +517,7 @@ impl BaseConfig {
         let onboarded_registries: Vec<String> = Vec::new();
         let cc_token_id: Option<String> = None;
         let instrument_registries: HashMap<String, String> = HashMap::new();
+        let instrument_wire_ids: HashMap<String, String> = HashMap::new();
 
         // Read env vars
         let dso_party = std::env::var("DSO").map_err(|_| anyhow!("DSO env var is required"))?;
@@ -808,6 +815,7 @@ impl BaseConfig {
             onboarded_registries,
             cc_token_id,
             instrument_registries,
+            instrument_wire_ids,
             auto_settle: agent.auto_settle,
             poll_interval_secs: agent.poll_interval_secs,
             role: agent.role,
@@ -850,6 +858,7 @@ impl BaseConfig {
     /// is the DSO party. Every other instrument simply maps id → registry.
     pub fn populate_instruments_from_rpc(&mut self, instruments: Vec<Instrument>) {
         let mut instrument_registries: HashMap<String, String> = HashMap::new();
+        let mut instrument_wire_ids: HashMap<String, String> = HashMap::new();
         let mut cc_token_id: Option<String> = None;
         let mut onboarded_registries: HashSet<String> = HashSet::new();
 
@@ -859,6 +868,15 @@ impl BaseConfig {
                 instrument_registries.insert(inst.instrument_id.clone(), registry.clone());
                 onboarded_registries.insert(registry);
             }
+            // The ON-CHAIN wire id is `symbol` (== instrument_id for legacy
+            // tokens; an opaque id, e.g. a UUID, for issuer-minted ones). Fall back to the
+            // id when an older RPC serves an empty symbol.
+            let wire_id = if inst.symbol.is_empty() {
+                inst.instrument_id.clone()
+            } else {
+                inst.symbol.clone()
+            };
+            instrument_wire_ids.insert(inst.instrument_id.clone(), wire_id);
             if inst.instrument_type == "token" && cc_token_id.is_none() {
                 cc_token_id = Some(inst.instrument_id.clone());
             }
@@ -866,6 +884,7 @@ impl BaseConfig {
 
         self.cc_token_id = cc_token_id;
         self.instrument_registries = instrument_registries;
+        self.instrument_wire_ids = instrument_wire_ids;
         self.onboarded_registries = onboarded_registries.into_iter().collect();
         tracing::info!(
             "Instrument registry populated from RPC: {} instruments, {} registries, cc_token_id={:?}",
@@ -875,16 +894,33 @@ impl BaseConfig {
         );
     }
 
+    /// ON-CHAIN wire id → orderbook-internal instrument id.
+    ///
+    /// `None` when unknown or when the ids coincide — legacy tokens never need
+    /// translation, so callers can use this as a "does this need renaming"
+    /// test. Linear scan over a handful of instruments.
+    pub fn internal_id_for_wire(&self, wire_id: &str) -> Option<String> {
+        self.instrument_wire_ids
+            .iter()
+            .find(|(internal, wire)| wire.as_str() == wire_id && internal.as_str() != wire_id)
+            .map(|(internal, _)| internal.clone())
+    }
+
     /// Resolve an orderbook instrument ID to (on_chain_id, registry_party).
     ///
-    /// CC maps to on-chain "Amulet"; other instruments use their ID as-is.
+    /// CC maps to on-chain "Amulet"; other instruments map to their WIRE id
+    /// (`instruments.symbol` — identical to the id for legacy tokens, an
+    /// opaque id such as a UUID for issuer-minted ones).
     /// Registry comes from instruments fetched via `populate_instruments_from_rpc`.
     /// Returns empty strings if instrument not found (verification skipped).
     pub fn resolve_instrument(&self, instrument_id: &str) -> (String, String) {
         let on_chain_id = if Some(instrument_id) == self.cc_token_id.as_deref() {
             "Amulet".to_string()
         } else {
-            instrument_id.to_string()
+            self.instrument_wire_ids
+                .get(instrument_id)
+                .cloned()
+                .unwrap_or_else(|| instrument_id.to_string())
         };
         let registry = self
             .instrument_registries
@@ -1315,6 +1351,60 @@ fn default_max_input_holdings() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_instrument_uses_wire_id_symbol() {
+        // Wire-id divergence: the RPC serves a readable instrument_id with the
+        // on-chain wire id in `symbol` (an opaque UUID). resolve_instrument must
+        // return the WIRE id — legacy tokens (symbol == id) and CC→Amulet unchanged.
+        let mut config = BaseConfig::test_minimal();
+        config.populate_instruments_from_rpc(vec![
+            Instrument {
+                instrument_id: "ACME".into(),
+                instrument_type: "fiat".into(),
+                name: "ACME".into(),
+                symbol: "0a1b2c3d-1111-4222-8333-444455556666".into(),
+                registry: Some("issuer-1::1220aaaa".into()),
+                ..Default::default()
+            },
+            Instrument {
+                instrument_id: "USDCx".into(),
+                instrument_type: "fiat".into(),
+                name: "USD Coin".into(),
+                symbol: "USDCx".into(),
+                registry: Some("usdc-rep::12208115".into()),
+                ..Default::default()
+            },
+            Instrument {
+                instrument_id: "CC".into(),
+                instrument_type: "token".into(),
+                name: "Canton Coin".into(),
+                symbol: "CC".into(),
+                registry: Some("DSO::1220b143".into()),
+                ..Default::default()
+            },
+        ]);
+
+        let (acme_wire, acme_reg) = config.resolve_instrument("ACME");
+        assert_eq!(acme_wire, "0a1b2c3d-1111-4222-8333-444455556666");
+        assert_eq!(acme_reg, "issuer-1::1220aaaa");
+
+        let (usdcx_wire, _) = config.resolve_instrument("USDCx");
+        assert_eq!(usdcx_wire, "USDCx", "legacy token unchanged");
+
+        let (cc_wire, _) = config.resolve_instrument("CC");
+        assert_eq!(cc_wire, "Amulet", "CC translation unchanged");
+
+        // Reverse direction: on-chain wire id → internal id.
+        assert_eq!(
+            config.internal_id_for_wire("0a1b2c3d-1111-4222-8333-444455556666"),
+            Some("ACME".to_string())
+        );
+        // Identity (legacy) and unknown ids need no translation.
+        assert_eq!(config.internal_id_for_wire("USDCx"), None);
+        assert_eq!(config.internal_id_for_wire("ACME"), None, "idempotent on internal ids");
+        assert_eq!(config.internal_id_for_wire("nonexistent"), None);
+    }
 
     #[test]
     fn test_decode_private_key() {

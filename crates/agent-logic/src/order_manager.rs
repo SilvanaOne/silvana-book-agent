@@ -4,7 +4,7 @@
 //! All orders are signed and tracked for settlement verification.
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -31,12 +31,52 @@ pub struct OrderManager {
     last_grid_prices: HashMap<String, f64>,
     balances: Vec<TokenBalance>,
     tick_sizes: HashMap<String, f64>,
+    /// Markets currently without a reliable server price. Tracks the
+    /// transition so the cancel + warn happen once, not every 5s cycle.
+    priceless: HashSet<String>,
+    /// Consecutive failed price fetches per market — the grid is only torn
+    /// down after 2 strikes, so a single blip (server negative-cache window,
+    /// one flaky upstream response) doesn't churn N cancels + N re-places.
+    price_fail_streak: HashMap<String, u32>,
+    /// Consecutive successful fetches while a market is priceless — resuming
+    /// also takes 2 strikes, so a feed flapping around its upstream timeout
+    /// doesn't re-grid on every lucky fetch (2026-07-29 devnet EDELx flap:
+    /// 5 cancel/re-grid cycles in 25 min).
+    price_restore_streak: HashMap<String, u32>,
 }
 
 impl OrderManager {
     /// Create a new order manager with shared order tracker
     pub fn new(config: BaseConfig, client: OrderbookClient, tracker: Arc<Mutex<OrderTracker>>) -> Self {
-        Self { config, client, tracker, last_grid_prices: HashMap::new(), balances: Vec::new(), tick_sizes: HashMap::new() }
+        Self {
+            config,
+            client,
+            tracker,
+            last_grid_prices: HashMap::new(),
+            balances: Vec::new(),
+            tick_sizes: HashMap::new(),
+            priceless: HashSet::new(),
+            price_fail_streak: HashMap::new(),
+            price_restore_streak: HashMap::new(),
+        }
+    }
+
+    /// A market lost its price: cancel every resting order (stale levels must
+    /// not stay executable) and clear the grid anchor. Idempotent — repeat
+    /// cycles find no active orders and only debug-log.
+    async fn handle_priceless(&mut self, market_id: &str, reason: &str) {
+        if self.priceless.insert(market_id.to_string()) {
+            warn!(
+                "Market {} has NO reliable price ({}); cancelling all orders and pausing quoting",
+                market_id, reason
+            );
+        } else {
+            debug!("Market {} still priceless ({})", market_id, reason);
+        }
+        self.last_grid_prices.remove(market_id);
+        if let Err(e) = self.cancel_all_orders(market_id).await {
+            warn!("Failed to cancel orders for priceless market {}: {}", market_id, e);
+        }
     }
 
     /// Get tick size for a market, fetching from server if not cached
@@ -56,8 +96,19 @@ impl OrderManager {
         self.tick_sizes.get(market_id).copied().unwrap_or(0.0000000100)
     }
 
-    /// Update cached balances (called before update_cycle)
-    pub fn set_balances(&mut self, balances: Vec<TokenBalance>) {
+    /// Update cached balances (called before update_cycle).
+    ///
+    /// Ledger balances carry ON-CHAIN wire ids; market configs and the grid
+    /// affordability checks use the orderbook-internal ids (issuer-minted
+    /// instruments can carry an opaque UUID on-chain). Normalize once on the
+    /// way in so `find_unlocked_token(<internal id>)` matches. No-op for
+    /// legacy tokens, whose two ids coincide.
+    pub fn set_balances(&mut self, mut balances: Vec<TokenBalance>) {
+        for b in &mut balances {
+            if let Some(internal) = self.config.internal_id_for_wire(&b.instrument_id) {
+                b.instrument_id = internal;
+            }
+        }
         self.balances = balances;
     }
 
@@ -212,10 +263,13 @@ impl OrderManager {
     pub async fn place_grid_orders(
         &mut self,
         market_config: &MarketConfig,
+        mid_price: f64,
         place_bids: bool,
         place_offers: bool,
     ) -> Result<()> {
-        let mid_price = self.get_price(&market_config.market_id).await?;
+        // The price comes from the caller's already-validated fetch — no
+        // re-fetch here (a second fetch could race the no-price transition
+        // and grid off 0/NaN).
         let tick = self.get_tick_size(&market_config.market_id).await;
         let mut placed: Vec<String> = Vec::new();
 
@@ -401,7 +455,7 @@ impl OrderManager {
 
         // If no existing orders, just place the grid
         if active_orders.is_empty() {
-            if let Err(e) = self.place_grid_orders(market, affordability.can_bid, affordability.can_offer).await {
+            if let Err(e) = self.place_grid_orders(market, current_price, affordability.can_bid, affordability.can_offer).await {
                 warn!("Failed to place grid for {}: {}", market_id, e);
             } else {
                 self.last_grid_prices.insert(market_id.clone(), current_price);
@@ -501,14 +555,58 @@ impl OrderManager {
         for market in &markets {
             let market_id = &market.market_id;
 
-            // 1. Fetch current price
-            let current_price = match self.get_price(market_id).await {
-                Ok(p) => {
-                    debug!("Market {} price: {}", market_id, p);
-                    p
+            // 1. Fetch current price. NO PRICE = NO QUOTES: when the server
+            // has no reliable price for the market (feed outage, oracle
+            // out-of-bounds → GetPrice NOT_FOUND) the LP must not leave
+            // resting orders executable at stale levels — cancel everything
+            // and pause until the price returns. Two-strike debounce: the
+            // first failed cycle only skips (no churn on a one-off blip);
+            // the second consecutive failure tears the grid down.
+            let (current_price, restored) = match self.get_price(market_id).await {
+                Ok(p) if p.is_finite() && p > 0.0 => {
+                    self.price_fail_streak.remove(market_id);
+                    if self.priceless.contains(market_id) {
+                        // Restore-side two-strike (mirror of the teardown
+                        // debounce): a feed oscillating around its timeout
+                        // must not re-grid on every lucky fetch — require two
+                        // consecutive successes before resuming (+5s latency).
+                        let streak =
+                            self.price_restore_streak.entry(market_id.clone()).or_insert(0);
+                        *streak += 1;
+                        if *streak < 2 {
+                            debug!(
+                                "Market {} price back ({}); awaiting a second consecutive \
+                                 success before resuming",
+                                market_id, p
+                            );
+                            continue;
+                        }
+                        self.price_restore_streak.remove(market_id);
+                        self.priceless.remove(market_id);
+                        info!("Market {} price restored ({}); resuming quoting", market_id, p);
+                        (p, true)
+                    } else {
+                        debug!("Market {} price: {}", market_id, p);
+                        (p, false)
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to get price for {}: {}", market_id, e);
+                other => {
+                    let reason = match other {
+                        Ok(p) => format!("non-positive price {p}"),
+                        Err(e) => e.to_string(),
+                    };
+                    self.price_restore_streak.remove(market_id);
+                    let streak = self.price_fail_streak.entry(market_id.clone()).or_insert(0);
+                    *streak += 1;
+                    if *streak >= 2 || self.priceless.contains(market_id) {
+                        self.handle_priceless(market_id, &reason).await;
+                    } else {
+                        warn!(
+                            "Market {} price fetch failed ({}); grid unchanged, will tear down \
+                             on a second consecutive failure",
+                            market_id, reason
+                        );
+                    }
                     continue;
                 }
             };
@@ -518,8 +616,12 @@ impl OrderManager {
             let expected_count = market.bid_levels.len() + market.offer_levels.len();
             let partial_fills = Self::has_partial_fills(&orders);
 
-            // 3. Determine if grid needs refresh
-            if orders.len() < expected_count || partial_fills {
+            // 3. Determine if grid needs refresh. A restore after a priceless
+            // spell ALWAYS refreshes: if cancels failed during the outage
+            // (server unreachable), the full pre-outage grid may still be
+            // resting at stale levels with a full-looking order count —
+            // refresh cancels and re-prices it against the fresh mid.
+            if restored || orders.len() < expected_count || partial_fills {
                 info!(
                     "Market {} needs refresh: {}/{} active, partial_fills={}",
                     market_id, orders.len(), expected_count, partial_fills
