@@ -4015,8 +4015,14 @@ pub async fn holdings_status_lines(
     let mut price_client: Option<agent_logic::client::OrderbookClient> = None;
     let mut lines = Vec::with_capacity(by_instrument.len());
     for (key, amounts) in &by_instrument {
-        // Display symbol: "admin::id" → id; the CC cache key stays "CC".
+        // The cache key is "admin::<on-chain wire id>"; the CC key stays "CC".
+        // Wire id == internal id for legacy tokens, but issuer-minted tokens
+        // can carry an opaque UUID on-chain — translate for display,
+        // canonicity and price lookups, which all speak internal ids.
         let sym = key.rsplit("::").next().unwrap_or(key).to_string();
+        let internal = config
+            .internal_id_for_wire(&sym)
+            .unwrap_or_else(|| sym.clone());
         // Canonicity: instruments can be DUPLICATED under different admins
         // (e.g. two cETH issuers on devnet). Only the admin the instruments
         // table lists (config.instrument_registries) is tradable — settle and
@@ -4025,9 +4031,9 @@ pub async fn holdings_status_lines(
         let canonical = key == holdings_cache::CC_INSTRUMENT
             || config
                 .instrument_registries
-                .get(&sym)
+                .get(&internal)
                 .is_some_and(|registry| key == &holdings_cache::instrument_key(registry, &sym));
-        let usd_price = if sym.starts_with("USDC") {
+        let usd_price = if internal.starts_with("USDC") {
             Some(1.0)
         } else if key == holdings_cache::CC_INSTRUMENT {
             cc_usd_rate
@@ -4038,7 +4044,7 @@ pub async fn holdings_status_lines(
             let mut found = None;
             if let Some(client) = price_client.as_mut() {
                 for stable in ["USDCx", "USDC"] {
-                    if let Ok(resp) = client.get_price(&format!("{sym}-{stable}")).await {
+                    if let Ok(resp) = client.get_price(&format!("{internal}-{stable}")).await {
                         let mid = match (resp.bid, resp.ask) {
                             (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
                             _ => resp.last,
@@ -4065,7 +4071,7 @@ pub async fn holdings_status_lines(
             "[no USD price]".to_string()
         };
         let label = if canonical {
-            sym.clone()
+            internal.clone()
         } else {
             let admin = key.strip_suffix(&format!("::{sym}")).unwrap_or(key);
             let admin_prefix: String = admin.chars().take(24).collect();

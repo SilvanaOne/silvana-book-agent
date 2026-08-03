@@ -127,6 +127,18 @@ fn spendable_under_configured_registry(
 ) -> Vec<TokenBalance> {
     balances
         .into_iter()
+        .map(|mut b| {
+            // Ledger balances carry ON-CHAIN wire ids; everything downstream
+            // (liquidity manager keys, grid affordability, market configs)
+            // speaks orderbook-internal ids, which differ for issuer-minted
+            // opaque ids. Normalize here, at the ingest boundary. No-op for
+            // legacy tokens whose two ids coincide — and it makes the registry
+            // check below exact instead of lenient.
+            if let Some(internal) = config.internal_id_for_wire(&b.instrument_id) {
+                b.instrument_id = internal;
+            }
+            b
+        })
         .filter(|b| {
             if b.is_canton_coin {
                 return true;
@@ -1035,6 +1047,36 @@ mod balance_filter_tests {
                 ("EDELx", "edel::abc"),
             ],
             "old-registry cETH must be dropped; CC + unconfigured kept"
+        );
+    }
+
+    /// Wire-id divergence: ledger balances arrive under the on-chain
+    /// UUID; the filter must normalize them to the internal id so downstream
+    /// (liquidity manager keys, find_unlocked_token) matches — and the registry
+    /// check must run against the CONFIGURED registry exactly.
+    #[test]
+    fn normalizes_wire_ids_to_internal() {
+        const WIRE: &str = "0a1b2c3d-1111-4222-8333-444455556666";
+        let mut config = BaseConfig::test_minimal();
+        config.instrument_registries.insert("ACME".into(), "issuer-1::1220aaaa".into());
+        config.instrument_wire_ids.insert("ACME".into(), WIRE.into());
+        config.instrument_wire_ids.insert("USDCx".into(), "USDCx".into());
+
+        let balances = vec![
+            tb(WIRE, "issuer-1::1220aaaa", "2400.0", false),   // canonical → keep, renamed
+            tb(WIRE, "impostor::1220ffff", "999.0", false),        // foreign admin → drop
+            tb("USDCx", "usdc-rep::12208115", "20.0", false),      // legacy id untouched (lenient)
+        ];
+
+        let out = spendable_under_configured_registry(&config, balances);
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|b| (b.instrument_id.as_str(), b.unlocked_amount.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("ACME", "2400.0"), ("USDCx", "20.0")],
+            "UUID row renamed to the internal id and kept; foreign-admin UUID dropped"
         );
     }
 }

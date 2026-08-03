@@ -96,8 +96,19 @@ impl OrderManager {
         self.tick_sizes.get(market_id).copied().unwrap_or(0.0000000100)
     }
 
-    /// Update cached balances (called before update_cycle)
-    pub fn set_balances(&mut self, balances: Vec<TokenBalance>) {
+    /// Update cached balances (called before update_cycle).
+    ///
+    /// Ledger balances carry ON-CHAIN wire ids; market configs and the grid
+    /// affordability checks use the orderbook-internal ids (issuer-minted
+    /// instruments can carry an opaque UUID on-chain). Normalize once on the
+    /// way in so `find_unlocked_token(<internal id>)` matches. No-op for
+    /// legacy tokens, whose two ids coincide.
+    pub fn set_balances(&mut self, mut balances: Vec<TokenBalance>) {
+        for b in &mut balances {
+            if let Some(internal) = self.config.internal_id_for_wire(&b.instrument_id) {
+                b.instrument_id = internal;
+            }
+        }
         self.balances = balances;
     }
 
