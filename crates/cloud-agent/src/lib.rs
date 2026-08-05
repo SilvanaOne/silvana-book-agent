@@ -1823,6 +1823,10 @@ pub async fn run_lp_atomic_stream(
                                         direction,
                                         &request.quantity,
                                         request.quote_quantity.as_deref().unwrap_or(""),
+                                        // V2: no min-notional floor — the user
+                                        // pays every fee (3x dust surcharge
+                                        // server-side); the LP pays none.
+                                        false,
                                     )
                                     .await
                                 {

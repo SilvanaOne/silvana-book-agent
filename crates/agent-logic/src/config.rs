@@ -1142,9 +1142,13 @@ pub struct LiquidityProviderConfig {
     pub max_concurrent_rfqs: usize,
     #[serde(default = "default_quote_valid_secs")]
     pub default_quote_valid_secs: u32,
-    /// Global minimum RFQ value in USD. RFQs whose USD notional is below this
-    /// are rejected (AmountTooSmall). 0 = disabled. Overridden per-market by
-    /// `[markets.rfq].min_notional_usd`.
+    /// Global minimum RFQ value in USD — RFQ V1 ONLY (the LP pays its own
+    /// dvp+allocation fees on a V1 settle). V1 RFQs whose USD notional is
+    /// below this are rejected (AmountTooSmall). RFQ V2 ignores it
+    /// (2026-08-05 dust enablement): the user pays every V2 fee — 3x below
+    /// the server's `min_order_value_usd` — and the LP pays none, so the LP
+    /// quotes any size (the base `min_quantity` bound still applies).
+    /// 0 = disabled. Overridden per-market by `[markets.rfq].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: f64,
     /// RFQ V2 (AtomicDVP) LP-level configuration — TOML `[liquidity_provider.rfq_v2]`.

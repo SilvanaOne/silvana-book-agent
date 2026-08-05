@@ -157,7 +157,10 @@ name = "My LP"
 # ladder sized for ~100 concurrent $10-20 swaps + 20% headroom.
 max_concurrent_rfqs = 120
 default_quote_valid_secs = 60
-# Refuse RFQs whose USD value is below this ($10).
+# Refuse RFQ V1 requests whose USD value is below this ($10). V1 ONLY since
+# 2026-08-05: Atomic DVP (V2) ignores this floor — the user pays every V2 fee
+# (3x below the server's min_order_value_usd), the LP pays none, so the LP
+# quotes any size (per-market min_quantity still bounds the base amount).
 min_notional_usd = 10
 
 # Atomic DVP — one-transaction atomic settles with secp256k1-signed
@@ -646,7 +649,7 @@ else falls back to the defaults shown.
 | `name` | — (**required**) | Display name used in the RFQ stream handshake |
 | `max_concurrent_rfqs` | `10` | For Atomic DVP, aligns the status display; **not** a hard cap (inventory bounds concurrency) |
 | `default_quote_valid_secs` | `30` | Fallback quote validity |
-| `min_notional_usd` | `0` (off) | Reject RFQs below this USD value |
+| `min_notional_usd` | `0` (off) | Reject **RFQ V1** requests below this USD value. V1-only since 2026-08-05: Atomic DVP (V2) quotes any size — the user pays all V2 fees (3x below the server's dust threshold), the LP pays none |
 
 ### `[liquidity_provider.rfq_v2]` (the Atomic DVP master switch)
 
