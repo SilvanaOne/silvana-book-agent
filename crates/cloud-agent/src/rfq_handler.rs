@@ -160,6 +160,13 @@ impl RfqHandler {
     /// quote instrument (`quote_quantity_str`, empty when unused). In quote
     /// mode the base is derived as `quote_quantity / price` after pricing, and
     /// the base min/max bounds are checked against that derived value.
+    ///
+    /// `enforce_min_notional`: apply the USD `min_notional_usd` floor. TRUE on
+    /// the RFQ V1 path — the LP pays its own dvp+allocation fees on a V1
+    /// settle, and a dust trade would cost more in fees than it moves. FALSE
+    /// on RFQ V2 (2026-08-05 dust enablement): the user pays every V2 fee
+    /// (the server charges 3x below `min_order_value_usd`), the LP pays none,
+    /// so the LP quotes any size; the base `min_quantity` bound still applies.
     pub(crate) async fn price_rfq(
         &self,
         rfq_id: &str,
@@ -167,6 +174,7 @@ impl RfqHandler {
         direction: i32,
         quantity_str: &str,
         quote_quantity_str: &str,
+        enforce_min_notional: bool,
     ) -> Result<PricedQuote, RejectInfo> {
         // Find market config
         let market_config = self.markets.iter().find(|m| m.market_id == market_id);
@@ -381,11 +389,14 @@ impl RfqHandler {
         let notional_usd = usd_per_quote.map(|p| quote_quantity * p);
 
         // USD minimum-value floor (global LP default, per-market override).
-        // Refuse to quote RFQs whose USD value falls below the configured minimum.
+        // V1 ONLY (`enforce_min_notional`): refuse to quote RFQs whose USD
+        // value falls below the configured minimum — on V1 the LP pays its own
+        // settle fees. V2 skips this floor: the user pays all V2 fees (3x for
+        // dust, server-side), the LP pays none.
         let min_notional_usd = rfq_config
             .min_notional_usd
             .unwrap_or(self.lp_config.min_notional_usd);
-        if min_notional_usd > 0.0 {
+        if enforce_min_notional && min_notional_usd > 0.0 {
             match notional_usd {
                 Some(value_usd) => {
                     if value_usd < min_notional_usd {
@@ -430,8 +441,25 @@ impl RfqHandler {
                 ));
             }
 
-            // Rough fee estimate: ~2 USD total for LP's dvp + allocation fees
-            let fee_cc = lm.estimate_fee_cc(Decimal::TWO).await;
+            // Fee headroom the LP itself needs for this settle:
+            //  - V1 (enforce_min_notional): the LP pays its own dvp +
+            //    allocation fees in CC. Worst non-dust share-count multiplier
+            //    (2026-08 rule) is x4 on ($0.3 dvp + max($0.7, 0.1% x
+            //    notional) alloc); unknown notional falls back to the $0.7
+            //    alloc minimum.
+            //  - V2: ZERO — the user submits the settle and pays every fee
+            //    leg (see rfq_v2.rs: try_commit passes a zero fee term), so
+            //    requiring CC here would spuriously reject V2 quotes on a
+            //    CC-poor LP.
+            let fee_cc = if enforce_min_notional {
+                let alloc = Decimal::from_f64_retain(notional_usd.unwrap_or(0.0) * 0.001)
+                    .unwrap_or_default()
+                    .max(Decimal::new(7, 1));
+                lm.estimate_fee_cc(Decimal::from(4) * (Decimal::new(3, 1) + alloc))
+                    .await
+            } else {
+                Decimal::ZERO
+            };
             let alloc_dec = Decimal::from_f64_retain(alloc_amount).unwrap_or_default();
 
             let available = lm.available(alloc_token).await;
@@ -545,7 +573,7 @@ impl RfqHandler {
 
         let priced = match self
             // v1 RFQ is base-only (no quote-denominated sizing).
-            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity, "")
+            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity, "", true)
             .await
         {
             Ok(p) => p,
@@ -626,7 +654,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn quote_denominated_inverts_and_passes_min_notional() {
         // direction 1 = buy.
-        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "", "50").await {
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "", "50", true).await {
             Ok(p) => p,
             Err(e) => panic!("quote-denominated 50 USDC must be quotable (>$10): {:?}", e.reason_detail),
         };
@@ -640,7 +668,7 @@ mod price_rfq_tests {
     /// $13.6 clears the $10 floor.
     #[tokio::test]
     async fn base_denominated_unchanged() {
-        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "1000", "").await {
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
             Ok(p) => p,
             Err(e) => panic!("1000 EDELx base ($13.6) is within [50, 10000] and >$10: {:?}", e.reason_detail),
         };
@@ -653,12 +681,71 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn quote_denominated_below_base_min_rejected() {
         // 0.5 USDC / 0.0136 ≈ 36.8 EDELx < min 50.
-        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "", "0.5").await {
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "", "0.5", true).await {
             Ok(_) => panic!("derived base below min_quantity must reject"),
             Err(e) => e,
         };
         assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
         assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min quantity"));
+    }
+
+    /// V2 (`enforce_min_notional = false`) quotes dust the V1 path refuses:
+    /// 100 EDELx ≈ $1.36 is under the $10 floor but above the base min (50).
+    /// The server charges the user the 3x dust fee; the LP pays nothing on V2,
+    /// so the floor must not fire. The base `min_quantity` bound still applies
+    /// on both paths.
+    #[tokio::test]
+    async fn v2_skips_min_notional_floor_but_keeps_base_bound() {
+        // V1: $1.36 < $10 → refused on the notional floor.
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "100", "", true).await {
+            Ok(_) => panic!("V1 dust must still reject on min_notional_usd"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
+        assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min notional"));
+
+        // V2: same request quotes.
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "100", "", false).await {
+            Ok(p) => p,
+            Err(e) => panic!("V2 dust must be quotable: {:?}", e.reason_detail),
+        };
+        assert!((f(&priced.quantity_str) - 100.0).abs() < 1e-6);
+
+        // V2 still enforces the base min_quantity bound (49 < 50).
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "49", "", false).await {
+            Ok(_) => panic!("V2 below base min_quantity must reject"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
+        assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min quantity"));
+    }
+
+    /// The liquidity gate's CC fee headroom is V1-only: the LP pays its own
+    /// dvp+alloc fees on a V1 settle (~$4 worst non-dust ⇒ 44 CC at $0.10 ×
+    /// 1.1 margin), but pays NOTHING on V2 — a CC-poor LP must still quote V2.
+    #[tokio::test]
+    async fn v1_fee_headroom_requires_cc_but_v2_needs_none() {
+        let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(6)).await; // 1 CC free above the 5 reserve
+        lm.update_token_balance("EDELx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::new(1, 1)).await; // $0.10 per CC
+        let mut h = handler();
+        h.liquidity_manager = Some(lm);
+
+        // V1 (enforce_min_notional=true): fee_cc = 4×(0.3+0.7)/0.10×1.1 = 44 CC
+        // needed for fees, 1 CC free ⇒ rejected on liquidity, not min-notional
+        // (1000 EDELx ≈ $13.6 clears the $10 floor).
+        let err = match h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
+            Ok(_) => panic!("V1 must reject on CC fee headroom"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
+
+        // V2 (false): fee headroom is ZERO — same 1 free CC quotes fine.
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", false).await {
+            panic!("V2 must quote with no CC headroom: {:?}", e.reason_detail);
+        }
     }
 
     /// The stress coefficient widens a protective (>= 0) spread by the full
@@ -701,7 +788,7 @@ mod price_rfq_tests {
             liquidity_manager: None,
         };
         // direction 1 = buy (LP sells base); 1000 EDELx ≈ $13.3 clears the $10 floor.
-        let priced = match handler.price_rfq("t", "EDELx-USDC", 1, "1000", "").await {
+        let priced = match handler.price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
             Ok(p) => p,
             Err(e) => panic!("negative offer_spread must be quotable, not rejected: {:?}", e.reason_detail),
         };
@@ -747,8 +834,8 @@ mod price_rfq_tests {
         assert!(!agent_logic::forecast::is_rfq_rejected_by_overload(), "0.45 >= 0.4 must still quote");
 
         // direction 2 = user sells → LP bids mid - bid_spread. 1000 EDELx ≈ $13 clears the floor.
-        let pinned_bid = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "").await;
-        let widened_bid = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "").await;
+        let pinned_bid = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true).await;
+        let widened_bid = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "", true).await;
         // Reset global overload state BEFORE asserting so a failure cannot leak it.
         agent_logic::forecast::update_forecast(0, None);
         assert!(!agent_logic::forecast::is_fees_paused_by_overload());
