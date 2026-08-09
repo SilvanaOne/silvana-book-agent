@@ -544,6 +544,13 @@ pub async fn run_cloud_agent(
     info!("Orderbook URL: {}", config.orderbook_grpc_url);
     info!("Fee reserve: {:.2} CC (traffic billing handled off-chain by ledger)", config.fee_reserve_cc);
 
+    if config.rfq_v2_only && orders_only {
+        anyhow::bail!(
+            "--orders-only conflicts with rfq_v2_only = true (agent.toml / RFQ_V2_ONLY): \
+             v2-only mode disables order placement, so the agent would do nothing"
+        );
+    }
+
     // Create LiquidityManager early so it can be shared with RfqHandler and Backend
     let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
@@ -609,6 +616,18 @@ pub async fn run_cloud_agent(
     let rfq_v2_active =
         config.liquidity_provider.is_some() && rfq_v2_cfg.is_some() && config.atomic_quote_key.is_some();
 
+    // Belt-and-braces for library embedders that build BaseConfig directly and
+    // skip validate_v2(): with V1 and orders disabled, an inactive V2 stack
+    // means the agent would run while quoting nothing. Unreachable via the CLI
+    // path (config::assemble enforces the same requirements).
+    if config.rfq_v2_only && !rfq_v2_active {
+        anyhow::bail!(
+            "rfq_v2_only = true but the RFQ V2 stack is not active — requires a \
+             [liquidity_provider] section, [liquidity_provider.rfq_v2].enabled = true \
+             and the atomic quote key; nothing to quote, refusing to run"
+        );
+    }
+
     // ONE shared multi-instrument holdings pool for RFQ v1 + V2. The splitter
     // reserve (largest holding per instrument) only exists in V2 mode so plain
     // v1 deployments keep their exact selection behavior.
@@ -636,11 +655,31 @@ pub async fn run_cloud_agent(
         let rfq_handler = Arc::new(rfq_handler);
         lp_mid_prices = Some(rfq_handler.mid_prices());
 
-        info!(
-            "LP mode enabled: name={}, starting settlement stream",
-            config.liquidity_provider.as_ref().unwrap().name
+        // Mid-price poller runs in BOTH modes — V2 pricing and the LIQUIDITY
+        // histogram need mid_prices even when the V1 stream never connects.
+        let rfq_market_ids: Vec<String> = config
+            .markets
+            .iter()
+            .filter(|m| m.enabled && m.rfq.as_ref().map_or(false, |r| r.enabled))
+            .map(|m| m.market_id.clone())
+            .collect();
+        spawn_mid_price_poller(
+            config.clone(),
+            rfq_handler.mid_prices(),
+            rfq_market_ids,
+            lp_shutdown.clone(),
         );
-        {
+
+        if config.rfq_v2_only {
+            info!(
+                "rfq_v2_only = true: V1 LP settlement stream disabled — no V1 LP \
+                 registration, no V1 quotes, no grid orders"
+            );
+        } else {
+            info!(
+                "LP mode enabled: name={}, starting settlement stream",
+                config.liquidity_provider.as_ref().unwrap().name
+            );
             let config_clone = config.clone();
             let lp_shutdown_clone = lp_shutdown.clone();
             let handler = rfq_handler.clone();
@@ -670,6 +709,13 @@ pub async fn run_cloud_agent(
             .await
             {
                 Ok(snapshot) => atomic_v2_snapshot = Some(snapshot),
+                Err(e) if config.rfq_v2_only => {
+                    // With V1 and orders disabled there is nothing left to
+                    // quote — fail loud instead of running a do-nothing agent.
+                    return Err(e.context(
+                        "RFQ V2 setup failed and rfq_v2_only = true — nothing to quote, refusing to run",
+                    ));
+                }
                 Err(e) => {
                     // Never crash v1 over a V2 wiring failure.
                     tracing::error!("RFQ V2 setup failed — atomic quoting disabled, v1 continues: {:#}", e);
@@ -1096,6 +1142,14 @@ pub async fn setup_rfq_v2(
     );
 
     if validated.is_empty() {
+        if config.rfq_v2_only {
+            // rfq_v2_only: no v1 to fall back to — without the atomic stream
+            // the agent would quote nothing. Bubble up to the fail-loud arm.
+            return Err(anyhow!(
+                "RFQ V2 enabled but NO market has a validated AtomicDVP venue — \
+                 run `atomic setup` and restart"
+            ));
+        }
         tracing::error!(
             "RFQ V2 enabled but NO market has a validated AtomicDVP venue — \
              atomic stream not started (v1 continues). Run `atomic setup` and restart."
@@ -1268,34 +1322,20 @@ pub async fn run_fill(
     result
 }
 
-/// Run the LP settlement stream (bidirectional gRPC for RFQ handling)
-pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_handler::RfqHandler>, shutdown: Shutdown) -> Result<()> {
-    use orderbook_proto::settlement::{
-        settlement_service_client::SettlementServiceClient,
-        CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
-        canton_to_server_message::Message as CantonMessage,
-        server_to_canton_message::Message as ServerMessage,
-    };
-    use tokio_stream::StreamExt;
-    use rfq_handler::RfqResponse;
+/// Mid-price poller — the ONLY writer to `RfqHandler::mid_prices()`. Feeds V1
+/// quoting, RFQ V2 pricing/confirm-time mid checks, and the LIQUIDITY
+/// heartbeat's USD-bucket histogram, so it must run whenever the agent is in
+/// LP mode — including `rfq_v2_only` mode, where the V1 settlement stream is
+/// never opened. `run_cloud_agent` spawns it once per process;
+/// `run_lp_settlement_stream` does NOT spawn it.
+fn spawn_mid_price_poller(
+    price_config: BaseConfig,
+    mid_prices: Arc<tokio::sync::RwLock<std::collections::HashMap<String, f64>>>,
+    price_markets: Vec<String>,
+    price_shutdown: Shutdown,
+) {
     use agent_logic::client::OrderbookClient;
 
-    let lp_config = config.liquidity_provider.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
-
-    // Collect RFQ-enabled market_ids for mid-price polling
-    let rfq_market_ids: Vec<String> = config
-        .markets
-        .iter()
-        .filter(|m| m.enabled && m.rfq.as_ref().map_or(false, |r| r.enabled))
-        .map(|m| m.market_id.clone())
-        .collect();
-
-    // Spawn mid-price polling loop so RfqHandler can quote
-    let mid_prices = rfq_handler.mid_prices();
-    let price_config = config.clone();
-    let price_markets = rfq_market_ids.clone();
-    let price_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_secs(10);
         // Inner future returns when the poller has nothing left to do (shutdown
@@ -1386,6 +1426,24 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
             info!("Mid-price poller shutting down");
         }
     });
+}
+
+/// Run the LP settlement stream (bidirectional gRPC for RFQ handling).
+/// Never spawned when `rfq_v2_only = true` — without the handshake's
+/// `liquidity_provider_name` registration the server routes no V1 RFQs to
+/// this party and it drops out of `GetConnectedLiquidityProviders`.
+pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_handler::RfqHandler>, shutdown: Shutdown) -> Result<()> {
+    use orderbook_proto::settlement::{
+        settlement_service_client::SettlementServiceClient,
+        CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
+        canton_to_server_message::Message as CantonMessage,
+        server_to_canton_message::Message as ServerMessage,
+    };
+    use tokio_stream::StreamExt;
+    use rfq_handler::RfqResponse;
+
+    let lp_config = config.liquidity_provider.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
 
     loop {
         if shutdown.is_shutting_down() {

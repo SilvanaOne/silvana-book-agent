@@ -36,6 +36,10 @@ pub struct RfqHandler {
     quoted_trades: Arc<Mutex<Vec<QuotedTrade>>>,
     /// Liquidity manager for balance checks and depletion-based spread adjustment
     liquidity_manager: Option<Arc<LiquidityManager>>,
+    /// rfq_v2_only mode: the V1 stream is never opened, so no V1 RfqRequest
+    /// should ever reach this handler — belt-and-braces reject if one does.
+    /// `price_rfq` is NOT gated (the V2 atomic stream shares it).
+    rfq_v2_only: bool,
 }
 
 /// Result of handling an RFQ request
@@ -115,6 +119,7 @@ impl RfqHandler {
             party_id: config.party_id.clone(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
             liquidity_manager: None,
+            rfq_v2_only: config.rfq_v2_only,
         })
     }
 
@@ -571,6 +576,20 @@ impl RfqHandler {
     pub async fn handle_rfq_request(&self, request: RfqRequest) -> RfqResponse {
         let rfq_id = request.rfq_id.clone();
 
+        if self.rfq_v2_only {
+            tracing::warn!(
+                "RFQ V1 request {} (market {}) received while rfq_v2_only=true — refusing to quote",
+                rfq_id, request.market_id
+            );
+            return RfqResponse::Reject(self.build_reject(
+                rfq_id,
+                RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "LP is RFQ V2 (AtomicDVP) only",
+                ),
+            ));
+        }
+
         let priced = match self
             // v1 RFQ is base-only (no quote-denominated sizing).
             .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity, "", true)
@@ -642,11 +661,44 @@ mod price_rfq_tests {
             party_id: "lp::test".to_string(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
             liquidity_manager: None,
+            rfq_v2_only: false,
         }
     }
 
     fn f(s: &str) -> f64 {
         s.parse().unwrap()
+    }
+
+    /// rfq_v2_only rejects every V1 request before pricing (belt-and-braces —
+    /// the V1 stream is never opened in that mode), while the same request
+    /// quotes normally with the switch off.
+    #[tokio::test]
+    async fn rfq_v2_only_rejects_v1_requests() {
+        let req = || RfqRequest {
+            rfq_id: "rfq-1".to_string(),
+            market_id: "EDELx-USDC".to_string(),
+            direction: 1,
+            quantity: "1000".to_string(),
+            ..Default::default()
+        };
+
+        let mut h = handler();
+        h.rfq_v2_only = true;
+        match h.handle_rfq_request(req()).await {
+            RfqResponse::Reject(r) => {
+                assert_eq!(r.reason, RfqRejectionReason::TemporarilyUnavailable as i32);
+                assert!(r.reason_detail.unwrap().contains("V2"));
+            }
+            RfqResponse::Quote(_) => panic!("must not quote V1 in rfq_v2_only mode"),
+        }
+
+        // Same request with the switch off quotes (1000 EDELx ≈ $13.6 > $10).
+        match handler().handle_rfq_request(req()).await {
+            RfqResponse::Quote(_) => {}
+            RfqResponse::Reject(r) => {
+                panic!("expected quote with switch off: {:?}", r.reason_detail)
+            }
+        }
     }
 
     /// Quote-denominated buy: "pay 50 USDC" prices at $50 (clears the $10
@@ -786,6 +838,7 @@ mod price_rfq_tests {
             party_id: "lp::test".to_string(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
             liquidity_manager: None,
+            rfq_v2_only: false,
         };
         // direction 1 = buy (LP sells base); 1000 EDELx ≈ $13.3 clears the $10 floor.
         let priced = match handler.price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
@@ -827,6 +880,7 @@ mod price_rfq_tests {
             party_id: "lp::test".to_string(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
             liquidity_manager: None,
+            rfq_v2_only: false,
         };
 
         agent_logic::forecast::update_forecast(0, Some("0.45".to_string()));
