@@ -652,7 +652,7 @@ else falls back to the defaults shown.
 | `role` | `"trader"` | Agent role |
 | `token_ttl_secs` | `3600` | Auth token lifetime |
 | `connection_timeout_secs` | `30` | gRPC connect timeout |
-| `rfq_v2_only` | `false` | **Atomic DVP only, enforced**: never open the V1 LP settlement stream (no V1 registration/quotes) and never place grid orders (bid/offer levels ignored). Requires `[liquidity_provider.rfq_v2].enabled = true` and ≥ 1 enabled market with `[markets.rfq.v2].enabled = true`; conflicts with `--orders-only`. Env override: `RFQ_V2_ONLY` |
+| `rfq_v2_only` | `false` | **Atomic DVP only, enforced**: never open the V1 LP settlement stream (no V1 registration/quotes) and never place grid orders (bid/offer levels ignored). In‑flight V1 settlements still needing this agent's steps are actively cancelled on encounter (already‑allocated ones are left to settle). Requires `[liquidity_provider.rfq_v2].enabled = true` and ≥ 1 enabled market with `[markets.rfq.v2].enabled = true`; conflicts with `--orders-only`. Env override: `RFQ_V2_ONLY` |
 
 ### `[liquidity_provider]`
 
@@ -743,10 +743,12 @@ transactions automatically, both by `atomic setup` and by the runtime split work
 - **About RFQ V1.** With `rfq_v2_only = true` (the recipes above) the V1 settlement stream is
   never opened: the agent does not register as a V1 LP, quotes no V1 RFQs, and does not appear in
   `GetConnectedLiquidityProviders`. Without the flag, an LP config opens the V1 stream and quotes
-  V1 even when no grid levels are configured. **Transition caveat:** in‑flight V1 DVPs that still
-  need this agent's fee or allocation steps cannot complete while the switch is on (the server's
-  fee gate only accepts off‑chain agent fee payments from a live‑registered V1 LP) and cancel at
-  their deadlines — flip the switch during a quiet V1 window.
+  V1 even when no grid levels are configured. **V1 transition behavior:** an in‑flight V1 DVP that
+  still needs this agent's fee or allocation steps is actively cancelled server‑side on encounter
+  (reservations released, counterparty notified within one poll cycle) instead of stranding until
+  deadline expiry; one this agent already allocated for is left to settle via the operator.
+  Leftover on‑chain DvpProposals are reaped by the DvpProposal GC; already‑paid fees are not
+  refunded — still prefer flipping during a quiet V1 window.
 
 ---
 
