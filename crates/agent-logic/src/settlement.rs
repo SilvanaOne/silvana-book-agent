@@ -51,6 +51,19 @@ use crate::runner::{AcceptedRfqTrade, QuotedTrade};
 use crate::shutdown::Shutdown;
 use crate::types::{AdvanceResult, CidWaitingType, FailedSettlement, SettlementStage, SettlementState};
 
+/// Outcome of the server-side user-order verification (Path B of proposal
+/// verification). `LookupFailed` is deliberately distinct from `Rejected`:
+/// an infrastructure failure (server unreachable, or the market gated as
+/// not_found by the inactive-market invisibility change) carries NO verdict
+/// about the trade and must never trigger a proposal reject — the proposal is
+/// held instead, to be retried or cleaned up by the server's expiry cancel.
+#[derive(Debug)]
+enum UserOrderVerdict {
+    Verified(u64),
+    Rejected(String),
+    LookupFailed(String),
+}
+
 /// Result from a settlement step operation
 #[derive(Debug, Clone)]
 pub struct StepResult {
@@ -1097,8 +1110,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 info!("[{}] Order {} not in tracker, fetching from server", proposal_id, lookup_id);
                 let market_id = proposal.market_id.clone();
                 match self.verify_user_order(&proposal, lookup_id, &market_id).await {
-                    Ok(oid) => oid,
-                    Err(reason) => {
+                    UserOrderVerdict::Verified(oid) => oid,
+                    UserOrderVerdict::Rejected(reason) => {
                         warn!("[{}] User order verification failed: {}", proposal_id, reason);
                         let state = SettlementState::new(proposal, is_buyer);
                         self.active_settlements.insert(proposal_id.clone(), state);
@@ -1106,6 +1119,20 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                             warn!("[{}] Failed to reject: {}", proposal_id, e);
                             self.active_settlements.shift_remove(&proposal_id);
                         }
+                        return Ok(());
+                    }
+                    UserOrderVerdict::LookupFailed(reason) => {
+                        // No verdict — HOLD, never reject. The proposal stays
+                        // pending: a later notification retries it, and if none
+                        // comes the server's expiry cancel releases it cleanly.
+                        // Rejecting here burned legitimate settlements when the
+                        // lookup failed for infra reasons (e.g. the market
+                        // deactivated after the match — GetOrders answers
+                        // not_found under the invisibility invariant).
+                        warn!(
+                            "[{}] User order lookup failed, holding proposal (no verdict): {}",
+                            proposal_id, reason
+                        );
                         return Ok(());
                     }
                 }
@@ -1917,30 +1944,51 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
     }
 
-    /// Verify a user order by fetching it from the server
+    /// Verify a user order by fetching it from the server.
     ///
-    /// Returns the order_id on success, or an error message on failure.
+    /// Distinguishes a definitive verdict from a failed lookup — only the
+    /// former may drive a proposal reject (see the call site).
     async fn verify_user_order(
         &mut self,
         proposal: &SettlementProposal,
         order_id: u64,
         market_id: &str,
-    ) -> std::result::Result<u64, String> {
-        let client = self.get_query_client().await
-            .map_err(|e| format!("Failed to create query client: {}", e))?;
+    ) -> UserOrderVerdict {
+        // Infrastructure failures are NOT verdicts. In particular, GetOrders
+        // with a market filter returns NOT_FOUND for a market deactivated
+        // after the match — rejecting on that would burn a legitimate
+        // in-flight settlement on what is an infra/lookup condition. Held
+        // proposals are retried on the next server notification or cleaned up
+        // by the server's expiry cancel; both are recoverable, a reject is not.
+        let client = match self.get_query_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                return UserOrderVerdict::LookupFailed(format!(
+                    "Failed to create query client: {}",
+                    e
+                ))
+            }
+        };
 
-        let orders = client.get_active_orders(market_id).await
-            .map_err(|e| format!("Failed to fetch orders: {}", e))?;
+        let orders = match client.get_active_orders(market_id).await {
+            Ok(o) => o,
+            Err(e) => {
+                return UserOrderVerdict::LookupFailed(format!("Failed to fetch orders: {}", e))
+            }
+        };
 
-        let order = orders.into_iter()
-            .find(|o| o.order_id == order_id)
-            .ok_or_else(|| format!("Order {} not found on server", order_id))?;
+        // The server answered — an absent order is a definitive verdict.
+        let Some(order) = orders.into_iter().find(|o| o.order_id == order_id) else {
+            return UserOrderVerdict::Rejected(format!("Order {} not found on server", order_id));
+        };
 
         let mut tracker = self.tracker.lock().await;
         match tracker.verify_and_import_order(&order, proposal) {
-            VerifyResult::Accepted { order_id } => Ok(order_id),
-            VerifyResult::Rejected { reason } => Err(reason),
-            VerifyResult::NeedServerLookup { .. } => Err("Unexpected NeedServerLookup".to_string()),
+            VerifyResult::Accepted { order_id } => UserOrderVerdict::Verified(order_id),
+            VerifyResult::Rejected { reason } => UserOrderVerdict::Rejected(reason),
+            VerifyResult::NeedServerLookup { .. } => {
+                UserOrderVerdict::Rejected("Unexpected NeedServerLookup".to_string())
+            }
         }
     }
 
