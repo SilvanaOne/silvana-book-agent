@@ -43,6 +43,13 @@ struct AgentToml {
     /// LP configuration (only for liquidity provider agents)
     #[serde(default)]
     liquidity_provider: Option<LiquidityProviderConfig>,
+    /// Force RFQ V2 (AtomicDVP) only: never connect the V1 LP settlement
+    /// stream (no V1 LP registration, no V1 quotes) and never place
+    /// grid/limit orders. Requires `[liquidity_provider.rfq_v2].enabled` and
+    /// at least one enabled market with `[markets.rfq.v2].enabled`.
+    /// Env override: RFQ_V2_ONLY.
+    #[serde(default)]
+    rfq_v2_only: bool,
 }
 
 // ============================================================================
@@ -173,6 +180,18 @@ pub struct BaseConfig {
     // Liquidity provider (LP agents only)
     pub liquidity_provider: Option<LiquidityProviderConfig>,
 
+    /// RFQ V2 (AtomicDVP) only mode: the V1 LP settlement stream is never
+    /// opened (no V1 LP registration/quotes) and grid/limit orders are never
+    /// placed. The startup cancel-all still runs (clears any existing grid).
+    /// In-flight V1 settlements still needing this agent's steps are ACTIVELY
+    /// CANCELLED on encounter (see `abort_v1_settlement`) — they could never
+    /// complete anyway, since the server's fee gate keys "agent" off live
+    /// V1-stream registration; ones this agent already allocated for are left
+    /// to settle via the operator. Already-paid counterparty fees are not
+    /// refunded — still prefer flipping during a quiet V1 window.
+    /// Env override: RFQ_V2_ONLY (LP-gated).
+    pub rfq_v2_only: bool,
+
     // Settlement throttle
     pub max_active_settlements: usize,
 
@@ -274,6 +293,7 @@ impl BaseConfig {
             venue_branch: None,
             ledger_service_public_key: [0u8; 32],
             liquidity_provider: None,
+            rfq_v2_only: false,
             max_active_settlements: 1000,
             max_pending_per_counterparty: 1000,
             settle_before_secs: 1800,
@@ -375,6 +395,7 @@ impl BaseConfig {
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
             ledger_service_public_key,
             liquidity_provider: None,
+            rfq_v2_only: false,
             max_active_settlements: 10,
             max_pending_per_counterparty: 10,
             settle_before_secs: default_rfq_settle_before_secs() as u64,
@@ -503,6 +524,35 @@ impl BaseConfig {
                 "RFQ V2 is enabled but no quote key is set — call \
                  BaseConfig::set_atomic_quote_scalar (or set ATOMIC_QUOTE_PRIVATE_KEY on the env path)"
             ));
+        }
+
+        if self.rfq_v2_only {
+            if self.liquidity_provider.is_none() {
+                return Err(anyhow!(
+                    "rfq_v2_only = true requires a [liquidity_provider] section"
+                ));
+            }
+            if !rfq_v2_enabled {
+                return Err(anyhow!(
+                    "rfq_v2_only = true requires [liquidity_provider.rfq_v2].enabled = true \
+                     (or RFQ_V2_ENABLED=true on the env path)"
+                ));
+            }
+            // Same predicate as setup_rfq_v2's runtime market filter:
+            // market.enabled && rfq.enabled && rfq.v2.enabled.
+            let any_v2_market = self.markets.iter().any(|m| {
+                m.enabled
+                    && m.rfq
+                        .as_ref()
+                        .is_some_and(|r| r.enabled && r.v2.as_ref().is_some_and(|v| v.enabled))
+            });
+            if !any_v2_market {
+                return Err(anyhow!(
+                    "rfq_v2_only = true requires at least one enabled market with \
+                     [markets.rfq].enabled and [markets.rfq.v2].enabled = true — \
+                     otherwise the agent would quote nothing"
+                ));
+            }
         }
         Ok(())
     }
@@ -720,6 +770,20 @@ impl BaseConfig {
             }
         }
 
+        // RFQ_V2_ONLY env override — LP-gated like RFQ_V2_ENABLED, so an
+        // exported env var cannot fail unrelated utility commands running on
+        // the load_or_defaults path in a directory without a
+        // [liquidity_provider] section. A toml-sourced `rfq_v2_only = true`
+        // without an LP section is still a hard error below.
+        if agent.liquidity_provider.is_some() {
+            if let Some(only) = std::env::var("RFQ_V2_ONLY")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+            {
+                agent.rfq_v2_only = only;
+            }
+        }
+
         // --- RFQ V2 validation + quote-key loading ---
         let rfq_v2_enabled = agent
             .liquidity_provider
@@ -779,6 +843,38 @@ impl BaseConfig {
             }
         }
 
+        // rfq_v2_only sanity: with V1 and orders disabled, a config without a
+        // working V2 stack would quote NOTHING — fail loud at startup instead.
+        // Runs after the env overrides above so RFQ_V2_ENABLED/RFQ_V2_ONLY count.
+        if agent.rfq_v2_only {
+            if agent.liquidity_provider.is_none() {
+                return Err(anyhow!(
+                    "rfq_v2_only = true requires a [liquidity_provider] section"
+                ));
+            }
+            if !rfq_v2_enabled {
+                return Err(anyhow!(
+                    "rfq_v2_only = true requires [liquidity_provider.rfq_v2].enabled = true \
+                     (or RFQ_V2_ENABLED=true)"
+                ));
+            }
+            // Same predicate as setup_rfq_v2's runtime market filter:
+            // market.enabled && rfq.enabled && rfq.v2.enabled.
+            let any_v2_market = agent.markets.iter().any(|m| {
+                m.enabled
+                    && m.rfq
+                        .as_ref()
+                        .is_some_and(|r| r.enabled && r.v2.as_ref().is_some_and(|v| v.enabled))
+            });
+            if !any_v2_market {
+                return Err(anyhow!(
+                    "rfq_v2_only = true requires at least one enabled market with \
+                     [markets.rfq].enabled and [markets.rfq.v2].enabled = true — \
+                     otherwise the agent would quote nothing"
+                ));
+            }
+        }
+
         // Quote key: required iff RFQ V2 is enabled. ENV-ONLY — no keyfiles:
         // ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex) is the single
         // source for the runtime AND the atomic CLI, so the venue key and the
@@ -829,6 +925,7 @@ impl BaseConfig {
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
             ledger_service_public_key,
             liquidity_provider: agent.liquidity_provider,
+            rfq_v2_only: agent.rfq_v2_only,
             max_active_settlements,
             max_pending_per_counterparty,
             settle_before_secs,
@@ -1429,6 +1526,7 @@ mod tests {
         assert_eq!(agent.request_timeout_secs, 120);
         assert_eq!(agent.canton_op_timeout_secs, 600);
         assert!(agent.markets.is_empty());
+        assert!(!agent.rfq_v2_only);
     }
 
     #[test]
@@ -1621,6 +1719,18 @@ ticket_threshold_usd = 250.5
                 .ticket_threshold_usd,
             Some(250.5)
         );
+
+        // top-level rfq_v2_only parses
+        let agent: AgentToml = toml::from_str(
+            r#"
+rfq_v2_only = true
+
+[liquidity_provider]
+name = "LP test"
+"#,
+        )
+        .unwrap();
+        assert!(agent.rfq_v2_only);
     }
 
     /// Env-mutating assemble test. Single test fn so the process-global env
@@ -1651,6 +1761,7 @@ ticket_threshold_usd = 250.5
         );
         for k in [
             "RFQ_V2_ENABLED",
+            "RFQ_V2_ONLY",
             "TICKET_THRESHOLD_USD",
             "TICKET_BATCH_SIZE",
             "ATOMIC_QUOTE_PRIVATE_KEY",
@@ -1772,14 +1883,132 @@ atomic_quote_valid_secs = 0
         let err = format!("{:#}", BaseConfig::assemble(agent).unwrap_err());
         assert!(err.contains("ATOMIC_QUOTE_PRIVATE_KEY"), "got: {err}");
 
+        // --- rfq_v2_only scenarios ---
+        let only_toml = format!("rfq_v2_only = true\n{market_v2_toml}");
+
+        // H: rfq_v2_only without a [liquidity_provider] section → error
+        unset("RFQ_V2_ENABLED");
+        let agent: AgentToml = toml::from_str("rfq_v2_only = true\n").unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("[liquidity_provider]"), "got: {err}");
+
+        // I: rfq_v2_only with the LP-level V2 switch off → error
+        let agent: AgentToml = toml::from_str(
+            r#"
+rfq_v2_only = true
+
+[liquidity_provider]
+name = "LP test"
+"#,
+        )
+        .unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("rfq_v2].enabled"), "got: {err}");
+
+        // J: rfq_v2_only with V2 enabled but no v2-enabled market → error
+        set("RFQ_V2_ENABLED", "true");
+        set("ATOMIC_QUOTE_PRIVATE_KEY", &kf.priv_scalar_hex);
+        let agent: AgentToml = toml::from_str(
+            r#"
+rfq_v2_only = true
+
+[liquidity_provider]
+name = "LP test"
+
+[liquidity_provider.rfq_v2]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        assert!(err.contains("at least one enabled market"), "got: {err}");
+
+        // K: happy path — toml switch + enabled V2 + v2 market → Ok
+        let agent: AgentToml = toml::from_str(&only_toml).unwrap();
+        let cfg = BaseConfig::assemble(agent).unwrap();
+        assert!(cfg.rfq_v2_only);
+
+        // L: env RFQ_V2_ONLY=true over a toml that omits the field
+        set("RFQ_V2_ONLY", "true");
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(agent).unwrap();
+        assert!(cfg.rfq_v2_only);
+
+        // M: env RFQ_V2_ONLY=false disarms a toml `rfq_v2_only = true`
+        // (validation then no longer applies, so this also passes without markets)
+        set("RFQ_V2_ONLY", "false");
+        let agent: AgentToml = toml::from_str(&only_toml).unwrap();
+        let cfg = BaseConfig::assemble(agent).unwrap();
+        assert!(!cfg.rfq_v2_only);
+
+        // N: RFQ_V2_ONLY is LP-gated (RFQ_V2_ENABLED idiom) — with no
+        // [liquidity_provider] section the env var is inert, so utility
+        // commands on the load_or_defaults path don't trip the validation
+        set("RFQ_V2_ONLY", "true");
+        let agent: AgentToml = toml::from_str("").unwrap();
+        let cfg = BaseConfig::assemble(agent).unwrap();
+        assert!(!cfg.rfq_v2_only);
+
         // cleanup
         for k in [
             "RFQ_V2_ENABLED",
+            "RFQ_V2_ONLY",
             "TICKET_THRESHOLD_USD",
             "TICKET_BATCH_SIZE",
             "ATOMIC_QUOTE_PRIVATE_KEY",
         ] {
             unset(k);
         }
+    }
+
+    /// Non-env mirror: the same rfq_v2_only requirements enforced by
+    /// `validate_v2` for `for_party` embedders.
+    #[test]
+    fn test_rfq_v2_only_validate_v2_mirror() {
+        let mut config = BaseConfig::test_minimal();
+        config.rfq_v2_only = true;
+
+        // No LP section
+        let err = config.validate_v2().unwrap_err().to_string();
+        assert!(err.contains("[liquidity_provider]"), "got: {err}");
+
+        // LP present but V2 switch off
+        config.liquidity_provider = Some(LiquidityProviderConfig {
+            name: "LP test".to_string(),
+            max_concurrent_rfqs: default_max_concurrent_rfqs(),
+            default_quote_valid_secs: default_quote_valid_secs(),
+            min_notional_usd: 0.0,
+            rfq_v2: None,
+        });
+        let err = config.validate_v2().unwrap_err().to_string();
+        assert!(err.contains("rfq_v2].enabled"), "got: {err}");
+
+        // V2 enabled (+ key so the shared quote-key check passes) but no v2 market
+        config.liquidity_provider.as_mut().unwrap().rfq_v2 = Some(RfqV2Config {
+            enabled: true,
+            ..RfqV2Config::default()
+        });
+        let kf = atomic_quote::gen_keypair().unwrap();
+        config.set_atomic_quote_scalar(&kf.priv_scalar_hex).unwrap();
+        let err = config.validate_v2().unwrap_err().to_string();
+        assert!(err.contains("at least one enabled market"), "got: {err}");
+
+        // Add a v2-enabled market → Ok
+        let market: MarketConfig = toml::from_str(
+            r#"
+market_id = "CC-USDCx"
+
+[rfq]
+min_quantity = "5"
+max_quantity = "1000"
+
+[rfq.v2]
+enabled = true
+"#,
+        )
+        .unwrap();
+        config.markets = vec![market];
+        config.recompute_deadline_windows();
+        config.validate_v2().unwrap();
     }
 }

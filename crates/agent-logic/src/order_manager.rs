@@ -611,8 +611,20 @@ impl OrderManager {
                 }
             };
 
-            // 2. Fetch active orders
-            let orders = self.get_active_orders(market_id).await?;
+            // 2. Fetch active orders. Per-market failure must not abort the
+            // cycle — a `?` here let one broken market (e.g. deactivated
+            // server-side, GetOrders → not_found) silently freeze grid
+            // maintenance for every market ordered after it, every cycle.
+            let orders = match self.get_active_orders(market_id).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(
+                        "Market {} order fetch failed ({}); skipping this market this cycle",
+                        market_id, e
+                    );
+                    continue;
+                }
+            };
             let expected_count = market.bid_levels.len() + market.offer_levels.len();
             let partial_fills = Self::has_partial_fills(&orders);
 

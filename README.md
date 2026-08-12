@@ -251,6 +251,7 @@ Flags:
 | `SYNCHRONIZER_ID`                | Canton synchronizer ID                                                 |         yes          |
 | `NODE_NAME`                      | Canton node name for routing                                           |         yes          |
 | `VENUE_BRANCH`                   | RFQ V2 analytics branch stamped into this agent's JWT; slug `^[a-z0-9][a-z0-9-]{1,19}$`. Unset = server default `main`. Production cloud-agents: `agent` |          no          |
+| `RFQ_V2_ONLY`                    | Overrides the top-level `rfq_v2_only` flag in `agent.toml` (same idiom as `RFQ_V2_ENABLED`: inert without a `[liquidity_provider]` section) — see the `agent.toml` section below |          no          |
 | `LEDGER_SERVICE_PUBLIC_KEY`      | Base58 public key of the ledger service (for verifying responses)      |         yes          |
 | `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
 | `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
@@ -303,6 +304,8 @@ auto_settle = true
 poll_interval_secs = 7
 token_ttl_secs = 3600
 connection_timeout_secs = 30
+# RFQ V2 (AtomicDVP) only — see below. Default: false.
+rfq_v2_only = false
 
 # Liquidity provider identity (enables RFQ handling)
 [liquidity_provider]
@@ -349,6 +352,13 @@ allocate_before_secs = 900
 settle_before_secs = 1800
 ```
 
+**`rfq_v2_only`** (top-level, default `false`, env override `RFQ_V2_ONLY`) forces the agent to quote via RFQ V2 (AtomicDVP) exclusively:
+
+- The V1 LP settlement stream is never opened — no V1 LP registration, no V1 quotes, and the agent disappears from `GetConnectedLiquidityProviders`.
+- No grid/limit orders are placed; `[[markets.bid_levels]]`/`[[markets.offer_levels]]` are ignored (keep them in the file for easy rollback). The startup cancel-all still runs, so flipping the switch on and restarting clears any resting orders.
+- The mid-price poller, balance refresh, and the settlement subscription keep running. **V1 transition behavior:** an in-flight V1 DVP that still needs *this agent's* fee or allocation steps is **actively cancelled server-side on encounter** — reservations released and the counterparty notified within one poll cycle, instead of stranding until deadline expiry (without live V1-stream registration the server's fee gate would classify the agent as a regular user and the DVP could never complete). One this agent has already allocated for is left alone and can still settle via the operator. Leftover on-chain DvpProposals are reaped by the DvpProposal GC; the counterparty's already-paid fees are not refunded — still prefer flipping during a quiet V1 window.
+- Startup fails loudly unless `[liquidity_provider.rfq_v2].enabled = true` and at least one enabled market has `[markets.rfq.v2].enabled = true`; a failed RFQ V2 setup is also fatal in this mode (nothing left to quote). `--orders-only` conflicts with it.
+
 ### Grid Orders
 
 When `agent` runs, it places limit orders on a grid of price levels around the current mid price.
@@ -362,7 +372,7 @@ When the mid price moves by more than `price_change_threshold_percent`, all grid
 
 ### RFQ (Request for Quote)
 
-When `[liquidity_provider]` is configured, the agent connects to the orderbook server via a bidirectional gRPC stream (`SettlementStream`) and receives RFQ requests in real time.
+When `[liquidity_provider]` is configured (and `rfq_v2_only` is off), the agent connects to the orderbook server via a bidirectional gRPC stream (`SettlementStream`) and receives RFQ requests in real time.
 
 Flow:
 
@@ -410,7 +420,7 @@ Flags (both `buy` and `sell`):
 | Flag                | Description                                                  |
 | ------------------- | ------------------------------------------------------------ |
 | `--settlement-only` | Disable order placement, only settle existing trades         |
-| `--orders-only`     | Disable settlement, only place/manage grid orders            |
+| `--orders-only`     | Disable settlement, only place/manage grid orders (conflicts with `rfq_v2_only = true`) |
 | `--no-restore`      | Skip loading previous state from `agent-state.json`          |
 | `--no-reject`       | Accept all proposals without RFQ-state verification          |
 | `--dry-run`         | Prepare and verify transactions without signing or executing |
@@ -483,7 +493,7 @@ The `SettlementStream` RPC is a long-lived bidirectional gRPC stream used for RF
 
 **Server sends:** handshake ack, heartbeats, settlement proposals, preconfirmation requests, RFQ requests.
 
-The agent opens this stream when `[liquidity_provider]` is configured in `agent.toml`.
+The agent opens this stream when `[liquidity_provider]` is configured in `agent.toml` — unless `rfq_v2_only = true`, in which case the stream is never opened and the agent never appears in `GetConnectedLiquidityProviders`.
 
 #### Authentication
 

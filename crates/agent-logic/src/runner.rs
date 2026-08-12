@@ -369,13 +369,16 @@ where
     result_collect_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Check if we have markets configured for order placement
-    let has_markets = !config.markets.is_empty() && !options.settlement_only;
+    let has_markets =
+        !config.markets.is_empty() && !options.settlement_only && !config.rfq_v2_only;
 
     if has_markets {
         info!(
             "Order placement enabled for {} market(s)",
             config.enabled_markets().len()
         );
+    } else if config.rfq_v2_only {
+        info!("rfq_v2_only mode - grid/limit order placement disabled (RFQ V2 / AtomicDVP only)");
     } else if options.settlement_only {
         info!("Running in settlement-only mode - order placement disabled");
     } else {

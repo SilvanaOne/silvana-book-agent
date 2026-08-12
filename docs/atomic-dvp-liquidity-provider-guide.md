@@ -149,6 +149,12 @@ role = "trader"
 token_ttl_secs = 3600
 connection_timeout_secs = 30
 
+# Atomic DVP ONLY, enforced: the V1 LP settlement stream is never opened (no
+# V1 registration/quotes) and grid orders are never placed. Without this flag,
+# omitting bid/offer levels only removed the grid — the agent still quoted
+# RFQ V1. Env override: RFQ_V2_ONLY.
+rfq_v2_only = true
+
 # Liquidity-provider identity (its presence enables RFQ handling)
 [liquidity_provider]
 name = "My LP"
@@ -185,7 +191,8 @@ CBTC  = ["0.00025x120"]  # ~= $20
 
 # ── Markets ───────────────────────────────────────────────────────────────────
 # Each market needs [markets.rfq] (enabled + min/max quantity) AND
-# [markets.rfq.v2] enabled = true. No bid_levels/offer_levels = no grid orders.
+# [markets.rfq.v2] enabled = true. Grid orders are off via rfq_v2_only above
+# (bid/offer levels are ignored, so none are configured here).
 
 [[markets]]
 market_id = "CC-USDC"
@@ -446,6 +453,10 @@ role = "trader"
 token_ttl_secs = 3600
 connection_timeout_secs = 30
 
+# Atomic DVP ONLY, enforced: no V1 LP stream registration/quotes, no grid
+# orders (bid/offer levels ignored). Env override: RFQ_V2_ONLY.
+rfq_v2_only = true
+
 [liquidity_provider]
 name = "My LP"
 max_concurrent_rfqs = 120
@@ -641,6 +652,7 @@ else falls back to the defaults shown.
 | `role` | `"trader"` | Agent role |
 | `token_ttl_secs` | `3600` | Auth token lifetime |
 | `connection_timeout_secs` | `30` | gRPC connect timeout |
+| `rfq_v2_only` | `false` | **Atomic DVP only, enforced**: never open the V1 LP settlement stream (no V1 registration/quotes) and never place grid orders (bid/offer levels ignored). In‑flight V1 settlements still needing this agent's steps are actively cancelled on encounter (already‑allocated ones are left to settle). Requires `[liquidity_provider.rfq_v2].enabled = true` and ≥ 1 enabled market with `[markets.rfq.v2].enabled = true`; conflicts with `--orders-only`. Env override: `RFQ_V2_ONLY` |
 
 ### `[liquidity_provider]`
 
@@ -690,8 +702,10 @@ transactions automatically, both by `atomic setup` and by the runtime split work
 | `markets.rfq.settle_before_secs` | `1800` | Settlement deadline; must be `>` allocate |
 | `markets.rfq.v2.enabled` | `false` | **Set `true` to serve Atomic DVP on this market** |
 
-> **Omitting `bid_levels` / `offer_levels` is what gives you "no orders".** They default to empty,
-> so this Atomic‑DVP‑only config never posts resting order‑book orders.
+> **`rfq_v2_only = true` is what enforces "Atomic DVP only".** It disables both grid orders
+> (bid/offer levels are ignored even if present) and RFQ V1 (the V1 stream is never opened).
+> Merely omitting `bid_levels` / `offer_levels` — the old recipe — removed the grid but the
+> agent still quoted RFQ V1.
 
 ---
 
@@ -726,10 +740,15 @@ transactions automatically, both by `atomic setup` and by the runtime split work
   `examples/atomic-dvp/devnet/atomic-dvp-service.json`); for mainnet, get it from Silvana. Put it
   in the folder you run `atomic setup` from. (`atomic status` does not need it.)
 
-- **About RFQ V1.** Because this is an LP, the agent also opens the V1 settlement stream — it is
-  used for settlement‑lifecycle coordination. There is no config switch to hard‑disable V1 while
-  V2 is on; configuring only `[markets.rfq.v2]` (no grid orders) and creating venues is what makes
-  swaps settle through the Atomic DVP path.
+- **About RFQ V1.** With `rfq_v2_only = true` (the recipes above) the V1 settlement stream is
+  never opened: the agent does not register as a V1 LP, quotes no V1 RFQs, and does not appear in
+  `GetConnectedLiquidityProviders`. Without the flag, an LP config opens the V1 stream and quotes
+  V1 even when no grid levels are configured. **V1 transition behavior:** an in‑flight V1 DVP that
+  still needs this agent's fee or allocation steps is actively cancelled server‑side on encounter
+  (reservations released, counterparty notified within one poll cycle) instead of stranding until
+  deadline expiry; one this agent already allocated for is left to settle via the operator.
+  Leftover on‑chain DvpProposals are reaped by the DvpProposal GC; already‑paid fees are not
+  refunded — still prefer flipping during a quiet V1 window.
 
 ---
 

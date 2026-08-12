@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 
 use orderbook_proto::{
     orderbook::{SettlementProposal, SettlementUpdate, settlement_update::EventType},
-    NextAction,
+    DvpStepStatusEnum, GetSettlementStatusResponse, NextAction,
     RecordSettlementEventRequest, SettlementEventType, SettlementEventResult, RecordedByRole,
 };
 
@@ -50,6 +50,19 @@ use crate::rpc_client::OrderbookRpcClient;
 use crate::runner::{AcceptedRfqTrade, QuotedTrade};
 use crate::shutdown::Shutdown;
 use crate::types::{AdvanceResult, CidWaitingType, FailedSettlement, SettlementStage, SettlementState};
+
+/// Outcome of the server-side user-order verification (Path B of proposal
+/// verification). `LookupFailed` is deliberately distinct from `Rejected`:
+/// an infrastructure failure (server unreachable, or the market gated as
+/// not_found by the inactive-market invisibility change) carries NO verdict
+/// about the trade and must never trigger a proposal reject — the proposal is
+/// held instead, to be retried or cleaned up by the server's expiry cancel.
+#[derive(Debug)]
+enum UserOrderVerdict {
+    Verified(u64),
+    Rejected(String),
+    LookupFailed(String),
+}
 
 /// Result from a settlement step operation
 #[derive(Debug, Clone)]
@@ -73,6 +86,38 @@ const MAX_ADVANCE_SPAWNS_PER_CYCLE: usize = 50;
 /// watchdog) within ~30s, without the 2s-tick hammering a full bypass would
 /// cause, and without burning through retries in seconds during an RPC outage.
 const EXPIRED_RETRY_SECS: u64 = 30;
+
+/// rfq_v2_only disposition for an encountered V1 settlement: true = leave it
+/// alone (do NOT cancel). The server's CancelSettlement guard only refuses
+/// after the settlement transaction is submitted — it does NOT protect a
+/// proposal this agent has already allocated for, which can still settle via
+/// the operator without any further agent action. So the agent self-gates on
+/// its OWN allocation step (Submitted/Completed/Confirmed); Failed/Rejected/
+/// Withdrawn/Cancelled/Timeout allocation attempts left nothing standing and
+/// are safe to cancel. The settlement-step and terminal-stage checks are
+/// belt-and-braces against races with the operator between the status read
+/// and the cancel. `stage` alone is party-agnostic (Allocating/Allocated can
+/// mean only the COUNTERPARTY allocated), so it never triggers leave-alone
+/// below Settling.
+fn v1_settlement_leave_alone(status: &GetSettlementStatusResponse, is_buyer: bool) -> bool {
+    fn at_least_submitted(step: Option<&orderbook_proto::DvpStepStatus>) -> bool {
+        matches!(
+            step.map(|s| s.status),
+            Some(s) if s == DvpStepStatusEnum::DvpStepStatusSubmitted as i32
+                || s == DvpStepStatusEnum::DvpStepStatusCompleted as i32
+                || s == DvpStepStatusEnum::DvpStepStatusConfirmed as i32
+        )
+    }
+    let my_alloc = if is_buyer {
+        status.allocation_buyer.as_ref()
+    } else {
+        status.allocation_seller.as_ref()
+    };
+    // Settling=10, Settled=11, Failed=12, Cancelled=13 (contiguous tail).
+    at_least_submitted(my_alloc)
+        || at_least_submitted(status.settlement.as_ref())
+        || status.stage >= orderbook_proto::SettlementStage::Settling as i32
+}
 
 /// Extract the 48-bit ms-since-epoch timestamp from a UUID-v7 string.
 /// Used to sort the spawn queue freshest-first so a brand-new RFQ-driven
@@ -380,6 +425,88 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 Err(e) => debug!("[{}] Best-effort cancel RPC failed: {}", pid, e),
             }
         });
+    }
+
+    /// rfq_v2_only: actively abort an encountered V1 settlement instead of
+    /// adopting it (server-side cancel via the unary CancelSettlement RPC —
+    /// no V1 LP stream needed). Proposals this agent already allocated for —
+    /// or whose settlement transaction is already in flight / terminal — are
+    /// left alone: they can still settle via the operator without agent
+    /// action (see `v1_settlement_leave_alone`). Failures do NOT insert into
+    /// `rejected_proposals`, so `poll_pending_proposals` re-surfaces the
+    /// proposal and retries at poll cadence; the server cancel is idempotent
+    /// (already-terminal → success=true).
+    async fn abort_v1_settlement(&mut self, proposal: &SettlementProposal, is_buyer: bool) {
+        let proposal_id = proposal.proposal_id.clone();
+
+        let jwt = match self.create_jwt() {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("[{}] rfq_v2_only abort: JWT generation failed: {:#} — retrying next poll", proposal_id, e);
+                return;
+            }
+        };
+        let mut rpc_client =
+            match OrderbookRpcClient::connect(&self.config.orderbook_grpc_url, Some(jwt)).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[{}] rfq_v2_only abort: RPC connect failed: {:#} — retrying next poll", proposal_id, e);
+                    return;
+                }
+            };
+        let status = match rpc_client.get_settlement_status(&proposal_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[{}] rfq_v2_only abort: GetSettlementStatus failed: {:#} — retrying next poll", proposal_id, e);
+                return;
+            }
+        };
+
+        if v1_settlement_leave_alone(&status, is_buyer) {
+            info!(
+                "[{}] rfq_v2_only: leaving in-flight V1 settlement to complete/expire \
+                 (stage={}, own allocation or settlement tx already submitted)",
+                proposal_id, status.stage
+            );
+            // Do NOT mark_failed here: a later Settled stream event needs the
+            // preserved settlement_orders entry for tracker accounting.
+            self.rejected_proposals.insert(proposal_id);
+            return;
+        }
+
+        match rpc_client
+            .cancel_settlement(
+                &proposal_id,
+                "rfq_v2_only: agent is RFQ V2 (AtomicDVP) only; aborting V1 settlement",
+            )
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    "[{}] rfq_v2_only: V1 settlement aborted server-side (stage={})",
+                    proposal_id, status.stage
+                );
+                // Release a restored order reservation, if any (no-op when
+                // untracked) — mirrors the restored-abandon arm above.
+                {
+                    let mut tracker = self.tracker.lock().await;
+                    tracker.mark_failed(&proposal_id);
+                }
+                // Buyer fill-loop feedback parity with the reject arms.
+                if let Some(ref rejected) = self.rejected_rfq_trades {
+                    rejected.lock().await.insert(proposal_id.clone());
+                }
+                self.rejected_proposals.insert(proposal_id);
+            }
+            Ok(false) => {
+                // Settlement tx submitted between the status read and the
+                // cancel — next poll's status check classifies it leave-alone.
+                warn!("[{}] rfq_v2_only: server declined cancel — re-checking next poll", proposal_id);
+            }
+            Err(e) => {
+                warn!("[{}] rfq_v2_only: cancel RPC failed: {:#} — retrying next poll", proposal_id, e);
+            }
+        }
     }
 
     /// True when a tracked settlement has outlived its settlement window — or its
@@ -737,6 +864,18 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
         let proposal_id = proposal.proposal_id.clone();
 
+        // rfq_v2_only: never adopt V1 settlements — every proposal reaching
+        // this pipeline is V1 by construction (RFQ V2 / AtomicDVP settles
+        // atomically and never creates settlement proposals). Actively abort
+        // it server-side unless this agent already allocated (it can still
+        // settle via the operator) or the settlement tx is already in flight.
+        // Must precede the restore / --no-reject / liquidity-not-ready
+        // bypasses below, all of which would otherwise adopt.
+        if self.config.rfq_v2_only {
+            self.abort_v1_settlement(&proposal, is_buyer).await;
+            return Ok(());
+        }
+
         // Check if this proposal was already verified and tracked before shutdown.
         // settlement_orders is restored from saved state — if present, the proposal
         // was previously accepted and pending_quantity is already accounted for.
@@ -971,8 +1110,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 info!("[{}] Order {} not in tracker, fetching from server", proposal_id, lookup_id);
                 let market_id = proposal.market_id.clone();
                 match self.verify_user_order(&proposal, lookup_id, &market_id).await {
-                    Ok(oid) => oid,
-                    Err(reason) => {
+                    UserOrderVerdict::Verified(oid) => oid,
+                    UserOrderVerdict::Rejected(reason) => {
                         warn!("[{}] User order verification failed: {}", proposal_id, reason);
                         let state = SettlementState::new(proposal, is_buyer);
                         self.active_settlements.insert(proposal_id.clone(), state);
@@ -980,6 +1119,20 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                             warn!("[{}] Failed to reject: {}", proposal_id, e);
                             self.active_settlements.shift_remove(&proposal_id);
                         }
+                        return Ok(());
+                    }
+                    UserOrderVerdict::LookupFailed(reason) => {
+                        // No verdict — HOLD, never reject. The proposal stays
+                        // pending: a later notification retries it, and if none
+                        // comes the server's expiry cancel releases it cleanly.
+                        // Rejecting here burned legitimate settlements when the
+                        // lookup failed for infra reasons (e.g. the market
+                        // deactivated after the match — GetOrders answers
+                        // not_found under the invisibility invariant).
+                        warn!(
+                            "[{}] User order lookup failed, holding proposal (no verdict): {}",
+                            proposal_id, reason
+                        );
                         return Ok(());
                     }
                 }
@@ -1791,30 +1944,51 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
     }
 
-    /// Verify a user order by fetching it from the server
+    /// Verify a user order by fetching it from the server.
     ///
-    /// Returns the order_id on success, or an error message on failure.
+    /// Distinguishes a definitive verdict from a failed lookup — only the
+    /// former may drive a proposal reject (see the call site).
     async fn verify_user_order(
         &mut self,
         proposal: &SettlementProposal,
         order_id: u64,
         market_id: &str,
-    ) -> std::result::Result<u64, String> {
-        let client = self.get_query_client().await
-            .map_err(|e| format!("Failed to create query client: {}", e))?;
+    ) -> UserOrderVerdict {
+        // Infrastructure failures are NOT verdicts. In particular, GetOrders
+        // with a market filter returns NOT_FOUND for a market deactivated
+        // after the match — rejecting on that would burn a legitimate
+        // in-flight settlement on what is an infra/lookup condition. Held
+        // proposals are retried on the next server notification or cleaned up
+        // by the server's expiry cancel; both are recoverable, a reject is not.
+        let client = match self.get_query_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                return UserOrderVerdict::LookupFailed(format!(
+                    "Failed to create query client: {}",
+                    e
+                ))
+            }
+        };
 
-        let orders = client.get_active_orders(market_id).await
-            .map_err(|e| format!("Failed to fetch orders: {}", e))?;
+        let orders = match client.get_active_orders(market_id).await {
+            Ok(o) => o,
+            Err(e) => {
+                return UserOrderVerdict::LookupFailed(format!("Failed to fetch orders: {}", e))
+            }
+        };
 
-        let order = orders.into_iter()
-            .find(|o| o.order_id == order_id)
-            .ok_or_else(|| format!("Order {} not found on server", order_id))?;
+        // The server answered — an absent order is a definitive verdict.
+        let Some(order) = orders.into_iter().find(|o| o.order_id == order_id) else {
+            return UserOrderVerdict::Rejected(format!("Order {} not found on server", order_id));
+        };
 
         let mut tracker = self.tracker.lock().await;
         match tracker.verify_and_import_order(&order, proposal) {
-            VerifyResult::Accepted { order_id } => Ok(order_id),
-            VerifyResult::Rejected { reason } => Err(reason),
-            VerifyResult::NeedServerLookup { .. } => Err("Unexpected NeedServerLookup".to_string()),
+            VerifyResult::Accepted { order_id } => UserOrderVerdict::Verified(order_id),
+            VerifyResult::Rejected { reason } => UserOrderVerdict::Rejected(reason),
+            VerifyResult::NeedServerLookup { .. } => {
+                UserOrderVerdict::Rejected("Unexpected NeedServerLookup".to_string())
+            }
         }
     }
 
@@ -2938,6 +3112,131 @@ mod tests {
         exec.handle_settlement_update(created_update(p4)).await.unwrap();
         assert!(exec.active_settlements.contains_key("p4"));
         assert!(exec.tracker.lock().await.has_settlement_order("p4"));
+    }
+
+    // rfq_v2_only disposition classifier: only the agent's OWN allocation step
+    // (or an in-flight/terminal settlement) protects a V1 settlement from the
+    // active abort. Counterparty progress and party-agnostic Allocating/
+    // Allocated stages must NOT protect it.
+    #[test]
+    fn test_v1_leave_alone_disposition() {
+        use orderbook_proto::DvpStepStatus;
+        fn step(status: i32) -> Option<DvpStepStatus> {
+            Some(DvpStepStatus { status, ..Default::default() })
+        }
+
+        // Fresh proposal: cancel (both roles).
+        let fresh = GetSettlementStatusResponse::default();
+        assert!(!v1_settlement_leave_alone(&fresh, true));
+        assert!(!v1_settlement_leave_alone(&fresh, false));
+
+        // My allocation Submitted/Completed/Confirmed → leave alone; the same
+        // step on the COUNTERPARTY's side must not protect.
+        for s in [2, 3, 4] {
+            let mut st = GetSettlementStatusResponse::default();
+            st.allocation_buyer = step(s);
+            assert!(v1_settlement_leave_alone(&st, true), "buyer alloc status {s}");
+            assert!(!v1_settlement_leave_alone(&st, false), "counterparty alloc status {s}");
+            let mut st = GetSettlementStatusResponse::default();
+            st.allocation_seller = step(s);
+            assert!(v1_settlement_leave_alone(&st, false), "seller alloc status {s}");
+            assert!(!v1_settlement_leave_alone(&st, true), "counterparty alloc status {s}");
+        }
+
+        // Pending or failed-flavour allocation attempts left nothing standing.
+        for s in [0, 1, 5, 6, 7, 8, 9] {
+            let mut st = GetSettlementStatusResponse::default();
+            st.allocation_buyer = step(s);
+            assert!(!v1_settlement_leave_alone(&st, true), "alloc status {s}");
+        }
+
+        // Settlement tx in flight/done → leave alone regardless of role.
+        for s in [2, 3, 4] {
+            let mut st = GetSettlementStatusResponse::default();
+            st.settlement = step(s);
+            assert!(v1_settlement_leave_alone(&st, true), "settlement status {s}");
+            assert!(v1_settlement_leave_alone(&st, false), "settlement status {s}");
+        }
+
+        // Terminal-ish stages (Settling=10..Cancelled=13) → leave alone;
+        // Allocating/Allocated (8/9) alone do not (party-agnostic).
+        for stage in [10, 11, 12, 13] {
+            let mut st = GetSettlementStatusResponse::default();
+            st.stage = stage;
+            assert!(v1_settlement_leave_alone(&st, true), "stage {stage}");
+        }
+        for stage in [8, 9] {
+            let mut st = GetSettlementStatusResponse::default();
+            st.stage = stage;
+            assert!(!v1_settlement_leave_alone(&st, true), "stage {stage}");
+        }
+    }
+
+    // rfq_v2_only: a V1 proposal is never adopted — even with a matching
+    // quoted trade that would adopt it with the switch off (see
+    // test_adoption_defers_reservation_until_counterparty_commits). In-harness
+    // the abort's GetSettlementStatus RPC fails (empty URL), so the pid must
+    // stay OUT of rejected_proposals — retry-able on the next poll — and a
+    // replayed delivery is equally inert.
+    #[tokio::test]
+    async fn test_rfq_v2_only_never_adopts_and_stays_retryable() {
+        let mut config = BaseConfig::test_minimal();
+        config.rfq_v2_only = true;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
+            market_id: String::new(),
+            price: String::new(),
+            base_quantity: "1000".to_string(),
+            quote_quantity: "500".to_string(),
+        }]));
+        exec.set_quoted_rfq_trades(quoted);
+
+        let mut p1 = test_proposal("p1");
+        p1.seller = "test-party".to_string();
+        p1.buyer = "cp-x".to_string();
+        exec.handle_settlement_update(created_update(p1.clone())).await.unwrap();
+
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(!exec.tracker.lock().await.has_settlement_order("p1"));
+        assert!(!exec.rejected_proposals.contains("p1"), "RPC failed → must stay retry-able");
+
+        // Replay (poll re-synthesizes ProposalCreated) — equally inert.
+        exec.handle_settlement_update(created_update(p1)).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p1"));
+    }
+
+    // rfq_v2_only precedes BOTH adoption bypasses: the restored-tracker path
+    // and --no-reject would otherwise adopt without verification.
+    #[tokio::test]
+    async fn test_rfq_v2_only_branch_precedes_restore_and_no_reject() {
+        let mut config = BaseConfig::test_minimal();
+        config.rfq_v2_only = true;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+
+        // Case A: restored settlement order (state restore) — would re-adopt.
+        {
+            let mut t = exec.tracker.lock().await;
+            t.record_settlement_order("p1", 0, Decimal::from(1000));
+        }
+        let mut p1 = test_proposal("p1");
+        p1.seller = "test-party".to_string();
+        p1.buyer = "cp-x".to_string();
+        exec.handle_settlement_update(created_update(p1)).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p1"));
+        // Tracker entry preserved: the abort's RPC failed before any
+        // disposition, so no mark_failed ran.
+        assert!(exec.tracker.lock().await.has_settlement_order("p1"));
+
+        // Case B: --no-reject — would adopt everything.
+        exec.set_no_reject(true);
+        let mut p2 = test_proposal("p2");
+        p2.seller = "test-party".to_string();
+        p2.buyer = "cp-x".to_string();
+        exec.handle_settlement_update(created_update(p2)).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p2"));
+        assert!(!exec.tracker.lock().await.has_settlement_order("p2"));
     }
 
     // Deferred reservation: adoption records the local decision but commits
