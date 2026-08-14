@@ -806,9 +806,22 @@ impl DAppProviderClient {
             let prepared = match self.prepare_transaction(req.clone()).await {
                 Ok(p) => p,
                 Err(e) => {
-                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                    let msg = format!("{:#}", e);
+                    let unreachable = agent_logic::ledger_health::is_sequencer_unreachable(&msg);
+                    if unreachable {
                         agent_logic::ledger_health::record_submit_failure();
                     }
+                    report_submit_error(
+                        if unreachable { "CONNECTION_ERROR" } else { "SERVER_ERROR" },
+                        "error",
+                        "ledger_client.prepare",
+                        &self.party_id,
+                        None,
+                        expectation,
+                        req.operation,
+                        attempt + 1,
+                        &msg,
+                    );
                     return Err(e);
                 }
             };
@@ -881,10 +894,22 @@ impl DAppProviderClient {
                         verification.rejection_reason.as_deref().unwrap_or("unknown")
                     );
                 } else {
-                    anyhow::bail!(
-                        "Transaction verification REJECTED: {}",
-                        verification.rejection_reason.unwrap_or_default()
+                    let reason = verification.rejection_reason.unwrap_or_default();
+                    // A local verifier rejection on the DVP (fund-moving) path
+                    // may indicate tampering — critical, mirroring the atomic
+                    // path.
+                    report_submit_error(
+                        "VALIDATION_ERROR",
+                        "critical",
+                        "ledger_client.verify",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        req.operation,
+                        attempt + 1,
+                        &format!("Transaction verification REJECTED: {reason}"),
                     );
+                    anyhow::bail!("Transaction verification REJECTED: {}", reason);
                 }
             }
 
@@ -938,9 +963,22 @@ impl DAppProviderClient {
                     // Terminal failure for this submission (retries exhausted). Signal
                     // the ledger-health breaker once per submit_transaction call, only
                     // for true sequencer-unreachable errors (not business rejections).
-                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                    let msg = format!("{:#}", e);
+                    let unreachable = agent_logic::ledger_health::is_sequencer_unreachable(&msg);
+                    if unreachable {
                         agent_logic::ledger_health::record_submit_failure();
                     }
+                    report_submit_error(
+                        if unreachable { "CONNECTION_ERROR" } else { "SERVER_ERROR" },
+                        "error",
+                        "ledger_client.execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        req.operation,
+                        attempt + 1,
+                        &msg,
+                    );
                     return Err(e);
                 }
             };
@@ -962,6 +1000,17 @@ impl DAppProviderClient {
                     // error text (SEQUENCER_BACKPRESSURE) reaches the caller
                     // intact so it can classify this as "try later", not a fault.
                     if is_background_op(req.operation) {
+                        report_submit_error(
+                            "SEQUENCER_BACKPRESSURE",
+                            "warning",
+                            "ledger_client.execute",
+                            &self.party_id,
+                            Some(&prepared.command_id),
+                            expectation,
+                            req.operation,
+                            attempt + 1,
+                            error_msg,
+                        );
                         anyhow::bail!("Transaction failed: {}", error_msg);
                     }
                 }
@@ -981,6 +1030,17 @@ impl DAppProviderClient {
                     }
                     // The command was accepted by the ledger (duplicate) — ledger is up.
                     agent_logic::ledger_health::record_submit_success();
+                    report_submit_error(
+                        "DUPLICATE_COMMAND",
+                        "warning",
+                        "ledger_client.execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        req.operation,
+                        attempt + 1,
+                        error_msg,
+                    );
                     anyhow::bail!("Command already submitted (DUPLICATE_COMMAND): {}", error_msg);
                 }
 
@@ -995,6 +1055,17 @@ impl DAppProviderClient {
                         tokio::time::sleep(Duration::from_millis(2000)).await;
                         continue;
                     }
+                    report_submit_error(
+                        "INACTIVE_CONTRACTS",
+                        "error",
+                        "ledger_client.execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        req.operation,
+                        attempt + 1,
+                        error_msg,
+                    );
                     anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
                 }
 
@@ -1011,9 +1082,21 @@ impl DAppProviderClient {
                 // Terminal failure for this submission (retries exhausted). Signal the
                 // ledger-health breaker once per call, only for sequencer-unreachable
                 // errors (SEQUENCER_BACKPRESSURE already handled above via its own pause).
-                if agent_logic::ledger_health::is_sequencer_unreachable(error_msg) {
+                let unreachable = agent_logic::ledger_health::is_sequencer_unreachable(error_msg);
+                if unreachable {
                     agent_logic::ledger_health::record_submit_failure();
                 }
+                report_submit_error(
+                    classify_submit_error(error_msg),
+                    "error",
+                    "ledger_client.execute",
+                    &self.party_id,
+                    Some(&prepared.command_id),
+                    expectation,
+                    req.operation,
+                    attempt + 1,
+                    error_msg,
+                );
                 anyhow::bail!("Transaction failed: {}", error_msg);
             }
 
@@ -1330,6 +1413,98 @@ pub fn is_ambiguous_execute_error(err: &anyhow::Error) -> bool {
 /// re-quote immediately. Distinct from a bare deadline-exceeded DAML_FAILURE,
 /// which is what we get if we re-submit into a dead window instead of stopping.
 pub const QUOTE_WINDOW_CLOSED: &str = "QUOTE_WINDOW_CLOSED";
+
+/// The settlement proposal an operation belongs to, if any — context for
+/// error reports.
+fn expectation_proposal_id(e: &OperationExpectation) -> Option<&str> {
+    match e {
+        OperationExpectation::PayFee { proposal_id, .. }
+        | OperationExpectation::ProposeDvp { proposal_id, .. }
+        | OperationExpectation::AcceptDvp { proposal_id, .. }
+        | OperationExpectation::Allocate { proposal_id, .. } => Some(proposal_id),
+        _ => None,
+    }
+}
+
+/// The RFQ quote id for atomic settles — the only business correlator an
+/// AtomicDVP carries (no settlement_proposal_id). Used as `order_id`.
+fn expectation_quote_id(e: &OperationExpectation) -> Option<&str> {
+    match e {
+        OperationExpectation::AtomicDvpSettle { quote_id, .. } => Some(quote_id),
+        _ => None,
+    }
+}
+
+/// Classify a terminal error message against the shared vocabulary (the same
+/// labels the rpc side whitelists in ERROR_TYPE_VOCAB). Substring match, most
+/// specific first; falls back to UNKNOWN. Replaces the binary
+/// unreachable/UNKNOWN choice so congestion/timeout/precondition failures are
+/// not all logged as UNKNOWN.
+fn classify_submit_error(msg: &str) -> &'static str {
+    const PATTERNS: &[(&str, &str)] = &[
+        ("SEQUENCER_NOT_ENOUGH_TRAFFIC_CREDIT", "TRAFFIC_CREDIT_EXHAUSTED"),
+        ("SEQUENCER_BACKPRESSURE", "SEQUENCER_BACKPRESSURE"),
+        ("LOCAL_VERDICT_INACTIVE_CONTRACTS", "INACTIVE_CONTRACTS"),
+        ("INACTIVE_CONTRACTS", "INACTIVE_CONTRACTS"),
+        ("DUPLICATE_COMMAND", "DUPLICATE_COMMAND"),
+        ("MEDIATOR_SAYS_TX_TIMED_OUT", "MEDIATOR_TX_TIMED_OUT"),
+        ("SUBMISSION_ALREADY_IN_FLIGHT", "ALREADY_IN_FLIGHT"),
+        ("CONTRACT_NOT_FOUND", "CONTRACT_NOT_FOUND"),
+        ("LOCAL_VERDICT_MALFORMED", "MALFORMED_TRANSACTION"),
+        ("SEQUENCER_REQUEST_REFUSED", "SEQUENCER_REQUEST_REFUSED"),
+        ("SEQUENCER_REQUEST_FAILED", "SEQUENCER_REQUEST_FAILED"),
+        ("PreconditionFailed", "PRECONDITION_FAILED"),
+        ("COMPLETION_TIMEOUT", "COMPLETION_TIMEOUT"),
+    ];
+    for (needle, label) in PATTERNS {
+        if msg.contains(needle) {
+            return label;
+        }
+    }
+    if agent_logic::ledger_health::is_sequencer_unreachable(msg) {
+        "SEQUENCER_REQUEST_FAILED"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+/// Best-effort structured error report for a terminal submission failure
+/// (ReportErrors -> orderbook-rpc via the global `error_reporter`). Sync
+/// try_send; never affects the calling flow; no-op if the reporter was never
+/// initialized. `attempts` is the number of submission attempts made (1-based
+/// at a terminal arm); the operation enum + attempts land in metadata for the
+/// §11 retry-exhaustion queries.
+#[allow(clippy::too_many_arguments)]
+fn report_submit_error(
+    error_type: &str,
+    severity: &str,
+    module: &str,
+    party_id: &str,
+    command_id: Option<&str>,
+    expectation: &OperationExpectation,
+    operation: i32,
+    attempts: u32,
+    message: &str,
+) {
+    let mut b = agent_logic::error_reporter::ErrorEventBuilder::new(error_type, message)
+        .severity(severity)
+        .module(module)
+        .party(party_id)
+        .metadata(serde_json::json!({
+            "operation": operation,
+            "attempts": attempts,
+        }));
+    if let Some(cid) = command_id {
+        b = b.command_id(cid);
+    }
+    if let Some(pid) = expectation_proposal_id(expectation) {
+        b = b.settlement_proposal_id(pid);
+    }
+    if let Some(qid) = expectation_quote_id(expectation) {
+        b = b.order_id(qid);
+    }
+    b.send();
+}
 
 /// The signed deadline an operation must settle within, if it has one. Only an
 /// AtomicDVP settle carries one — every other operation is deadline-free, so
@@ -1679,6 +1854,17 @@ impl AtomicProviderClient {
             // grows as 1000 * 2^attempt ms, so a late retry can outlive the
             // window it was cleared against.
             if attempt > 0 && window_closed() {
+                report_submit_error(
+                    "quote_window_closed",
+                    "warning", // clean re-quote, not a fault
+                    "ledger_client.atomic_execute",
+                    &self.party_id,
+                    None,
+                    expectation,
+                    0,
+                    attempt + 1,
+                    "window closed during retry backoff",
+                );
                 anyhow::bail!("{QUOTE_WINDOW_CLOSED}: window closed during retry backoff");
             }
 
@@ -1686,9 +1872,22 @@ impl AtomicProviderClient {
             let prepared = match self.prepare_atomic(req.clone()).await {
                 Ok(p) => p,
                 Err(e) => {
-                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                    let msg = format!("{:#}", e);
+                    let unreachable = agent_logic::ledger_health::is_sequencer_unreachable(&msg);
+                    if unreachable {
                         agent_logic::ledger_health::record_submit_failure();
                     }
+                    report_submit_error(
+                        if unreachable { "CONNECTION_ERROR" } else { "SERVER_ERROR" },
+                        "error",
+                        "ledger_client.atomic_prepare",
+                        &self.party_id,
+                        None,
+                        expectation,
+                        0,
+                        attempt + 1,
+                        &msg,
+                    );
                     return Err(e);
                 }
             };
@@ -1735,10 +1934,19 @@ impl AtomicProviderClient {
                         verification.rejection_reason.as_deref().unwrap_or("unknown")
                     );
                 } else {
-                    anyhow::bail!(
-                        "Atomic transaction verification REJECTED: {}",
-                        verification.rejection_reason.unwrap_or_default()
+                    let reason = verification.rejection_reason.unwrap_or_default();
+                    report_submit_error(
+                        "VALIDATION_ERROR",
+                        "critical", // a local verifier rejection may indicate tampering
+                        "ledger_client.atomic_verify",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        0,
+                        attempt + 1,
+                        &format!("Atomic transaction verification REJECTED: {reason}"),
                     );
+                    anyhow::bail!("Atomic transaction verification REJECTED: {}", reason);
                 }
             }
 
@@ -1763,9 +1971,21 @@ impl AtomicProviderClient {
                     // Transport error after the execute was sent: the tx may
                     // have landed. Do NOT blind-retry with a fresh prepare —
                     // surface a distinct error kind for caller reconciliation.
-                    if agent_logic::ledger_health::is_sequencer_unreachable(&format!("{:#}", e)) {
+                    let msg = format!("{:#}", e);
+                    if agent_logic::ledger_health::is_sequencer_unreachable(&msg) {
                         agent_logic::ledger_health::record_submit_failure();
                     }
+                    report_submit_error(
+                        "atomic_execute_ambiguous",
+                        "warning", // needs reconciliation, not a failure
+                        "ledger_client.atomic_execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        0,
+                        attempt + 1,
+                        &msg,
+                    );
                     return Err(anyhow!(
                         "{}: execute failed with transport error (tx may have committed): {:#}",
                         ATOMIC_EXECUTE_AMBIGUOUS,
@@ -1789,6 +2009,17 @@ impl AtomicProviderClient {
                 // status unknown without an update scan.
                 if error_msg.contains("DUPLICATE_COMMAND") {
                     agent_logic::ledger_health::record_submit_success();
+                    report_submit_error(
+                        "atomic_execute_ambiguous",
+                        "warning",
+                        "ledger_client.atomic_execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        0,
+                        attempt + 1,
+                        error_msg,
+                    );
                     return Err(anyhow!(
                         "{}: DUPLICATE_COMMAND (an earlier submission likely committed): {}",
                         ATOMIC_EXECUTE_AMBIGUOUS,
@@ -1807,14 +2038,47 @@ impl AtomicProviderClient {
                         continue;
                     }
                     if window_closed() {
+                        report_submit_error(
+                            "quote_window_closed",
+                            "warning",
+                            "ledger_client.atomic_execute",
+                            &self.party_id,
+                            Some(&prepared.command_id),
+                            expectation,
+                            0,
+                            attempt + 1,
+                            error_msg,
+                        );
                         anyhow::bail!("{QUOTE_WINDOW_CLOSED}: {error_msg}");
                     }
+                    report_submit_error(
+                        "INACTIVE_CONTRACTS",
+                        "error",
+                        "ledger_client.atomic_execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        0,
+                        attempt + 1,
+                        error_msg,
+                    );
                     anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
                 }
 
                 if window_closed() {
                     // Nothing committed (the execute was rejected), so this is a
                     // clean re-quote — not an ambiguous outcome.
+                    report_submit_error(
+                        "quote_window_closed",
+                        "warning",
+                        "ledger_client.atomic_execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        0,
+                        attempt + 1,
+                        error_msg,
+                    );
                     anyhow::bail!("{QUOTE_WINDOW_CLOSED}: {error_msg}");
                 }
 
@@ -1828,9 +2092,21 @@ impl AtomicProviderClient {
                     tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
                     continue;
                 }
-                if agent_logic::ledger_health::is_sequencer_unreachable(error_msg) {
+                let unreachable = agent_logic::ledger_health::is_sequencer_unreachable(error_msg);
+                if unreachable {
                     agent_logic::ledger_health::record_submit_failure();
                 }
+                report_submit_error(
+                    classify_submit_error(error_msg),
+                    "error",
+                    "ledger_client.atomic_execute",
+                    &self.party_id,
+                    Some(&prepared.command_id),
+                    expectation,
+                    0,
+                    attempt + 1,
+                    error_msg,
+                );
                 anyhow::bail!("Atomic transaction failed: {}", error_msg);
             }
 

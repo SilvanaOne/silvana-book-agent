@@ -36,6 +36,7 @@ use orderbook_proto::{
     GetSettlementStatusRequest, GetSettlementStatusResponse,
     DisclosedContractMessage,
     settlement::CancelSettlementRequest,
+    settlement::{ErrorEvent, ReportErrorsRequest},
 };
 
 /// Authentication interceptor for gRPC requests
@@ -99,12 +100,14 @@ impl OrderbookRpcClient {
             Channel::from_shared(url.to_string())?
                 .tls_config(tls_config)?
                 .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
                 .connect()
                 .await
                 .map_err(|e| anyhow!("Failed to connect to {}: {}", url, e))?
         } else {
             Channel::from_shared(url.to_string())?
                 .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
                 .connect()
                 .await
                 .map_err(|e| anyhow!("Failed to connect to {}: {}", url, e))?
@@ -144,6 +147,20 @@ impl OrderbookRpcClient {
     /// Record a transaction in the transaction_history table
     ///
     /// Returns the auto-generated transaction ID
+    /// Report structured errors to the server (best-effort ingestion).
+    /// Returns (accepted, rejected). Callers are expected to swallow errors
+    /// with a warn — reporting must never affect the calling flow, and an
+    /// older server answering UNIMPLEMENTED is a normal rollout state.
+    pub async fn report_errors(&mut self, errors: Vec<ErrorEvent>) -> Result<(u32, u32)> {
+        let response = self
+            .settlement_client
+            .report_errors(ReportErrorsRequest { errors })
+            .await
+            .map_err(|e| anyhow!("ReportErrors RPC failed ({}): {}", e.code(), e.message()))?;
+        let inner = response.into_inner();
+        Ok((inner.accepted, inner.rejected))
+    }
+
     pub async fn record_transaction(
         &mut self,
         request: RecordTransactionRequest,

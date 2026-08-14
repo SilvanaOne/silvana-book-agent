@@ -4,7 +4,7 @@
 //! DAppProviderService (CIP-0103). The agent signs transaction hashes locally
 //! with its Ed25519 private key — the key never leaves the agent.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -13,23 +13,19 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use agent_logic::config::BaseConfig;
-use agent_logic::runner::{run_agent, AgentOptions, BalanceProvider};
+use agent_logic::runner::{AgentOptions, BalanceProvider, run_agent};
 use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
-    PrepareTransactionRequest, RequestPreapprovalParams,
-    RequestRecurringPrepaidParams, RequestRecurringPayasyougoParams,
-    TransferCcParams, TransferCip56Params, AcceptCip56Params, SplitCcParams,
-    PrepayTrafficParams,
-    ExecuteMultiCallParams, MultiCallOp, McBatchPay, McPaymentTarget,
-    RequestUserServiceParams, TransactionOperation, TokenBalance,
-    LockHoldingsParams, ProcessLockUnlockRequestsParams, ResizeLockParams, TerminateLockParams,
+    AcceptCip56Params, ExecuteMultiCallParams, FaucetInstrument, FaucetRequest,
+    GetAgentConfigRequest, GetAgentConfigResponse, GetOnboardingStatusRequest, LockHoldingsParams,
+    McBatchPay, McPaymentTarget, MessageSignature, MultiCallOp,
+    OnboardingStatus as ProtoOnboardingStatus, PrepareTransactionRequest, PrepayTrafficParams,
+    ProcessLockUnlockRequestsParams, RegisterAgentRequest, RequestPreapprovalParams,
+    RequestRecurringPayasyougoParams, RequestRecurringPrepaidParams, RequestUserServiceParams,
+    ResizeLockParams, SplitCcParams, SubmitOnboardingSignatureRequest, TerminateLockParams,
+    TokenBalance, TransactionOperation, TransferCcParams, TransferCip56Params,
     VotingAllocation as ProtoVotingAllocation, VotingRequest as ProtoVotingRequest,
-    FaucetRequest, FaucetInstrument,
-    prepare_transaction_request::Params,
-    d_app_provider_service_client::DAppProviderServiceClient,
-    GetAgentConfigRequest, GetAgentConfigResponse, RegisterAgentRequest,
-    GetOnboardingStatusRequest, SubmitOnboardingSignatureRequest, MessageSignature,
-    OnboardingStatus as ProtoOnboardingStatus,
+    d_app_provider_service_client::DAppProviderServiceClient, prepare_transaction_request::Params,
 };
 use tx_verifier::OperationExpectation;
 
@@ -542,7 +538,14 @@ pub async fn run_cloud_agent(
     }
     info!("Party ID: {}", config.party_id);
     info!("Orderbook URL: {}", config.orderbook_grpc_url);
-    info!("Fee reserve: {:.2} CC (traffic billing handled off-chain by ledger)", config.fee_reserve_cc);
+    info!(
+        "Fee reserve: {:.2} CC (traffic billing handled off-chain by ledger)",
+        config.fee_reserve_cc
+    );
+
+    // Ensure the error reporter is installed for the production agent path,
+    // for library embedders that bypass the CLI. Idempotent.
+    agent_logic::error_reporter::init_from_config(&config);
 
     if config.rfq_v2_only && orders_only {
         anyhow::bail!(
@@ -572,12 +575,19 @@ pub async fn run_cloud_agent(
                 for market in &markets {
                     let parts: Vec<&str> = market.market_id.split('-').collect();
                     if parts.len() == 2 {
-                        liquidity_manager.register_alias(parts[0], &market.base_instrument).await;
-                        liquidity_manager.register_alias(parts[1], &market.quote_instrument).await;
+                        liquidity_manager
+                            .register_alias(parts[0], &market.base_instrument)
+                            .await;
+                        liquidity_manager
+                            .register_alias(parts[1], &market.quote_instrument)
+                            .await;
                     }
                     market_instrument_ids.insert(
                         market.market_id.clone(),
-                        (market.base_instrument.clone(), market.quote_instrument.clone()),
+                        (
+                            market.base_instrument.clone(),
+                            market.quote_instrument.clone(),
+                        ),
                     );
                 }
                 info!("Registered token aliases from {} markets", markets.len());
@@ -613,8 +623,9 @@ pub async fn run_cloud_agent(
         .as_ref()
         .and_then(|lp| lp.rfq_v2.clone())
         .filter(|v2| v2.enabled);
-    let rfq_v2_active =
-        config.liquidity_provider.is_some() && rfq_v2_cfg.is_some() && config.atomic_quote_key.is_some();
+    let rfq_v2_active = config.liquidity_provider.is_some()
+        && rfq_v2_cfg.is_some()
+        && config.atomic_quote_key.is_some();
 
     // Belt-and-braces for library embedders that build BaseConfig directly and
     // skip validate_v2(): with V1 and orders disabled, an inactive V2 stack
@@ -645,8 +656,9 @@ pub async fn run_cloud_agent(
 
     // Captured from the RfqHandler (LP mode only) so the LIQUIDITY heartbeat can
     // bucket the holdings histogram by USD; None when not an LP.
-    let mut lp_mid_prices: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, f64>>>> =
-        None;
+    let mut lp_mid_prices: Option<
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, f64>>>,
+    > = None;
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
         let mut rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
@@ -684,7 +696,9 @@ pub async fn run_cloud_agent(
             let lp_shutdown_clone = lp_shutdown.clone();
             let handler = rfq_handler.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_lp_settlement_stream(config_clone, handler, lp_shutdown_clone).await {
+                if let Err(e) =
+                    run_lp_settlement_stream(config_clone, handler, lp_shutdown_clone).await
+                {
                     tracing::error!("LP settlement stream failed: {}", e);
                 }
             });
@@ -693,7 +707,10 @@ pub async fn run_cloud_agent(
         // ---- RFQ V2 stack (updates watcher, split/ticket maintenance, atomic stream) ----
         if rfq_v2_active {
             let v2cfg = rfq_v2_cfg.clone().expect("checked by rfq_v2_active");
-            let quote_key = config.atomic_quote_key.clone().expect("checked by rfq_v2_active");
+            let quote_key = config
+                .atomic_quote_key
+                .clone()
+                .expect("checked by rfq_v2_active");
             match setup_rfq_v2(
                 &config,
                 &v2cfg,
@@ -718,7 +735,10 @@ pub async fn run_cloud_agent(
                 }
                 Err(e) => {
                     // Never crash v1 over a V2 wiring failure.
-                    tracing::error!("RFQ V2 setup failed — atomic quoting disabled, v1 continues: {:#}", e);
+                    tracing::error!(
+                        "RFQ V2 setup failed — atomic quoting disabled, v1 continues: {:#}",
+                        e
+                    );
                 }
             }
         }
@@ -730,8 +750,15 @@ pub async fn run_cloud_agent(
 
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
     let mut backend = CloudSettlementBackend::new(
-        config.clone(), verbose, dry_run, force, confirm, confirm_lock,
-        liquidity_manager, lp_shutdown.clone(), holdings_cache,
+        config.clone(),
+        verbose,
+        dry_run,
+        force,
+        confirm,
+        confirm_lock,
+        liquidity_manager,
+        lp_shutdown.clone(),
+        holdings_cache,
     );
     if let Some(mp) = lp_mid_prices {
         backend = backend.with_mid_prices(mp);
@@ -803,7 +830,9 @@ pub async fn run_cloud_agent(
             Some(Arc::new(runner).spawn(lp_shutdown.clone()))
         }
         _ => {
-            info!("Auto-topup disabled (MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC not set)");
+            info!(
+                "Auto-topup disabled (MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC not set)"
+            );
             None
         }
     };
@@ -871,7 +900,7 @@ pub async fn setup_rfq_v2(
             + Sync,
     >,
 > {
-    use holdings_cache::{instrument_key, CC_INSTRUMENT};
+    use holdings_cache::{CC_INSTRUMENT, instrument_key};
 
     let lp_config = config
         .liquidity_provider
@@ -895,8 +924,12 @@ pub async fn setup_rfq_v2(
         if !market.enabled {
             continue;
         }
-        let Some(rfq) = market.rfq.as_ref().filter(|r| r.enabled) else { continue };
-        let Some(v2m) = rfq.v2.as_ref().filter(|v| v.enabled) else { continue };
+        let Some(rfq) = market.rfq.as_ref().filter(|r| r.enabled) else {
+            continue;
+        };
+        let Some(v2m) = rfq.v2.as_ref().filter(|v| v.enabled) else {
+            continue;
+        };
 
         // Orderbook instrument ids: server market data, else market_id split.
         let (base_instr, quote_instr) = market_instrument_ids
@@ -994,7 +1027,12 @@ pub async fn setup_rfq_v2(
                 instrument_key(&admin, &on_chain_id)
             };
             out.push(split_worker::SplitTarget {
-                instrument: split_worker::SplitInstrument { key, is_cc, on_chain_id, admin },
+                instrument: split_worker::SplitInstrument {
+                    key,
+                    is_cc,
+                    on_chain_id,
+                    admin,
+                },
                 denominations: ladder.clone(),
             });
         }
@@ -1013,7 +1051,10 @@ pub async fn setup_rfq_v2(
             if ladder.is_empty() || !seen.insert(instr.key.clone()) {
                 continue;
             }
-            out.push(split_worker::SplitTarget { instrument: instr, denominations: ladder });
+            out.push(split_worker::SplitTarget {
+                instrument: instr,
+                denominations: ladder,
+            });
         }
         out
     };
@@ -1213,7 +1254,10 @@ pub async fn run_fill(
     };
     info!(
         "Starting {} mode: market={}, amount={}, interval={}s{}{}",
-        dir_str, market, amount, interval,
+        dir_str,
+        market,
+        amount,
+        interval,
         if atomic { " (atomic RFQ V2)" } else { "" },
         if atomic && !fee_tokens.is_empty() {
             format!(" fee_tokens={fee_tokens:?}")
@@ -1248,7 +1292,13 @@ pub async fn run_fill(
         });
     }
     let backend = CloudSettlementBackend::new(
-        config.clone(), verbose, dry_run, force, confirm, confirm_lock.clone(), fill_lm,
+        config.clone(),
+        verbose,
+        dry_run,
+        force,
+        confirm,
+        confirm_lock.clone(),
+        fill_lm,
         fill_backend_shutdown.clone(),
         holdings_cache::HoldingsCache::new(false),
     );
@@ -1315,7 +1365,15 @@ pub async fn run_fill(
 
     // Keep `backend` alive so its ACS worker keeps refreshing amulets until return.
     let _backend_guard = backend;
-    let result = fill_loop::run_fill_loop(config, settler, params, atomic_swapper, saved_fill_state, Some(state_file)).await;
+    let result = fill_loop::run_fill_loop(
+        config,
+        settler,
+        params,
+        atomic_swapper,
+        saved_fill_state,
+        Some(state_file),
+    )
+    .await;
     // Signal backend shutdown on natural completion too — covers paths where
     // the fill loop returns without a Ctrl-C (target filled, error, etc.).
     fill_backend_shutdown.signal();
@@ -1432,17 +1490,23 @@ fn spawn_mid_price_poller(
 /// Never spawned when `rfq_v2_only = true` — without the handshake's
 /// `liquidity_provider_name` registration the server routes no V1 RFQs to
 /// this party and it drops out of `GetConnectedLiquidityProviders`.
-pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_handler::RfqHandler>, shutdown: Shutdown) -> Result<()> {
+pub async fn run_lp_settlement_stream(
+    config: BaseConfig,
+    rfq_handler: Arc<rfq_handler::RfqHandler>,
+    shutdown: Shutdown,
+) -> Result<()> {
     use orderbook_proto::settlement::{
-        settlement_service_client::SettlementServiceClient,
-        CantonToServerMessage, SettlementHandshake, CantonNodeAuth, Heartbeat,
+        CantonNodeAuth, CantonToServerMessage, Heartbeat, SettlementHandshake,
         canton_to_server_message::Message as CantonMessage,
         server_to_canton_message::Message as ServerMessage,
+        settlement_service_client::SettlementServiceClient,
     };
-    use tokio_stream::StreamExt;
     use rfq_handler::RfqResponse;
+    use tokio_stream::StreamExt;
 
-    let lp_config = config.liquidity_provider.as_ref()
+    let lp_config = config
+        .liquidity_provider
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
 
     loop {
@@ -1451,7 +1515,10 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
             return Ok(());
         }
 
-        info!("Connecting LP settlement stream to {}", config.orderbook_grpc_url);
+        info!(
+            "Connecting LP settlement stream to {}",
+            config.orderbook_grpc_url
+        );
 
         let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
             Ok(c) => c,
@@ -1464,15 +1531,46 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
             }
         };
 
-        let mut client = SettlementServiceClient::new(channel)
-            .max_decoding_message_size(16 * 1024 * 1024);
+        let mut client =
+            SettlementServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
 
         // Create the outbound channel
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<CantonToServerMessage>(64);
         let outbound_stream = tokio_stream::wrappers::ReceiverStream::new(outbound_rx);
 
+        let auth_header = agent_logic::auth::generate_jwt(
+            &config.party_id,
+            &config.role,
+            &config.private_key_bytes,
+            config.token_ttl_secs,
+            Some(&config.node_name),
+        )
+        .map_err(|e| anyhow!("{}", e))
+        .and_then(|jwt| {
+            format!("Bearer {}", jwt)
+                .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+                .map_err(|e| anyhow!("{}", e))
+        });
+        let auth_header = match auth_header {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(
+                    "LP settlement stream: failed to build auth token: {}, retrying in 5s",
+                    e
+                );
+                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let mut open_request = tonic::Request::new(outbound_stream);
+        open_request
+            .metadata_mut()
+            .insert("authorization", auth_header);
+
         // Open bidirectional stream
-        let response = match client.settlement_stream(outbound_stream).await {
+        let response = match client.settlement_stream(open_request).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Failed to open settlement stream: {}, retrying in 5s", e);
@@ -1526,9 +1624,8 @@ pub async fn run_lp_settlement_stream(config: BaseConfig, rfq_handler: Arc<rfq_h
         // half-closes on the read side, so we can't rely on inbound activity
         // alone; the heartbeat send-failure is what detects a dead stream.
         const HEARTBEAT_INTERVAL_SECS: u64 = 30;
-        let mut heartbeat_interval = tokio::time::interval(
-            std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
-        );
+        let mut heartbeat_interval =
+            tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick so we don't send a heartbeat 0s after connect.
         heartbeat_interval.tick().await;
@@ -1657,10 +1754,10 @@ pub async fn run_lp_atomic_stream(
     shutdown: Shutdown,
 ) -> Result<()> {
     use orderbook_proto::rfqv2::{
-        atomic_rfq_service_client::AtomicRfqServiceClient,
-        atomic_lp_to_server::Message as LpMessage,
-        atomic_server_to_lp::Message as ServerMessage,
         AtomicHandshake, AtomicHeartbeat, AtomicLpToServer, AtomicRfqReject,
+        atomic_lp_to_server::Message as LpMessage,
+        atomic_rfq_service_client::AtomicRfqServiceClient,
+        atomic_server_to_lp::Message as ServerMessage,
     };
     use tokio_stream::StreamExt;
 
@@ -1710,7 +1807,10 @@ pub async fn run_lp_atomic_stream(
             return Ok(());
         }
 
-        info!("Connecting LP atomic stream to {}", config.orderbook_grpc_url);
+        info!(
+            "Connecting LP atomic stream to {}",
+            config.orderbook_grpc_url
+        );
 
         let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
             Ok(c) => c,
@@ -1723,8 +1823,8 @@ pub async fn run_lp_atomic_stream(
             }
         };
 
-        let mut client = AtomicRfqServiceClient::new(channel)
-            .max_decoding_message_size(16 * 1024 * 1024);
+        let mut client =
+            AtomicRfqServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
 
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<AtomicLpToServer>(64);
         let outbound_stream = tokio_stream::wrappers::ReceiverStream::new(outbound_rx);
@@ -1747,7 +1847,10 @@ pub async fn run_lp_atomic_stream(
         let auth_header = match auth_header {
             Ok(h) => h,
             Err(e) => {
-                tracing::error!("Atomic stream: failed to build auth token: {}, retrying in 5s", e);
+                tracing::error!(
+                    "Atomic stream: failed to build auth token: {}, retrying in 5s",
+                    e
+                );
                 if shutdown.sleep(std::time::Duration::from_secs(5)).await {
                     return Ok(());
                 }
@@ -1755,7 +1858,9 @@ pub async fn run_lp_atomic_stream(
             }
         };
         let mut open_request = tonic::Request::new(outbound_stream);
-        open_request.metadata_mut().insert("authorization", auth_header);
+        open_request
+            .metadata_mut()
+            .insert("authorization", auth_header);
 
         let response = match client.atomic_rfq_stream(open_request).await {
             Ok(r) => r,
@@ -1790,13 +1895,11 @@ pub async fn run_lp_atomic_stream(
         info!("LP atomic stream connected, listening for atomic RFQ requests");
 
         const HEARTBEAT_INTERVAL_SECS: u64 = 30;
-        let mut heartbeat_interval = tokio::time::interval(
-            std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
-        );
+        let mut heartbeat_interval =
+            tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat_interval.tick().await; // skip the immediate first tick
-        let mut sweep_interval =
-            tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut client_seq: u64 = 0;
 
@@ -2007,9 +2110,9 @@ pub fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
 pub fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
     match &v.kind {
         Some(prost_types::value::Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(prost_types::value::Kind::NumberValue(n)) => {
-            serde_json::Value::Number(serde_json::Number::from_f64(*n).unwrap_or_else(|| serde_json::Number::from(0)))
-        }
+        Some(prost_types::value::Kind::NumberValue(n)) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*n).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
         Some(prost_types::value::Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
         Some(prost_types::value::Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
         Some(prost_types::value::Kind::StructValue(s)) => prost_struct_to_json(s),
@@ -2093,7 +2196,8 @@ pub fn print_info_list_table(contracts: &[orderbook_proto::ledger::ActiveContrac
 }
 
 pub fn print_info_list_count(contracts: &[orderbook_proto::ledger::ActiveContractInfo]) {
-    let mut template_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut template_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for contract in contracts {
         *template_counts
             .entry(contract.template_id.clone())
@@ -2211,10 +2315,22 @@ pub async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
             } else {
                 for round in &rates.issuing_mining_rounds {
                     println!("Round {}:", round.round_number);
-                    println!("  Featured App:     {}", round.issuance_per_featured_app_reward_coupon);
-                    println!("  Unfeatured App:   {}", round.issuance_per_unfeatured_app_reward_coupon);
-                    println!("  Validator:        {}", round.issuance_per_validator_reward_coupon);
-                    println!("  SV:               {}", round.issuance_per_sv_reward_coupon);
+                    println!(
+                        "  Featured App:     {}",
+                        round.issuance_per_featured_app_reward_coupon
+                    );
+                    println!(
+                        "  Unfeatured App:   {}",
+                        round.issuance_per_unfeatured_app_reward_coupon
+                    );
+                    println!(
+                        "  Validator:        {}",
+                        round.issuance_per_validator_reward_coupon
+                    );
+                    println!(
+                        "  SV:               {}",
+                        round.issuance_per_sv_reward_coupon
+                    );
                     if let Some(faucet) = &round.opt_issuance_per_validator_faucet_coupon {
                         println!("  Validator Faucet: {}", faucet);
                     }
@@ -2233,7 +2349,14 @@ pub async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
 // Preapproval commands
 // ============================================================================
 
-pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_preapproval(
+    config: BaseConfig,
+    command: PreapprovalCommands,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -2259,20 +2382,29 @@ pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, v
                 .iter()
                 .find(|inst| inst.registry == instrument_admin)
                 .map(|inst| inst.operator.clone())
-                .ok_or_else(|| anyhow!(
-                    "No faucet instrument matches admin '{}'; cannot determine operator. \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No faucet instrument matches admin '{}'; cannot determine operator. \
                      Available registries: [{}]",
-                    instrument_admin,
-                    faucet_instruments.iter().map(|i| i.registry.as_str())
-                        .collect::<Vec<_>>().join(", "),
-                ))?;
+                        instrument_admin,
+                        faucet_instruments
+                            .iter()
+                            .map(|i| i.registry.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                })?;
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Create CIP-56 Preapproval",
-                    &format!("party: {}, admin: {}, operator: {}", config.party_id, instrument_admin, operator),
-                ).await?;
+                    &format!(
+                        "party: {}, admin: {}, operator: {}",
+                        config.party_id, instrument_admin, operator
+                    ),
+                )
+                .await?;
             }
             let expectation = OperationExpectation::RequestPreapproval {
                 party: config.party_id.clone(),
@@ -2294,7 +2426,10 @@ pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, v
                     force,
                 )
                 .await?;
-            println!("CIP-56 preapproval created, update id: {}", result.update_id);
+            println!(
+                "CIP-56 preapproval created, update id: {}",
+                result.update_id
+            );
         }
         PreapprovalCommands::Fetch => {
             let preapprovals = client.get_preapprovals().await?;
@@ -2305,7 +2440,8 @@ pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, v
                     let allowances = if p.instrument_allowances.is_empty() {
                         "all".to_string()
                     } else {
-                        p.instrument_allowances.iter()
+                        p.instrument_allowances
+                            .iter()
                             .map(|a| a.id.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
@@ -2326,7 +2462,14 @@ pub async fn run_preapproval(config: BaseConfig, command: PreapprovalCommands, v
 // Subscription payment commands
 // ============================================================================
 
-pub async fn run_subscription(config: BaseConfig, command: SubscriptionCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_subscription(
+    config: BaseConfig,
+    command: SubscriptionCommands,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -2356,7 +2499,8 @@ pub async fn run_subscription(config: BaseConfig, command: SubscriptionCommands,
                     &lock,
                     "Request subscription prepaid",
                     &format!("app: {}, amount: {}/day, limit: {}", app, amount, limit),
-                ).await?;
+                )
+                .await?;
             }
             let expectation = OperationExpectation::RequestRecurringPrepaid {
                 party: config.party_id.clone(),
@@ -2401,7 +2545,8 @@ pub async fn run_subscription(config: BaseConfig, command: SubscriptionCommands,
                     &lock,
                     "Request subscription pay-as-you-go",
                     &format!("app: {}, amount: {}", app, amount),
-                ).await?;
+                )
+                .await?;
             }
             let expectation = OperationExpectation::RequestRecurringPayasyougo {
                 party: config.party_id.clone(),
@@ -2439,7 +2584,14 @@ pub async fn run_subscription(config: BaseConfig, command: SubscriptionCommands,
 // Transfer commands
 // ============================================================================
 
-pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_transfer(
+    config: BaseConfig,
+    command: TransferCommands,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -2471,7 +2623,8 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                     &lock,
                     "Transfer CC",
                     &format!("receiver: {}, amount: {}", receiver, amount),
-                ).await?;
+                )
+                .await?;
             }
             let command_id = format!("cli-cc-{}", chrono::Utc::now().timestamp_millis());
             let expectation = OperationExpectation::TransferCc {
@@ -2515,7 +2668,8 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                     &lock,
                     &format!("Transfer CIP-56 ({})", instrument_id),
                     &format!("receiver: {}, amount: {}", receiver, amount),
-                ).await?;
+                )
+                .await?;
             }
             let expectation = OperationExpectation::TransferCip56 {
                 sender_party: config.party_id.clone(),
@@ -2546,7 +2700,10 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                     force,
                 )
                 .await?;
-            println!("CIP-56 transfer sent ({}): {}", instrument_id, result.update_id);
+            println!(
+                "CIP-56 transfer sent ({}): {}",
+                instrument_id, result.update_id
+            );
             if let Some(cid) = result.contract_id {
                 println!("TransferOffer contract: {}", cid);
             }
@@ -2558,7 +2715,8 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                     &lock,
                     "Accept CIP-56 transfer",
                     &format!("contract: {}", contract_id),
-                ).await?;
+                )
+                .await?;
             }
             let expectation = OperationExpectation::AcceptCip56 {
                 receiver_party: config.party_id.clone(),
@@ -2579,7 +2737,10 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                     force,
                 )
                 .await?;
-            println!("CIP-56 transfer accepted ({}): {}", contract_id, result.update_id);
+            println!(
+                "CIP-56 transfer accepted ({}): {}",
+                contract_id, result.update_id
+            );
         }
         TransferCommands::SplitCc {
             output_amounts,
@@ -2596,8 +2757,13 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Split CC",
-                    &format!("outputs: [{}], inputs: {} amulets", output_amounts.join(", "), amulet_cids.len()),
-                ).await?;
+                    &format!(
+                        "outputs: [{}], inputs: {} amulets",
+                        output_amounts.join(", "),
+                        amulet_cids.len()
+                    ),
+                )
+                .await?;
             }
             let expectation = OperationExpectation::SplitCc {
                 party: config.party_id.clone(),
@@ -2656,10 +2822,14 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                 .iter()
                 .map(|(_, amt)| amt.parse::<rust_decimal::Decimal>().unwrap_or_default())
                 .sum();
-            println!("Batch pay: {} recipients, total {:.4} CC", targets.len(), total);
+            println!(
+                "Batch pay: {} recipients, total {:.4} CC",
+                targets.len(),
+                total
+            );
             for (i, (receiver, amount)) in targets.iter().enumerate() {
                 let short_party = if receiver.len() > 24 {
-                    format!("{}...{}", &receiver[..12], &receiver[receiver.len()-8..])
+                    format!("{}...{}", &receiver[..12], &receiver[receiver.len() - 8..])
                 } else {
                     receiver.clone()
                 };
@@ -2677,38 +2847,57 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                 amulets.sort_by(|a, b| a.amount.cmp(&b.amount));
 
                 // Prefer ONE amulet that covers the total (smallest-fit)
-                let indices: Vec<usize> = if let Some(i) = amulets.iter().position(|a| a.amount >= total) {
-                    vec![i]
-                } else {
-                    // Accumulate smallest-first
-                    let mut acc = rust_decimal::Decimal::ZERO;
-                    let mut picked = Vec::new();
-                    for (i, a) in amulets.iter().enumerate() {
-                        picked.push(i);
-                        acc += a.amount;
-                        if acc >= total { break; }
-                    }
-                    picked
-                };
+                let indices: Vec<usize> =
+                    if let Some(i) = amulets.iter().position(|a| a.amount >= total) {
+                        vec![i]
+                    } else {
+                        // Accumulate smallest-first
+                        let mut acc = rust_decimal::Decimal::ZERO;
+                        let mut picked = Vec::new();
+                        for (i, a) in amulets.iter().enumerate() {
+                            picked.push(i);
+                            acc += a.amount;
+                            if acc >= total {
+                                break;
+                            }
+                        }
+                        picked
+                    };
 
-                let selected_total: rust_decimal::Decimal = indices.iter().map(|&i| amulets[i].amount).sum();
+                let selected_total: rust_decimal::Decimal =
+                    indices.iter().map(|&i| amulets[i].amount).sum();
                 if selected_total < total {
                     return Err(anyhow::anyhow!(
                         "Insufficient CC: need {:.4} but only {:.4} available across {} amulets",
-                        total, selected_total, amulets.len()
+                        total,
+                        selected_total,
+                        amulets.len()
                     ));
                 }
 
-                println!("Auto-selected {} amulet(s) ({:.4} CC):", indices.len(), selected_total);
+                println!(
+                    "Auto-selected {} amulet(s) ({:.4} CC):",
+                    indices.len(),
+                    selected_total
+                );
                 for &i in &indices {
                     let a = &amulets[i];
                     let short = if a.contract_id.len() > 24 {
-                        format!("{}...{}", &a.contract_id[..12], &a.contract_id[a.contract_id.len()-8..])
-                    } else { a.contract_id.clone() };
+                        format!(
+                            "{}...{}",
+                            &a.contract_id[..12],
+                            &a.contract_id[a.contract_id.len() - 8..]
+                        )
+                    } else {
+                        a.contract_id.clone()
+                    };
                     println!("  {} ({:.4} CC)", short, a.amount);
                 }
 
-                indices.into_iter().map(|i| amulets[i].contract_id.clone()).collect()
+                indices
+                    .into_iter()
+                    .map(|i| amulets[i].contract_id.clone())
+                    .collect()
             };
 
             if confirm && !dry_run {
@@ -2717,7 +2906,8 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                     &lock,
                     "Batch Pay",
                     &format!("{} recipients, total {} CC", targets.len(), total),
-                ).await?;
+                )
+                .await?;
             }
 
             // Build proto targets
@@ -2760,14 +2950,18 @@ pub async fn run_transfer(config: BaseConfig, command: TransferCommands, verbose
                 .await?;
             println!("Batch pay completed: {}", result.update_id);
         }
-        TransferCommands::PrepayTraffic { amount, description } => {
+        TransferCommands::PrepayTraffic {
+            amount,
+            description,
+        } => {
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Prepay traffic",
                     &format!("amount: {} CC", amount),
-                ).await?;
+                )
+                .await?;
             }
             let command_id = format!("cli-prepay-{}", chrono::Utc::now().timestamp_millis());
             let expectation = OperationExpectation::PrepayTraffic {
@@ -2828,13 +3022,18 @@ pub fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String
     for (i, record) in reader.records().enumerate() {
         let record = record.with_context(|| format!("Failed to parse CSV row {}", i + 1))?;
         if record.len() < 2 {
-            return Err(anyhow::anyhow!("CSV row {} has fewer than 2 columns", i + 1));
+            return Err(anyhow::anyhow!(
+                "CSV row {} has fewer than 2 columns",
+                i + 1
+            ));
         }
         let party = record[0].trim().to_string();
         let amount = record[1].trim().to_string();
 
         // Skip header row if present
-        if i == 0 && (party.contains("Party") || party.contains("party") || party.contains("Recipient")) {
+        if i == 0
+            && (party.contains("Party") || party.contains("party") || party.contains("Recipient"))
+        {
             continue;
         }
 
@@ -2912,8 +3111,7 @@ pub fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> R
         lines.push(new_line);
     }
 
-    std::fs::write(env_file, lines.join("\n") + "\n")
-        .context("Failed to write .env file")?;
+    std::fs::write(env_file, lines.join("\n") + "\n").context("Failed to write .env file")?;
     Ok(())
 }
 
@@ -2926,12 +3124,20 @@ pub fn write_server_config_to_env(
     // Write all KEY=VALUE pairs from the server's .env.agent
     for line in config_resp.env.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim().trim_matches('"');
             // Don't overwrite agent-specific keys
-            if matches!(key, "PARTY_AGENT" | "PARTY_AGENT_PRIVATE_KEY" | "PARTY_AGENT_PUBLIC_KEY" | "ORDERBOOK_GRPC_URL") {
+            if matches!(
+                key,
+                "PARTY_AGENT"
+                    | "PARTY_AGENT_PRIVATE_KEY"
+                    | "PARTY_AGENT_PUBLIC_KEY"
+                    | "ORDERBOOK_GRPC_URL"
+            ) {
                 continue;
             }
             upsert_env_value(env_file, key, value)?;
@@ -2952,17 +3158,17 @@ pub fn maybe_write_agent_toml(
     if config_resp.agent_toml.is_empty() {
         return;
     }
-    let toml_path = env_file.parent().unwrap_or(std::path::Path::new(".")).join("agent.toml");
+    let toml_path = env_file
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("agent.toml");
     if toml_path.exists() {
         println!("agent.toml already exists, skipping write");
         return;
     }
     let mut content = config_resp.agent_toml.clone();
     if let Some(name) = agent_name {
-        content = content.replace(
-            "name = \"LP agent\"",
-            &format!("name = \"LP {}\"", name),
-        );
+        content = content.replace("name = \"LP agent\"", &format!("name = \"LP {}\"", name));
     }
     match std::fs::write(&toml_path, &content) {
         Ok(_) => println!("Agent config written to {}", toml_path.display()),
@@ -2975,13 +3181,15 @@ pub async fn create_raw_channel(grpc_url: &str) -> Result<tonic::transport::Chan
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     if grpc_url.starts_with("https://") {
-        let tls_config = tonic::transport::ClientTlsConfig::new().with_webpki_roots().domain_name(
-            grpc_url
-                .trim_start_matches("https://")
-                .split(':')
-                .next()
-                .unwrap_or("localhost"),
-        );
+        let tls_config = tonic::transport::ClientTlsConfig::new()
+            .with_webpki_roots()
+            .domain_name(
+                grpc_url
+                    .trim_start_matches("https://")
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost"),
+            );
 
         tonic::transport::Channel::from_shared(grpc_url.to_string())
             .context("Invalid gRPC URL")?
@@ -3090,8 +3298,8 @@ pub async fn run_onboard(
     // Step 2: Connect to RPC (raw channel, no JWT auth needed)
     println!("\nConnecting to {}...", rpc);
     let channel = create_raw_channel(&rpc).await?;
-    let mut client = DAppProviderServiceClient::new(channel)
-        .max_decoding_message_size(16 * 1024 * 1024);
+    let mut client =
+        DAppProviderServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
     println!("Connected.");
 
     // Step 3: Fetch server config
@@ -3108,10 +3316,7 @@ pub async fn run_onboard(
 
     // Step 4: Register on waiting list (idempotent)
     println!("\nRegistering agent on waiting list...");
-    let canonical = message_signing::canonical_register_agent(
-        &public_key_b58,
-        Some(&invite_code),
-    );
+    let canonical = message_signing::canonical_register_agent(&public_key_b58, Some(&invite_code));
     let sig = sign_onboarding_request(&private_key_bytes, &canonical);
 
     let register_resp = client
@@ -3126,7 +3331,10 @@ pub async fn run_onboard(
         .context("RegisterAgent RPC failed")?
         .into_inner();
 
-    println!("Registration: {} (id={})", register_resp.message, register_resp.waiting_list_id);
+    println!(
+        "Registration: {} (id={})",
+        register_resp.message, register_resp.waiting_list_id
+    );
 
     // Step 5: Poll for SIGNATURE_REQUIRED status
     let mut current_status = register_resp.status;
@@ -3138,7 +3346,10 @@ pub async fn run_onboard(
             break;
         }
 
-        println!("Status: REQUESTED — waiting for backend to create multihash (polling every {}s)...", poll_interval);
+        println!(
+            "Status: REQUESTED — waiting for backend to create multihash (polling every {}s)...",
+            poll_interval
+        );
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
 
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
@@ -3171,9 +3382,12 @@ pub async fn run_onboard(
             .context("GetOnboardingStatus RPC failed")?
             .into_inner();
 
-        let multihash = status_resp.multihash
+        let multihash = status_resp
+            .multihash
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Status is SIGNATURE_REQUIRED but no multihash was provided"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Status is SIGNATURE_REQUIRED but no multihash was provided")
+            })?;
 
         println!("\nSigning multihash...");
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key_bytes);
@@ -3207,7 +3421,10 @@ pub async fn run_onboard(
             break;
         }
 
-        println!("Status: SIGNATURE_SUBMITTED — waiting for topology creation (polling every {}s)...", poll_interval);
+        println!(
+            "Status: SIGNATURE_SUBMITTED — waiting for topology creation (polling every {}s)...",
+            poll_interval
+        );
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
 
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
@@ -3227,9 +3444,12 @@ pub async fn run_onboard(
         if current_status == ProtoOnboardingStatus::TopologyCreated as i32
             || current_status == ProtoOnboardingStatus::Onboarded as i32
         {
-            let party_id = status_resp.party_id
+            let party_id = status_resp
+                .party_id
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Status is TOPOLOGY_CREATED but no party_id was provided"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Status is TOPOLOGY_CREATED but no party_id was provided")
+                })?;
             // Step 8: Write party_id to .env
             upsert_env_value(&env_file, "PARTY_AGENT", &party_id)?;
             println!("\nTopology created! PARTY_AGENT={}", party_id);
@@ -3251,7 +3471,8 @@ pub async fn run_onboard(
             .context("GetOnboardingStatus RPC failed")?
             .into_inner();
 
-        let party_id = status_resp.party_id
+        let party_id = status_resp
+            .party_id
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Onboarding completed but no party_id was provided"))?;
         upsert_env_value(&env_file, "PARTY_AGENT", &party_id)?;
@@ -3291,9 +3512,8 @@ impl OnboardConfig {
             .map_err(|_| anyhow::anyhow!("NODE_NAME env var is required"))?;
         let ledger_service_public_key_base58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
             .map_err(|_| anyhow::anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
-        let ledger_service_public_key = agent_logic::config::decode_public_key(
-            &ledger_service_public_key_base58,
-        )?;
+        let ledger_service_public_key =
+            agent_logic::config::decode_public_key(&ledger_service_public_key_base58)?;
 
         Ok(Self {
             party_id,
@@ -3310,17 +3530,16 @@ impl OnboardConfig {
 
 /// Complete ledger onboarding (preapproval + user-service).
 /// Called after PARTY_AGENT is set in .env. Does not require `agent.toml`.
-pub async fn complete_ledger_onboarding(
-    env_file: &std::path::Path,
-    rpc: &str,
-) -> Result<()> {
+pub async fn complete_ledger_onboarding(env_file: &std::path::Path, rpc: &str) -> Result<()> {
     // Ensure .env is loaded into process env
     let _ = dotenvy::from_path(env_file);
 
-    let cfg = OnboardConfig::from_env()
-        .context("Failed to load onboarding config from .env")?;
+    let cfg = OnboardConfig::from_env().context("Failed to load onboarding config from .env")?;
 
-    println!("\nCompleting ledger onboarding for party {}...", cfg.party_id);
+    println!(
+        "\nCompleting ledger onboarding for party {}...",
+        cfg.party_id
+    );
 
     let mut client = DAppProviderClient::new(
         rpc,
@@ -3356,54 +3575,71 @@ pub async fn complete_ledger_onboarding(
         "#splice-amulet:Splice.AmuletRules:TransferPreapproval".to_string(),
         "#splice-wallet:Splice.Wallet.TransferPreapproval:TransferPreapprovalProposal".to_string(),
     ];
-    let splice_contracts = client.get_active_contracts(&splice_preapproval_templates).await.unwrap_or_default();
+    let splice_contracts = client
+        .get_active_contracts(&splice_preapproval_templates)
+        .await
+        .unwrap_or_default();
     if splice_contracts.is_empty() {
         // DSO is the Amulet's instrument admin (issuer baked into the contract);
         // operator is the featured-app provider used only for preapproval creation.
         // They are distinct: DSO comes from the local .env, operator from the
         // ListFaucetInstruments response (Amulet entry).
         let dso_for_cc = read_env_value(env_file, "DSO").unwrap_or_default();
-        let amulet_operator = faucet_instruments.iter()
+        let amulet_operator = faucet_instruments
+            .iter()
             .find(|i| i.token_name == "Amulet")
             .map(|i| i.operator.clone())
             .unwrap_or_default();
         if dso_for_cc.is_empty() {
             println!("Warning: DSO not set in .env; skipping CC preapproval.");
         } else if amulet_operator.is_empty() {
-            println!("Warning: faucet returned no Amulet operator (PREAPPROVAL_FEATURED_APP); skipping CC preapproval.");
+            println!(
+                "Warning: faucet returned no Amulet operator (PREAPPROVAL_FEATURED_APP); skipping CC preapproval."
+            );
         } else {
             println!("Creating Splice preapproval for CC...");
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
             };
-            match client.submit_transaction(
-                PrepareTransactionRequest {
-                    operation: TransactionOperation::RequestPreapproval as i32,
-                    params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
-                        instrument_admin: dso_for_cc,
-                        instrument_allowances: vec![],
-                        operator: amulet_operator,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                false, false, false,
-            ).await {
-                Ok(_) => println!("Splice preapproval proposal created for CC (pending featured-app acceptance)."),
+            match client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::RequestPreapproval as i32,
+                        params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
+                            instrument_admin: dso_for_cc,
+                            instrument_allowances: vec![],
+                            operator: amulet_operator,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    false,
+                    false,
+                    false,
+                )
+                .await
+            {
+                Ok(_) => println!(
+                    "Splice preapproval proposal created for CC (pending featured-app acceptance)."
+                ),
                 Err(e) => println!("Warning: failed to create CC preapproval: {}", e),
             }
         }
     } else {
-        println!("Splice CC preapproval already exists ({} found).", splice_contracts.len());
+        println!(
+            "Splice CC preapproval already exists ({} found).",
+            splice_contracts.len()
+        );
     }
 
     // 11a-CIP56: Create CIP-56 TransferPreapprovals for utility tokens.
     let preapprovals = client.get_preapprovals().await?;
-    let existing_admins: std::collections::HashSet<&str> = preapprovals.iter()
+    let existing_admins: std::collections::HashSet<&str> = preapprovals
+        .iter()
         .map(|p| p.instrument_admin.as_str())
         .collect();
 
-    let mut needed: Vec<(String, String, String)> = Vec::new();  // (registry, token_name, operator)
+    let mut needed: Vec<(String, String, String)> = Vec::new(); // (registry, token_name, operator)
     let mut seen_admins: std::collections::HashSet<String> =
         existing_admins.iter().map(|s| s.to_string()).collect();
     for inst in &faucet_instruments {
@@ -3411,19 +3647,31 @@ pub async fn complete_ledger_onboarding(
             continue;
         }
         if seen_admins.insert(inst.registry.clone()) {
-            needed.push((inst.registry.clone(), inst.token_name.clone(), inst.operator.clone()));
+            needed.push((
+                inst.registry.clone(),
+                inst.token_name.clone(),
+                inst.operator.clone(),
+            ));
         }
     }
 
     if needed.is_empty() {
         if preapprovals.is_empty() {
-            println!("Warning: faucet returned no utility instruments; no CIP-56 preapprovals to create.");
+            println!(
+                "Warning: faucet returned no utility instruments; no CIP-56 preapprovals to create."
+            );
         } else {
-            println!("CIP-56 preapprovals up to date ({} found).", preapprovals.len());
+            println!(
+                "CIP-56 preapprovals up to date ({} found).",
+                preapprovals.len()
+            );
         }
     } else {
         for (admin, label, operator) in &needed {
-            println!("Creating CIP-56 preapproval for {} (admin={})...", label, admin);
+            println!(
+                "Creating CIP-56 preapproval for {} (admin={})...",
+                label, admin
+            );
             let label = label.as_str();
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
@@ -3481,7 +3729,10 @@ pub async fn complete_ledger_onboarding(
             .context("Failed to request user service")?;
         println!("User service requested.");
     } else {
-        println!("User service already exists or pending ({} contracts found).", user_contracts.len());
+        println!(
+            "User service already exists or pending ({} contracts found).",
+            user_contracts.len()
+        );
     }
 
     // Devnet: auto-faucet CC and USDC to bootstrap agent balance
@@ -3490,7 +3741,8 @@ pub async fn complete_ledger_onboarding(
         let balances = client.get_balances().await.unwrap_or_default();
         // Anything in faucet_instruments that's neither already funded nor Amulet runs first;
         // CC (Amulet) runs last because Splice preapproval may still be pending operator acceptance.
-        let needs_faucet: Vec<&FaucetInstrument> = faucet_instruments.iter()
+        let needs_faucet: Vec<&FaucetInstrument> = faucet_instruments
+            .iter()
             .filter(|inst| {
                 if inst.token_name == "Amulet" {
                     !balances.iter().any(|b| b.is_canton_coin)
@@ -3507,14 +3759,17 @@ pub async fn complete_ledger_onboarding(
             // Utility tokens first (CIP-56 preapproval is already active, no waiting needed)
             for inst in needs_faucet.iter().filter(|i| i.token_name != "Amulet") {
                 print!("  {}... ", inst.token_name);
-                match client.request_faucet(FaucetRequest {
-                    token_name: inst.token_name.clone(),
-                    token_admin: inst.registry.clone(),
-                    ticket: String::new(),
-                    amount: String::new(),
-                    dry_run: false,
-                    request_signature: None,
-                }).await {
+                match client
+                    .request_faucet(FaucetRequest {
+                        token_name: inst.token_name.clone(),
+                        token_admin: inst.registry.clone(),
+                        ticket: String::new(),
+                        amount: String::new(),
+                        dry_run: false,
+                        request_signature: None,
+                    })
+                    .await
+                {
                     Ok(r) if r.success => println!("OK ({})", r.amount_approved),
                     Ok(r) => println!("failed: {}", r.error_message.unwrap_or_default()),
                     Err(e) => println!("error: {}", e),
@@ -3528,18 +3783,24 @@ pub async fn complete_ledger_onboarding(
                 for attempt in 0..delays.len() as u64 {
                     if attempt > 0 {
                         let delay = delays[attempt as usize];
-                        println!("  CC: retrying in {}s (waiting for preapproval acceptance)...", delay);
+                        println!(
+                            "  CC: retrying in {}s (waiting for preapproval acceptance)...",
+                            delay
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     }
                     print!("  CC (Amulet)... ");
-                    match client.request_faucet(FaucetRequest {
-                        token_name: cc_inst.token_name.clone(),
-                        token_admin: cc_inst.registry.clone(),
-                        ticket: String::new(),
-                        amount: String::new(),
-                        dry_run: false,
-                        request_signature: None,
-                    }).await {
+                    match client
+                        .request_faucet(FaucetRequest {
+                            token_name: cc_inst.token_name.clone(),
+                            token_admin: cc_inst.registry.clone(),
+                            ticket: String::new(),
+                            amount: String::new(),
+                            dry_run: false,
+                            request_signature: None,
+                        })
+                        .await
+                    {
                         Ok(r) if r.success => {
                             println!("OK ({})", r.amount_approved);
                             cc_ok = true;
@@ -3550,7 +3811,9 @@ pub async fn complete_ledger_onboarding(
                     }
                 }
                 if !cc_ok {
-                    println!("  CC faucet failed after retries. Run './cloud-agent faucet get --token CC' manually.");
+                    println!(
+                        "  CC faucet failed after retries. Run './cloud-agent faucet get --token CC' manually."
+                    );
                 }
             }
 
@@ -3562,7 +3825,11 @@ pub async fn complete_ledger_onboarding(
                 if !balances.is_empty() {
                     println!("\n=== Initial Balances ===");
                     for b in &balances {
-                        let name = if b.is_canton_coin { "CC".to_string() } else { b.instrument_id.clone() };
+                        let name = if b.is_canton_coin {
+                            "CC".to_string()
+                        } else {
+                            b.instrument_id.clone()
+                        };
                         println!("  {}: {}", name, b.total_amount);
                     }
                     break;
@@ -3582,12 +3849,23 @@ pub async fn complete_ledger_onboarding(
     let topup_env = std::env::var("PREPAID_TRAFFIC_TOPUP_CC").ok();
     match (min_env, topup_env) {
         (Some(min_str), Some(topup_str)) => {
-            let min_cc: rust_decimal::Decimal = min_str.parse()
-                .with_context(|| format!("MIN_PREPAID_TRAFFIC_BALANCE_CC must be a decimal, got '{}'", min_str))?;
-            let topup_cc: rust_decimal::Decimal = topup_str.parse()
-                .with_context(|| format!("PREPAID_TRAFFIC_TOPUP_CC must be a decimal, got '{}'", topup_str))?;
+            let min_cc: rust_decimal::Decimal = min_str.parse().with_context(|| {
+                format!(
+                    "MIN_PREPAID_TRAFFIC_BALANCE_CC must be a decimal, got '{}'",
+                    min_str
+                )
+            })?;
+            let topup_cc: rust_decimal::Decimal = topup_str.parse().with_context(|| {
+                format!(
+                    "PREPAID_TRAFFIC_TOPUP_CC must be a decimal, got '{}'",
+                    topup_str
+                )
+            })?;
             if topup_cc <= rust_decimal::Decimal::ZERO {
-                return Err(anyhow!("PREPAID_TRAFFIC_TOPUP_CC must be > 0, got {}", topup_cc));
+                return Err(anyhow!(
+                    "PREPAID_TRAFFIC_TOPUP_CC must be > 0, got {}",
+                    topup_cc
+                ));
             }
 
             // Build a dedicated client for the topup. The onboarding
@@ -3619,7 +3897,10 @@ pub async fn complete_ledger_onboarding(
             if canton_chain == "devnet" {
                 // Devnet: faucet above funded the agent's CC amulet wallet, so an
                 // on-chain PrepayTraffic to seed the prepaid pool succeeds here.
-                println!("\nSeeding prepaid traffic balance with first topup of {} CC...", topup_cc);
+                println!(
+                    "\nSeeding prepaid traffic balance with first topup of {} CC...",
+                    topup_cc
+                );
                 match runner.force_topup().await {
                     Ok(()) => match runner.get_balance().await {
                         Ok(pt) => {
@@ -3684,7 +3965,14 @@ pub async fn complete_ledger_onboarding(
 // User service commands
 // ============================================================================
 
-pub async fn run_user_service(config: BaseConfig, command: UserServiceCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_user_service(
+    config: BaseConfig,
+    command: UserServiceCommands,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+) -> Result<()> {
     let mut client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -3699,14 +3987,18 @@ pub async fn run_user_service(config: BaseConfig, command: UserServiceCommands, 
     .await?;
 
     match command {
-        UserServiceCommands::Request { reference_id, party_name } => {
+        UserServiceCommands::Request {
+            reference_id,
+            party_name,
+        } => {
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Request UserService",
                     &format!("party: {}", config.party_id),
-                ).await?;
+                )
+                .await?;
             }
             let expectation = OperationExpectation::RequestUserService {
                 party: config.party_id.clone(),
@@ -3779,10 +4071,17 @@ pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bo
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
         Some(config.request_timeout_secs),
-    ).await?;
+    )
+    .await?;
 
     match command {
-        FaucetCommands::Get { token, admin, ticket, amount, dry_run } => {
+        FaucetCommands::Get {
+            token,
+            admin,
+            ticket,
+            amount,
+            dry_run,
+        } => {
             // "CC" and "Amulet" (case-insensitive) both mean Canton Coin — normalize
             // to "Amulet" before signing, since the server canonical includes token_name.
             let is_cc = token.eq_ignore_ascii_case("cc") || token.eq_ignore_ascii_case("amulet");
@@ -3806,14 +4105,16 @@ pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bo
                 }
             };
 
-            let response = client.request_faucet(FaucetRequest {
-                token_name: normalized_token,
-                token_admin: resolved_admin,
-                ticket,
-                amount: amount.unwrap_or_default(),
-                dry_run,
-                request_signature: None,
-            }).await?;
+            let response = client
+                .request_faucet(FaucetRequest {
+                    token_name: normalized_token,
+                    token_admin: resolved_admin,
+                    ticket,
+                    amount: amount.unwrap_or_default(),
+                    dry_run,
+                    request_signature: None,
+                })
+                .await?;
 
             if response.success {
                 if response.is_dry_run {
@@ -3822,10 +4123,16 @@ pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bo
                     println!("Faucet transfer completed:");
                     println!("  Update ID: {}", response.update_id);
                 }
-                println!("  Token:     {} (admin: {})", response.token_name, response.token_admin);
+                println!(
+                    "  Token:     {} (admin: {})",
+                    response.token_name, response.token_admin
+                );
                 println!("  Amount:    {}", response.amount_approved);
             } else {
-                println!("Faucet request failed: {}", response.error_message.as_deref().unwrap_or("unknown"));
+                println!(
+                    "Faucet request failed: {}",
+                    response.error_message.as_deref().unwrap_or("unknown")
+                );
             }
 
             if verbose {
@@ -3841,7 +4148,14 @@ pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bo
 // Lock commands
 // ============================================================================
 
-pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, dry_run: bool, force: bool, confirm: bool) -> Result<()> {
+pub async fn run_lock(
+    config: BaseConfig,
+    command: LockCommands,
+    verbose: bool,
+    dry_run: bool,
+    force: bool,
+    confirm: bool,
+) -> Result<()> {
     let mut client = ledger_client::DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,
@@ -3852,13 +4166,21 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
         &config.ledger_service_public_key,
         Some(config.connection_timeout_secs),
         Some(config.request_timeout_secs),
-    ).await?;
+    )
+    .await?;
 
     match command {
         LockCommands::Holdings {
-            lock_service_cid, lock_service_template_id, lock_service_blob,
-            amount, instrument_id, context, allocations_file,
-            fee_parties, fee_amounts, amulet_cids,
+            lock_service_cid,
+            lock_service_template_id,
+            lock_service_blob,
+            amount,
+            instrument_id,
+            context,
+            allocations_file,
+            fee_parties,
+            fee_amounts,
+            amulet_cids,
         } => {
             let context = context.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
@@ -3869,10 +4191,21 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
                         .with_context(|| format!("Failed to read allocations file '{}'", path))?;
                     let allocs: Vec<serde_json::Value> = serde_json::from_str(&content)
                         .with_context(|| format!("Invalid allocations JSON in '{}'", path))?;
-                    allocs.iter().map(|a| ProtoVotingAllocation {
-                        context: a.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        amount: a.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                    }).collect()
+                    allocs
+                        .iter()
+                        .map(|a| ProtoVotingAllocation {
+                            context: a
+                                .get("context")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            amount: a
+                                .get("amount")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0")
+                                .to_string(),
+                        })
+                        .collect()
                 }
                 None => vec![],
             };
@@ -3882,8 +4215,12 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Lock Holdings",
-                    &format!("amount: {}, instrument: {}, context: {}", amount, instrument_id, context),
-                ).await?;
+                    &format!(
+                        "amount: {}, instrument: {}, context: {}",
+                        amount, instrument_id, context
+                    ),
+                )
+                .await?;
             }
 
             let expectation = OperationExpectation::LockHoldings {
@@ -3893,75 +4230,106 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
                 context: context.clone(),
             };
 
-            let result = client.submit_transaction(
-                PrepareTransactionRequest {
-                    operation: TransactionOperation::LockHoldings as i32,
-                    params: Some(Params::LockHoldings(LockHoldingsParams {
-                        lock_service_cid,
-                        lock_service_template_id,
-                        lock_service_blob,
-                        amount,
-                        instrument_id,
-                        context: context.clone(),
-                        allocations,
-                        fee_party_ids: fee_parties,
-                        fee_amounts,
-                        amulet_cids,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                verbose,
-                dry_run,
-                force,
-            ).await?;
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::LockHoldings as i32,
+                        params: Some(Params::LockHoldings(LockHoldingsParams {
+                            lock_service_cid,
+                            lock_service_template_id,
+                            lock_service_blob,
+                            amount,
+                            instrument_id,
+                            context: context.clone(),
+                            allocations,
+                            fee_party_ids: fee_parties,
+                            fee_amounts,
+                            amulet_cids,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
 
             println!("Lock holdings submitted, update id: {}", result.update_id);
             println!("  Context: {}", context);
         }
         LockCommands::Vote {
-            lock_controller_cid, lock_controller_template_id, requests_file,
-            fee_parties, fee_amounts, amulet_cids,
+            lock_controller_cid,
+            lock_controller_template_id,
+            requests_file,
+            fee_parties,
+            fee_amounts,
+            amulet_cids,
         } => {
             let content = std::fs::read_to_string(&requests_file)
                 .with_context(|| format!("Failed to read requests file '{}'", requests_file))?;
             let reqs_json: Vec<serde_json::Value> = serde_json::from_str(&content)
                 .with_context(|| format!("Invalid requests JSON in '{}'", requests_file))?;
-            let requests: Vec<ProtoVotingRequest> = reqs_json.iter().map(|r| ProtoVotingRequest {
-                context: r.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                amount: r.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                direction: r.get("direction").and_then(|v| v.as_str()).unwrap_or("VoteLock").to_string(),
-            }).collect();
+            let requests: Vec<ProtoVotingRequest> = reqs_json
+                .iter()
+                .map(|r| ProtoVotingRequest {
+                    context: r
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    amount: r
+                        .get("amount")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0")
+                        .to_string(),
+                    direction: r
+                        .get("direction")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("VoteLock")
+                        .to_string(),
+                })
+                .collect();
 
             let expectation = OperationExpectation::ProcessLockUnlockRequests {
                 party: config.party_id.clone(),
                 request_count: requests.len(),
             };
 
-            let result = client.submit_transaction(
-                PrepareTransactionRequest {
-                    operation: TransactionOperation::ProcessLockUnlockRequests as i32,
-                    params: Some(Params::ProcessLockUnlockRequests(ProcessLockUnlockRequestsParams {
-                        lock_controller_cid,
-                        lock_controller_template_id,
-                        requests,
-                        fee_party_ids: fee_parties,
-                        fee_amounts,
-                        amulet_cids,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                verbose,
-                dry_run,
-                force,
-            ).await?;
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::ProcessLockUnlockRequests as i32,
+                        params: Some(Params::ProcessLockUnlockRequests(
+                            ProcessLockUnlockRequestsParams {
+                                lock_controller_cid,
+                                lock_controller_template_id,
+                                requests,
+                                fee_party_ids: fee_parties,
+                                fee_amounts,
+                                amulet_cids,
+                            },
+                        )),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
 
             println!("Vote submitted, update id: {}", result.update_id);
         }
         LockCommands::Resize {
-            lock_controller_cid, lock_controller_template_id, new_amount, instrument_id,
-            requests_file, fee_parties, fee_amounts, amulet_cids,
+            lock_controller_cid,
+            lock_controller_template_id,
+            new_amount,
+            instrument_id,
+            requests_file,
+            fee_parties,
+            fee_amounts,
+            amulet_cids,
         } => {
             let requests: Vec<ProtoVotingRequest> = match requests_file {
                 Some(path) => {
@@ -3969,11 +4337,26 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
                         .with_context(|| format!("Failed to read requests file '{}'", path))?;
                     let reqs_json: Vec<serde_json::Value> = serde_json::from_str(&content)
                         .with_context(|| format!("Invalid requests JSON in '{}'", path))?;
-                    reqs_json.iter().map(|r| ProtoVotingRequest {
-                        context: r.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        amount: r.get("amount").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                        direction: r.get("direction").and_then(|v| v.as_str()).unwrap_or("VoteLock").to_string(),
-                    }).collect()
+                    reqs_json
+                        .iter()
+                        .map(|r| ProtoVotingRequest {
+                            context: r
+                                .get("context")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            amount: r
+                                .get("amount")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0")
+                                .to_string(),
+                            direction: r
+                                .get("direction")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("VoteLock")
+                                .to_string(),
+                        })
+                        .collect()
                 }
                 None => vec![],
             };
@@ -3983,54 +4366,61 @@ pub async fn run_lock(config: BaseConfig, command: LockCommands, verbose: bool, 
                 new_amount: new_amount.clone(),
             };
 
-            let result = client.submit_transaction(
-                PrepareTransactionRequest {
-                    operation: TransactionOperation::ResizeLock as i32,
-                    params: Some(Params::ResizeLock(ResizeLockParams {
-                        lock_controller_cid,
-                        lock_controller_template_id,
-                        new_amount,
-                        requests,
-                        instrument_id,
-                        fee_party_ids: fee_parties,
-                        fee_amounts,
-                        amulet_cids,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                verbose,
-                dry_run,
-                force,
-            ).await?;
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::ResizeLock as i32,
+                        params: Some(Params::ResizeLock(ResizeLockParams {
+                            lock_controller_cid,
+                            lock_controller_template_id,
+                            new_amount,
+                            requests,
+                            instrument_id,
+                            fee_party_ids: fee_parties,
+                            fee_amounts,
+                            amulet_cids,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
 
             println!("Resize lock submitted, update id: {}", result.update_id);
         }
         LockCommands::Terminate {
-            lock_controller_cid, lock_controller_template_id,
-            fee_parties, fee_amounts, amulet_cids,
+            lock_controller_cid,
+            lock_controller_template_id,
+            fee_parties,
+            fee_amounts,
+            amulet_cids,
         } => {
             let expectation = OperationExpectation::TerminateLock {
                 party: config.party_id.clone(),
             };
 
-            let result = client.submit_transaction(
-                PrepareTransactionRequest {
-                    operation: TransactionOperation::TerminateLock as i32,
-                    params: Some(Params::TerminateLock(TerminateLockParams {
-                        lock_controller_cid,
-                        lock_controller_template_id,
-                        fee_party_ids: fee_parties,
-                        fee_amounts,
-                        amulet_cids,
-                    })),
-                    request_signature: None,
-                },
-                &expectation,
-                verbose,
-                dry_run,
-                force,
-            ).await?;
+            let result = client
+                .submit_transaction(
+                    PrepareTransactionRequest {
+                        operation: TransactionOperation::TerminateLock as i32,
+                        params: Some(Params::TerminateLock(TerminateLockParams {
+                            lock_controller_cid,
+                            lock_controller_template_id,
+                            fee_party_ids: fee_parties,
+                            fee_amounts,
+                            amulet_cids,
+                        })),
+                        request_signature: None,
+                    },
+                    &expectation,
+                    verbose,
+                    dry_run,
+                    force,
+                )
+                .await?;
 
             println!("Terminate lock submitted, update id: {}", result.update_id);
         }
@@ -4071,7 +4461,10 @@ pub async fn holdings_status_lines(
     use std::collections::BTreeMap;
     let mut by_instrument: BTreeMap<String, Vec<rust_decimal::Decimal>> = BTreeMap::new();
     for h in holdings {
-        by_instrument.entry(h.instrument.clone()).or_default().push(h.amount);
+        by_instrument
+            .entry(h.instrument.clone())
+            .or_default()
+            .push(h.amount);
     }
 
     let mut price_client: Option<agent_logic::client::OrderbookClient> = None;
@@ -4137,7 +4530,9 @@ pub async fn holdings_status_lines(
         } else {
             let admin = key.strip_suffix(&format!("::{sym}")).unwrap_or(key);
             let admin_prefix: String = admin.chars().take(24).collect();
-            format!("{sym} [FOREIGN ADMIN {admin_prefix}… — not in instruments, ignored by trading]")
+            format!(
+                "{sym} [FOREIGN ADMIN {admin_prefix}… — not in instruments, ignored by trading]"
+            )
         };
         lines.push(format!(
             "{}: {} bal | holdings {} ({} rsvd) {}",
@@ -4167,7 +4562,12 @@ pub async fn atomic_find_venues(
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(&c.payload_json) else {
             continue;
         };
-        let s = |ptr: &str| payload.pointer(ptr).and_then(|v| v.as_str()).map(str::to_string);
+        let s = |ptr: &str| {
+            payload
+                .pointer(ptr)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
         if s("/lp").as_deref() != Some(party_id) {
             continue;
         }
@@ -4216,9 +4616,14 @@ fn read_service_file(path: &str) -> Result<String> {
              provider to export it: `orderbook atomic export --file {path}`"
         )
     })?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("{path} is not valid JSON"))?;
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("{path} is not valid JSON"))?;
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
     let (cid, tid, blob) = (s("contractId"), s("templateId"), s("createdEventBlob"));
     if cid.is_empty() || blob.is_empty() || !tid.contains(":AtomicDVPService") {
         anyhow::bail!(
@@ -4236,7 +4641,10 @@ pub async fn atomic_list_live_tickets(
     party_id: &str,
 ) -> Result<Vec<String>> {
     let resp = client
-        .get_atomic_contracts(&[venue_registry::TEMPLATE_SETTLEMENT_TICKET.to_string()], &[])
+        .get_atomic_contracts(
+            &[venue_registry::TEMPLATE_SETTLEMENT_TICKET.to_string()],
+            &[],
+        )
         .await?;
     let mut cids = Vec::new();
     for c in resp.contracts {
@@ -4268,7 +4676,11 @@ pub fn atomic_resolve_market_pair(
         return Err(anyhow!(
             "cannot resolve instrument admins for market {} (base {}: '{}', quote {}: '{}') — \
              instrument registry not populated",
-            market_id, base, base_admin, quote, quote_admin
+            market_id,
+            base,
+            base_admin,
+            quote,
+            quote_admin
         ));
     }
     Ok(((base_id, base_admin), (quote_id, quote_admin)))
@@ -4340,8 +4752,8 @@ pub async fn atomic_split_denominations(
     force: bool,
 ) -> Result<Option<String>> {
     use orderbook_proto::rfqv2::{
-        prepare_atomic_transaction_request::Params as AtomicParams,
         PrepareAtomicTransactionRequest, SplitHoldingsParams, SplitSpec,
+        prepare_atomic_transaction_request::Params as AtomicParams,
     };
     use rust_decimal::Decimal;
 
@@ -4417,7 +4829,9 @@ pub async fn atomic_split_denominations(
                 if outstanding >= prev {
                     tracing::warn!(
                         "{}: split made no progress ({} output(s) outstanding, was {}) — stopping",
-                        instr_key, outstanding, prev
+                        instr_key,
+                        outstanding,
+                        prev
                     );
                     break;
                 }
@@ -4456,12 +4870,16 @@ pub async fn atomic_split_denominations(
                 if committed_txs == 0 {
                     return Err(anyhow!(
                         "insufficient {} holdings for splits: have {}, need {}",
-                        instr_key, available, requested
+                        instr_key,
+                        available,
+                        requested
                     ));
                 }
                 tracing::warn!(
                     "{}: balance exhausted with {} output(s) outstanding — stopping after {} committed split tx(s)",
-                    instr_key, outstanding, committed_txs
+                    instr_key,
+                    outstanding,
+                    committed_txs
                 );
                 break;
             }
@@ -4469,7 +4887,10 @@ pub async fn atomic_split_denominations(
             if capped_total < requested {
                 tracing::warn!(
                     "{}: partial split — balance {} covers {} of the requested {} ladder total",
-                    instr_key, available, capped_total, requested
+                    instr_key,
+                    available,
+                    capped_total,
+                    requested
                 );
             }
             capped
@@ -4501,12 +4922,17 @@ pub async fn atomic_split_denominations(
             if committed_txs == 0 {
                 return Err(anyhow!(
                     "insufficient {} holdings for splits: have {}, need {}",
-                    instr_key, covered, total
+                    instr_key,
+                    covered,
+                    total
                 ));
             }
             tracing::warn!(
                 "{}: inputs cover {} of the {} needed for the next chunk — stopping after {} committed split tx(s)",
-                instr_key, covered, total, committed_txs
+                instr_key,
+                covered,
+                total,
+                committed_txs
             );
             break;
         }
@@ -4541,7 +4967,9 @@ pub async fn atomic_split_denominations(
                 .with_context(|| {
                     format!(
                         "split tx {} for {} ({} tx(s) already committed)",
-                        iter + 1, instr_key, committed_txs
+                        iter + 1,
+                        instr_key,
+                        committed_txs
                     )
                 })?
                 .update_id
@@ -4584,7 +5012,9 @@ pub async fn atomic_split_denominations(
                 .with_context(|| {
                     format!(
                         "split tx {} for {} ({} tx(s) already committed)",
-                        iter + 1, instr_key, committed_txs
+                        iter + 1,
+                        instr_key,
+                        committed_txs
                     )
                 })?
                 .update_id
@@ -4631,7 +5061,8 @@ pub async fn atomic_split_denominations(
     if !ladder_covered && committed_txs == max_iters {
         tracing::warn!(
             "{}: split iteration bound ({}) reached — remaining rungs fill via the split worker or the next setup run",
-            instr_key, max_iters
+            instr_key,
+            max_iters
         );
     }
     Ok(last_update)
@@ -4646,9 +5077,9 @@ pub async fn run_atomic(
     confirm: bool,
 ) -> Result<()> {
     use orderbook_proto::rfqv2::{
-        prepare_atomic_transaction_request::Params as AtomicParams, CancelTicketsParams,
-        CreateAtomicDvpVenueParams, IssueTicketsParams,
+        CancelTicketsParams, CreateAtomicDvpVenueParams, IssueTicketsParams,
         PrepareAtomicTransactionRequest, RetireVenueParams, UpdateVenueKeyParams,
+        prepare_atomic_transaction_request::Params as AtomicParams,
     };
 
     match command {
@@ -4667,11 +5098,12 @@ pub async fn run_atomic(
                     println!("ATOMIC_QUOTE_PRIVATE_KEY={}", kf.priv_scalar_hex);
                     println!();
                     println!("SPKI public key: {}", kf.pub_spki_hex);
-                    println!("⚠ Keep the .env safe: this key signs all quotes for venues created with it.");
+                    println!(
+                        "⚠ Keep the .env safe: this key signs all quotes for venues created with it."
+                    );
                 }
             }
         }
-
 
         AtomicCommands::Venue { command } => match command {
             AtomicVenueCommands::Create { market } => {
@@ -4684,7 +5116,10 @@ pub async fn run_atomic(
                     .into_iter()
                     .find(|v| v.pair_name == market)
                 {
-                    if existing.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) {
+                    if existing
+                        .quote_public_key
+                        .eq_ignore_ascii_case(&kf.pub_spki_hex)
+                    {
                         println!(
                             "Venue for {} already exists with the current key: {}",
                             market, existing.contract_id
@@ -4694,7 +5129,9 @@ pub async fn run_atomic(
                     return Err(anyhow!(
                         "venue for {} already exists ({}) with a DIFFERENT quote key — \
                          use `atomic venue rotate-key --market {}`",
-                        market, existing.contract_id, market
+                        market,
+                        existing.contract_id,
+                        market
                     ));
                 }
                 let expectation = OperationExpectation::CreateAtomicDvpVenue {
@@ -4723,7 +5160,10 @@ pub async fn run_atomic(
                         force,
                     )
                     .await?;
-                println!("AtomicDVP venue created for {}, update id: {}", market, resp.update_id);
+                println!(
+                    "AtomicDVP venue created for {}, update id: {}",
+                    market, resp.update_id
+                );
             }
             AtomicVenueCommands::List => {
                 let mut client = atomic_swap::create_atomic_client(&config).await?;
@@ -4795,7 +5235,10 @@ pub async fn run_atomic(
                         force,
                     )
                     .await?;
-                println!("Venue key rotated for {}, update id: {}", market, resp.update_id);
+                println!(
+                    "Venue key rotated for {}, update id: {}",
+                    market, resp.update_id
+                );
                 println!("(the venue has a NEW contract id — restart the LP agent to re-validate)");
             }
             AtomicVenueCommands::Retire { market } => {
@@ -4839,8 +5282,14 @@ pub async fn run_atomic(
                         force,
                     )
                     .await?;
-                println!("AtomicDVP venue retired for {}, update id: {}", market, resp.update_id);
-                println!("(re-create under the new registrar with `atomic venue create --market {}`)", market);
+                println!(
+                    "AtomicDVP venue retired for {}, update id: {}",
+                    market, resp.update_id
+                );
+                println!(
+                    "(re-create under the new registrar with `atomic venue create --market {}`)",
+                    market
+                );
             }
         },
 
@@ -4851,8 +5300,9 @@ pub async fn run_atomic(
                     if count == 0 {
                         return Err(anyhow!("--count must be > 0"));
                     }
-                    let ticket_ids: Vec<String> =
-                        (0..count).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+                    let ticket_ids: Vec<String> = (0..count)
+                        .map(|_| uuid::Uuid::now_v7().to_string())
+                        .collect();
                     let expectation = OperationExpectation::IssueTickets {
                         lp_party: config.party_id.clone(),
                         ticket_count: ticket_ids.len(),
@@ -4916,7 +5366,11 @@ pub async fn run_atomic(
             }
         }
 
-        AtomicCommands::Split { market, instrument, splits } => {
+        AtomicCommands::Split {
+            market,
+            instrument,
+            splits,
+        } => {
             let specs: Vec<String> = splits
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -4930,7 +5384,10 @@ pub async fn run_atomic(
                 "base" => base_instr,
                 "quote" => quote_instr,
                 other => {
-                    return Err(anyhow!("--instrument must be 'base' or 'quote', got '{}'", other))
+                    return Err(anyhow!(
+                        "--instrument must be 'base' or 'quote', got '{}'",
+                        other
+                    ));
                 }
             };
             let (on_chain_id, admin) = config.resolve_instrument(target);
@@ -4945,12 +5402,22 @@ pub async fn run_atomic(
                 agent_logic::confirm::confirm_transaction(
                     &lock,
                     "Split holdings",
-                    &format!("market: {}, instrument: {} ({}), splits: {}", market, target, on_chain_id, splits),
+                    &format!(
+                        "market: {}, instrument: {} ({}), splits: {}",
+                        market, target, on_chain_id, splits
+                    ),
                 )
                 .await?;
             }
             match atomic_split_denominations(
-                &config, &on_chain_id, &admin, &rungs, false, verbose, dry_run, force,
+                &config,
+                &on_chain_id,
+                &admin,
+                &rungs,
+                false,
+                verbose,
+                dry_run,
+                force,
             )
             .await?
             {
@@ -5032,7 +5499,10 @@ pub async fn run_atomic(
             // keyfiles; the same resolution the runtime agent uses, so the
             // venue key and the signing key can never diverge)
             let kf = quote_key_from_env()?;
-            println!("[1/6] Quote key (from ATOMIC_QUOTE_PRIVATE_KEY): {}", kf.pub_spki_hex);
+            println!(
+                "[1/6] Quote key (from ATOMIC_QUOTE_PRIVATE_KEY): {}",
+                kf.pub_spki_hex
+            );
 
             let warnings =
                 atomic_setup_agent(&config, &kf, Some(&service_file), verbose, dry_run, force)
@@ -5073,270 +5543,289 @@ pub async fn atomic_setup_agent(
     force: bool,
 ) -> Result<u32> {
     use orderbook_proto::rfqv2::{
-        prepare_atomic_transaction_request::Params as AtomicParams, CreateAtomicDvpVenueParams,
-        IssueTicketsParams, PrepareAtomicTransactionRequest,
+        CreateAtomicDvpVenueParams, IssueTicketsParams, PrepareAtomicTransactionRequest,
+        prepare_atomic_transaction_request::Params as AtomicParams,
     };
     let mut warnings: u32 = 0;
     {
-            // Alias so the body below (moved verbatim from the CLI arm) keeps
-            // its original name for the key.
-            let kf = quote_key;
+        // Alias so the body below (moved verbatim from the CLI arm) keeps
+        // its original name for the key.
+        let kf = quote_key;
 
-            let mut client = atomic_swap::create_atomic_client(config).await?;
+        let mut client = atomic_swap::create_atomic_client(config).await?;
 
-            // 2. AtomicDVPService disclosure file check — the singleton is
-            // provider-only (invisible in the LP's ACS); the provider exports
-            // its blob and the LP keeps a reference copy. Venue creation is
-            // prepared server-side with the server's own disclosure.
-            match service_file {
-                Some(sf) => {
-                    let service_cid = read_service_file(sf)?;
-                    println!("[2/6] AtomicDVPService (from {sf}): {service_cid}");
-                }
-                None => println!(
-                    "[2/6] AtomicDVPService disclosure file not provided — check skipped \
+        // 2. AtomicDVPService disclosure file check — the singleton is
+        // provider-only (invisible in the LP's ACS); the provider exports
+        // its blob and the LP keeps a reference copy. Venue creation is
+        // prepared server-side with the server's own disclosure.
+        match service_file {
+            Some(sf) => {
+                let service_cid = read_service_file(sf)?;
+                println!("[2/6] AtomicDVPService (from {sf}): {service_cid}");
+            }
+            None => println!(
+                "[2/6] AtomicDVPService disclosure file not provided — check skipped \
                      (the ledger-service discloses the singleton at prepare time)"
-                ),
-            }
+            ),
+        }
 
-            // 3. venue per rfq_v2-enabled market (skip existing with matching key)
-            let v2_markets: Vec<&agent_logic::config::MarketConfig> = config
-                .markets
-                .iter()
-                .filter(|m| m.enabled)
-                .filter(|m| {
-                    m.rfq
-                        .as_ref()
-                        .is_some_and(|r| r.enabled && r.v2.as_ref().is_some_and(|v| v.enabled))
-                })
-                .collect();
-            if v2_markets.is_empty() {
-                println!(
-                    "[3/6] No [markets.rfq.v2]-enabled markets in agent.toml — \
+        // 3. venue per rfq_v2-enabled market (skip existing with matching key)
+        let v2_markets: Vec<&agent_logic::config::MarketConfig> = config
+            .markets
+            .iter()
+            .filter(|m| m.enabled)
+            .filter(|m| {
+                m.rfq
+                    .as_ref()
+                    .is_some_and(|r| r.enabled && r.v2.as_ref().is_some_and(|v| v.enabled))
+            })
+            .collect();
+        if v2_markets.is_empty() {
+            println!(
+                "[3/6] No [markets.rfq.v2]-enabled markets in agent.toml — \
                      skipping venues / preapprovals / splits"
-                );
-            }
-            let venues = atomic_find_venues(&mut client, &config.party_id).await?;
-            for m in &v2_markets {
-                if let Some(v) = venues.iter().find(|v| v.pair_name == m.market_id) {
-                    if v.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) {
-                        println!("[3/6] Venue for {} exists with matching key — skipped", m.market_id);
-                    } else {
-                        warnings += 1;
-                        tracing::warn!(
-                            "[3/6] Venue for {} exists with a DIFFERENT key ({}) — \
+            );
+        }
+        let venues = atomic_find_venues(&mut client, &config.party_id).await?;
+        for m in &v2_markets {
+            if let Some(v) = venues.iter().find(|v| v.pair_name == m.market_id) {
+                if v.quote_public_key.eq_ignore_ascii_case(&kf.pub_spki_hex) {
+                    println!(
+                        "[3/6] Venue for {} exists with matching key — skipped",
+                        m.market_id
+                    );
+                } else {
+                    warnings += 1;
+                    tracing::warn!(
+                        "[3/6] Venue for {} exists with a DIFFERENT key ({}) — \
                              run `atomic venue rotate-key --market {}`",
-                            m.market_id, v.contract_id, m.market_id
-                        );
-                    }
-                    continue;
+                        m.market_id,
+                        v.contract_id,
+                        m.market_id
+                    );
                 }
-                match atomic_resolve_market_pair(&config, &m.market_id) {
-                    Ok(((base_id, base_admin), (quote_id, quote_admin))) => {
-                        let expectation = OperationExpectation::CreateAtomicDvpVenue {
-                            lp_party: config.party_id.clone(),
-                            pair_name: m.market_id.clone(),
-                            quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
-                        };
-                        match client
-                            .submit_atomic_transaction(
-                                PrepareAtomicTransactionRequest {
-                                    params: Some(AtomicParams::CreateAtomicDvpVenue(
-                                        CreateAtomicDvpVenueParams {
-                                            pair_name: m.market_id.clone(),
-                                            base_instrument_id: base_id,
-                                            base_instrument_admin: base_admin,
-                                            quote_instrument_id: quote_id,
-                                            quote_instrument_admin: quote_admin,
-                                            quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
-                                        },
-                                    )),
-                                    request_signature: None,
-                                },
-                                &expectation,
-                                verbose,
-                                dry_run,
-                                force,
-                            )
-                            .await
-                        {
-                            Ok(resp) => println!(
-                                "[3/6] Venue created for {} (update {})",
-                                m.market_id, resp.update_id
-                            ),
-                            Err(e) => {
-                                warnings += 1;
-                                tracing::warn!(
-                                    "[3/6] Venue creation for {} failed: {:#}",
-                                    m.market_id, e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warnings += 1;
-                        tracing::warn!("[3/6] {} skipped: {:#}", m.market_id, e);
-                    }
-                }
+                continue;
             }
-
-            // 4. LP receiving preapprovals per non-CC instrument across those
-            // markets (the LP can receive either leg depending on direction)
-            let mut v1_client = atomic_swap::create_v1_client(&config).await?;
-            let mut instruments: Vec<String> = Vec::new();
-            for m in &v2_markets {
-                if let Some((base, quote)) = m.market_id.split_once('-') {
-                    for instr in [base, quote] {
-                        if !instruments.iter().any(|i| i == instr) {
-                            instruments.push(instr.to_string());
-                        }
-                    }
-                }
-            }
-            for instr in &instruments {
-                match atomic_swap::ensure_receiver_preapproval(
-                    &config, &mut v1_client, instr, verbose, dry_run, force,
-                )
-                .await
-                {
-                    Ok(true) => println!("[4/6] Receiving preapproval created for {}", instr),
-                    Ok(false) => println!(
-                        "[4/6] Receiving preapproval for {} already present / not needed",
-                        instr
-                    ),
-                    Err(e) => {
-                        warnings += 1;
-                        tracing::warn!("[4/6] Preapproval for {} failed: {:#}", instr, e);
-                    }
-                }
-            }
-
-            // 5. ticket batch iff ticket_threshold_usd is configured (D1)
-            let v2cfg = config
-                .liquidity_provider
-                .as_ref()
-                .and_then(|lp| lp.rfq_v2.as_ref());
-            match v2cfg {
-                Some(v2) if v2.ticket_threshold_usd.is_some() => {
-                    let live = atomic_list_live_tickets(&mut client, &config.party_id)
-                        .await?
-                        .len();
-                    if live >= v2.ticket_low_water {
-                        println!(
-                            "[5/6] {} live tickets (>= low water {}) — issue skipped",
-                            live, v2.ticket_low_water
-                        );
-                    } else {
-                        let ticket_ids: Vec<String> = (0..v2.ticket_batch_size)
-                            .map(|_| uuid::Uuid::now_v7().to_string())
-                            .collect();
-                        let expectation = OperationExpectation::IssueTickets {
-                            lp_party: config.party_id.clone(),
-                            ticket_count: ticket_ids.len(),
-                        };
-                        match client
-                            .submit_atomic_transaction(
-                                PrepareAtomicTransactionRequest {
-                                    params: Some(AtomicParams::IssueTickets(IssueTicketsParams {
-                                        ticket_ids,
-                                    })),
-                                    request_signature: None,
-                                },
-                                &expectation,
-                                verbose,
-                                dry_run,
-                                force,
-                            )
-                            .await
-                        {
-                            Ok(resp) => println!(
-                                "[5/6] Issued {} tickets (update {})",
-                                v2.ticket_batch_size, resp.update_id
-                            ),
-                            Err(e) => {
-                                warnings += 1;
-                                tracing::warn!("[5/6] Ticket issue failed: {:#}", e);
-                            }
-                        }
-                    }
-                }
-                _ => println!(
-                    "[5/6] ticket_threshold_usd not configured — tickets skipped (ticketless quoting)"
-                ),
-            }
-
-            // 6. denomination splits per INSTRUMENT (best effort). The global
-            // [liquidity_provider.rfq_v2.denominations] ladder map wins; the
-            // legacy per-market ladders (applied to both legs, first market
-            // wins per instrument) remain as fallback.
-            let max_concurrent = config
-                .liquidity_provider
-                .as_ref()
-                .map(|lp| lp.max_concurrent_rfqs)
-                .unwrap_or(10);
-            let global_denoms = v2cfg
-                .map(|v| v.denominations.clone())
-                .unwrap_or_default();
-            let mut instrument_ladders: Vec<(String, Vec<String>)> = Vec::new();
-            if !global_denoms.is_empty() {
-                for (symbol, ladder) in &global_denoms {
-                    instrument_ladders.push((symbol.clone(), ladder.clone()));
-                }
-            } else {
-                let mut seen = std::collections::HashSet::new();
-                for m in &v2_markets {
-                    let Some(v2m) = m.rfq.as_ref().and_then(|r| r.v2.as_ref()) else { continue };
-                    let ladder: Vec<String> = if v2m.denominations.is_empty() {
-                        m.base_order_size
-                            .as_ref()
-                            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
-                            .map(|amt| vec![format!("{amt}x{max_concurrent}")])
-                            .unwrap_or_default()
-                    } else {
-                        v2m.denominations.clone()
+            match atomic_resolve_market_pair(&config, &m.market_id) {
+                Ok(((base_id, base_admin), (quote_id, quote_admin))) => {
+                    let expectation = OperationExpectation::CreateAtomicDvpVenue {
+                        lp_party: config.party_id.clone(),
+                        pair_name: m.market_id.clone(),
+                        quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
                     };
-                    if ladder.is_empty() {
-                        continue;
-                    }
-                    let Some((base, quote)) = m.market_id.split_once('-') else { continue };
-                    for instr in [base, quote] {
-                        if seen.insert(instr.to_string()) {
-                            instrument_ladders.push((instr.to_string(), ladder.clone()));
-                        }
-                    }
-                }
-            }
-            for (symbol, ladder) in instrument_ladders {
-                let rungs: Vec<(rust_decimal::Decimal, u32)> =
-                    match split_worker::parse_splits(&ladder) {
-                        Ok(r) => r,
+                    match client
+                        .submit_atomic_transaction(
+                            PrepareAtomicTransactionRequest {
+                                params: Some(AtomicParams::CreateAtomicDvpVenue(
+                                    CreateAtomicDvpVenueParams {
+                                        pair_name: m.market_id.clone(),
+                                        base_instrument_id: base_id,
+                                        base_instrument_admin: base_admin,
+                                        quote_instrument_id: quote_id,
+                                        quote_instrument_admin: quote_admin,
+                                        quote_public_key_spki_hex: kf.pub_spki_hex.clone(),
+                                    },
+                                )),
+                                request_signature: None,
+                            },
+                            &expectation,
+                            verbose,
+                            dry_run,
+                            force,
+                        )
+                        .await
+                    {
+                        Ok(resp) => println!(
+                            "[3/6] Venue created for {} (update {})",
+                            m.market_id, resp.update_id
+                        ),
                         Err(e) => {
                             warnings += 1;
-                            tracing::warn!("[6/6] {}: bad denominations: {:#}", symbol, e);
-                            continue;
+                            tracing::warn!(
+                                "[3/6] Venue creation for {} failed: {:#}",
+                                m.market_id,
+                                e
+                            );
                         }
-                    };
-                if rungs.is_empty() {
-                    continue;
+                    }
                 }
-                let (on_chain_id, admin) = config.resolve_instrument(&symbol);
-                match atomic_split_denominations(
-                    &config, &on_chain_id, &admin, &rungs, true, verbose, dry_run, force,
-                )
-                .await
-                {
-                    Ok(Some(update_id)) => println!(
-                        "[6/6] Split committed for {} (update {})",
-                        symbol, update_id
-                    ),
-                    Ok(None) => println!("[6/6] Denomination coverage OK for {}", symbol),
-                    Err(e) => {
-                        warnings += 1;
-                        tracing::warn!("[6/6] Split for {} failed: {:#}", symbol, e);
+                Err(e) => {
+                    warnings += 1;
+                    tracing::warn!("[3/6] {} skipped: {:#}", m.market_id, e);
+                }
+            }
+        }
+
+        // 4. LP receiving preapprovals per non-CC instrument across those
+        // markets (the LP can receive either leg depending on direction)
+        let mut v1_client = atomic_swap::create_v1_client(&config).await?;
+        let mut instruments: Vec<String> = Vec::new();
+        for m in &v2_markets {
+            if let Some((base, quote)) = m.market_id.split_once('-') {
+                for instr in [base, quote] {
+                    if !instruments.iter().any(|i| i == instr) {
+                        instruments.push(instr.to_string());
                     }
                 }
             }
+        }
+        for instr in &instruments {
+            match atomic_swap::ensure_receiver_preapproval(
+                &config,
+                &mut v1_client,
+                instr,
+                verbose,
+                dry_run,
+                force,
+            )
+            .await
+            {
+                Ok(true) => println!("[4/6] Receiving preapproval created for {}", instr),
+                Ok(false) => println!(
+                    "[4/6] Receiving preapproval for {} already present / not needed",
+                    instr
+                ),
+                Err(e) => {
+                    warnings += 1;
+                    tracing::warn!("[4/6] Preapproval for {} failed: {:#}", instr, e);
+                }
+            }
+        }
 
+        // 5. ticket batch iff ticket_threshold_usd is configured (D1)
+        let v2cfg = config
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref());
+        match v2cfg {
+            Some(v2) if v2.ticket_threshold_usd.is_some() => {
+                let live = atomic_list_live_tickets(&mut client, &config.party_id)
+                    .await?
+                    .len();
+                if live >= v2.ticket_low_water {
+                    println!(
+                        "[5/6] {} live tickets (>= low water {}) — issue skipped",
+                        live, v2.ticket_low_water
+                    );
+                } else {
+                    let ticket_ids: Vec<String> = (0..v2.ticket_batch_size)
+                        .map(|_| uuid::Uuid::now_v7().to_string())
+                        .collect();
+                    let expectation = OperationExpectation::IssueTickets {
+                        lp_party: config.party_id.clone(),
+                        ticket_count: ticket_ids.len(),
+                    };
+                    match client
+                        .submit_atomic_transaction(
+                            PrepareAtomicTransactionRequest {
+                                params: Some(AtomicParams::IssueTickets(IssueTicketsParams {
+                                    ticket_ids,
+                                })),
+                                request_signature: None,
+                            },
+                            &expectation,
+                            verbose,
+                            dry_run,
+                            force,
+                        )
+                        .await
+                    {
+                        Ok(resp) => println!(
+                            "[5/6] Issued {} tickets (update {})",
+                            v2.ticket_batch_size, resp.update_id
+                        ),
+                        Err(e) => {
+                            warnings += 1;
+                            tracing::warn!("[5/6] Ticket issue failed: {:#}", e);
+                        }
+                    }
+                }
+            }
+            _ => println!(
+                "[5/6] ticket_threshold_usd not configured — tickets skipped (ticketless quoting)"
+            ),
+        }
+
+        // 6. denomination splits per INSTRUMENT (best effort). The global
+        // [liquidity_provider.rfq_v2.denominations] ladder map wins; the
+        // legacy per-market ladders (applied to both legs, first market
+        // wins per instrument) remain as fallback.
+        let max_concurrent = config
+            .liquidity_provider
+            .as_ref()
+            .map(|lp| lp.max_concurrent_rfqs)
+            .unwrap_or(10);
+        let global_denoms = v2cfg.map(|v| v.denominations.clone()).unwrap_or_default();
+        let mut instrument_ladders: Vec<(String, Vec<String>)> = Vec::new();
+        if !global_denoms.is_empty() {
+            for (symbol, ladder) in &global_denoms {
+                instrument_ladders.push((symbol.clone(), ladder.clone()));
+            }
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            for m in &v2_markets {
+                let Some(v2m) = m.rfq.as_ref().and_then(|r| r.v2.as_ref()) else {
+                    continue;
+                };
+                let ladder: Vec<String> = if v2m.denominations.is_empty() {
+                    m.base_order_size
+                        .as_ref()
+                        .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                        .map(|amt| vec![format!("{amt}x{max_concurrent}")])
+                        .unwrap_or_default()
+                } else {
+                    v2m.denominations.clone()
+                };
+                if ladder.is_empty() {
+                    continue;
+                }
+                let Some((base, quote)) = m.market_id.split_once('-') else {
+                    continue;
+                };
+                for instr in [base, quote] {
+                    if seen.insert(instr.to_string()) {
+                        instrument_ladders.push((instr.to_string(), ladder.clone()));
+                    }
+                }
+            }
+        }
+        for (symbol, ladder) in instrument_ladders {
+            let rungs: Vec<(rust_decimal::Decimal, u32)> = match split_worker::parse_splits(&ladder)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warnings += 1;
+                    tracing::warn!("[6/6] {}: bad denominations: {:#}", symbol, e);
+                    continue;
+                }
+            };
+            if rungs.is_empty() {
+                continue;
+            }
+            let (on_chain_id, admin) = config.resolve_instrument(&symbol);
+            match atomic_split_denominations(
+                &config,
+                &on_chain_id,
+                &admin,
+                &rungs,
+                true,
+                verbose,
+                dry_run,
+                force,
+            )
+            .await
+            {
+                Ok(Some(update_id)) => println!(
+                    "[6/6] Split committed for {} (update {})",
+                    symbol, update_id
+                ),
+                Ok(None) => println!("[6/6] Denomination coverage OK for {}", symbol),
+                Err(e) => {
+                    warnings += 1;
+                    tracing::warn!("[6/6] Split for {} failed: {:#}", symbol, e);
+                }
+            }
+        }
     }
 
     Ok(warnings)
