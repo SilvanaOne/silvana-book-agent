@@ -143,6 +143,10 @@ pub async fn run_fill_loop(
         Some(config.node_name.as_str()),
     )?);
 
+    // Best-effort error reporter (ReportErrors -> orderbook-rpc). Idempotent
+    // across the per-market fill loops; mints a fresh short-TTL JWT per flush.
+    agent_logic::error_reporter::init_from_config(&config);
+
     // RFQ V2: receiver-preapproval preflight (once per loop start, design §6.5)
     // and the per-market input-cid cap for own-holdings selection.
     let atomic_max_inputs = config

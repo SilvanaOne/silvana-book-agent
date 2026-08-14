@@ -544,6 +544,10 @@ pub async fn run_cloud_agent(
     info!("Orderbook URL: {}", config.orderbook_grpc_url);
     info!("Fee reserve: {:.2} CC (traffic billing handled off-chain by ledger)", config.fee_reserve_cc);
 
+    // Ensure the error reporter is installed for the production agent path,
+    // for library embedders that bypass the CLI. Idempotent.
+    agent_logic::error_reporter::init_from_config(&config);
+
     if config.rfq_v2_only && orders_only {
         anyhow::bail!(
             "--orders-only conflicts with rfq_v2_only = true (agent.toml / RFQ_V2_ONLY): \

@@ -251,6 +251,13 @@ async fn main() -> Result<()> {
     }
     let base_config = base_config;
 
+    // Install the best-effort error reporter (ReportErrors -> orderbook-rpc)
+    // for EVERY command before dispatch — the production `agent` path never
+    // enters a fill loop, so initializing only there (or in the unused
+    // cancel_settlement path) left all agent error hooks as silent no-ops.
+    // Idempotent; a no-op for commands that never report.
+    agent_logic::error_reporter::init_from_config(&base_config);
+
     let verbose = cli.verbose;
     let dry_run = cli.dry_run;
     let force = cli.force;

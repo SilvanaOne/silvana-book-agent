@@ -80,6 +80,19 @@ pub fn record_submit_failure() {
             "Ledger submission unhealthy ({} consecutive failures) — pausing RFQ quoting for up to {}s",
             failures, *COOLDOWN_SECS
         );
+        // Fires once per breaker OPEN (not per failure). Sync try_send —
+        // this module has no async context.
+        crate::error_reporter::ErrorEventBuilder::new(
+            "ledger_unhealthy",
+            format!(
+                "ledger submission circuit breaker OPEN after {failures} consecutive failures; \
+                 pausing RFQ quoting for up to {}s",
+                *COOLDOWN_SECS
+            ),
+        )
+        .severity("critical")
+        .module("ledger_health")
+        .send();
     }
 }
 

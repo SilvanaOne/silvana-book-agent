@@ -13,6 +13,7 @@ pub mod auth;
 pub mod client;
 pub mod confirm;
 pub mod config;
+pub mod error_reporter;
 pub mod fees;
 pub mod forecast;
 pub mod ledger_health;
