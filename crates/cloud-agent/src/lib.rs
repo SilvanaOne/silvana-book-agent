@@ -1948,9 +1948,21 @@ pub async fn run_lp_atomic_stream(
                                 info!("Ignoring atomic RFQ {} - shutting down", request.rfq_id);
                                 break;
                             }
+                            // Venue identity for [[venue_overrides]] pricing:
+                            // explicit venue_name, falling back to the VA2
+                            // attribution prefix for servers predating it.
+                            let rfq_venue = request
+                                .venue_name
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .or(request.quote_id_prefix.as_deref().filter(|s| !s.is_empty()));
+                            let rfq_venue_branch =
+                                request.venue_branch.as_deref().filter(|s| !s.is_empty());
                             info!(
-                                "Received atomic RFQ: rfq_id={}, market={}, direction={}, qty={}",
-                                request.rfq_id, request.market_id, request.direction, request.quantity
+                                "Received atomic RFQ: rfq_id={}, market={}, direction={}, qty={}, venue={}{}",
+                                request.rfq_id, request.market_id, request.direction, request.quantity,
+                                rfq_venue.unwrap_or("-"),
+                                rfq_venue_branch.map(|b| format!("/{b}")).unwrap_or_default()
                             );
 
                             let reject = |reason: String, min: String, max: String| {
@@ -1988,6 +2000,8 @@ pub async fn run_lp_atomic_stream(
                                         // pays every fee (3x dust surcharge
                                         // server-side); the LP pays none.
                                         false,
+                                        rfq_venue,
+                                        rfq_venue_branch,
                                     )
                                     .await
                                 {

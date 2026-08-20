@@ -40,6 +40,9 @@ struct AgentToml {
     canton_op_timeout_secs: u64,
     #[serde(default)]
     markets: Vec<MarketConfig>,
+    /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only).
+    #[serde(default)]
+    venue_overrides: Vec<VenueOverride>,
     /// LP configuration (only for liquidity provider agents)
     #[serde(default)]
     liquidity_provider: Option<LiquidityProviderConfig>,
@@ -166,6 +169,11 @@ pub struct BaseConfig {
     pub canton_op_timeout_secs: u64,
     pub markets: Vec<MarketConfig>,
 
+    /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only) —
+    /// TOML `[[venue_overrides]]`, resolved per request by
+    /// [`resolve_rfq_config`].
+    pub venue_overrides: Vec<VenueOverride>,
+
     // Multi-node routing
     pub node_name: String,
 
@@ -289,6 +297,7 @@ impl BaseConfig {
             request_timeout_secs: 10,
             canton_op_timeout_secs: 60,
             markets: Vec::new(),
+            venue_overrides: Vec::new(),
             node_name: String::new(),
             venue_branch: None,
             ledger_service_public_key: [0u8; 32],
@@ -391,6 +400,7 @@ impl BaseConfig {
             request_timeout_secs: default_request_timeout_secs(),
             canton_op_timeout_secs: default_canton_op_timeout_secs(),
             markets: Vec::new(),
+            venue_overrides: Vec::new(),
             node_name: node_name.to_string(),
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
             ledger_service_public_key,
@@ -826,6 +836,125 @@ impl BaseConfig {
             }
         }
 
+        // --- [[venue_overrides]] validation (RFQ V2 venue/branch overlays) ---
+        // Invalid slugs are hard errors: a typoed venue would otherwise just
+        // silently never match and the operator would ship pair-default
+        // pricing believing the override was live.
+        for (i, ov) in agent.venue_overrides.iter().enumerate() {
+            if !crate::auth::is_valid_venue_branch(&ov.venue) {
+                return Err(anyhow!(
+                    "[[venue_overrides]] #{}: venue '{}' is not a valid slug \
+                     (^[a-z0-9][a-z0-9-]{{1,19}}$) — it must equal the server's \
+                     swap-venue name (AtomicRfqRequest.venue_name)",
+                    i + 1,
+                    ov.venue
+                ));
+            }
+            if let Some(ref b) = ov.branch {
+                if !crate::auth::is_valid_venue_branch(b) {
+                    return Err(anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): branch '{}' is not a \
+                         valid slug (^[a-z0-9][a-z0-9-]{{1,19}}$)",
+                        i + 1,
+                        ov.venue,
+                        b
+                    ));
+                }
+            }
+            if let Some(ref markets) = ov.markets {
+                if markets.is_empty() {
+                    return Err(anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): markets = [] can never \
+                         match — omit the key entirely to target all markets",
+                        i + 1,
+                        ov.venue
+                    ));
+                }
+                for m in markets {
+                    if !agent.markets.iter().any(|mc| &mc.market_id == m) {
+                        tracing::warn!(
+                            "[[venue_overrides]] #{} (venue '{}'): market '{}' is not in \
+                             [[markets]] — that scope entry can never match",
+                            i + 1,
+                            ov.venue,
+                            m
+                        );
+                    }
+                    // The "open" direction is unsupported: a market whose own
+                    // [markets.rfq] is disabled is never subscribed on the V2
+                    // stream, so an override claiming to enable it would be a
+                    // policy that silently does not exist.
+                    if ov.rfq.enabled == Some(true) {
+                        let pair_enabled = agent
+                            .markets
+                            .iter()
+                            .find(|mc| &mc.market_id == m)
+                            .and_then(|mc| mc.rfq.as_ref())
+                            .map(|r| r.enabled)
+                            .unwrap_or(false);
+                        if !pair_enabled {
+                            return Err(anyhow!(
+                                "[[venue_overrides]] #{} (venue '{}'): enabled = true on \
+                                 market '{}' whose [markets.rfq] is disabled or absent — \
+                                 overrides cannot OPEN a pair-disabled market (the V2 \
+                                 stream never subscribes it); enable the pair and close \
+                                 the other venues instead",
+                                i + 1,
+                                ov.venue,
+                                m
+                            ));
+                        }
+                    }
+                }
+            }
+            if ov.rfq.is_empty() {
+                tracing::warn!(
+                    "[[venue_overrides]] #{} (venue '{}'): empty [venue_overrides.rfq] \
+                     overlay — entry has no effect",
+                    i + 1,
+                    ov.venue
+                );
+            }
+            // Bounds must PARSE (a typo would otherwise silently become
+            // min 0.0 / max f64::MAX at runtime), and be ordered when both set.
+            let min = match &ov.rfq.min_quantity {
+                Some(s) => Some(s.parse::<f64>().map_err(|_| {
+                    anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): min_quantity '{}' is not \
+                         a number — the runtime fallback would silently disable the floor",
+                        i + 1,
+                        ov.venue,
+                        s
+                    )
+                })?),
+                None => None,
+            };
+            let max = match &ov.rfq.max_quantity {
+                Some(s) => Some(s.parse::<f64>().map_err(|_| {
+                    anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): max_quantity '{}' is not \
+                         a number — the runtime fallback would silently remove the cap",
+                        i + 1,
+                        ov.venue,
+                        s
+                    )
+                })?),
+                None => None,
+            };
+            if let (Some(min), Some(max)) = (min, max) {
+                if min > max {
+                    return Err(anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): min_quantity {} > \
+                         max_quantity {}",
+                        i + 1,
+                        ov.venue,
+                        min,
+                        max
+                    ));
+                }
+            }
+        }
+
         if let Some(v2) = agent
             .liquidity_provider
             .as_ref()
@@ -920,6 +1049,7 @@ impl BaseConfig {
             request_timeout_secs: agent.request_timeout_secs,
             canton_op_timeout_secs: agent.canton_op_timeout_secs,
             markets: agent.markets,
+            venue_overrides: agent.venue_overrides,
             node_name,
             // Production cloud-agent deployments set VENUE_BRANCH=agent (VA13).
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
@@ -1212,6 +1342,166 @@ pub struct RfqMarketConfig {
     /// RFQ V2 (AtomicDVP) per-market configuration — TOML `[markets.rfq.v2]`.
     #[serde(default)]
     pub v2: Option<RfqV2MarketConfig>,
+}
+
+/// A venue/branch-scoped override of `[markets.rfq]` parameters — TOML
+/// `[[venue_overrides]]`. RFQ V2 only: the venue arrives on the atomic
+/// stream as `AtomicRfqRequest.venue_name` (agents fall back to the VA2
+/// `quote_id_prefix` for servers predating that field) and the branch as
+/// `AtomicRfqRequest.venue_branch`; V1 RFQs carry no venue identity and
+/// always price at the pair defaults. Grid orders are the public
+/// venue-agnostic book and are never affected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VenueOverride {
+    /// Swap-venue slug this entry applies to (= `AtomicRfqRequest.venue_name`).
+    pub venue: String,
+    /// Restrict to one branch of the venue; absent = any branch. Branch-scoped
+    /// entries only ever match once the server sends `venue_branch` (older
+    /// servers omit it) — and the server forwards branches ONLY for delegated
+    /// venue traffic (platform-minted venue JWTs); self-asserted non-delegated
+    /// branches are never forwarded, so they can only match branch-less entries.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Restrict to these market_ids; absent = all markets.
+    #[serde(default)]
+    pub markets: Option<Vec<String>>,
+    /// The sparse `[venue_overrides.rfq]` overlay.
+    pub rfq: RfqOverlayConfig,
+}
+
+impl VenueOverride {
+    fn matches(&self, market_id: &str, venue: &str, branch: Option<&str>) -> bool {
+        if self.venue != venue {
+            return false;
+        }
+        if let Some(ref b) = self.branch {
+            if branch != Some(b.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref markets) = self.markets {
+            if !markets.iter().any(|m| m == market_id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// More constrained entries apply later (and therefore win) in
+    /// [`resolve_rfq_config`].
+    fn specificity(&self) -> u8 {
+        self.branch.is_some() as u8 + self.markets.is_some() as u8
+    }
+}
+
+/// Sparse all-`Option` mirror of [`RfqMarketConfig`]'s venue-effective
+/// scalars: a set field replaces the pair value, an unset one inherits it.
+/// Deliberately excluded — fields with NO effect on any venue-carrying
+/// request (offering them would be dead config that deceives the operator):
+/// `v2` (denomination ladders, structural), `min_notional_usd` (the floor is
+/// V1-only, and V1 carries no venue), `allocate_before_secs` /
+/// `settle_before_secs` (consumed only by the V1 quote message; V2 deadlines
+/// come from the atomic-quote globals).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RfqOverlayConfig {
+    /// `Some(false)` = do not quote this venue on the matched markets;
+    /// `Some(true)` re-opens after a broader matching entry's close (e.g.
+    /// venue-wide `enabled = false`, one branch re-enabled). It can NOT open
+    /// a market whose own `[markets.rfq]` is disabled — the V2 stream never
+    /// subscribes such markets, so no venue request ever reaches pricing
+    /// (assemble() rejects overrides that attempt it).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub min_quantity: Option<String>,
+    #[serde(default)]
+    pub max_quantity: Option<String>,
+    #[serde(default)]
+    pub bid_spread_percent: Option<f64>,
+    #[serde(default)]
+    pub offer_spread_percent: Option<f64>,
+    #[serde(default)]
+    pub disable_overload_spread_widening: Option<bool>,
+    #[serde(default)]
+    pub disable_depletion_spread_widening: Option<bool>,
+    #[serde(default)]
+    pub quote_valid_secs: Option<u32>,
+}
+
+impl RfqOverlayConfig {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.min_quantity.is_none()
+            && self.max_quantity.is_none()
+            && self.bid_spread_percent.is_none()
+            && self.offer_spread_percent.is_none()
+            && self.disable_overload_spread_widening.is_none()
+            && self.disable_depletion_spread_widening.is_none()
+            && self.quote_valid_secs.is_none()
+    }
+
+    fn apply(&self, cfg: &mut RfqMarketConfig) {
+        if let Some(v) = self.enabled {
+            cfg.enabled = v;
+        }
+        if let Some(ref v) = self.min_quantity {
+            cfg.min_quantity = v.clone();
+        }
+        if let Some(ref v) = self.max_quantity {
+            cfg.max_quantity = v.clone();
+        }
+        if let Some(v) = self.bid_spread_percent {
+            cfg.bid_spread_percent = v;
+        }
+        if let Some(v) = self.offer_spread_percent {
+            cfg.offer_spread_percent = v;
+        }
+        if let Some(v) = self.disable_overload_spread_widening {
+            cfg.disable_overload_spread_widening = v;
+        }
+        if let Some(v) = self.disable_depletion_spread_widening {
+            cfg.disable_depletion_spread_widening = v;
+        }
+        if let Some(v) = self.quote_valid_secs {
+            cfg.quote_valid_secs = Some(v);
+        }
+    }
+}
+
+/// Resolve the effective RFQ config for one request: the pair's
+/// `[markets.rfq]` plus every matching `[[venue_overrides]]` overlay.
+///
+/// Matching entries apply in ascending specificity (venue-wide first, then
+/// branch-/market-scoped; ties in file order, so a later entry wins), each
+/// `Some` field overwriting — a venue-wide entry can set spreads and a
+/// branch-specific one can tweak a single field on top. `venue = None` (V1
+/// requests, or a server that sent no prefix) borrows the pair config
+/// untouched; a clone happens only when an overlay actually matched.
+pub fn resolve_rfq_config<'a>(
+    pair: &'a RfqMarketConfig,
+    overrides: &[VenueOverride],
+    market_id: &str,
+    venue: Option<&str>,
+    branch: Option<&str>,
+) -> std::borrow::Cow<'a, RfqMarketConfig> {
+    let Some(venue) = venue else {
+        return std::borrow::Cow::Borrowed(pair);
+    };
+    let mut matching: Vec<&VenueOverride> = overrides
+        .iter()
+        .filter(|o| o.matches(market_id, venue, branch))
+        .collect();
+    if matching.is_empty() {
+        return std::borrow::Cow::Borrowed(pair);
+    }
+    // Stable sort: equal specificity keeps file order, so later entries
+    // apply later and win.
+    matching.sort_by_key(|o| o.specificity());
+    let mut cfg = pair.clone();
+    for o in &matching {
+        o.rfq.apply(&mut cfg);
+    }
+    std::borrow::Cow::Owned(cfg)
 }
 
 /// RFQ V2 per-market configuration (`[markets.rfq.v2]`)
@@ -1581,6 +1871,176 @@ min_notional_usd = 25.0
             agent.markets[0].rfq.as_ref().unwrap().min_notional_usd,
             Some(25.0)
         );
+    }
+
+    #[test]
+    fn test_venue_overrides_parse() {
+        // Omitted list → empty (no overrides), the deployed-toml default.
+        let agent: AgentToml = toml::from_str("").unwrap();
+        assert!(agent.venue_overrides.is_empty());
+
+        // A full and a sparse entry; unset overlay fields must parse to None
+        // (inherit the pair value), not to a default.
+        let agent: AgentToml = toml::from_str(
+            r#"
+[[venue_overrides]]
+venue = "walley"
+branch = "main"
+markets = ["HECTO-USDCx", "HECTO-CC"]
+
+[venue_overrides.rfq]
+enabled = true
+min_quantity = "100"
+max_quantity = "20000"
+bid_spread_percent = 2.0
+offer_spread_percent = 0.5
+disable_overload_spread_widening = true
+disable_depletion_spread_widening = true
+quote_valid_secs = 30
+
+[[venue_overrides]]
+venue = "lattice"
+
+[venue_overrides.rfq]
+offer_spread_percent = 1.0
+"#,
+        )
+        .unwrap();
+        assert_eq!(agent.venue_overrides.len(), 2);
+
+        let full = &agent.venue_overrides[0];
+        assert_eq!(full.venue, "walley");
+        assert_eq!(full.branch.as_deref(), Some("main"));
+        assert_eq!(
+            full.markets.as_deref(),
+            Some(&["HECTO-USDCx".to_string(), "HECTO-CC".to_string()][..])
+        );
+        assert_eq!(full.rfq.enabled, Some(true));
+        assert_eq!(full.rfq.min_quantity.as_deref(), Some("100"));
+        assert_eq!(full.rfq.bid_spread_percent, Some(2.0));
+        assert_eq!(full.rfq.disable_overload_spread_widening, Some(true));
+        assert_eq!(full.rfq.quote_valid_secs, Some(30));
+        assert!(!full.rfq.is_empty());
+
+        let sparse = &agent.venue_overrides[1];
+        assert_eq!(sparse.venue, "lattice");
+        assert_eq!(sparse.branch, None, "omitted branch = any branch");
+        assert_eq!(sparse.markets, None, "omitted markets = all markets");
+        assert_eq!(sparse.rfq.offer_spread_percent, Some(1.0));
+        assert_eq!(sparse.rfq.bid_spread_percent, None);
+        assert_eq!(sparse.rfq.enabled, None);
+        assert_eq!(sparse.rfq.disable_overload_spread_widening, None);
+    }
+
+    #[test]
+    fn test_resolve_rfq_config_matching_and_layering() {
+        let pair: RfqMarketConfig = serde_json::from_str(
+            r#"{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":0.5}"#,
+        )
+        .unwrap();
+        let overrides: Vec<VenueOverride> = toml::from_str::<AgentToml>(
+            r#"
+# venue-wide (specificity 0): sets both spreads
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+bid_spread_percent = 4.0
+offer_spread_percent = 4.0
+
+# branch-scoped (specificity 1): tweaks ONE field on top
+[[venue_overrides]]
+venue = "walley"
+branch = "main"
+[venue_overrides.rfq]
+offer_spread_percent = 1.0
+
+# market-scoped for another venue
+[[venue_overrides]]
+venue = "lattice"
+markets = ["CC-USDCx"]
+[venue_overrides.rfq]
+disable_overload_spread_widening = true
+"#,
+        )
+        .unwrap()
+        .venue_overrides;
+
+        // No venue (V1 / legacy server) → borrowed pair config untouched.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", None, None);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(r.bid_spread_percent, 2.5);
+
+        // Unknown venue → borrowed pair config.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("supa"), None);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+
+        // Venue-wide match, no branch sent: only the specificity-0 entry
+        // applies (branch-scoped needs the branch on the wire).
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), None);
+        assert!(matches!(r, std::borrow::Cow::Owned(_)));
+        assert_eq!(r.bid_spread_percent, 4.0);
+        assert_eq!(r.offer_spread_percent, 4.0);
+        assert_eq!(r.min_quantity, "50", "unset overlay fields inherit the pair");
+
+        // Branch sent: venue-wide applies first, branch-scoped overwrites the
+        // one field it sets.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), Some("main"));
+        assert_eq!(r.bid_spread_percent, 4.0, "kept from the venue-wide layer");
+        assert_eq!(r.offer_spread_percent, 1.0, "branch layer wins");
+
+        // Other branch: branch-scoped entry does not match.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), Some("beta"));
+        assert_eq!(r.offer_spread_percent, 4.0);
+
+        // Market scoping: lattice matches CC-USDCx only.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("lattice"), None);
+        assert!(r.disable_overload_spread_widening);
+        let r = resolve_rfq_config(&pair, &overrides, "CBTC-USDCx", Some("lattice"), None);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// EQUAL-specificity tie rule: stable sort keeps file order, the later
+    /// entry applies later and wins. Pins the documented behavior against a
+    /// routine sort_by_key -> sort_unstable_by_key "optimization", which
+    /// would make live venue pricing implementation-defined.
+    #[test]
+    fn test_resolve_rfq_config_equal_specificity_later_entry_wins() {
+        let pair: RfqMarketConfig = serde_json::from_str(
+            r#"{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":0.5}"#,
+        )
+        .unwrap();
+        let overrides = toml::from_str::<AgentToml>(
+            r#"
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+bid_spread_percent = 3.0
+offer_spread_percent = 3.0
+
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+bid_spread_percent = 1.0
+"#,
+        )
+        .unwrap()
+        .venue_overrides;
+
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), None);
+        assert_eq!(r.bid_spread_percent, 1.0, "later same-specificity entry must win");
+        assert_eq!(r.offer_spread_percent, 3.0, "field untouched by the later entry keeps the earlier layer");
+    }
+
+    #[test]
+    fn test_venue_overrides_validation() {
+        // Invalid venue slug (uppercase) must fail assemble-time validation.
+        // Exercise the same predicate the validation uses.
+        assert!(crate::auth::is_valid_venue_branch("walley"));
+        assert!(crate::auth::is_valid_venue_branch("main"));
+        assert!(!crate::auth::is_valid_venue_branch("Walley"));
+        assert!(!crate::auth::is_valid_venue_branch(""));
+        assert!(!crate::auth::is_valid_venue_branch("x"));
+        assert!(!crate::auth::is_valid_venue_branch("-bad"));
     }
 
     #[test]

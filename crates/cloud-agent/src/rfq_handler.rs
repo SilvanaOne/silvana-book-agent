@@ -10,10 +10,13 @@
 //! The pricing + gating pipeline is shared between RFQ v1
 //! (`handle_rfq_request`) and the RFQ V2 atomic stream (`price_rfq`).
 
-use agent_logic::config::{BaseConfig, LiquidityProviderConfig, MarketConfig};
+use agent_logic::config::{
+    resolve_rfq_config, BaseConfig, LiquidityProviderConfig, MarketConfig, VenueOverride,
+};
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::runner::QuotedTrade;
 use rust_decimal::Decimal;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,6 +32,9 @@ use orderbook_proto::settlement::{
 pub struct RfqHandler {
     lp_config: LiquidityProviderConfig,
     markets: Vec<MarketConfig>,
+    /// Venue/branch-scoped `[markets.rfq]` overlays (`[[venue_overrides]]`),
+    /// resolved per request in `price_rfq` — RFQ V2 only (V1 has no venue).
+    venue_overrides: Vec<VenueOverride>,
     /// Market mid-prices: market_id -> mid_price
     mid_prices: Arc<RwLock<HashMap<String, f64>>>,
     party_id: String,
@@ -72,6 +78,7 @@ pub(crate) struct PricedQuote {
 }
 
 /// A rejection from the shared pricing pipeline.
+#[derive(Debug)]
 pub(crate) struct RejectInfo {
     pub reason: RfqRejectionReason,
     pub reason_detail: Option<String>,
@@ -115,6 +122,7 @@ impl RfqHandler {
         Some(Self {
             lp_config,
             markets: config.markets.clone(),
+            venue_overrides: config.venue_overrides.clone(),
             mid_prices: Arc::new(RwLock::new(HashMap::new())),
             party_id: config.party_id.clone(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
@@ -172,6 +180,12 @@ impl RfqHandler {
     /// on RFQ V2 (2026-08-05 dust enablement): the user pays every V2 fee
     /// (the server charges 3x below `min_order_value_usd`), the LP pays none,
     /// so the LP quotes any size; the base `min_quantity` bound still applies.
+    ///
+    /// `venue`/`venue_branch`: the requesting swap venue (RFQ V2:
+    /// `AtomicRfqRequest.venue_name` — falling back to the VA2
+    /// `quote_id_prefix` on older servers — and `.venue_branch`) — selects
+    /// any matching `[[venue_overrides]]` overlay of the pair's RFQ config.
+    /// V1 carries no venue identity and passes `(None, None)` (pair defaults).
     pub(crate) async fn price_rfq(
         &self,
         rfq_id: &str,
@@ -180,6 +194,8 @@ impl RfqHandler {
         quantity_str: &str,
         quote_quantity_str: &str,
         enforce_min_notional: bool,
+        venue: Option<&str>,
+        venue_branch: Option<&str>,
     ) -> Result<PricedQuote, RejectInfo> {
         // Find market config
         let market_config = self.markets.iter().find(|m| m.market_id == market_id);
@@ -194,10 +210,15 @@ impl RfqHandler {
             }
         };
 
-        // Check RFQ market config
-        let rfq_config = match &market_config.rfq {
-            Some(rfq) if rfq.enabled => rfq,
-            _ => {
+        // RFQ market config + venue/branch overlay. The `enabled` check runs
+        // on the EFFECTIVE config, so an overlay can close a pair to one
+        // venue (`enabled = false`) — and a more specific entry can re-open
+        // after a broader entry's close. It can NOT open a pair-disabled
+        // market: the V2 stream never subscribes those, so no venue request
+        // reaches this point (assemble() rejects overrides attempting it).
+        let pair_rfq = match &market_config.rfq {
+            Some(rfq) => rfq,
+            None => {
                 debug!("RFQ {}: RFQ not enabled for market {}", rfq_id, market_id);
                 return Err(RejectInfo::new(
                     RfqRejectionReason::MarketNotSupported,
@@ -205,6 +226,29 @@ impl RfqHandler {
                 ));
             }
         };
+        let rfq_config = resolve_rfq_config(
+            pair_rfq,
+            &self.venue_overrides,
+            market_id,
+            venue,
+            venue_branch,
+        );
+        let venue_override_applied = matches!(rfq_config, Cow::Owned(_));
+        let rfq_config = rfq_config.as_ref();
+        if !rfq_config.enabled {
+            debug!(
+                "RFQ {}: RFQ not enabled for market {} (venue {:?}/{:?})",
+                rfq_id, market_id, venue, venue_branch
+            );
+            return Err(RejectInfo::new(
+                RfqRejectionReason::MarketNotSupported,
+                if pair_rfq.enabled {
+                    "RFQ not available for this venue"
+                } else {
+                    "RFQ not enabled for this market"
+                },
+            ));
+        }
 
         // Size mode: the taker gives EITHER a base `quantity` OR a
         // `quote_quantity` (quote-instrument amount, e.g. "pay 50 USDC"). In
@@ -513,7 +557,7 @@ impl RfqHandler {
         // actually applied — a stress-capped aggressive quote (side_spread < 0)
         // must not falsely advertise OVERLOAD/depletion widening.
         info!(
-            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{})",
+            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{}{})",
             rfq_id,
             quantity,
             market_id,
@@ -521,7 +565,16 @@ impl RfqHandler {
             mid_price,
             effective_spread,
             if side_spread >= 0.0 && spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if side_spread >= 0.0 && spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" },
-            if side_spread >= 0.0 && depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() }
+            if side_spread >= 0.0 && depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() },
+            if venue_override_applied {
+                format!(
+                    " venue-ovr({}{})",
+                    venue.unwrap_or("?"),
+                    venue_branch.map(|b| format!("/{b}")).unwrap_or_default()
+                )
+            } else {
+                String::new()
+            }
         );
 
         // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
@@ -591,8 +644,9 @@ impl RfqHandler {
         }
 
         let priced = match self
-            // v1 RFQ is base-only (no quote-denominated sizing).
-            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity, "", true)
+            // v1 RFQ is base-only (no quote-denominated sizing) and carries no
+            // venue identity — always pair-default config.
+            .price_rfq(&rfq_id, &request.market_id, request.direction, &request.quantity, "", true, None, None)
             .await
         {
             Ok(p) => p,
@@ -657,6 +711,7 @@ mod price_rfq_tests {
         RfqHandler {
             lp_config,
             markets: vec![market],
+            venue_overrides: Vec::new(),
             mid_prices: Arc::new(RwLock::new(mids)),
             party_id: "lp::test".to_string(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
@@ -706,7 +761,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn quote_denominated_inverts_and_passes_min_notional() {
         // direction 1 = buy.
-        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "", "50", true).await {
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "", "50", true, None, None).await {
             Ok(p) => p,
             Err(e) => panic!("quote-denominated 50 USDC must be quotable (>$10): {:?}", e.reason_detail),
         };
@@ -720,7 +775,7 @@ mod price_rfq_tests {
     /// $13.6 clears the $10 floor.
     #[tokio::test]
     async fn base_denominated_unchanged() {
-        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None).await {
             Ok(p) => p,
             Err(e) => panic!("1000 EDELx base ($13.6) is within [50, 10000] and >$10: {:?}", e.reason_detail),
         };
@@ -733,7 +788,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn quote_denominated_below_base_min_rejected() {
         // 0.5 USDC / 0.0136 ≈ 36.8 EDELx < min 50.
-        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "", "0.5", true).await {
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "", "0.5", true, None, None).await {
             Ok(_) => panic!("derived base below min_quantity must reject"),
             Err(e) => e,
         };
@@ -749,7 +804,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn v2_skips_min_notional_floor_but_keeps_base_bound() {
         // V1: $1.36 < $10 → refused on the notional floor.
-        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "100", "", true).await {
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "100", "", true, None, None).await {
             Ok(_) => panic!("V1 dust must still reject on min_notional_usd"),
             Err(e) => e,
         };
@@ -757,14 +812,14 @@ mod price_rfq_tests {
         assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min notional"));
 
         // V2: same request quotes.
-        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "100", "", false).await {
+        let priced = match handler().price_rfq("t", "EDELx-USDC", 1, "100", "", false, None, None).await {
             Ok(p) => p,
             Err(e) => panic!("V2 dust must be quotable: {:?}", e.reason_detail),
         };
         assert!((f(&priced.quantity_str) - 100.0).abs() < 1e-6);
 
         // V2 still enforces the base min_quantity bound (49 < 50).
-        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "49", "", false).await {
+        let err = match handler().price_rfq("t", "EDELx-USDC", 1, "49", "", false, None, None).await {
             Ok(_) => panic!("V2 below base min_quantity must reject"),
             Err(e) => e,
         };
@@ -787,7 +842,7 @@ mod price_rfq_tests {
         // V1 (enforce_min_notional=true): fee_cc = 4×(0.3+0.7)/0.10×1.1 = 44 CC
         // needed for fees, 1 CC free ⇒ rejected on liquidity, not min-notional
         // (1000 EDELx ≈ $13.6 clears the $10 floor).
-        let err = match h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
+        let err = match h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None).await {
             Ok(_) => panic!("V1 must reject on CC fee headroom"),
             Err(e) => e,
         };
@@ -795,7 +850,7 @@ mod price_rfq_tests {
         assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
 
         // V2 (false): fee headroom is ZERO — same 1 free CC quotes fine.
-        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", false).await {
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None).await {
             panic!("V2 must quote with no CC headroom: {:?}", e.reason_detail);
         }
     }
@@ -834,6 +889,7 @@ mod price_rfq_tests {
         let handler = RfqHandler {
             lp_config,
             markets: vec![market],
+            venue_overrides: Vec::new(),
             mid_prices: Arc::new(RwLock::new(mids)),
             party_id: "lp::test".to_string(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
@@ -841,7 +897,7 @@ mod price_rfq_tests {
             rfq_v2_only: false,
         };
         // direction 1 = buy (LP sells base); 1000 EDELx ≈ $13.3 clears the $10 floor.
-        let priced = match handler.price_rfq("t", "EDELx-USDC", 1, "1000", "", true).await {
+        let priced = match handler.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None).await {
             Ok(p) => p,
             Err(e) => panic!("negative offer_spread must be quotable, not rejected: {:?}", e.reason_detail),
         };
@@ -856,8 +912,14 @@ mod price_rfq_tests {
     /// multiplier) WITHOUT tripping the RFQ-reject threshold (0.4). Safe with
     /// concurrent tests: they use zero spreads (0 × 3 = 0) or a negative spread
     /// (stress-gated to raw), so a transient global overload cannot move them.
+    /// Serializes the tests that read or flip the PROCESS-GLOBAL overload
+    /// forecast (`agent_logic::forecast`), so one test's overload window can
+    /// never widen another test's positive-spread quote mid-assertion.
+    static OVERLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn disable_overload_widening_pins_raw_spread() {
+        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let lp_config: LiquidityProviderConfig =
             serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
         // Same bid spread on both markets; only the flag differs. The absent
@@ -876,6 +938,7 @@ mod price_rfq_tests {
         let handler = RfqHandler {
             lp_config,
             markets: vec![pinned, widening],
+            venue_overrides: Vec::new(),
             mid_prices: Arc::new(RwLock::new(mids)),
             party_id: "lp::test".to_string(),
             quoted_trades: Arc::new(Mutex::new(Vec::new())),
@@ -888,8 +951,8 @@ mod price_rfq_tests {
         assert!(!agent_logic::forecast::is_rfq_rejected_by_overload(), "0.45 >= 0.4 must still quote");
 
         // direction 2 = user sells → LP bids mid - bid_spread. 1000 EDELx ≈ $13 clears the floor.
-        let pinned_bid = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true).await;
-        let widened_bid = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "", true).await;
+        let pinned_bid = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true, None, None).await;
+        let widened_bid = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "", true, None, None).await;
         // Reset global overload state BEFORE asserting so a failure cannot leak it.
         agent_logic::forecast::update_forecast(0, None);
         assert!(!agent_logic::forecast::is_fees_paused_by_overload());
@@ -908,5 +971,132 @@ mod price_rfq_tests {
         // Unflagged market: 2.5% × 3 = 7.5% under overload (also proves flag default = false).
         let expected_widened = MID * (1.0 - 0.075);
         assert!((f(&widened_bid.price_str) - expected_widened).abs() < 1e-9, "widened {} vs {}", widened_bid.price_str, expected_widened);
+    }
+
+    /// Build the zero-spread handler() fixture with `[[venue_overrides]]`
+    /// entries (JSON mirrors the TOML shape 1:1).
+    fn handler_with_overrides(overrides_json: &str) -> RfqHandler {
+        let mut h = handler();
+        h.venue_overrides = serde_json::from_str(overrides_json).unwrap();
+        h
+    }
+
+    /// A venue override re-prices ONLY the matching venue: the overlaid offer
+    /// spread applies to that venue's quotes while another venue and the
+    /// venue-less (V1) path keep the pair's raw config.
+    #[tokio::test]
+    async fn venue_override_changes_spread_for_matching_venue_only() {
+        // Positive spread ⇒ overload-sensitive ⇒ hold the global-state lock.
+        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = handler_with_overrides(
+            r#"[{"venue":"walley","rfq":{"offer_spread_percent":2.0}}]"#,
+        );
+
+        // Matching venue: pair offer spread 0.0 overridden to 2.0.
+        let priced = h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, Some("walley"), None)
+            .await
+            .expect("override venue must quote");
+        let expected = MID * 1.02;
+        assert!((f(&priced.price_str) - expected).abs() < 1e-9, "walley {} vs {}", priced.price_str, expected);
+
+        // Non-matching venue and no venue: raw pair config (price == mid).
+        for venue in [Some("lattice"), None] {
+            let priced = h
+                .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, venue, None)
+                .await
+                .expect("non-override path must quote");
+            assert!((f(&priced.price_str) - MID).abs() < 1e-9, "{:?} {} vs mid {}", venue, priced.price_str, MID);
+        }
+    }
+
+    /// A venue override can pin widening for one venue while the pair keeps
+    /// widening for everyone else — the venue-scoped mirror of
+    /// `disable_overload_widening_pins_raw_spread`.
+    #[tokio::test]
+    async fn venue_override_pins_widening_for_matching_venue() {
+        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lp_config: LiquidityProviderConfig =
+            serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
+        // Pair has NO disable flags — widens 3x under overload by default.
+        let market: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDC","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":-2.4}}"#,
+        )
+        .unwrap();
+        let mut mids = HashMap::new();
+        mids.insert("EDELx-USDC".to_string(), MID);
+        let handler = RfqHandler {
+            lp_config,
+            markets: vec![market],
+            venue_overrides: serde_json::from_str(
+                r#"[{"venue":"walley","rfq":{"disable_overload_spread_widening":true,"disable_depletion_spread_widening":true}}]"#,
+            )
+            .unwrap(),
+            mid_prices: Arc::new(RwLock::new(mids)),
+            party_id: "lp::test".to_string(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
+            liquidity_manager: None,
+            rfq_v2_only: false,
+        };
+
+        agent_logic::forecast::update_forecast(0, Some("0.45".to_string()));
+        assert!(agent_logic::forecast::is_fees_paused_by_overload());
+
+        // direction 2 = user sells → LP bids mid - bid_spread.
+        let pinned = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true, Some("walley"), None).await;
+        let widened = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true, Some("lattice"), None).await;
+        // Reset global overload state BEFORE asserting so a failure cannot leak it.
+        agent_logic::forecast::update_forecast(0, None);
+
+        let pinned = pinned.expect("override venue must quote under overload");
+        let widened = widened.expect("other venue must quote under overload");
+        // Override venue: raw 2.5% regardless of overload.
+        let expected_raw = MID * (1.0 - 0.025);
+        assert!((f(&pinned.price_str) - expected_raw).abs() < 1e-9, "pinned {} vs {}", pinned.price_str, expected_raw);
+        // Everyone else: 2.5% × 3 = 7.5%.
+        let expected_widened = MID * (1.0 - 0.075);
+        assert!((f(&widened.price_str) - expected_widened).abs() < 1e-9, "widened {} vs {}", widened.price_str, expected_widened);
+    }
+
+    /// `enabled = false` in an override closes the pair to that venue only;
+    /// the venue-less path (and other venues) still quote.
+    #[tokio::test]
+    async fn venue_override_disabled_venue_rejected() {
+        let h = handler_with_overrides(r#"[{"venue":"walley","rfq":{"enabled":false}}]"#);
+
+        let err = match h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, Some("walley"), None)
+            .await
+        {
+            Ok(_) => panic!("venue-disabled override must reject"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::MarketNotSupported));
+        assert!(err.reason_detail.as_deref().unwrap_or("").contains("venue"));
+
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None).await {
+            panic!("venue-less path must still quote: {:?}", e.reason_detail);
+        }
+    }
+
+    /// A venue-scoped `min_quantity` bounds ONLY that venue's requests.
+    #[tokio::test]
+    async fn venue_override_min_quantity_bound() {
+        let h = handler_with_overrides(r#"[{"venue":"walley","rfq":{"min_quantity":"2000"}}]"#);
+
+        let err = match h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, Some("walley"), None)
+            .await
+        {
+            Ok(_) => panic!("1000 < venue min 2000 must reject"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
+        assert_eq!(err.min_quantity.as_deref(), Some("2000"), "reject must carry the VENUE bound");
+
+        // Pair default min (50) still governs the venue-less path.
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None).await {
+            panic!("1000 > pair min 50 must quote without the override: {:?}", e.reason_detail);
+        }
     }
 }
