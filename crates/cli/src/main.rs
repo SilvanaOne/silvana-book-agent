@@ -27,6 +27,11 @@ struct Cli {
     #[arg(short, long, default_value = "agent.toml")]
     config: PathBuf,
 
+    /// Path to env file to load (default: search for `.env` in CWD and parents).
+    /// An explicit --env-file overrides variables already set in the environment.
+    #[arg(long, global = true, value_name = "PATH")]
+    env_file: Option<PathBuf>,
+
     /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -189,9 +194,6 @@ enum Commands {
         /// Base58-encoded Ed25519 private key — optional, required when --party is provided
         #[arg(long)]
         private_key: Option<String>,
-        /// Path to .env file — optional (default: .env)
-        #[arg(long, default_value = ".env")]
-        env_file: PathBuf,
         /// Seconds between status polls — optional (default: 10)
         #[arg(long, default_value = "10")]
         poll_interval: u64,
@@ -204,8 +206,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
+
+    match &cli.env_file {
+        Some(path) if path.exists() => {
+            dotenvy::from_path_override(path)
+                .with_context(|| format!("Failed to load env file {}", path.display()))?;
+        }
+        // onboard creates the env file itself — a missing target is expected
+        Some(_) if matches!(cli.command, Commands::Onboard { .. }) => {}
+        Some(path) => anyhow::bail!("env file not found: {}", path.display()),
+        None => {
+            let _ = dotenvy::dotenv();
+        }
+    }
 
     // Initialize logging (LOG_DESTINATION=console|file)
     agent_logic::logging::init_logging(
@@ -219,7 +233,8 @@ async fn main() -> Result<()> {
         return run_generate_private_key();
     }
 
-    if let Commands::Onboard { rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval } = cli.command {
+    if let Commands::Onboard { rpc, party, private_key, invite_code, agent_name, email, poll_interval } = cli.command {
+        let env_file = cli.env_file.unwrap_or_else(|| PathBuf::from(".env"));
         return run_onboard(rpc, party, private_key, invite_code, agent_name, email, env_file, poll_interval).await;
     }
 

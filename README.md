@@ -232,12 +232,21 @@ Flags:
 | `--invite-code <CODE>`   | Waiting list invite code (required)              |
 | `--party <ID>`           | Skip waiting list (requires `--private-key`)     |
 | `--private-key <B58>`    | Base58-encoded Ed25519 private key               |
-| `--env-file <PATH>`      | Path to .env file (default: `.env`)              |
+| `--env-file <PATH>`      | Path to .env file (default: `.env`; global flag, works on every command) |
 | `--poll-interval <SECS>` | Polling interval during onboarding (default: 10) |
 
 ### Configuration
 
 `.env` and `agent.toml` are both created by `cloud-agent onboard` — you typically don't write them from scratch. The tables below describe each field so you can tune an existing config.
+
+Every command accepts a global `--env-file <PATH>` flag to load a specific env file instead of the default `.env` lookup — useful for running several agents (one env file per identity) that share a single `agent.toml`:
+
+```bash
+cloud-agent --env-file agent1.env -c agent.toml info balance
+cloud-agent --env-file agent2.env -c agent.toml agent
+```
+
+An explicit `--env-file` overrides variables already set in the shell. Without the flag, `.env` is searched for in the current directory and its parents, and already-set shell variables win.
 
 #### `.env` — Environment Variables
 
