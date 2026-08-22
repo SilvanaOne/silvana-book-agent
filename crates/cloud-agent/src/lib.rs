@@ -657,12 +657,43 @@ pub async fn run_cloud_agent(
     // Captured from the RfqHandler (LP mode only) so the LIQUIDITY heartbeat can
     // bucket the holdings histogram by USD; None when not an LP.
     let mut lp_mid_prices: Option<
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, f64>>>,
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, agent_logic::pool_impact::MarketMid>>>,
     > = None;
+    // Trailing net tracker, LP mode only. Created before any pricing so it
+    // accumulates even while the config is still in shadow.
+    let mut net_positions: Option<Arc<agent_logic::net_position::NetPositionTracker>> = None;
     let quoted_rfq_trades = if config.liquidity_provider.is_some() {
+        // Decay window = the max across configured pool_impact sections (the
+        // tracker is per-token, so per-market windows cannot differ anyway).
+        let window_hours = config
+            .markets
+            .iter()
+            .filter_map(|m| m.rfq.as_ref())
+            .filter_map(|r| r.pool_impact.as_ref())
+            .map(|p| p.window_hours)
+            .fold(f64::NAN, f64::max);
+        let window_hours = if window_hours.is_finite() { window_hours } else { 24.0 };
+        // Derived from the quote lifetime: a shorter backstop would reverse
+        // counts for quotes that are still open.
+        let stale_pending_after = config
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.as_ref())
+            .map(|v2| v2.stale_pending_after())
+            .unwrap_or_else(|| {
+                agent_logic::config::RfqV2Config::default().stale_pending_after()
+            });
+        let tracker = agent_logic::net_position::NetPositionTracker::load_or_new(
+            PathBuf::from("net-positions.json"),
+            window_hours,
+            stale_pending_after,
+        );
+        net_positions = Some(tracker.clone());
+
         let mut rfq_handler = rfq_handler::RfqHandler::new(&config)
             .ok_or_else(|| anyhow::anyhow!("Failed to create RFQ handler"))?;
         rfq_handler.set_liquidity_manager(liquidity_manager.clone());
+        rfq_handler.set_net_positions(tracker);
         let quoted_trades = rfq_handler.quoted_trades();
         let rfq_handler = Arc::new(rfq_handler);
         lp_mid_prices = Some(rfq_handler.mid_prices());
@@ -719,6 +750,7 @@ pub async fn run_cloud_agent(
                 rfq_handler.clone(),
                 holdings_cache.clone(),
                 liquidity_manager.clone(),
+                net_positions.clone(),
                 no_restore,
                 version_info,
                 lp_shutdown.clone(),
@@ -847,7 +879,7 @@ pub async fn run_cloud_agent(
         client: TokioMutex::new(ledger_client),
     };
 
-    run_agent(
+    let result = run_agent(
         config,
         backend,
         balance_provider,
@@ -865,9 +897,17 @@ pub async fn run_cloud_agent(
             fill_state: None,
             no_reject,
             atomic_v2_snapshot,
+            net_positions: net_positions.clone(),
         },
     )
-    .await
+    .await;
+
+    // Graceful-shutdown save of the net-position map (checkpoints cover
+    // crashes up to 60 s back; this makes a clean stop lossless).
+    if let Some(tracker) = &net_positions {
+        tracker.save();
+    }
+    result
 }
 
 /// Wire the RFQ V2 stack: ticket pool + venue registry + quote state, restore
@@ -888,6 +928,7 @@ pub async fn setup_rfq_v2(
     rfq_handler: Arc<rfq_handler::RfqHandler>,
     holdings_cache: Arc<holdings_cache::HoldingsCache>,
     liquidity_manager: Arc<agent_logic::liquidity::LiquidityManager>,
+    net_positions: Option<Arc<agent_logic::net_position::NetPositionTracker>>,
     no_restore: bool,
     version_info: Option<&str>,
     lp_shutdown: Shutdown,
@@ -1108,24 +1149,26 @@ pub async fn setup_rfq_v2(
         expected_venues,
     ));
 
-    let state = Arc::new(
-        rfq_v2::RfqV2State::new(
-            config.party_id.clone(),
-            lp_config.name.clone(),
-            config.synchronizer_id.clone(),
-            quote_key.priv_scalar_hex.clone(),
-            v2cfg.clone(),
-            market_v2,
-            market_instruments,
-            holdings_cache.clone(),
-            ticket_pool.clone(),
-            venue_registry.clone(),
-            liquidity_manager,
-            config.clone(),
-            &split_targets,
-        )
-        .with_mid_prices(rfq_handler.mid_prices()),
-    );
+    let mut state = rfq_v2::RfqV2State::new(
+        config.party_id.clone(),
+        lp_config.name.clone(),
+        config.synchronizer_id.clone(),
+        quote_key.priv_scalar_hex.clone(),
+        v2cfg.clone(),
+        market_v2,
+        market_instruments,
+        holdings_cache.clone(),
+        ticket_pool.clone(),
+        venue_registry.clone(),
+        liquidity_manager,
+        config.clone(),
+        &split_targets,
+    )
+    .with_mid_prices(rfq_handler.mid_prices());
+    if let Some(tracker) = net_positions {
+        state = state.with_net_positions(tracker);
+    }
+    let state = Arc::new(state);
 
     // RESTORE saved V2 state BEFORE any worker starts: an already-delivered
     // envelope is self-contained (the ledger verifies it), so the reservations
@@ -1388,11 +1431,14 @@ pub async fn run_fill(
 /// `run_lp_settlement_stream` does NOT spawn it.
 fn spawn_mid_price_poller(
     price_config: BaseConfig,
-    mid_prices: Arc<tokio::sync::RwLock<std::collections::HashMap<String, f64>>>,
+    mid_prices: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, agent_logic::pool_impact::MarketMid>>,
+    >,
     price_markets: Vec<String>,
     price_shutdown: Shutdown,
 ) {
     use agent_logic::client::OrderbookClient;
+    use agent_logic::pool_impact::{MarketMid, PoolDepth};
 
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_secs(10);
@@ -1437,7 +1483,16 @@ fn spawn_mid_price_poller(
                                 _ => resp.last,
                             };
                             if mid > 0.0 && mid.is_finite() {
-                                if mid_prices.write().await.insert(market_id.clone(), mid).is_none()
+                                // Any size reference rides the same response
+                                // and shares one entry with the mid.
+                                let entry = MarketMid {
+                                    mid,
+                                    pool_depth: resp
+                                        .pool_depth
+                                        .as_ref()
+                                        .and_then(PoolDepth::from_proto),
+                                };
+                                if mid_prices.write().await.insert(market_id.clone(), entry).is_none()
                                 {
                                     tracing::info!(
                                         "Mid-price poller: {} price available ({}); RFQ quoting enabled",
@@ -1458,10 +1513,8 @@ fn spawn_mid_price_poller(
                             }
                         }
                         Err(e) => {
-                            // NO PRICE = NO QUOTES: a market whose price the
-                            // server no longer serves (feed outage, oracle
-                            // out-of-bounds) must not keep quoting off the
-                            // last-known mid. Evict; warn on the transition.
+                            // NO PRICE = NO QUOTES. Evict rather than quote
+                            // off the last-known mid; warn on the transition.
                             if mid_prices.write().await.remove(market_id).is_some() {
                                 tracing::warn!(
                                     "Mid-price poller: {} has NO price ({}); evicting stale mid — \
@@ -1958,6 +2011,10 @@ pub async fn run_lp_atomic_stream(
                                 .or(request.quote_id_prefix.as_deref().filter(|s| !s.is_empty()));
                             let rfq_venue_branch =
                                 request.venue_branch.as_deref().filter(|s| !s.is_empty());
+                            // Requesting party id; keys the per-counterparty
+                            // accumulator. Absent ⇒ no per-party term.
+                            let rfq_user_party =
+                                request.user_party.as_deref().filter(|s| !s.is_empty());
                             info!(
                                 "Received atomic RFQ: rfq_id={}, market={}, direction={}, qty={}, venue={}{}",
                                 request.rfq_id, request.market_id, request.direction, request.quantity,
@@ -2002,6 +2059,7 @@ pub async fn run_lp_atomic_stream(
                                         false,
                                         rfq_venue,
                                         rfq_venue_branch,
+                                        rfq_user_party,
                                     )
                                     .await
                                 {
@@ -2034,6 +2092,7 @@ pub async fn run_lp_atomic_stream(
                                                 side,
                                                 &priced,
                                                 request.settlement_fee.clone(),
+                                                rfq_user_party,
                                             )
                                             .await
                                         {

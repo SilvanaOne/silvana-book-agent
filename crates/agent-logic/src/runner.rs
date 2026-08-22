@@ -109,6 +109,9 @@ pub struct AgentOptions {
     pub atomic_v2_snapshot: Option<
         Arc<dyn Fn() -> (Vec<crate::state::SavedTicket>, Vec<crate::state::SavedPendingV2>) + Send + Sync>,
     >,
+    /// LP: trailing net tracker, wired into the OrderManager for grid shaping
+    /// and checkpointed from the heartbeat. Load/save is the caller's job.
+    pub net_positions: Option<Arc<crate::net_position::NetPositionTracker>>,
 }
 
 /// Run the agent event loop
@@ -343,6 +346,12 @@ where
         tracker.clone(),
     );
 
+    // Wire the net tracker so offer rungs can shrink as the desk net-sells.
+    // No-op without a config section or a server-supplied size reference.
+    if let Some(ref np) = options.net_positions {
+        order_manager.set_net_positions(np.clone());
+    }
+
     // Subscribe to settlements if not in orders-only mode
     let mut settlement_stream = if !options.orders_only {
         info!("Subscribing to settlement updates...");
@@ -530,6 +539,12 @@ where
 
                 _ = heartbeat_timer.tick() => {
                     heartbeat_count += 1;
+
+                    // Net-position checkpoint (dirty-gated, ≤1 write/min) —
+                    // covers grid-only agents where the V2 sweep never runs.
+                    if let Some(ref np) = options.net_positions {
+                        np.checkpoint_if_dirty();
+                    }
 
                     let active_settlements = settlement_executor.active_settlements();
                     let n = active_settlements.len();

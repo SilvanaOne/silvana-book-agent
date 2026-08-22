@@ -128,11 +128,8 @@ impl OrderbookClient {
         // Initialize Rustls crypto provider
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        // Per-RPC deadline + HTTP/2 keepalive: the whole no-price safety
-        // (grid teardown, RFQ mid eviction) keys off calls RETURNING — a
-        // server that accepts connections but never responds (the
-        // 2026-07-19 silent-freeze failure mode) must convert into an error,
-        // never an indefinite hang that leaves stale quotes standing.
+        // Per-RPC deadline + keepalive: safety keys off calls RETURNING, so a
+        // server that never responds must error rather than hang.
         let builder = |endpoint: tonic::transport::Endpoint| {
             endpoint
                 .timeout(std::time::Duration::from_secs(30))

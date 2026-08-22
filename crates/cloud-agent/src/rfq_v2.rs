@@ -26,6 +26,8 @@ use tracing::{debug, info, warn};
 
 use agent_logic::config::{RfqV2Config, RfqV2MarketConfig};
 use agent_logic::liquidity::LiquidityManager;
+use agent_logic::net_position::NetPositionTracker;
+use agent_logic::pool_impact::{self, ImpactSide, MarketMid};
 use agent_logic::state::SavedPendingV2;
 use atomic_quote::envelope::{
     canonical_from_dvp, InstrumentIdJson, LpFeeJson, QuoteJson, ENVELOPE_VERSION,
@@ -37,7 +39,7 @@ use orderbook_proto::rfqv2::{
 };
 
 use crate::holdings_cache::{HoldingsCache, InstrumentKey};
-use crate::rfq_handler::PricedQuote;
+use crate::rfq_handler::{PoolPricingSnapshot, PricedQuote};
 use crate::ticket_pool::TicketPool;
 use crate::venue_registry::VenueRegistry;
 
@@ -92,6 +94,12 @@ enum PendingV2 {
         /// The AUTHORITATIVE settlement fee received with the RFQ fan-out —
         /// signed into Quote.lpFees at confirm (design §14 D20). None = zero-fee pair.
         settlement_fee: Option<AtomicFeeSpec>,
+        /// Requesting user's party id from the fan-out (None on older
+        /// servers) — keys the net-position accumulator at confirm.
+        user_party: Option<String>,
+        /// Pricing inputs, present iff the adjustment applied — this is what
+        /// arms the confirm-time staleness re-check.
+        pool_inputs: Option<PoolPricingSnapshot>,
     },
     Confirmed {
         holding_cids: Vec<String>,
@@ -142,10 +150,11 @@ pub struct RfqV2State {
     base_config: agent_logic::config::BaseConfig,
     split_rungs: HashMap<InstrumentKey, (crate::split_worker::SplitInstrument, Vec<(Decimal, u32)>)>,
     splits_in_flight: Arc<Mutex<std::collections::HashSet<InstrumentKey>>>,
-    /// Live mid-price map shared with the RFQ poller (None in tests). An
-    /// indicative quote priced BEFORE a feed outage must not be signed into a
-    /// binding envelope after it: confirm re-checks that a mid still exists.
-    mid_prices: Option<Arc<tokio::sync::RwLock<HashMap<String, f64>>>>,
+    /// Live mid-price map shared with the RFQ poller (None in tests). Confirm
+    /// re-checks it so a stale indicative is never signed into an envelope.
+    mid_prices: Option<Arc<tokio::sync::RwLock<HashMap<String, MarketMid>>>>,
+    /// Trailing net-position accumulator. None in tests / non-LP.
+    net_positions: Option<Arc<NetPositionTracker>>,
 }
 
 impl RfqV2State {
@@ -191,6 +200,7 @@ impl RfqV2State {
             split_rungs,
             splits_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             mid_prices: None,
+            net_positions: None,
         }
     }
 
@@ -198,9 +208,16 @@ impl RfqV2State {
     /// when the market has gone priceless since the indicative quote.
     pub fn with_mid_prices(
         mut self,
-        mid_prices: Arc<tokio::sync::RwLock<HashMap<String, f64>>>,
+        mid_prices: Arc<tokio::sync::RwLock<HashMap<String, MarketMid>>>,
     ) -> Self {
         self.mid_prices = Some(mid_prices);
+        self
+    }
+
+    /// Attach the net-position tracker: confirms soft-count into it, observed
+    /// settles finalize, the expiry sweep releases.
+    pub fn with_net_positions(mut self, tracker: Arc<NetPositionTracker>) -> Self {
+        self.net_positions = Some(tracker);
         self
     }
 
@@ -291,10 +308,9 @@ impl RfqV2State {
     // Phase 1 — indicative quote + availability check
     // ------------------------------------------------------------------
 
-    /// Check the LP-pays amount is available (advisory — no commitment) and
-    /// record the Indicative entry; the LiquidityManager commitment happens at
-    /// confirm (Step 1.5). `side` is the USER side (Buy = user buys base ⇒ LP
-    /// pays base).
+    /// Advisory availability check plus the Indicative entry; commitment
+    /// happens at confirm. Nothing is counted into the accumulator here.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register_indicative(
         &self,
         quote_id: &str,
@@ -302,6 +318,7 @@ impl RfqV2State {
         side: QuoteSide,
         priced: &PricedQuote,
         settlement_fee: Option<AtomicFeeSpec>,
+        user_party: Option<&str>,
     ) -> Result<(), String> {
         let mi = self
             .market_instruments
@@ -313,15 +330,8 @@ impl RfqV2State {
         };
         let (lp_pays_token, lp_pays_amount) = priced.lp_pays.clone();
 
-        // Advisory availability check ONLY — no commitment. Indicative quotes
-        // are non-binding; reserving the full LP-pays leg per quote saturated
-        // the whole balance under concurrent RFQ load (mainnet 2026-07-22:
-        // 999.9 bal / 999.3 committed) while most quotes never confirmed. The
-        // atomic check-and-reserve happens at confirm (`handle_confirm` Step
-        // 1.5) — over-quoting across concurrent indicatives is by design
-        // (last-look), with the confirm-time try_commit as the backstop.
-        // (No CC-fee term: the LP pays no on-chain fee on a V2 settle — the
-        // user submits the transaction.)
+        // Advisory only: reserving per indicative saturates the balance under
+        // load. Over-quoting is by design, with try_commit at confirm.
         let avail = self.liquidity_manager.available(&lp_pays_token).await;
         if avail < lp_pays_amount {
             return Err(format!(
@@ -342,6 +352,8 @@ impl RfqV2State {
                 notional_usd: priced.notional_usd,
                 valid_until,
                 settlement_fee,
+                user_party: user_party.map(|p| p.to_string()),
+                pool_inputs: priced.pool_pricing.clone(),
             },
         );
 
@@ -443,16 +455,21 @@ impl RfqV2State {
             Restored,
             Dead,
             ExpiredIndicative,
-            Live {
-                market_id: String,
-                side: QuoteSide,
-                base_amount: Decimal,
-                quote_amount: Decimal,
-                lp_pays: (InstrumentKey, Decimal),
-                lp_pays_token: String,
-                notional_usd: Option<f64>,
-                settlement_fee: Option<AtomicFeeSpec>,
-            },
+            Live(Box<LiveQuote>),
+        }
+        /// The Indicative entry's fields a live confirm needs (boxed to keep
+        /// the Lookup enum small).
+        struct LiveQuote {
+            market_id: String,
+            side: QuoteSide,
+            base_amount: Decimal,
+            quote_amount: Decimal,
+            lp_pays: (InstrumentKey, Decimal),
+            lp_pays_token: String,
+            notional_usd: Option<f64>,
+            settlement_fee: Option<AtomicFeeSpec>,
+            user_party: Option<String>,
+            pool_inputs: Option<PoolPricingSnapshot>,
         }
         let lookup = {
             let pending = self.pending.lock().unwrap();
@@ -473,11 +490,13 @@ impl RfqV2State {
                     notional_usd,
                     valid_until,
                     settlement_fee,
+                    user_party,
+                    pool_inputs,
                 }) => {
                     if now >= *valid_until {
                         Lookup::ExpiredIndicative
                     } else {
-                        Lookup::Live {
+                        Lookup::Live(Box::new(LiveQuote {
                             market_id: market_id.clone(),
                             side: *side,
                             base_amount: *base_amount,
@@ -486,79 +505,65 @@ impl RfqV2State {
                             lp_pays_token: lp_pays_token.clone(),
                             notional_usd: *notional_usd,
                             settlement_fee: settlement_fee.clone(),
-                        }
+                            user_party: user_party.clone(),
+                            pool_inputs: pool_inputs.clone(),
+                        }))
                     }
                 }
             }
         };
-        #[allow(clippy::type_complexity)]
-        let (market_id, side, base_amount, quote_amount, lp_pays, lp_pays_token, notional_usd, settlement_fee): (
-            String,
-            QuoteSide,
-            Decimal,
-            Decimal,
-            (InstrumentKey, Decimal),
-            String,
-            Option<f64>,
-            Option<AtomicFeeSpec>,
-        ) = match lookup {
-                Lookup::NotFound => {
-                    return Err(self.reject(
-                        &req,
-                        RfqConfirmRejectReason::QuoteNotFound,
-                        "unknown quote_id",
-                    ));
-                }
-                Lookup::Resend(env) => {
-                    debug!("Confirm {}: idempotent envelope re-send", quote_id);
-                    return Ok(*env);
-                }
-                Lookup::Restored => {
-                    // Restored after restart: the reservation backs a possibly
-                    // live envelope — do NOT release anything here.
-                    return Err(self.reject(
-                        &req,
-                        RfqConfirmRejectReason::QuoteNotFound,
-                        "LP restarted — envelope state lost",
-                    ));
-                }
-                Lookup::Dead => {
-                    return Err(self.reject(
-                        &req,
-                        RfqConfirmRejectReason::QuoteExpired,
-                        "quote no longer live",
-                    ));
-                }
-                Lookup::ExpiredIndicative => {
-                    // eager entry drop (no LM commitment exists at indicative;
-                    // release_on_reject's LM part is an idempotent no-op)
-                    self.release_on_reject(&quote_id, &[], false).await;
-                    return Err(self.reject(
-                        &req,
-                        RfqConfirmRejectReason::QuoteExpired,
-                        "indicative quote expired",
-                    ));
-                }
-                Lookup::Live {
-                    market_id,
-                    side,
-                    base_amount,
-                    quote_amount,
-                    lp_pays,
-                    lp_pays_token,
-                    notional_usd,
-                    settlement_fee,
-                } => (
-                    market_id,
-                    side,
-                    base_amount,
-                    quote_amount,
-                    lp_pays,
-                    lp_pays_token,
-                    notional_usd,
-                    settlement_fee,
-                ),
-            };
+        let live: LiveQuote = match lookup {
+            Lookup::NotFound => {
+                return Err(self.reject(
+                    &req,
+                    RfqConfirmRejectReason::QuoteNotFound,
+                    "unknown quote_id",
+                ));
+            }
+            Lookup::Resend(env) => {
+                debug!("Confirm {}: idempotent envelope re-send", quote_id);
+                return Ok(*env);
+            }
+            Lookup::Restored => {
+                // Restored after restart: the reservation backs a possibly
+                // live envelope — do NOT release anything here.
+                return Err(self.reject(
+                    &req,
+                    RfqConfirmRejectReason::QuoteNotFound,
+                    "LP restarted — envelope state lost",
+                ));
+            }
+            Lookup::Dead => {
+                return Err(self.reject(
+                    &req,
+                    RfqConfirmRejectReason::QuoteExpired,
+                    "quote no longer live",
+                ));
+            }
+            Lookup::ExpiredIndicative => {
+                // eager entry drop (no LM commitment exists at indicative;
+                // release_on_reject's LM part is an idempotent no-op)
+                self.release_on_reject(&quote_id, &[], false).await;
+                return Err(self.reject(
+                    &req,
+                    RfqConfirmRejectReason::QuoteExpired,
+                    "indicative quote expired",
+                ));
+            }
+            Lookup::Live(live) => *live,
+        };
+        let LiveQuote {
+            market_id,
+            side,
+            base_amount,
+            quote_amount,
+            lp_pays,
+            lp_pays_token,
+            notional_usd,
+            settlement_fee,
+            user_party,
+            pool_inputs,
+        } = live;
 
         // Defense-in-depth (design §14 D18): the confirm echoes the cached fee —
         // it must equal what this LP received with the RFQ fan-out.
@@ -570,17 +575,13 @@ impl RfqV2State {
             ));
         }
 
-        // No-price safety: the indicative quote was priced off a mid that may
-        // have vanished since (oracle out-of-bounds, feed outage — the poller
-        // evicts the entry within ~15s). Signing would bind the LP to a price
-        // nobody can currently stand behind, so reject and drop the entry
-        // (nothing is acquired yet — same eager drop as ExpiredIndicative).
+        // The indicative may have been priced off a mid that has since
+        // vanished, so reject rather than sign it. Nothing is acquired yet.
         if let Some(mids) = &self.mid_prices {
-            let mid_ok = mids
-                .read()
-                .await
-                .get(&market_id)
-                .is_some_and(|m| m.is_finite() && *m > 0.0);
+            let current = mids.read().await.get(&market_id).cloned();
+            let mid_ok = current
+                .as_ref()
+                .is_some_and(|m| m.mid.is_finite() && m.mid > 0.0);
             if !mid_ok {
                 warn!(
                     "Confirm {}: refusing to sign — no reliable mid for {}",
@@ -592,6 +593,85 @@ impl RfqV2State {
                     RfqConfirmRejectReason::QuoteExpired,
                     format!("no reliable price for {market_id} — quote withdrawn"),
                 ));
+            }
+
+            // Staleness re-check, armed only when the adjustment applied — a
+            // zero-adjustment quote must not inherit a rejection surface.
+            if let Some(inputs) = pool_inputs.as_ref().filter(|i| i.impact_pct > 0.0) {
+                let depth_now = current.as_ref().and_then(|m| m.pool_depth.as_ref());
+                let cfg = self
+                    .base_config
+                    .markets
+                    .iter()
+                    .find(|mk| mk.market_id == market_id)
+                    .and_then(|mk| mk.rfq.as_ref())
+                    .and_then(|r| r.pool_impact.as_ref());
+                if let (Some(depth), Some(cfg), Some(mid_now)) =
+                    (depth_now, cfg, current.as_ref().map(|m| m.mid))
+                {
+                    let q = base_amount.to_f64().unwrap_or(0.0);
+                    let net_now = match (&self.net_positions, &user_party) {
+                        (Some(t), Some(p)) => {
+                            t.net(p, market_id.split('-').next().unwrap_or(""))
+                        }
+                        _ => 0.0,
+                    };
+                    let (impact_side, sign) = match side {
+                        QuoteSide::Buy => (ImpactSide::UserBuys, 1.0),
+                        QuoteSide::Sell => (ImpactSide::UserSells, -1.0),
+                    };
+                    let impact_now =
+                        pool_impact::pool_impact_percent(impact_side, q, net_now, depth, cfg);
+                    let fair_now =
+                        mid_now * (1.0 + sign * (inputs.eff_spread_base + impact_now) / 100.0);
+                    let held = if base_amount > Decimal::ZERO {
+                        (quote_amount / base_amount).to_f64().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let tol = cfg.confirm_tolerance_percent.max(0.0) / 100.0;
+                    // A non-positive fair price means the term saturated past
+                    // 100%: reject rather than pass silently.
+                    let saturated = !(fair_now.is_finite() && fair_now > 0.0);
+                    let taker_favourable = held > 0.0
+                        && (saturated
+                            || match side {
+                                QuoteSide::Buy => held < fair_now * (1.0 - tol),
+                                QuoteSide::Sell => held > fair_now * (1.0 + tol),
+                            });
+                    if saturated {
+                        warn!(
+                            "Confirm {}: impact saturated (fair price {:.10} <= 0 at net {:.0}) \
+                             — rejecting rather than failing open",
+                            quote_id, fair_now, net_now
+                        );
+                    }
+                    if taker_favourable {
+                        warn!(
+                            "Confirm {}: held price {:.10} is taker-favourable vs fair {:.10} \
+                             (mid_now={}, R now={} was={}, net now={:.0} was={:.0}, \
+                             impact now={:.3}% was={:.3}%) — rejecting stale quote",
+                            quote_id,
+                            held,
+                            fair_now,
+                            mid_now,
+                            depth.base_reserve,
+                            inputs.base_reserve,
+                            net_now,
+                            inputs.net_used,
+                            impact_now,
+                            inputs.impact_pct,
+                        );
+                        self.release_on_reject(&quote_id, &[], false).await;
+                        return Err(self.reject(
+                            &req,
+                            RfqConfirmRejectReason::QuoteExpired,
+                            format!(
+                                "market moved since quote for {market_id} — quote withdrawn"
+                            ),
+                        ));
+                    }
+                }
             }
         }
 
@@ -908,6 +988,18 @@ impl RfqV2State {
             },
         );
 
+        // A binding envelope now exists: count the signed base delta. Last, so
+        // no reject path ever counts.
+        if let Some(tracker) = &self.net_positions {
+            let base_token = market_id.split('-').next().unwrap_or("");
+            let delta = base_amount.to_f64().unwrap_or(0.0)
+                * match side {
+                    QuoteSide::Buy => 1.0,
+                    QuoteSide::Sell => -1.0,
+                };
+            tracker.record_confirm(&quote_id, user_party.as_deref(), base_token, delta);
+        }
+
         info!(
             "Confirm {}: envelope issued (market={}, side={:?}, ticket={}, holdings={})",
             quote_id,
@@ -980,6 +1072,11 @@ impl RfqV2State {
             // Primary release of the Step-1.5 confirm-time commitment: the
             // settle landed, the funds have physically left.
             self.liquidity_manager.release(&Self::lm_key(quote_id)).await;
+            // Net-position accounting: the confirm-time soft count becomes
+            // AUTHORITATIVE (the settle is on-ledger) — finalize it.
+            if let Some(tracker) = &self.net_positions {
+                tracker.settle(quote_id);
+            }
         }
     }
 
@@ -1055,6 +1152,11 @@ impl RfqV2State {
             info!("V2 sweep: expiring quote {}", r.quote_id);
             if r.lm {
                 self.liquidity_manager.release(&Self::lm_key(&r.quote_id)).await;
+                // A Confirmed quote expired unfilled: reverse its confirm-time
+                // net-position soft count (no-op for quote_ids never counted).
+                if let Some(tracker) = &self.net_positions {
+                    tracker.release(&r.quote_id);
+                }
             }
             if !r.holding_cids.is_empty() {
                 self.cache.release_reservations(&r.holding_cids).await;
@@ -1068,6 +1170,13 @@ impl RfqV2State {
 
         if let Some(pool) = &self.ticket_pool {
             pool.expire_assignments(now);
+        }
+
+        // Net-tracker housekeeping on the same sweep: reverse unreachable
+        // pendings and checkpoint the state file.
+        if let Some(tracker) = &self.net_positions {
+            tracker.expire_stale_pending();
+            tracker.checkpoint_if_dirty();
         }
     }
 
@@ -1223,6 +1332,7 @@ mod tests {
             valid_for_secs,
             allocate_before_secs: 0,
             settle_before_secs: 0,
+            pool_pricing: None,
         }
     }
 
@@ -1247,7 +1357,7 @@ mod tests {
         let state = state_with(lm.clone());
 
         state
-            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None)
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None, None)
             .await
             .unwrap();
 
@@ -1258,7 +1368,7 @@ mod tests {
         // Over-quoting across concurrent indicatives is allowed by design:
         // a second 800 quote passes the check even though 500 + 800 > 1000.
         state
-            .register_indicative("q2", MARKET, QuoteSide::Sell, &priced_sell(800, 90), None)
+            .register_indicative("q2", MARKET, QuoteSide::Sell, &priced_sell(800, 90), None, None)
             .await
             .unwrap();
         assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
@@ -1270,7 +1380,7 @@ mod tests {
         let state = state_with(lm.clone());
 
         let err = state
-            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(1500, 90), None)
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(1500, 90), None, None)
             .await
             .unwrap_err();
         assert!(err.contains("insufficient"), "unexpected error: {err}");
@@ -1283,7 +1393,7 @@ mod tests {
         let state = state_with(lm.clone());
 
         state
-            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None)
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None, None)
             .await
             .unwrap();
 
@@ -1304,13 +1414,149 @@ mod tests {
         // restore the commitment (commit-then-release ordering).
         lm.release("competitor").await;
         state
-            .register_indicative("q3", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None)
+            .register_indicative("q3", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None, None)
             .await
             .unwrap();
         let reject = state.handle_confirm(confirm_req("q3")).await.unwrap_err();
         assert_eq!(reject.reason, RfqConfirmRejectReason::VenueUnavailable as i32);
         assert_eq!(state.pending_kind("q3"), None);
         assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+    }
+
+    /// A held price gone taker-favourable is rejected before any commitment;
+    /// an unchanged market passes; a quote with no adjustment is never checked.
+    #[tokio::test]
+    async fn confirm_recheck_rejects_taker_favourable_stale_quote() {
+        use agent_logic::pool_impact::PoolDepth;
+
+        let tracker_path = std::env::temp_dir()
+            .join(format!("silvana-rfqv2-recheck-{}.json", uuid::Uuid::now_v7()));
+        let tracker =
+            agent_logic::net_position::NetPositionTracker::load_or_new(
+                tracker_path,
+                24.0,
+                agent_logic::config::RfqV2Config::default().stale_pending_after(),
+            );
+
+        let mids: HashMap<String, MarketMid> = HashMap::from([(
+            MARKET.to_string(),
+            MarketMid {
+                mid: 0.01,
+                // Huge reserve: impact_now ≈ 0, isolating the mid-move check.
+                pool_depth: Some(PoolDepth { base_reserve: 1e12 }),
+            },
+        )]);
+        let mids = Arc::new(tokio::sync::RwLock::new(mids));
+
+        let lm = lm_with_usdcx(10_000).await;
+        let mut state = state_with(lm.clone())
+            .with_mid_prices(mids.clone())
+            .with_net_positions(tracker);
+        // The market's pool_impact section (tolerance default 0.25%).
+        state.base_config.markets = vec![serde_json::from_str(
+            r#"{"market_id":"EDELx-USDCx",
+                "rfq":{"min_quantity":"1","max_quantity":"100000000",
+                       "pool_impact":{"enabled":true}}}"#,
+        )
+        .unwrap()];
+
+        // Adjusted indicative: held sell price 0.01 at spread 0. impact_pct
+        // must be > 0, since the re-check is scoped to adjusted quotes only.
+        let mut priced = priced_sell(500, 90);
+        priced.pool_pricing = Some(crate::rfq_handler::PoolPricingSnapshot {
+            base_reserve: 1e12,
+            net_used: 0.0,
+            impact_pct: 0.01,
+            eff_spread_base: 0.0,
+        });
+
+        // Control: market unchanged → re-check passes, pipeline proceeds to
+        // the harness's empty venue registry (VenueUnavailable, NOT expired).
+        state
+            .register_indicative("q-ok", MARKET, QuoteSide::Sell, &priced, None, Some("user::1"))
+            .await
+            .unwrap();
+        let reject = state.handle_confirm(confirm_req("q-ok")).await.unwrap_err();
+        assert_eq!(
+            reject.reason,
+            RfqConfirmRejectReason::VenueUnavailable as i32,
+            "unchanged market must pass the re-check: {:?}",
+            reject.reason_detail
+        );
+
+        // The mid drops 0.01 → 0.009, so the held 0.01 is taker-favourable
+        // beyond tolerance and must expire.
+        state
+            .register_indicative("q-stale", MARKET, QuoteSide::Sell, &priced, None, Some("user::1"))
+            .await
+            .unwrap();
+        mids.write().await.get_mut(MARKET).unwrap().mid = 0.009;
+        let reject = state.handle_confirm(confirm_req("q-stale")).await.unwrap_err();
+        assert_eq!(
+            reject.reason,
+            RfqConfirmRejectReason::QuoteExpired as i32,
+            "a moved market must expire the held quote: {:?}",
+            reject.reason_detail
+        );
+        assert!(reject.reason_detail.unwrap().contains("market moved"));
+        assert_eq!(state.pending_kind("q-stale"), None, "entry dropped");
+        assert_eq!(lm.available("USDCx").await, Decimal::from(10_000), "nothing committed");
+
+        // Complement: a zero-adjustment quote must NOT expire on the same
+        // move, or ordinary volatility would reject honest flow.
+        let mut retail = priced_sell(500, 90);
+        retail.pool_pricing = Some(crate::rfq_handler::PoolPricingSnapshot {
+            base_reserve: 1e12,
+            net_used: 0.0,
+            impact_pct: 0.0,
+            eff_spread_base: 0.0,
+        });
+        state
+            .register_indicative("q-retail", MARKET, QuoteSide::Sell, &retail, None, Some("user::9"))
+            .await
+            .unwrap();
+        let reject = state.handle_confirm(confirm_req("q-retail")).await.unwrap_err();
+        assert_ne!(
+            reject.reason,
+            RfqConfirmRejectReason::QuoteExpired as i32,
+            "retail quote rejected as stale by a defence that never priced it: {:?}",
+            reject.reason_detail
+        );
+
+        // Parity: a NON-impact quote (pool_inputs None) is not re-checked
+        // even though the mid stays moved — behaves exactly like today.
+        state
+            .register_indicative(
+                "q-legacy",
+                MARKET,
+                QuoteSide::Sell,
+                &priced_sell(500, 90),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reject = state.handle_confirm(confirm_req("q-legacy")).await.unwrap_err();
+        assert_eq!(
+            reject.reason,
+            RfqConfirmRejectReason::VenueUnavailable as i32,
+            "legacy quote must skip the re-check: {:?}",
+            reject.reason_detail
+        );
+
+        // Depth ABSENT at confirm ⇒ fail-open: the impact-priced quote passes.
+        state
+            .register_indicative("q-nodepth", MARKET, QuoteSide::Sell, &priced, None, Some("user::1"))
+            .await
+            .unwrap();
+        mids.write().await.get_mut(MARKET).unwrap().pool_depth = None;
+        let reject = state.handle_confirm(confirm_req("q-nodepth")).await.unwrap_err();
+        assert_eq!(
+            reject.reason,
+            RfqConfirmRejectReason::VenueUnavailable as i32,
+            "depth absent at confirm must fail open: {:?}",
+            reject.reason_detail
+        );
     }
 
     #[tokio::test]
@@ -1320,7 +1566,7 @@ mod tests {
 
         // valid_for_secs = 0: expired the moment it is registered.
         state
-            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 0), None)
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 0), None, None)
             .await
             .unwrap();
         state.sweep(Instant::now()).await;

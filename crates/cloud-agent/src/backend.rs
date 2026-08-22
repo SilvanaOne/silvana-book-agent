@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 /// `RfqHandler::token_usd_price`): USDC*/USDCx = $1; else the mid of
 /// `{token}-USDCx` or `{token}-USDC`. `None` when no market mid is loaded.
 async fn token_usd_price(
-    mid_prices: &RwLock<HashMap<String, f64>>,
+    mid_prices: &RwLock<HashMap<String, agent_logic::pool_impact::MarketMid>>,
     token: &str,
 ) -> Option<f64> {
     if token.starts_with("USDC") {
@@ -46,9 +46,9 @@ async fn token_usd_price(
     }
     let mids = mid_prices.read().await;
     for stable in ["USDCx", "USDC"] {
-        if let Some(&p) = mids.get(&format!("{token}-{stable}")) {
-            if p > 0.0 {
-                return Some(p);
+        if let Some(m) = mids.get(&format!("{token}-{stable}")) {
+            if m.mid > 0.0 {
+                return Some(m.mid);
             }
         }
     }
@@ -104,10 +104,9 @@ pub struct CloudSettlementBackend {
     amulet_cache: CcView,
     /// Liquidity manager for balance tracking and commitment gating
     liquidity_manager: Arc<LiquidityManager>,
-    /// Shared market mid-prices (`market_id` → mid), owned by the RfqHandler.
-    /// Used only to bucket the holdings histogram by USD in the LIQUIDITY log.
-    /// `None` when RFQ V2 is disabled (no histogram then).
-    mid_prices: Option<Arc<RwLock<HashMap<String, f64>>>>,
+    /// Shared market mids owned by the RfqHandler, used only to bucket the
+    /// holdings histogram by USD. `None` when RFQ V2 is disabled.
+    mid_prices: Option<Arc<RwLock<HashMap<String, agent_logic::pool_impact::MarketMid>>>>,
     /// Shared shutdown signal for background tasks (ACS / merge / payment queue).
     /// Cloned from the runner's `Shutdown` so Ctrl-C reaches every worker
     /// the moment it fires, not only after the main loop has exited.
@@ -151,7 +150,10 @@ impl CloudSettlementBackend {
 
     /// Wire the RfqHandler's shared mid-price map so the LIQUIDITY heartbeat can
     /// bucket the holdings histogram by USD. Call only when RFQ V2 is enabled.
-    pub fn with_mid_prices(mut self, mid_prices: Arc<RwLock<HashMap<String, f64>>>) -> Self {
+    pub fn with_mid_prices(
+        mut self,
+        mid_prices: Arc<RwLock<HashMap<String, agent_logic::pool_impact::MarketMid>>>,
+    ) -> Self {
         self.mid_prices = Some(mid_prices);
         self
     }

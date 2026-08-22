@@ -13,8 +13,10 @@ use orderbook_proto::orderbook::{Order, OrderType};
 use orderbook_proto::ledger::TokenBalance;
 
 use crate::client::OrderbookClient;
-use crate::config::{BaseConfig, MarketConfig};
+use crate::config::{BaseConfig, MarketConfig, PriceLevel};
+use crate::net_position::NetPositionTracker;
 use crate::order_tracker::OrderTracker;
+use crate::pool_impact::{self, ImpactSide, PoolDepth};
 
 /// Per-side result of balance check
 #[derive(Debug, Clone, Copy)]
@@ -38,12 +40,28 @@ pub struct OrderManager {
     /// down after 2 strikes, so a single blip (server negative-cache window,
     /// one flaky upstream response) doesn't churn N cancels + N re-places.
     price_fail_streak: HashMap<String, u32>,
-    /// Consecutive successful fetches while a market is priceless — resuming
-    /// also takes 2 strikes, so a feed flapping around its upstream timeout
-    /// doesn't re-grid on every lucky fetch (2026-07-29 devnet EDELx flap:
-    /// 5 cancel/re-grid cycles in 25 min).
+    /// Consecutive successful fetches while a market is priceless. Resuming
+    /// also takes 2 strikes, so a flapping feed does not re-grid each time.
     price_restore_streak: HashMap<String, u32>,
+    /// Trailing net tracker for grid shaping: resting rungs are anonymous, so
+    /// the desk-level net shapes them. None = unchanged grid behaviour.
+    net_positions: Option<Arc<NetPositionTracker>>,
+    /// Last pool depth seen per market — rides the same `get_price` response
+    /// the grid already fetches every cycle, so shaping needs no extra RPC.
+    pool_depths: HashMap<String, PoolDepth>,
+    /// Shaped offer set at the last placement, so a desk-net move can act as
+    /// a refresh trigger.
+    last_shaped_offers: HashMap<String, Vec<PriceLevel>>,
 }
+
+/// Shaped rungs below this fraction of their configured size are dropped, not
+/// placed. Overridable via `pool_impact.grid_min_rung_base`.
+const DEFAULT_MIN_RUNG_FRACTION: f64 = 0.10;
+
+/// Materiality thresholds for the shape-driven refresh, set far above ordinary
+/// decay drift so the book is not re-placed every cycle.
+const SHAPE_REFRESH_QTY_FRACTION: f64 = 0.005;
+const SHAPE_REFRESH_DELTA_PCT: f64 = 0.01;
 
 impl OrderManager {
     /// Create a new order manager with shared order tracker
@@ -58,7 +76,15 @@ impl OrderManager {
             priceless: HashSet::new(),
             price_fail_streak: HashMap::new(),
             price_restore_streak: HashMap::new(),
+            net_positions: None,
+            pool_depths: HashMap::new(),
+            last_shaped_offers: HashMap::new(),
         }
+    }
+
+    /// Wire the trailing net-position tracker for desk-net offer shaping.
+    pub fn set_net_positions(&mut self, tracker: Arc<NetPositionTracker>) {
+        self.net_positions = Some(tracker);
     }
 
     /// A market lost its price: cancel every resting order (stale levels must
@@ -74,6 +100,8 @@ impl OrderManager {
             debug!("Market {} still priceless ({})", market_id, reason);
         }
         self.last_grid_prices.remove(market_id);
+        // Depth came with the (now-gone) price — drop it with the grid.
+        self.pool_depths.remove(market_id);
         if let Err(e) = self.cancel_all_orders(market_id).await {
             warn!("Failed to cancel orders for priceless market {}: {}", market_id, e);
         }
@@ -250,10 +278,54 @@ impl OrderManager {
         Ok(())
     }
 
-    /// Get current price for a market
+    /// Current price for a market. Any size reference on the same response is
+    /// cached for grid shaping; absence clears it and means no adjustment.
     pub async fn get_price(&mut self, market_id: &str) -> Result<f64> {
         let response = self.client.get_price(market_id).await?;
+        match response.pool_depth.as_ref().and_then(PoolDepth::from_proto) {
+            Some(d) => {
+                self.pool_depths.insert(market_id.to_string(), d);
+            }
+            None => {
+                self.pool_depths.remove(market_id);
+            }
+        }
         Ok(response.last)
+    }
+
+    /// Whether the shaped offer set differs MATERIALLY from what is resting.
+    /// Exact comparison would churn every cycle, since the net decays.
+    fn shaped_offers_changed(&self, market: &MarketConfig) -> bool {
+        let now = self.shaped_offer_levels(market, false);
+        match self.last_shaped_offers.get(&market.market_id) {
+            None => false, // nothing placed yet; placement will record it
+            Some(prev) => {
+                if prev.len() != now.len() {
+                    return true; // a rung appeared or was dropped
+                }
+                shaped_sets_differ_materially(prev, &now)
+            }
+        }
+    }
+
+    /// Scale offer rung quantities and widen their deltas from the desk net.
+    /// Bids untouched; levels returned verbatim when shaping is unavailable.
+    fn shaped_offer_levels(&self, market: &MarketConfig, log: bool) -> Vec<PriceLevel> {
+        let raw = market.offer_levels.clone();
+        let (Some(cfg), Some(depth), Some(tracker)) = (
+            market.rfq.as_ref().and_then(|r| r.pool_impact.as_ref()),
+            self.pool_depths.get(&market.market_id),
+            self.net_positions.as_ref(),
+        ) else {
+            return raw;
+        };
+        let base_token = market.market_id.split('-').next().unwrap_or("");
+        let desk = tracker.desk_net(base_token);
+        let shaped = shape_offer_levels(&raw, cfg, depth.base_reserve, desk);
+        if log {
+            shaped.log(&market.market_id, cfg.enabled, desk, depth.base_reserve);
+        }
+        shaped.levels
     }
 
     /// Place grid orders for a market based on config.
@@ -293,9 +365,14 @@ impl OrderManager {
             }
         }
 
-        // Place offer orders
+        // Place offer orders — desk-net/depth-shaped (raw when no shaping
+        // context; see shaped_offer_levels).
         if place_offers {
-            for (i, level) in market_config.offer_levels.iter().enumerate() {
+            let offer_levels = self.shaped_offer_levels(market_config, true);
+            // Baseline for the shape-change refresh trigger.
+            self.last_shaped_offers
+                .insert(market_config.market_id.clone(), offer_levels.clone());
+            for (i, level) in offer_levels.iter().enumerate() {
                 let raw_price = mid_price * (1.0 + level.delta_percent / 100.0);
                 let price = (raw_price / tick).ceil() * tick;
                 let price_str = format!("{:.10}", price);
@@ -326,8 +403,14 @@ impl OrderManager {
     /// Returns `GridAffordability` indicating which sides (bids, offers) the
     /// agent can afford.  When balance data is unavailable, both sides are
     /// assumed affordable.  Parses market_id "BASE-QUOTE" to determine which
-    /// tokens are needed.
-    fn check_grid_balance(&self, market_config: &MarketConfig, mid_price: f64) -> GridAffordability {
+    /// tokens are needed. `offer_levels` is the (possibly shaped) offer set
+    /// the caller is about to place, so affordability matches reality.
+    fn check_grid_balance(
+        &self,
+        market_config: &MarketConfig,
+        mid_price: f64,
+        offer_levels: &[PriceLevel],
+    ) -> GridAffordability {
         if self.balances.is_empty() {
             return GridAffordability { can_bid: true, can_offer: true };
         }
@@ -371,7 +454,8 @@ impl OrderManager {
             .sum();
 
         // Total base needed for offers (selling base)
-        let total_offer_base: f64 = market_config.offer_levels.iter()
+        let total_offer_base: f64 = offer_levels
+            .iter()
             .map(|l| l.quantity.parse::<f64>().unwrap_or(0.0))
             .sum();
 
@@ -440,7 +524,12 @@ impl OrderManager {
         active_orders: &[Order],
     ) -> Result<()> {
         let market_id = &market.market_id;
-        let affordability = self.check_grid_balance(market, current_price);
+        // One shaped-offer computation per refresh: affordability, placement
+        // and the interleaved replacement below all see the same rungs.
+        let offer_levels = self.shaped_offer_levels(market, true);
+        self.last_shaped_offers
+            .insert(market.market_id.clone(), offer_levels.clone());
+        let affordability = self.check_grid_balance(market, current_price, &offer_levels);
         if !affordability.can_bid && !affordability.can_offer {
             warn!("Insufficient balance for any side on {}, skipping", market_id);
             return Ok(());
@@ -479,7 +568,7 @@ impl OrderManager {
             }
         }
         if affordability.can_offer {
-            for level in &market.offer_levels {
+            for level in &offer_levels {
                 let raw = mid_price * (1.0 + level.delta_percent / 100.0);
                 let price = (raw / tick).ceil() * tick;
                 new_orders.push((level.delta_percent.abs(), "offer", format!("{:.10}", price), level.quantity.clone()));
@@ -555,13 +644,8 @@ impl OrderManager {
         for market in &markets {
             let market_id = &market.market_id;
 
-            // 1. Fetch current price. NO PRICE = NO QUOTES: when the server
-            // has no reliable price for the market (feed outage, oracle
-            // out-of-bounds → GetPrice NOT_FOUND) the LP must not leave
-            // resting orders executable at stale levels — cancel everything
-            // and pause until the price returns. Two-strike debounce: the
-            // first failed cycle only skips (no churn on a one-off blip);
-            // the second consecutive failure tears the grid down.
+            // 1. Fetch price. NO PRICE = NO QUOTES, so cancel and pause
+            // rather than rest at stale levels. Two-strike debounce.
             let (current_price, restored) = match self.get_price(market_id).await {
                 Ok(p) if p.is_finite() && p > 0.0 => {
                     self.price_fail_streak.remove(market_id);
@@ -625,18 +709,20 @@ impl OrderManager {
                     continue;
                 }
             };
-            let expected_count = market.bid_levels.len() + market.offer_levels.len();
+            // Count against the SHAPED set, or an omitted rung reads as
+            // "order missing" and churns a refresh.
+            let expected_count =
+                market.bid_levels.len() + self.shaped_offer_levels(market, false).len();
             let partial_fills = Self::has_partial_fills(&orders);
 
-            // 3. Determine if grid needs refresh. A restore after a priceless
-            // spell ALWAYS refreshes: if cancels failed during the outage
-            // (server unreachable), the full pre-outage grid may still be
-            // resting at stale levels with a full-looking order count —
-            // refresh cancels and re-prices it against the fresh mid.
-            if restored || orders.len() < expected_count || partial_fills {
+            // 3. Refresh? A restore always refreshes, since cancels may have
+            // failed during the outage. The shaped set needs its own trigger.
+            let shape_changed = self.shaped_offers_changed(market);
+
+            if restored || orders.len() < expected_count || partial_fills || shape_changed {
                 info!(
-                    "Market {} needs refresh: {}/{} active, partial_fills={}",
-                    market_id, orders.len(), expected_count, partial_fills
+                    "Market {} needs refresh: {}/{} active, partial_fills={}, shape_changed={}",
+                    market_id, orders.len(), expected_count, partial_fills, shape_changed
                 );
                 self.refresh_grid(market, current_price, &orders).await?;
             } else if let Some(&last_price) = self.last_grid_prices.get(market_id) {
@@ -655,5 +741,249 @@ impl OrderManager {
             }
         }
         Ok(())
+    }
+}
+
+/// Outcome of shaping one market's offer ladder (pure — see [`shape_offer_levels`]).
+pub struct ShapedOffers {
+    pub levels: Vec<PriceLevel>,
+    /// Quantity scale factor applied (1.0 = untouched).
+    pub factor: f64,
+    /// Largest marginal impact added to any rung's delta, percent.
+    pub max_impact: f64,
+    /// Rungs dropped for landing below the dust floor.
+    pub dropped: usize,
+}
+
+impl ShapedOffers {
+    fn log(&self, market_id: &str, enabled: bool, desk: f64, reserve: f64) {
+        if self.factor >= 1.0 && self.max_impact <= 0.0 {
+            return;
+        }
+        if enabled {
+            info!(
+                "Grid impact {}: offers x{:.3}, delta +{:.3}% max, {} rung(s) dropped (desk_net={:.0}, R={:.0})",
+                market_id, self.factor, self.max_impact, self.dropped, desk, reserve
+            );
+        } else {
+            info!(
+                "SHADOW pool impact (grid) {}: would scale offers x{:.3} and raise deltas up to {:.3}% (desk_net={:.0}, R={:.0}) — NOT applied",
+                market_id, self.factor, self.max_impact, desk, reserve
+            );
+        }
+    }
+}
+
+/// Shape an offer ladder against the desk's trailing net. Pure, so the
+/// byte-identical and dust-drop guarantees can be tested without a client.
+pub fn shape_offer_levels(
+    raw: &[PriceLevel],
+    cfg: &crate::config::PoolImpactConfig,
+    base_reserve: f64,
+    desk_net: f64,
+) -> ShapedOffers {
+    let fz = cfg.grid_free_zone_base.unwrap_or(cfg.free_zone_base).max(0.0);
+    let excess = (desk_net - fz).max(0.0);
+    let span = cfg
+        .grid_offer_scale_base
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(cfg.max_pool_fraction.clamp(0.01, 0.99) * base_reserve);
+    let factor = if span > 0.0 { (1.0 - excess / span).clamp(0.0, 1.0) } else { 1.0 };
+
+    let mut levels = Vec::with_capacity(raw.len());
+    let mut max_impact = 0.0f64;
+    let mut dropped = 0usize;
+    for level in raw {
+        let qty: f64 = level.quantity.parse().unwrap_or(0.0);
+        let scaled = qty * factor;
+        let impact = pool_impact::marginal_impact_percent(
+            ImpactSide::UserBuys,
+            scaled.max(0.0),
+            desk_net,
+            base_reserve,
+            fz,
+            cfg.max_pool_fraction,
+            cfg.impact_multiplier,
+            cfg.max_impact_percent,
+        );
+        max_impact = max_impact.max(impact);
+        if !cfg.enabled {
+            levels.push(level.clone()); // SHADOW: raw rung
+            continue;
+        }
+        if factor >= 1.0 && impact <= 0.0 {
+            levels.push(level.clone()); // no-op: keep the ORIGINAL strings
+            continue;
+        }
+        let min_rung = cfg
+            .grid_min_rung_base
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(qty * DEFAULT_MIN_RUNG_FRACTION);
+        if !(scaled.is_finite() && scaled >= min_rung) {
+            dropped += 1;
+            continue;
+        }
+        levels.push(PriceLevel {
+            delta_percent: level.delta_percent + impact,
+            quantity: format!("{scaled:.10}"),
+        });
+    }
+    ShapedOffers { levels, factor, max_impact, dropped }
+}
+
+/// Whether two shaped offer sets differ MATERIALLY (see the thresholds).
+/// Pure, so the churn regression is testable without a client.
+pub fn shaped_sets_differ_materially(prev: &[PriceLevel], now: &[PriceLevel]) -> bool {
+    if prev.len() != now.len() {
+        return true; // a rung appeared or was dropped
+    }
+    prev.iter().zip(now.iter()).any(|(a, b)| {
+        let qa: f64 = a.quantity.parse().unwrap_or(0.0);
+        let qb: f64 = b.quantity.parse().unwrap_or(0.0);
+        let qty_moved = if qa > 0.0 {
+            ((qb - qa).abs() / qa) > SHAPE_REFRESH_QTY_FRACTION
+        } else {
+            qa != qb
+        };
+        qty_moved || (a.delta_percent - b.delta_percent).abs() > SHAPE_REFRESH_DELTA_PCT
+    })
+}
+
+#[cfg(test)]
+mod grid_shaping_tests {
+    use super::*;
+    use crate::config::PoolImpactConfig;
+
+    const R: f64 = 45_500_000.0;
+
+    fn ladder() -> Vec<PriceLevel> {
+        vec![
+            PriceLevel { delta_percent: -1.95, quantity: "12000".to_string() },
+            PriceLevel { delta_percent: -1.95, quantity: "12000".to_string() },
+            PriceLevel { delta_percent: -1.95, quantity: "12000".to_string() },
+        ]
+    }
+
+    fn cfg(enabled: bool) -> PoolImpactConfig {
+        PoolImpactConfig { enabled, free_zone_base: 100_000.0, ..Default::default() }
+    }
+
+
+    /// THE churn regression: the net decays continuously, so an exact
+    /// comparison re-places the whole grid every cycle.
+    #[test]
+    fn decay_drift_between_cycles_does_not_trigger_a_refresh() {
+        let mut c = cfg(true);
+        c.grid_free_zone_base = Some(0.0);
+        let desk0 = 8_000_000.0;
+        // One 5s grid cycle of exponential decay on a 24h window.
+        let desk1 = desk0 * (-5.0f64 / (24.0 * 3600.0)).exp();
+        let a = shape_offer_levels(&ladder(), &c, R, desk0).levels;
+        let b = shape_offer_levels(&ladder(), &c, R, desk1).levels;
+        assert!(a[0].quantity != b[0].quantity, "precondition: the raw strings DO differ");
+        assert!(
+            !shaped_sets_differ_materially(&a, &b),
+            "one cycle of desk decay triggered a full grid refresh: {} -> {}",
+            a[0].quantity, b[0].quantity
+        );
+    }
+
+    /// ...but a real desk-net move must still refresh the book, or the trigger
+    /// is pointless.
+    #[test]
+    fn a_material_desk_move_does_trigger_a_refresh() {
+        let mut c = cfg(true);
+        c.grid_free_zone_base = Some(0.0);
+        let a = shape_offer_levels(&ladder(), &c, R, 8_000_000.0).levels;
+        let b = shape_offer_levels(&ladder(), &c, R, 9_000_000.0).levels;
+        assert!(
+            shaped_sets_differ_materially(&a, &b),
+            "a 1M desk-net move must re-place the book"
+        );
+    }
+
+    /// A rung being dropped or restored is always material.
+    #[test]
+    fn rung_count_change_always_triggers() {
+        let a = shape_offer_levels(&ladder(), &cfg(false), R, 0.0).levels;
+        let b: Vec<PriceLevel> = a.iter().skip(1).cloned().collect();
+        assert!(shaped_sets_differ_materially(&a, &b));
+    }
+
+    /// Shadow mode must be BYTE-IDENTICAL to the configured ladder — the whole
+    /// point of shipping disabled is that nothing moves.
+    #[test]
+    fn shadow_mode_is_byte_identical() {
+        let raw = ladder();
+        let out = shape_offer_levels(&raw, &cfg(false), R, 5_000_000.0);
+        assert_eq!(out.levels.len(), raw.len());
+        for (a, b) in raw.iter().zip(out.levels.iter()) {
+            assert_eq!(a.quantity, b.quantity, "quantity string must not be reformatted");
+            assert_eq!(a.delta_percent, b.delta_percent);
+        }
+        assert_eq!(out.dropped, 0);
+    }
+
+    /// Enabled but with the desk inside the free zone: also byte-identical, so
+    /// ordinary operation never reformats or nudges a rung.
+    #[test]
+    fn enabled_but_inside_the_free_zone_is_byte_identical() {
+        let raw = ladder();
+        let out = shape_offer_levels(&raw, &cfg(true), R, 0.0);
+        for (a, b) in raw.iter().zip(out.levels.iter()) {
+            assert_eq!(a.quantity, b.quantity);
+            assert_eq!(a.delta_percent, b.delta_percent);
+        }
+    }
+
+    /// A rung scaled into dust must be DROPPED: the server would reject it
+    /// while it still counted toward expected_count.
+    #[test]
+    fn dust_rungs_are_dropped_not_placed() {
+        let raw = ladder();
+        let mut c = cfg(true);
+        c.grid_free_zone_base = Some(0.0);
+        // Desk net just under the span, so factor is tiny but > 0.
+        let span = c.max_pool_fraction * R;
+        let out = shape_offer_levels(&raw, &c, R, span * 0.999);
+        assert!(out.factor > 0.0 && out.factor < 0.01, "factor {}", out.factor);
+        assert_eq!(out.levels.len(), 0, "dust rungs must be omitted");
+        assert_eq!(out.dropped, raw.len());
+        // And every surviving rung is always >= its floor.
+        for lvl in &out.levels {
+            let q: f64 = lvl.quantity.parse().unwrap();
+            assert!(q >= 12_000.0 * DEFAULT_MIN_RUNG_FRACTION);
+        }
+    }
+
+    /// Past the free zone the offers shrink and widen — never the reverse.
+    #[test]
+    fn shaping_only_shrinks_and_widens_offers() {
+        let raw = ladder();
+        let mut c = cfg(true);
+        c.grid_free_zone_base = Some(0.0);
+        let out = shape_offer_levels(&raw, &c, R, 2_000_000.0);
+        assert!(out.factor < 1.0, "offers must shrink as desk net grows");
+        for (a, b) in raw.iter().zip(out.levels.iter()) {
+            let qa: f64 = a.quantity.parse().unwrap();
+            let qb: f64 = b.quantity.parse().unwrap();
+            assert!(qb <= qa, "rung grew: {qb} > {qa}");
+            assert!(b.delta_percent >= a.delta_percent, "offer moved toward the taker");
+        }
+    }
+
+    #[test]
+    fn absurd_depth_cannot_produce_nan_or_negative_rungs() {
+        let raw = ladder();
+        let mut c = cfg(true);
+        c.grid_free_zone_base = Some(0.0);
+        for reserve in [0.0, f64::NAN, -1.0, 1.0] {
+            let out = shape_offer_levels(&raw, &c, reserve, 1_000.0);
+            for lvl in &out.levels {
+                let q: f64 = lvl.quantity.parse().unwrap();
+                assert!(q.is_finite() && q > 0.0, "bad rung {q} at reserve {reserve}");
+                assert!(lvl.delta_percent.is_finite());
+            }
+        }
     }
 }

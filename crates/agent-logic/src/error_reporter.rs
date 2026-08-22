@@ -1,6 +1,5 @@
 //! Best-effort structured error reporting to the orderbook server
-//! (`SettlementService.ReportErrors` — see canton-agent
-//! plans/errors/2026-08-13-error-logging.md).
+//! (`SettlementService.ReportErrors`).
 //!
 //! The agent has no database; every error it wants recorded travels over
 //! gRPC. Design rules, in order:

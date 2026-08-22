@@ -654,6 +654,16 @@ impl BaseConfig {
             .map_err(|_| anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
         let ledger_service_public_key = decode_public_key(&ledger_service_public_key_b58)?;
 
+        // Clamp any out-of-range [markets.rfq.pool_impact] knobs — warn and
+        // run (the section is an additive protection, not a precondition).
+        for market in &mut agent.markets {
+            if let Some(rfq) = &mut market.rfq {
+                if let Some(pi) = &mut rfq.pool_impact {
+                    pi.sanitize(&market.market_id);
+                }
+            }
+        }
+
         // The quoted windows are stamped into the on-chain DVP terms, where the
         // DAML model requires 0 < allocateBefore < settleBefore — a misordered
         // market would permanently fail every DVP propose on that pair, so
@@ -1339,9 +1349,122 @@ pub struct RfqMarketConfig {
     /// When set, takes precedence over `[liquidity_provider].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: Option<f64>,
+    /// Size-aware pricing — `[markets.rfq.pool_impact]`. Applies to RFQ V2 and
+    /// this market's offer grid. Absent = no adjustment. Not per-venue.
+    #[serde(default)]
+    pub pool_impact: Option<PoolImpactConfig>,
     /// RFQ V2 (AtomicDVP) per-market configuration — TOML `[markets.rfq.v2]`.
     #[serde(default)]
     pub v2: Option<RfqV2MarketConfig>,
+}
+
+/// Size-aware pricing knobs (`[markets.rfq.pool_impact]`). The math lives in
+/// [`crate::pool_impact`], which clamps every field defensively.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolImpactConfig {
+    /// false (default) = SHADOW MODE: compute + log the would-be impact but
+    /// do not apply it to any price or grid rung. true = enforce.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hard cap on the applied impact, percent of mid.
+    #[serde(default = "default_max_impact_percent")]
+    pub max_impact_percent: f64,
+    /// Cap on the pool fraction the impact curve is evaluated at (u clamp).
+    #[serde(default = "default_max_pool_fraction")]
+    pub max_pool_fraction: f64,
+    /// Scales the marginal cost before the cap. >1 compensates for flow this
+    /// agent cannot observe.
+    #[serde(default = "default_impact_multiplier")]
+    pub impact_multiplier: f64,
+    /// Net position (base units) exempt from any charge, per counterparty.
+    #[serde(default)]
+    pub free_zone_base: f64,
+    /// Trailing-net decay window, hours. The tracker is per-token, so the
+    /// effective window is the max across markets sharing that token.
+    #[serde(default = "default_impact_window_hours")]
+    pub window_hours: f64,
+    /// Confirm-time re-check tolerance, percent: reject when the held price is
+    /// taker-favourable versus the current fair price by more than this.
+    #[serde(default = "default_confirm_tolerance_percent")]
+    pub confirm_tolerance_percent: f64,
+    /// Grid shaping: desk-net free zone for offer-rung shaping; falls back to
+    /// `free_zone_base` when absent.
+    #[serde(default)]
+    pub grid_free_zone_base: Option<f64>,
+    /// Grid shaping: desk-net span (base units) over which offer rungs scale to
+    /// zero past the grid free zone. Absent = derived from the size reference.
+    #[serde(default)]
+    pub grid_offer_scale_base: Option<f64>,
+    /// Grid: drop a shaped offer rung below this many base units — the server
+    /// rejects sub-minimum orders. Absent = `DEFAULT_MIN_RUNG_FRACTION`.
+    #[serde(default)]
+    pub grid_min_rung_base: Option<f64>,
+}
+
+fn default_max_impact_percent() -> f64 {
+    50.0
+}
+fn default_max_pool_fraction() -> f64 {
+    0.9
+}
+fn default_impact_multiplier() -> f64 {
+    1.0
+}
+fn default_impact_window_hours() -> f64 {
+    24.0
+}
+fn default_confirm_tolerance_percent() -> f64 {
+    0.25
+}
+
+impl Default for PoolImpactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_impact_percent: default_max_impact_percent(),
+            max_pool_fraction: default_max_pool_fraction(),
+            impact_multiplier: default_impact_multiplier(),
+            free_zone_base: 0.0,
+            window_hours: default_impact_window_hours(),
+            confirm_tolerance_percent: default_confirm_tolerance_percent(),
+            grid_free_zone_base: None,
+            grid_min_rung_base: None,
+            grid_offer_scale_base: None,
+        }
+    }
+}
+
+impl PoolImpactConfig {
+    /// Clamp out-of-range knobs, warning per change. Never panic over a
+    /// config typo: this section is additive, not a correctness precondition.
+    pub fn sanitize(&mut self, market_id: &str) {
+        let clamp = |name: &str, v: &mut f64, lo: f64, hi: f64| {
+            let c = if v.is_finite() { v.clamp(lo, hi) } else { lo };
+            if c != *v {
+                tracing::warn!(
+                    "Market {market_id}: [markets.rfq.pool_impact] {name}={v} out of range — clamped to {c}"
+                );
+                *v = c;
+            }
+        };
+        clamp("max_impact_percent", &mut self.max_impact_percent, 0.0, 95.0);
+        clamp("max_pool_fraction", &mut self.max_pool_fraction, 0.01, 0.99);
+        clamp("impact_multiplier", &mut self.impact_multiplier, 0.0, 100.0);
+        clamp("free_zone_base", &mut self.free_zone_base, 0.0, f64::MAX);
+        clamp("window_hours", &mut self.window_hours, 0.01, 720.0);
+        clamp(
+            "confirm_tolerance_percent",
+            &mut self.confirm_tolerance_percent,
+            0.0,
+            100.0,
+        );
+        if let Some(v) = &mut self.grid_free_zone_base {
+            clamp("grid_free_zone_base", v, 0.0, f64::MAX);
+        }
+        if let Some(v) = &mut self.grid_offer_scale_base {
+            clamp("grid_offer_scale_base", v, 0.0, f64::MAX);
+        }
+    }
 }
 
 /// A venue/branch-scoped override of `[markets.rfq]` parameters — TOML
@@ -1531,10 +1654,10 @@ pub struct LiquidityProviderConfig {
     pub default_quote_valid_secs: u32,
     /// Global minimum RFQ value in USD — RFQ V1 ONLY (the LP pays its own
     /// dvp+allocation fees on a V1 settle). V1 RFQs whose USD notional is
-    /// below this are rejected (AmountTooSmall). RFQ V2 ignores it
-    /// (2026-08-05 dust enablement): the user pays every V2 fee — 3x below
-    /// the server's `min_order_value_usd` — and the LP pays none, so the LP
-    /// quotes any size (the base `min_quantity` bound still applies).
+    /// below this are rejected (AmountTooSmall). RFQ V2 ignores it: the user
+    /// pays every V2 fee — 3x below the server's `min_order_value_usd` — and
+    /// the LP pays none, so the LP quotes any size (the base `min_quantity`
+    /// bound still applies).
     /// 0 = disabled. Overridden per-market by `[markets.rfq].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: f64,
@@ -1594,6 +1717,20 @@ pub struct RfqV2Config {
     /// rung broken), else are swept as extra inputs into rung-funded settles.
     #[serde(default)]
     pub denominations: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl RfqV2Config {
+    /// How long a confirmed quote's count may stand before it is a leak.
+    /// DERIVED from the quote lifetime — a shorter backstop would reverse it.
+    pub fn stale_pending_after(&self) -> std::time::Duration {
+        const STALE_PENDING_SLACK_SECS: u64 = 600;
+        const STALE_PENDING_FLOOR_SECS: u64 = 900;
+        let lifetime = self
+            .atomic_quote_valid_secs
+            .saturating_add(self.settle_grace_secs)
+            .saturating_add(STALE_PENDING_SLACK_SECS);
+        std::time::Duration::from_secs(lifetime.max(STALE_PENDING_FLOOR_SECS))
+    }
 }
 
 impl Default for RfqV2Config {
@@ -2109,6 +2246,25 @@ denominations = ["25x20", "100x10"]
         assert!(v2m.enabled);
         assert_eq!(v2m.denominations, vec!["25x20", "100x10"]);
         assert_eq!(v2m.max_input_holdings, 100);
+        // The net-tracker backstop is DERIVED, so raising the quote validity
+        // cannot make it reverse the soft counts of quotes that are still open.
+        assert_eq!(v2.stale_pending_after().as_secs(), 900);
+
+        // ...and it outlives the quote at every plausible setting, including
+        // ones far past the 900 s the backstop used to hard-code.
+        for (valid, grace) in [(120, 30), (900, 300), (1800, 600), (3600, 3600)] {
+            let c = RfqV2Config {
+                atomic_quote_valid_secs: valid,
+                settle_grace_secs: grace,
+                ..Default::default()
+            };
+            let backstop = c.stale_pending_after().as_secs();
+            assert!(
+                backstop > valid + grace,
+                "backstop {backstop}s would reverse a still-live quote \
+                 ({valid}s validity + {grace}s grace)"
+            );
+        }
 
         // global per-instrument ladder map parses
         let agent: AgentToml = toml::from_str(

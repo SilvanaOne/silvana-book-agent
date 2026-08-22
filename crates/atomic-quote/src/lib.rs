@@ -4,8 +4,7 @@
 //! (`canonicalQuoteMessage` in atomic-dvp-v2) and what `DA.Crypto.Text.secp256k1`
 //! verifies: ECDSA/secp256k1 over SHA256(utf8(canonical_message)), ASN.1 DER
 //! signature (lowercase hex), X.509 SPKI public key with an uncompressed point
-//! (lowercase hex). Spec: atomic-dvp/plans/atomic-dvp-design.md §5 +
-//! atomic-dvp-fa-design.md §4 (v3/v4: line 3 is `provider=`); reference
+//! (lowercase hex). v3/v4 of the message put `provider=` on line 3. Reference
 //! implementations: the DAML module and tests/.../helpers/quoteSigner.ts.
 //! Proven against the committed cross-language golden vectors (see tests below).
 //!

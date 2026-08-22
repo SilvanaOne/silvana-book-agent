@@ -1084,7 +1084,6 @@ message GetSettlementProposalByIdResponse {
 
 // ============================================================================
 // Error Reporting (cross-stack structured error ingestion)
-// See canton-agent/plans/errors/2026-08-13-error-logging.md
 // ============================================================================
 
 // One structured error occurrence. Field-for-field aligned with the
