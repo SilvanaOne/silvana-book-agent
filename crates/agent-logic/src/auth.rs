@@ -131,28 +131,6 @@ pub fn venue_branch_from_env(var: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Decode Base58 Solana-style Ed25519 private key to 32-byte seed
-///
-/// Solana keys can be:
-/// - 32 bytes: seed only
-/// - 64 bytes: seed + public key (first 32 bytes are the seed)
-pub fn decode_base58_private_key(base58_key: &str) -> Result<[u8; 32]> {
-    let key_bytes = bs58::decode(base58_key.trim())
-        .into_vec()
-        .map_err(|e| anyhow!("Failed to decode Base58 private key: {}", e))?;
-
-    if key_bytes.len() < 32 {
-        return Err(anyhow!(
-            "Private key too short: expected at least 32 bytes, got {}",
-            key_bytes.len()
-        ));
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&key_bytes[..32]);
-    Ok(arr)
-}
-
 /// Get public key hex string from private key bytes
 ///
 /// Derives the Ed25519 public key from the 32-byte seed and returns it as hex.

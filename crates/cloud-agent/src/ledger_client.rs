@@ -6,6 +6,7 @@
 //! Phase A: Signs the server-provided hash directly.
 //! Phase B (future): tx-verifier will inspect + recompute hash before signing.
 
+use agent_logic::secret::Secret;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
@@ -211,7 +212,7 @@ struct AuthInterceptor {
     expires_at: Arc<RwLock<u64>>,
     party_id: String,
     role: String,
-    private_key_bytes: [u8; 32],
+    private_key: Secret<32>,
     ttl_secs: u64,
     node_name: Option<String>,
 }
@@ -228,7 +229,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
             match generate_jwt(
                 &self.party_id,
                 &self.role,
-                &self.private_key_bytes,
+                &self.private_key.expose(),
                 self.ttl_secs,
                 self.node_name.as_deref(),
             ) {
@@ -262,7 +263,7 @@ pub struct DAppProviderClient {
     /// The party id whose JWT this client carries. Used to bind fees
     /// authorization signatures to a specific party.
     party_id: String,
-    private_key_bytes: [u8; 32],
+    private_key: Secret<32>,
     /// Pre-configured ledger service public key for response signature verification
     ledger_service_public_key: [u8; 32],
     /// Optional auto-topup trigger. When set, every successful
@@ -278,7 +279,7 @@ impl DAppProviderClient {
         grpc_url: &str,
         party_id: &str,
         role: &str,
-        private_key_bytes: &[u8; 32],
+        private_key: &Secret<32>,
         ttl_secs: u64,
         node_name: Option<&str>,
         ledger_service_public_key: &[u8; 32],
@@ -286,14 +287,14 @@ impl DAppProviderClient {
         request_timeout_secs: Option<u64>,
     ) -> Result<Self> {
         let channel = Self::create_channel(grpc_url, connection_timeout_secs, request_timeout_secs).await?;
-        let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
+        let jwt = generate_jwt(party_id, role, &private_key.expose(), ttl_secs, node_name)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interceptor = AuthInterceptor {
             token: Arc::new(RwLock::new(jwt)),
             expires_at: Arc::new(RwLock::new(now + ttl_secs)),
             party_id: party_id.to_string(),
             role: role.to_string(),
-            private_key_bytes: *private_key_bytes,
+            private_key: private_key.clone(),
             ttl_secs,
             node_name: node_name.map(|s| s.to_string()),
         };
@@ -302,7 +303,7 @@ impl DAppProviderClient {
         Ok(Self {
             client,
             party_id: party_id.to_string(),
-            private_key_bytes: *private_key_bytes,
+            private_key: private_key.clone(),
             ledger_service_public_key: *ledger_service_public_key,
             topup_trigger: None,
         })
@@ -325,19 +326,19 @@ impl DAppProviderClient {
         channel: Channel,
         party_id: &str,
         role: &str,
-        private_key_bytes: &[u8; 32],
+        private_key: &Secret<32>,
         ttl_secs: u64,
         node_name: Option<&str>,
         ledger_service_public_key: &[u8; 32],
     ) -> Result<Self> {
-        let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
+        let jwt = generate_jwt(party_id, role, &private_key.expose(), ttl_secs, node_name)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interceptor = AuthInterceptor {
             token: Arc::new(RwLock::new(jwt)),
             expires_at: Arc::new(RwLock::new(now + ttl_secs)),
             party_id: party_id.to_string(),
             role: role.to_string(),
-            private_key_bytes: *private_key_bytes,
+            private_key: private_key.clone(),
             ttl_secs,
             node_name: node_name.map(|s| s.to_string()),
         };
@@ -346,7 +347,7 @@ impl DAppProviderClient {
         Ok(Self {
             client,
             party_id: party_id.to_string(),
-            private_key_bytes: *private_key_bytes,
+            private_key: private_key.clone(),
             ledger_service_public_key: *ledger_service_public_key,
             topup_trigger: None,
         })
@@ -637,7 +638,7 @@ impl DAppProviderClient {
     ) -> Result<PrepareTransactionResponse> {
         // Sign request
         let canonical = build_canonical_from_prepare_request(&req)?;
-        let sig_data = sign_canonical(&self.private_key_bytes, &canonical);
+        let sig_data = sign_canonical(&self.private_key.expose(), &canonical);
         req.request_signature = Some(MessageSignature {
             signature: sig_data.signature_b64,
             public_key: sig_data.public_key_b64url,
@@ -703,7 +704,7 @@ impl DAppProviderClient {
         // request_signature — UNCHANGED so the Canton multihash signature
         // stays untouched.
         let canonical = canonical_execute_request(transaction_id, signature);
-        let sig_data = sign_canonical(&self.private_key_bytes, &canonical);
+        let sig_data = sign_canonical(&self.private_key.expose(), &canonical);
 
         // Independently sign the context-bound fees authorization. Bound to
         // (party, transaction_id, fees_json) — single-use because the
@@ -713,7 +714,7 @@ impl DAppProviderClient {
             transaction_id,
             fees_json,
         );
-        let fees_auth_data = sign_canonical(&self.private_key_bytes, &fees_canonical);
+        let fees_auth_data = sign_canonical(&self.private_key.expose(), &fees_canonical);
 
         let resp = self
             .client
@@ -925,7 +926,7 @@ impl DAppProviderClient {
                 verification.computed_hash.to_vec()
             };
 
-            let signature = sign_hash_bytes(&self.private_key_bytes, &hash_to_sign)?;
+            let signature = sign_hash_bytes(&self.private_key.expose(), &hash_to_sign)?;
 
             // 4. Execute (catch gRPC errors for update-based recovery).
             //    Echo back the server's fees_json verbatim — the server
@@ -1178,7 +1179,7 @@ impl DAppProviderClient {
             &req.token_name, &req.token_admin, &req.ticket, req.dry_run,
         );
         let canonical_bytes = canonical_prepare_request(0, &canonical);
-        let sig_data = sign_canonical(&self.private_key_bytes, &canonical_bytes);
+        let sig_data = sign_canonical(&self.private_key.expose(), &canonical_bytes);
         req.request_signature = Some(MessageSignature {
             signature: sig_data.signature_b64,
             public_key: sig_data.public_key_b64url,
@@ -1225,7 +1226,7 @@ impl DAppProviderClient {
     ) -> Result<PreparePayFeeResponse> {
         // Sign the request canonical.
         let canonical = message_signing::canonical_prepare_pay_fee_request(proposal_id, fee_type);
-        let sig_data = message_signing::sign_canonical(&self.private_key_bytes, &canonical);
+        let sig_data = message_signing::sign_canonical(&self.private_key.expose(), &canonical);
 
         let resp = self
             .client
@@ -1300,7 +1301,7 @@ impl DAppProviderClient {
         let canonical = message_signing::canonical_execute_pay_fee_request(
             proposal_id, fee_type, fees_json, session_id,
         );
-        let sig_data = message_signing::sign_canonical(&self.private_key_bytes, &canonical);
+        let sig_data = message_signing::sign_canonical(&self.private_key.expose(), &canonical);
 
         let fees_canonical = message_signing::canonical_pay_fee_authorization(
             &self.party_id,
@@ -1310,7 +1311,7 @@ impl DAppProviderClient {
             fees_json,
         );
         let fees_auth_data =
-            message_signing::sign_canonical(&self.private_key_bytes, &fees_canonical);
+            message_signing::sign_canonical(&self.private_key.expose(), &fees_canonical);
 
         let resp = self
             .client
@@ -1619,7 +1620,7 @@ pub struct AtomicProviderClient {
         tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>,
     >,
     party_id: String,
-    private_key_bytes: [u8; 32],
+    private_key: Secret<32>,
     ledger_service_public_key: [u8; 32],
 }
 
@@ -1630,7 +1631,7 @@ impl AtomicProviderClient {
         grpc_url: &str,
         party_id: &str,
         role: &str,
-        private_key_bytes: &[u8; 32],
+        private_key: &Secret<32>,
         ttl_secs: u64,
         node_name: Option<&str>,
         ledger_service_public_key: &[u8; 32],
@@ -1643,14 +1644,14 @@ impl AtomicProviderClient {
             request_timeout_secs,
         )
         .await?;
-        let jwt = generate_jwt(party_id, role, private_key_bytes, ttl_secs, node_name)?;
+        let jwt = generate_jwt(party_id, role, &private_key.expose(), ttl_secs, node_name)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interceptor = AuthInterceptor {
             token: Arc::new(RwLock::new(jwt)),
             expires_at: Arc::new(RwLock::new(now + ttl_secs)),
             party_id: party_id.to_string(),
             role: role.to_string(),
-            private_key_bytes: *private_key_bytes,
+            private_key: private_key.clone(),
             ttl_secs,
             node_name: node_name.map(|s| s.to_string()),
         };
@@ -1659,7 +1660,7 @@ impl AtomicProviderClient {
         Ok(Self {
             client,
             party_id: party_id.to_string(),
-            private_key_bytes: *private_key_bytes,
+            private_key: private_key.clone(),
             ledger_service_public_key: *ledger_service_public_key,
         })
     }
@@ -1676,7 +1677,7 @@ impl AtomicProviderClient {
     }
 
     fn sign_as_atomic(&self, canonical: &[u8]) -> AtomicMessageSignature {
-        let sig_data = sign_canonical(&self.private_key_bytes, canonical);
+        let sig_data = sign_canonical(&self.private_key.expose(), canonical);
         AtomicMessageSignature {
             signature: sig_data.signature_b64,
             public_key: sig_data.public_key_b64url,
@@ -1959,7 +1960,7 @@ impl AtomicProviderClient {
             } else {
                 verification.computed_hash.to_vec()
             };
-            let signature = sign_hash_bytes(&self.private_key_bytes, &hash_to_sign)?;
+            let signature = sign_hash_bytes(&self.private_key.expose(), &hash_to_sign)?;
 
             // 4. Execute — echo fees_json verbatim
             let result = match self

@@ -32,7 +32,7 @@ use agent_logic::state::SavedPendingV2;
 use atomic_quote::envelope::{
     canonical_from_dvp, InstrumentIdJson, LpFeeJson, QuoteJson, ENVELOPE_VERSION,
 };
-use atomic_quote::{render_decimal, sign_quote, verify_quote, QuoteSide};
+use atomic_quote::{render_decimal, sign_quote_scalar, verify_quote, QuoteSide};
 use orderbook_proto::rfqv2::{
     AtomicAcsContract, AtomicDisclosedContract, AtomicFeeSpec, AtomicQuote, AtomicQuoteEnvelope,
     RfqConfirmReject, RfqConfirmRejectReason, RfqConfirmRequest,
@@ -130,7 +130,7 @@ pub struct RfqV2State {
     party_id: String,
     lp_name: String,
     synchronizer_id: String,
-    quote_priv_scalar_hex: String,
+    quote_key: agent_logic::config::AtomicQuoteKey,
     v2: RfqV2Config,
     /// rfq_v2-enabled markets only
     market_v2: HashMap<String, RfqV2MarketConfig>,
@@ -163,7 +163,7 @@ impl RfqV2State {
         party_id: String,
         lp_name: String,
         synchronizer_id: String,
-        quote_priv_scalar_hex: String,
+        quote_key: agent_logic::config::AtomicQuoteKey,
         v2: RfqV2Config,
         market_v2: HashMap<String, RfqV2MarketConfig>,
         market_instruments: HashMap<String, MarketInstruments>,
@@ -186,7 +186,7 @@ impl RfqV2State {
             party_id,
             lp_name,
             synchronizer_id,
-            quote_priv_scalar_hex,
+            quote_key,
             v2,
             market_v2,
             market_instruments,
@@ -868,7 +868,7 @@ impl RfqV2State {
                 ));
             }
         };
-        let signature = match sign_quote(&self.quote_priv_scalar_hex, &canonical) {
+        let signature = match sign_quote_scalar(&self.quote_key.scalar(), &canonical) {
             Ok(s) => s,
             Err(e) => {
                 self.release_on_reject(&quote_id, &holding_cids, ticket.is_some()).await;
@@ -1288,11 +1288,15 @@ mod tests {
                 quote_is_cc: false,
             },
         );
+        let quote_key = agent_logic::config::AtomicQuoteKey::from_scalar_hex(
+            &atomic_quote::gen_keypair().unwrap().priv_scalar_hex,
+        )
+        .unwrap();
         RfqV2State::new(
             "lp-party::1220test".to_string(),
             "LP Test".to_string(),
             "sync::test".to_string(),
-            String::new(),
+            quote_key,
             RfqV2Config::default(),
             HashMap::new(),
             market_instruments,

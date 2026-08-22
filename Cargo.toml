@@ -62,3 +62,9 @@ prost-reflect-build = "0.16"
 
 # Additional dependencies
 tokio-stream = "0.1"
+
+# Key handling
+zeroize = "1.8"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] } # listed only so the feature reaches aes-gcm's cipher
+rpassword = "7"

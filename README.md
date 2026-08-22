@@ -37,7 +37,7 @@ Binary at `target/release/cloud-agent`.
 
 ### Onboard
 
-Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. On success, it writes a `.env` (Canton party ID, private key, network parties, fee config) and a starter `agent.toml` (role, poll interval, empty `[[markets]]`) into the current directory. The command is idempotent — re-run safely; existing keys and party IDs are preserved.
+Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. On success, it writes a `.env` (Canton party ID, private key, network parties, fee config) and a starter `agent.toml` (role, poll interval, empty `[[markets]]`) into the current directory. The command can be re-run; an existing party ID and key in `.env` are reused. A key passed with `--private-key` or entered at the prompt is not written to `.env`: later commands for that identity read it from `--private-key`, from `PARTY_AGENT_PRIVATE_KEY` in the environment, or from a terminal prompt.
 
 ```bash
 cloud-agent onboard \
@@ -210,7 +210,7 @@ cargo run -p buy-cc-example -- --amount 10.0 --max-price 0.16 --poll-period 600
 
 The `onboard` command performs 11 steps automatically:
 
-1. Load or generate an Ed25519 keypair (written to `.env` as `PARTY_AGENT_PRIVATE_KEY`).
+1. Load an Ed25519 key (from `--private-key`, a prompt, or `.env`) or generate one; only a generated key is written to `.env` as `PARTY_AGENT_PRIVATE_KEY`.
 2. Connect to the orderbook RPC (raw gRPC, no auth yet).
 3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`.
 4. Register on the waiting list (`RegisterAgent`, signed).
@@ -230,8 +230,8 @@ Flags:
 | `--agent-name <NAME>`    | Display name (required)                          |
 | `--email <EMAIL>`        | Contact email (required)                         |
 | `--invite-code <CODE>`   | Waiting list invite code (required)              |
-| `--party <ID>`           | Skip waiting list (requires `--private-key`)     |
-| `--private-key <B58>`    | Base58-encoded Ed25519 private key               |
+| `--party <ID>`           | Skip the waiting list; prompts for the private key when none is configured |
+| `--private-key <B58>`    | Base58 Ed25519 private key for `--party` (optional in a terminal — prompted, input hidden) |
 | `--env-file <PATH>`      | Path to .env file (default: `.env`; global flag, works on every command) |
 | `--poll-interval <SECS>` | Polling interval during onboarding (default: 10) |
 
@@ -248,12 +248,24 @@ cloud-agent --env-file agent2.env -c agent.toml agent
 
 An explicit `--env-file` overrides variables already set in the shell. Without the flag, `.env` is searched for in the current directory and its parents, and already-set shell variables win.
 
+#### Identity flags
+
+The agent identity can also be passed on the command line, **before** the subcommand:
+
+```bash
+cloud-agent --party <ID> --private-key <B58> info balance
+cloud-agent --party <ID> agent            # prompts for the key in a terminal
+cloud-agent --quote-private-key <HEX> agent
+```
+
+`--party` overrides `PARTY_AGENT`, `--private-key` overrides `PARTY_AGENT_PRIVATE_KEY`, and `--quote-private-key` overrides `ATOMIC_QUOTE_PRIVATE_KEY`. Precedence is flag, then environment (`.env`/shell), then — for the private key only — a hidden terminal prompt when a party is known but no key is configured. Without a terminal the command exits with an error, so non-interactive runs need the variable or the flag. The quote key is never prompted for. Keys supplied this way are not written to `.env`.
+
 #### `.env` — Environment Variables
 
 | Variable                         | Description                                                            | Written by `onboard` |
 | -------------------------------- | ---------------------------------------------------------------------- | :------------------: |
 | `PARTY_AGENT`                    | Your Canton party ID                                                   |         yes          |
-| `PARTY_AGENT_PRIVATE_KEY`        | Base58 Ed25519 private key (32-byte seed)                              |         yes          |
+| `PARTY_AGENT_PRIVATE_KEY`        | Base58 Ed25519 private key (32-byte seed); alternatively `--private-key` or a terminal prompt | generated keys only |
 | `PARTY_AGENT_PUBLIC_KEY`         | Base58 Ed25519 public key (derived from the private key)               |         yes          |
 | `ORDERBOOK_GRPC_URL`             | Orderbook gRPC endpoint                                                |         yes          |
 | `CANTON_CHAIN`                   | `devnet` \| `testnet` \| `mainnet`                                     |         yes          |
@@ -445,6 +457,8 @@ Flags (both `buy` and `sell`):
 | `agent`                                                                                       | Long-running LP agent (grid + RFQ + settlement)         |
 | `onboard`                                                                                     | Self-service onboarding                                 |
 | `generate-private-key`                                                                        | Generate a new Ed25519 keypair (no config needed)       |
+| `--party <ID> --private-key <B58> <command>`                                                  | Identity from flags instead of `.env` (flags go first)  |
+| `--quote-private-key <HEX> <command>`                                                         | Quote key from a flag instead of `.env`                 |
 | `info balance`                                                                                | Show token balances                                     |
 | `info party`                                                                                  | Show party ID, public key, node name                    |
 | `info network`                                                                                | Show DSO party, rates, mining rounds                    |

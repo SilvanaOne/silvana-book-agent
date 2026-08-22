@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 orderbook-proto = { path = "../orderbook-proto" }
 atomic-quote = { path = "../atomic-quote" }
+aes = { workspace = true } # direct dep only to enable aes/zeroize
+aes-gcm = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
 base64 = { workspace = true }
@@ -29,3 +31,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v7"] }
+zeroize = { workspace = true }

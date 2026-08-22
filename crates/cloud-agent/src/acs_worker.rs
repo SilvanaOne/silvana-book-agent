@@ -71,7 +71,7 @@ async fn refresh_holdings(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,

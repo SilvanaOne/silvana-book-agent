@@ -235,7 +235,7 @@ where
     // Create shared order tracker
     let tracker = Arc::new(Mutex::new(OrderTracker::new(
         start_time_ms,
-        config.private_key_bytes,
+        config.private_key.clone(),
     )));
 
     // Restore order tracker state if available

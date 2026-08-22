@@ -25,6 +25,7 @@ pub mod order_tracker;
 pub mod pool_impact;
 pub mod rpc_client;
 pub mod runner;
+pub mod secret;
 pub mod settlement;
 pub mod shutdown;
 pub mod sign;

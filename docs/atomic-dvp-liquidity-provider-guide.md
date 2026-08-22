@@ -35,7 +35,8 @@ An Atomic DVP LP uses **two different keys**. Keep both secret; neither ever lea
 | **Quote key** | `ATOMIC_QUOTE_PRIVATE_KEY` | secp256k1 — signs every Atomic DVP quote | **You generate it** with `cloud-agent atomic keygen` and paste it into `.env` |
 
 The quote key is **only** needed for Atomic DVP. If `[liquidity_provider.rfq_v2].enabled = true` but
-`ATOMIC_QUOTE_PRIVATE_KEY` is missing from `.env`, the agent refuses to start.
+`ATOMIC_QUOTE_PRIVATE_KEY` is missing from `.env`, the agent refuses to start. The key can also be
+passed on the command line as `cloud-agent --quote-private-key <HEX> agent` instead of `.env`.
 
 ---
 
@@ -110,7 +111,8 @@ ATOMIC_QUOTE_PRIVATE_KEY=<64-hex-character scalar printed by atomic keygen>
 ```
 
 Re‑running `atomic keygen` once the var is set just prints `ATOMIC_QUOTE_PRIVATE_KEY is set and
-valid.` plus the public key — a handy way to confirm `.env` is loaded.
+valid.` plus the public key — a handy way to confirm `.env` is loaded. (`--quote-private-key <HEX>`
+before the subcommand supplies the key from the command line instead; keygen then validates that value.)
 
 ## A4. Check your balance (devnet)
 
@@ -712,7 +714,8 @@ transactions automatically, both by `atomic setup` and by the runtime split work
 # Troubleshooting
 
 - **`ATOMIC_QUOTE_PRIVATE_KEY` missing / invalid.** The agent won't start with
-  `[liquidity_provider.rfq_v2].enabled = true` unless a valid secp256k1 key is in `.env`. Run
+  `[liquidity_provider.rfq_v2].enabled = true` unless a valid secp256k1 key is in `.env` (or passed
+  as `--quote-private-key`). Run
   `./cloud-agent atomic keygen` and paste the printed line. Confirm it's loaded by re‑running
   `atomic keygen` (it should say "is set and valid") — and make sure you're in the directory that
   contains `.env`.

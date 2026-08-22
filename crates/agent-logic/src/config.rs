@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use zeroize::Zeroize;
 
 use crate::auth::get_public_key_hex;
+use crate::secret::{Secret, Zeroizing};
 
 // ============================================================================
 // Agent TOML (agent.toml) — agent-specific settings only
@@ -125,8 +127,8 @@ pub struct BaseConfig {
     pub orderbook_grpc_url: String,
     pub synchronizer_id: String,
     pub party_id: String,
-    pub private_key_bytes: [u8; 32],
-    pub private_key_base58: String,
+    /// Ed25519 signing seed, stored sealed; decrypt via `.expose()`.
+    pub private_key: Secret<32>,
     pub public_key_hex: String,
     pub settlement_operator: String,
     pub fee_reserve_cc: f64,
@@ -242,23 +244,48 @@ pub struct BaseConfig {
     pub atomic_quote_key: Option<AtomicQuoteKey>,
 }
 
-/// Wrapper around [`atomic_quote::QuoteKeyFile`] with a redacting `Debug`
-/// (the inner struct carries the private scalar and derives no Debug).
+/// RFQ V2 quote-signing key: public SPKI hex plus the sealed private scalar,
+/// with a redacting `Debug`.
 #[derive(Clone)]
-pub struct AtomicQuoteKey(pub atomic_quote::QuoteKeyFile);
+pub struct AtomicQuoteKey {
+    /// X.509 SPKI DER with uncompressed point, lowercase hex
+    pub pub_spki_hex: String,
+    scalar: Secret<32>,
+}
+
+impl AtomicQuoteKey {
+    /// Build from a raw 32-byte scalar (64 hex chars); derives the public key.
+    pub fn from_scalar_hex(scalar_hex: &str) -> Result<Self> {
+        let mut kf = atomic_quote::keyfile_from_scalar(scalar_hex.trim())?;
+        let decoded = hex::decode(&kf.priv_scalar_hex).map(Zeroizing::new);
+        kf.priv_scalar_hex.zeroize();
+        let decoded = decoded?;
+        let mut bytes: [u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("quote scalar must be 32 bytes"))?;
+        Ok(Self {
+            pub_spki_hex: kf.pub_spki_hex,
+            scalar: Secret::seal(&mut bytes),
+        })
+    }
+
+    /// Sealed scalar, exposed briefly for signing.
+    pub fn scalar(&self) -> crate::secret::Exposed<32> {
+        self.scalar.expose()
+    }
+
+    /// Lowercase hex of the scalar; the returned string is zeroed on drop.
+    pub fn scalar_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(self.scalar.expose().as_slice()))
+    }
+}
 
 impl std::fmt::Debug for AtomicQuoteKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomicQuoteKey")
-            .field("pub_spki_hex", &self.0.pub_spki_hex)
+            .field("pub_spki_hex", &self.pub_spki_hex)
             .finish_non_exhaustive()
-    }
-}
-
-impl std::ops::Deref for AtomicQuoteKey {
-    type Target = atomic_quote::QuoteKeyFile;
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -275,8 +302,7 @@ impl BaseConfig {
             orderbook_grpc_url: String::new(),
             synchronizer_id: String::new(),
             party_id: "test-party".to_string(),
-            private_key_bytes: [0u8; 32],
-            private_key_base58: String::new(),
+            private_key: Secret::seal(&mut [0u8; 32]),
             public_key_hex: String::new(),
             settlement_operator: String::new(),
             fee_reserve_cc: 5.0,
@@ -318,15 +344,35 @@ impl BaseConfig {
     }
 }
 
+/// CLI-supplied values that take precedence over the corresponding env vars.
+#[derive(Default)]
+pub struct ConfigOverrides {
+    /// Overrides `PARTY_AGENT`.
+    pub party: Option<String>,
+    /// Overrides `PARTY_AGENT_PRIVATE_KEY` (base58).
+    pub private_key: Option<Zeroizing<String>>,
+    /// Overrides `ATOMIC_QUOTE_PRIVATE_KEY` (hex scalar).
+    pub quote_private_key: Option<Zeroizing<String>>,
+}
+
 impl BaseConfig {
     /// Strict loader — fails if `agent.toml` is missing or unparseable.
     /// Use from commands that actually consume market/LP settings (i.e. `agent`).
     pub fn load<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
+        Self::load_with(agent_toml_path, ConfigOverrides::default())
+    }
+
+    /// [`BaseConfig::load`] with CLI-supplied overrides for the env-sourced
+    /// identity fields.
+    pub fn load_with<P: AsRef<Path>>(
+        agent_toml_path: P,
+        overrides: ConfigOverrides,
+    ) -> Result<Self> {
         let agent_toml_str = fs::read_to_string(agent_toml_path.as_ref())
             .with_context(|| format!("Failed to read {}", agent_toml_path.as_ref().display()))?;
         let agent: AgentToml = toml::from_str(&agent_toml_str)
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
-        Self::assemble(agent)
+        Self::assemble(agent, overrides)
     }
 
     /// Lenient loader — if `agent.toml` is missing, use serde defaults
@@ -334,6 +380,15 @@ impl BaseConfig {
     /// exists but is malformed, and still requires the mandatory env vars.
     /// Use from commands that don't need market/LP config (faucet, transfer, etc.).
     pub fn load_or_defaults<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
+        Self::load_or_defaults_with(agent_toml_path, ConfigOverrides::default())
+    }
+
+    /// [`BaseConfig::load_or_defaults`] with CLI-supplied overrides for the
+    /// env-sourced identity fields.
+    pub fn load_or_defaults_with<P: AsRef<Path>>(
+        agent_toml_path: P,
+        overrides: ConfigOverrides,
+    ) -> Result<Self> {
         let agent: AgentToml = if agent_toml_path.as_ref().exists() {
             let s = fs::read_to_string(agent_toml_path.as_ref()).with_context(|| {
                 format!("Failed to read {}", agent_toml_path.as_ref().display())
@@ -345,7 +400,7 @@ impl BaseConfig {
             // Empty string round-trips to AgentToml with all serde defaults.
             toml::from_str("").expect("AgentToml serde defaults must parse")
         };
-        Self::assemble(agent)
+        Self::assemble(agent, overrides)
     }
 
     /// Programmatic constructor for embedding the agent as a LIBRARY — e.g. a
@@ -371,15 +426,15 @@ impl BaseConfig {
         node_name: &str,
         ledger_service_public_key_base58: &str,
     ) -> Result<Self> {
-        let private_key_bytes = decode_private_key(private_key_base58)?;
+        let mut private_key_bytes = decode_private_key(private_key_base58)?;
         let public_key_hex = get_public_key_hex(&private_key_bytes);
+        let private_key = Secret::seal(&mut private_key_bytes);
         let ledger_service_public_key = decode_public_key(ledger_service_public_key_base58)?;
         Ok(Self {
             orderbook_grpc_url: orderbook_grpc_url.to_string(),
             synchronizer_id: synchronizer_id.to_string(),
             party_id: party_id.to_string(),
-            private_key_bytes,
-            private_key_base58: private_key_base58.to_string(),
+            private_key,
             public_key_hex,
             settlement_operator: settlement_operator.to_string(),
             fee_reserve_cc: 5.0,
@@ -448,9 +503,10 @@ impl BaseConfig {
     /// the env path (`assemble`). For [`BaseConfig::for_party`] embedders that
     /// load per-agent keys from their own store instead of process env.
     pub fn set_atomic_quote_scalar(&mut self, scalar_hex: &str) -> Result<()> {
-        let kf = atomic_quote::keyfile_from_scalar(scalar_hex.trim())
-            .context("quote key is not a valid secp256k1 scalar")?;
-        self.atomic_quote_key = Some(AtomicQuoteKey(kf));
+        self.atomic_quote_key = Some(
+            AtomicQuoteKey::from_scalar_hex(scalar_hex)
+                .context("quote key is not a valid secp256k1 scalar")?,
+        );
         Ok(())
     }
 
@@ -571,7 +627,7 @@ impl BaseConfig {
     /// env vars. Instrument/registry info is populated later by
     /// [`BaseConfig::populate_instruments_from_rpc`]. Shared between
     /// strict/lenient loaders.
-    fn assemble(mut agent: AgentToml) -> Result<Self> {
+    fn assemble(mut agent: AgentToml, overrides: ConfigOverrides) -> Result<Self> {
         // Instrument registry placeholders — filled by populate_instruments_from_rpc
         // after the cloud-agent fetches them over gRPC at startup.
         let onboarded_registries: Vec<String> = Vec::new();
@@ -579,17 +635,29 @@ impl BaseConfig {
         let instrument_registries: HashMap<String, String> = HashMap::new();
         let instrument_wire_ids: HashMap<String, String> = HashMap::new();
 
-        // Read env vars
+        // Read env vars (CLI overrides win where provided)
         let dso_party = std::env::var("DSO").map_err(|_| anyhow!("DSO env var is required"))?;
 
-        let party_id =
-            std::env::var("PARTY_AGENT").map_err(|_| anyhow!("PARTY_AGENT env var is required"))?;
+        let party_id = match overrides.party.filter(|s| !s.trim().is_empty()) {
+            Some(p) => p,
+            None => std::env::var("PARTY_AGENT")
+                .map_err(|_| anyhow!("PARTY_AGENT env var (or --party) is required"))?,
+        };
 
-        let private_key_base58 = std::env::var("PARTY_AGENT_PRIVATE_KEY")
-            .map_err(|_| anyhow!("PARTY_AGENT_PRIVATE_KEY env var is required"))?;
+        let private_key_b58: Zeroizing<String> = match overrides
+            .private_key
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(k) => k,
+            None => Zeroizing::new(std::env::var("PARTY_AGENT_PRIVATE_KEY").map_err(|_| {
+                anyhow!("PARTY_AGENT_PRIVATE_KEY env var (or --private-key) is required")
+            })?),
+        };
 
-        let private_key_bytes = decode_private_key(&private_key_base58)?;
+        let mut private_key_bytes = decode_private_key(&private_key_b58)?;
         let public_key_hex = get_public_key_hex(&private_key_bytes);
+        let private_key = Secret::seal(&mut private_key_bytes);
+        drop(private_key_b58);
 
         let orderbook_grpc_url = std::env::var("ORDERBOOK_GRPC_URL")
             .map_err(|_| anyhow!("ORDERBOOK_GRPC_URL env var is required"))?;
@@ -1014,21 +1082,32 @@ impl BaseConfig {
             }
         }
 
-        // Quote key: required iff RFQ V2 is enabled. ENV-ONLY — no keyfiles:
-        // ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex) is the single
-        // source for the runtime AND the atomic CLI, so the venue key and the
-        // signing key can never diverge.
+        // Quote key: required iff RFQ V2 is enabled — `--quote-private-key`,
+        // else ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex).
         let atomic_quote_key = if rfq_v2_enabled {
-            let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
-                .ok()
+            let (scalar, source): (Zeroizing<String>, &str) = match overrides
+                .quote_private_key
                 .filter(|s| !s.trim().is_empty())
-                .context(
-                    "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
-                     run `atomic keygen` and add the printed line to .env",
-                )?;
-            let kf = atomic_quote::keyfile_from_scalar(scalar.trim())
-                .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")?;
-            Some(AtomicQuoteKey(kf))
+            {
+                Some(s) => (s, "--quote-private-key"),
+                None => (
+                    Zeroizing::new(
+                        std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .context(
+                                "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
+                                 run `atomic keygen` and add the printed line to .env, \
+                                 or pass --quote-private-key",
+                            )?,
+                    ),
+                    "ATOMIC_QUOTE_PRIVATE_KEY",
+                ),
+            };
+            Some(
+                AtomicQuoteKey::from_scalar_hex(&scalar)
+                    .with_context(|| format!("{source} is not a valid secp256k1 scalar"))?,
+            )
         } else {
             None
         };
@@ -1037,8 +1116,7 @@ impl BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
             party_id,
-            private_key_bytes,
-            private_key_base58,
+            private_key,
             public_key_hex,
             settlement_operator,
             fee_reserve_cc,
@@ -1192,9 +1270,11 @@ pub fn decode_public_key(base58_key: &str) -> Result<[u8; 32]> {
 
 /// Decode base58 Ed25519 private key to 32-byte seed
 pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
-    let key_bytes = bs58::decode(base58_key)
-        .into_vec()
-        .context("Invalid base58 private key")?;
+    let key_bytes = Zeroizing::new(
+        bs58::decode(base58_key.trim())
+            .into_vec()
+            .context("Invalid base58 private key")?,
+    );
 
     if key_bytes.len() < 32 {
         anyhow::bail!(
@@ -1206,6 +1286,13 @@ pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&key_bytes[..32]);
     Ok(arr)
+}
+
+/// Check that `base58_key` decodes to a usable private key.
+pub fn validate_private_key(base58_key: &str) -> Result<()> {
+    let mut bytes = decode_private_key(base58_key)?;
+    bytes.zeroize();
+    Ok(())
 }
 
 /// Load the optional `[ledger_interfaces]` section from `configuration.toml`.
@@ -2402,7 +2489,7 @@ enabled = true
 
         // A: market v2 enabled without the LP-level switch → error
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("liquidity_provider.rfq_v2"), "got: {err}");
 
         // B: RFQ_V2_ENABLED forces the LP switch; scalar env supplies the key;
@@ -2413,7 +2500,7 @@ enabled = true
         set("TICKET_THRESHOLD_USD", "250");
         set("TICKET_BATCH_SIZE", "77");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         let v2 = cfg
             .liquidity_provider
             .as_ref()
@@ -2436,7 +2523,7 @@ name = "LP test"
 "#,
         )
         .unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(cfg.atomic_quote_key.is_none());
 
         // D: max_input_holdings out of the 1..=100 protocol bound → error
@@ -2459,7 +2546,7 @@ max_input_holdings = 125
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("max_input_holdings"), "got: {err}");
 
         // E: ticket_batch_size == 0 → error
@@ -2475,7 +2562,7 @@ ticket_batch_size = 0
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("ticket_batch_size"), "got: {err}");
 
         // F: atomic_quote_valid_secs == 0 → error
@@ -2490,13 +2577,13 @@ atomic_quote_valid_secs = 0
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("atomic_quote_valid_secs"), "got: {err}");
 
         // G: enabled without the env key → error (env-only, no keyfile fallback)
         unset("ATOMIC_QUOTE_PRIVATE_KEY");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let err = format!("{:#}", BaseConfig::assemble(agent).unwrap_err());
+        let err = format!("{:#}", BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err());
         assert!(err.contains("ATOMIC_QUOTE_PRIVATE_KEY"), "got: {err}");
 
         // --- rfq_v2_only scenarios ---
@@ -2505,7 +2592,7 @@ atomic_quote_valid_secs = 0
         // H: rfq_v2_only without a [liquidity_provider] section → error
         unset("RFQ_V2_ENABLED");
         let agent: AgentToml = toml::from_str("rfq_v2_only = true\n").unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("[liquidity_provider]"), "got: {err}");
 
         // I: rfq_v2_only with the LP-level V2 switch off → error
@@ -2518,7 +2605,7 @@ name = "LP test"
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("rfq_v2].enabled"), "got: {err}");
 
         // J: rfq_v2_only with V2 enabled but no v2-enabled market → error
@@ -2536,25 +2623,25 @@ enabled = true
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("at least one enabled market"), "got: {err}");
 
         // K: happy path — toml switch + enabled V2 + v2 market → Ok
         let agent: AgentToml = toml::from_str(&only_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(cfg.rfq_v2_only);
 
         // L: env RFQ_V2_ONLY=true over a toml that omits the field
         set("RFQ_V2_ONLY", "true");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(cfg.rfq_v2_only);
 
         // M: env RFQ_V2_ONLY=false disarms a toml `rfq_v2_only = true`
         // (validation then no longer applies, so this also passes without markets)
         set("RFQ_V2_ONLY", "false");
         let agent: AgentToml = toml::from_str(&only_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(!cfg.rfq_v2_only);
 
         // N: RFQ_V2_ONLY is LP-gated (RFQ_V2_ENABLED idiom) — with no
@@ -2562,8 +2649,70 @@ enabled = true
         // commands on the load_or_defaults path don't trip the validation
         set("RFQ_V2_ONLY", "true");
         let agent: AgentToml = toml::from_str("").unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(!cfg.rfq_v2_only);
+
+        // O: CLI overrides beat the env values; blank overrides are ignored; the
+        // quote override satisfies RFQ V2 with the env var unset
+        unset("RFQ_V2_ONLY");
+        set("RFQ_V2_ENABLED", "true");
+        set("ATOMIC_QUOTE_PRIVATE_KEY", &kf.priv_scalar_hex);
+        let kf2 = atomic_quote::gen_keypair().unwrap();
+        let (k2_b58, _) = crate::sign::generate_keypair();
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(
+            agent,
+            ConfigOverrides {
+                party: Some("other::1220ff".to_string()),
+                private_key: Some(Zeroizing::new(k2_b58.clone())),
+                quote_private_key: Some(Zeroizing::new(kf2.priv_scalar_hex.clone())),
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.party_id, "other::1220ff");
+        assert_eq!(
+            cfg.public_key_hex,
+            get_public_key_hex(&decode_private_key(&k2_b58).unwrap())
+        );
+        assert_eq!(cfg.atomic_quote_key.as_ref().unwrap().pub_spki_hex, kf2.pub_spki_hex);
+
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(
+            agent,
+            ConfigOverrides {
+                party: Some("   ".to_string()),
+                private_key: Some(Zeroizing::new(String::new())),
+                quote_private_key: Some(Zeroizing::new(" ".to_string())),
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.party_id, "lp::1220bb");
+        assert_eq!(cfg.atomic_quote_key.as_ref().unwrap().pub_spki_hex, kf.pub_spki_hex);
+
+        unset("ATOMIC_QUOTE_PRIVATE_KEY");
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(
+            agent,
+            ConfigOverrides {
+                quote_private_key: Some(Zeroizing::new(kf2.priv_scalar_hex.clone())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.atomic_quote_key.as_ref().unwrap().pub_spki_hex, kf2.pub_spki_hex);
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let err = format!(
+            "{:#}",
+            BaseConfig::assemble(
+                agent,
+                ConfigOverrides {
+                    quote_private_key: Some(Zeroizing::new("zz".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("--quote-private-key"), "got: {err}");
 
         // cleanup
         for k in [
@@ -2575,6 +2724,27 @@ enabled = true
         ] {
             unset(k);
         }
+    }
+
+    #[test]
+    fn test_quote_key_from_short_scalar_hex() {
+        let short = "01".repeat(24);
+        let key = AtomicQuoteKey::from_scalar_hex(&short).unwrap();
+        assert_eq!(key.scalar_hex().len(), 64);
+        assert!(key.scalar_hex().starts_with(&"0".repeat(16)));
+        assert!(key.scalar_hex().ends_with(&short));
+        assert!(AtomicQuoteKey::from_scalar_hex(&"01".repeat(10)).is_err());
+    }
+
+    #[test]
+    fn test_quote_key_from_scalar_hex() {
+        let kf = atomic_quote::gen_keypair().unwrap();
+        let key = AtomicQuoteKey::from_scalar_hex(&kf.priv_scalar_hex).unwrap();
+        assert_eq!(key.pub_spki_hex, kf.pub_spki_hex);
+        assert_eq!(*key.scalar_hex(), kf.priv_scalar_hex.to_lowercase());
+        assert_eq!(hex::encode(key.scalar().as_slice()), kf.priv_scalar_hex.to_lowercase());
+        assert_eq!(format!("{key:?}"), format!("AtomicQuoteKey {{ pub_spki_hex: {:?}, .. }}", kf.pub_spki_hex));
+        assert!(AtomicQuoteKey::from_scalar_hex("zz").is_err());
     }
 
     /// Non-env mirror: the same rfq_v2_only requirements enforced by

@@ -402,7 +402,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let jwt = match generate_jwt(
                 &config.party_id,
                 &config.role,
-                &config.private_key_bytes,
+                &config.private_key.expose(),
                 config.token_ttl_secs,
                 Some(config.node_name.as_str()),
             ) {
@@ -750,7 +750,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let jwt = generate_jwt(
             &config.party_id,
             &config.role,
-            &config.private_key_bytes,
+            &config.private_key.expose(),
             config.token_ttl_secs,
             Some(config.node_name.as_str()),
         )?;
@@ -1411,7 +1411,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                                 SettlementEventType::AllocationSellerCompleted
                             };
                             let jwt = match generate_jwt(
-                                &config.party_id, &config.role, &config.private_key_bytes,
+                                &config.party_id, &config.role, &config.private_key.expose(),
                                 config.token_ttl_secs, Some(config.node_name.as_str()),
                             ) {
                                 Ok(j) => j,
@@ -2076,7 +2076,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         generate_jwt(
             &self.config.party_id,
             &self.config.role,
-            &self.config.private_key_bytes,
+            &self.config.private_key.expose(),
             self.config.token_ttl_secs,
             Some(self.config.node_name.as_str()),
         )
@@ -2423,7 +2423,7 @@ async fn advance_single<B: SettlementBackend>(
     let jwt = match generate_jwt(
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key.expose(),
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
     ) {
@@ -2815,7 +2815,7 @@ mod tests {
         assert!(lm.available_cc().await < Decimal::from(95));
 
         let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
         exec.set_liquidity_manager(lm.clone());
         exec.active_settlements
@@ -3075,7 +3075,7 @@ mod tests {
     async fn test_per_counterparty_cap() {
         let mut config = BaseConfig::test_minimal();
         config.max_pending_per_counterparty = 2;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
 
         // Two active settlements with counterparty "cp-x" (we are the seller,
@@ -3182,7 +3182,7 @@ mod tests {
     async fn test_rfq_v2_only_never_adopts_and_stays_retryable() {
         let mut config = BaseConfig::test_minimal();
         config.rfq_v2_only = true;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
         let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
             market_id: String::new(),
@@ -3212,7 +3212,7 @@ mod tests {
     async fn test_rfq_v2_only_branch_precedes_restore_and_no_reject() {
         let mut config = BaseConfig::test_minimal();
         config.rfq_v2_only = true;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
 
         // Case A: restored settlement order (state restore) — would re-adopt.
@@ -3246,7 +3246,7 @@ mod tests {
     async fn test_adoption_defers_reservation_until_counterparty_commits() {
         let config = BaseConfig::test_minimal();
         let lm = ready_lm().await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
         exec.set_liquidity_manager(lm.clone());
         let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
@@ -3308,7 +3308,7 @@ mod tests {
         lm.update_cc_balance(Decimal::from(10)).await;
         lm.update_token_balance("USDCx", Decimal::from(1000)).await; // exactly the leg
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         tracker
             .lock()
             .await
@@ -3336,7 +3336,7 @@ mod tests {
     async fn test_collect_results_releases_orphaned_reservation() {
         let config = BaseConfig::test_minimal();
         let lm = ready_lm().await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
         exec.set_liquidity_manager(lm.clone());
 
@@ -3382,7 +3382,7 @@ mod tests {
         lm.update_token_balance("USDCx", Decimal::from(500)).await; // < the 1000 leg
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
 
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [7u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [7u8; 32]))));
         tracker
             .lock()
             .await
@@ -3418,7 +3418,7 @@ mod tests {
     #[tokio::test]
     async fn test_thread_utilization_partitions_active_set() {
         let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, [0u8; 32])));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
         let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
 
         // active: a1 (in-progress + stale backoff entry), a2 (runnable/waiting)

@@ -188,7 +188,7 @@ pub enum SignCommands {
         /// Base64-encoded 34-byte multihash
         #[arg(long)]
         input: String,
-        /// Private key (base58). Defaults to PARTY_AGENT_PRIVATE_KEY from config
+        /// Private key (base58). Defaults to the configured agent key
         #[arg(long)]
         private_key: Option<String>,
     },
@@ -197,7 +197,7 @@ pub enum SignCommands {
         /// Text message to sign (signed as UTF-8 bytes)
         #[arg(long)]
         input: String,
-        /// Private key (base58). Defaults to PARTY_AGENT_PRIVATE_KEY from config
+        /// Private key (base58). Defaults to the configured agent key
         #[arg(long)]
         private_key: Option<String>,
     },
@@ -206,7 +206,7 @@ pub enum SignCommands {
         /// Hex-encoded binary data (with or without 0x prefix)
         #[arg(long)]
         input: String,
-        /// Private key (base58). Defaults to PARTY_AGENT_PRIVATE_KEY from config
+        /// Private key (base58). Defaults to the configured agent key
         #[arg(long)]
         private_key: Option<String>,
     },
@@ -814,7 +814,7 @@ pub async fn run_cloud_agent(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -838,7 +838,7 @@ pub async fn run_cloud_agent(
                 &config.orderbook_grpc_url,
                 &config.party_id,
                 &config.role,
-                &config.private_key_bytes,
+                &config.private_key,
                 config.token_ttl_secs,
                 Some(config.node_name.as_str()),
                 &config.ledger_service_public_key,
@@ -1153,7 +1153,7 @@ pub async fn setup_rfq_v2(
         config.party_id.clone(),
         lp_config.name.clone(),
         config.synchronizer_id.clone(),
-        quote_key.priv_scalar_hex.clone(),
+        quote_key.clone(),
         v2cfg.clone(),
         market_v2,
         market_instruments,
@@ -1190,7 +1190,7 @@ pub async fn setup_rfq_v2(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -1594,7 +1594,7 @@ pub async fn run_lp_settlement_stream(
         let auth_header = agent_logic::auth::generate_jwt(
             &config.party_id,
             &config.role,
-            &config.private_key_bytes,
+            &config.private_key.expose(),
             config.token_ttl_secs,
             Some(&config.node_name),
         )
@@ -1887,7 +1887,7 @@ pub async fn run_lp_atomic_stream(
         let auth_header = agent_logic::auth::generate_jwt(
             &config.party_id,
             &config.role,
-            &config.private_key_bytes,
+            &config.private_key.expose(),
             config.token_ttl_secs,
             Some(&config.node_name),
         )
@@ -2303,7 +2303,7 @@ pub async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -2434,7 +2434,7 @@ pub async fn run_preapproval(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -2547,7 +2547,7 @@ pub async fn run_subscription(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -2669,7 +2669,7 @@ pub async fn run_transfer(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -3293,7 +3293,7 @@ pub fn sign_onboarding_request(private_key_bytes: &[u8; 32], canonical: &[u8]) -
 pub async fn run_onboard(
     rpc: String,
     party: Option<String>,
-    private_key: Option<String>,
+    private_key: Option<agent_logic::secret::Zeroizing<String>>,
     invite_code: String,
     agent_name: String,
     email: String,
@@ -3303,34 +3303,7 @@ pub async fn run_onboard(
     println!("=== Cloud Agent Self-Service Onboarding ===\n");
 
     // Step 1: Handle keys
-    if let Some(ref pk_b58) = private_key {
-        // --private-key provided (with --party): write key and derive public key
-        let bytes = agent_logic::config::decode_private_key(pk_b58)?;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
-        let pub_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
-        upsert_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY", pk_b58)?;
-        upsert_env_value(&env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
-        upsert_env_value(&env_file, "ORDERBOOK_GRPC_URL", &rpc)?;
-        println!("Private key written to {}", env_file.display());
-        println!("Public key: {}", pub_b58);
-    } else if let Some(pk) = read_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY") {
-        // Existing private key in .env
-        println!("Found existing private key in {}", env_file.display());
-        let bytes = agent_logic::config::decode_private_key(&pk)?;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
-        let pub_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
-        upsert_env_value(&env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
-        println!("Public key: {}", pub_b58);
-    } else {
-        // No key provided and none in .env — generate new keypair
-        println!("Generating new Ed25519 keypair...");
-        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair();
-        upsert_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY", &priv_b58)?;
-        upsert_env_value(&env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
-        upsert_env_value(&env_file, "ORDERBOOK_GRPC_URL", &rpc)?;
-        println!("Private key written to {}", env_file.display());
-        println!("Public key: {}", pub_b58);
-    };
+    let (_, effective_key) = prepare_onboard_key(&env_file, private_key.as_ref(), &rpc)?;
 
     // If --party provided, write it and skip waiting list entirely
     if let Some(ref party_id) = party {
@@ -3357,14 +3330,13 @@ pub async fn run_onboard(
                 maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
             }
             println!("\nPARTY_AGENT={} — checking ledger onboarding...", party_id);
-            return complete_ledger_onboarding(&env_file, &rpc).await;
+            return complete_ledger_onboarding(&env_file, &rpc, Some(&party_id), Some(&effective_key))
+                .await;
         }
     }
 
     // Need private key bytes and public key for the waiting list flow
-    let pk = read_env_value(&env_file, "PARTY_AGENT_PRIVATE_KEY")
-        .ok_or_else(|| anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY missing from .env"))?;
-    let private_key_bytes = agent_logic::config::decode_private_key(&pk)?;
+    let private_key_bytes = agent_logic::config::decode_private_key(&effective_key)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key_bytes);
     let public_key_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
 
@@ -3553,7 +3525,75 @@ pub async fn run_onboard(
     }
 
     // Steps 9-11: Complete ledger onboarding
-    complete_ledger_onboarding(&env_file, &rpc).await
+    let party_id = read_env_value(&env_file, "PARTY_AGENT");
+    complete_ledger_onboarding(&env_file, &rpc, party_id.as_deref(), Some(&effective_key)).await
+}
+
+/// Onboarding Step 1: resolve the agent key from the supplied value, the env
+/// file, or a fresh keypair. Returns the public key and the key to sign with.
+fn prepare_onboard_key(
+    env_file: &std::path::Path,
+    supplied: Option<&agent_logic::secret::Zeroizing<String>>,
+    rpc: &str,
+) -> Result<(String, agent_logic::secret::Zeroizing<String>)> {
+    use agent_logic::secret::Zeroizing;
+    let env_value = |name: &str| read_env_value(env_file, name).filter(|v| !v.is_empty());
+    let public_key_of = |b58: &str| -> Result<String> {
+        let bytes = agent_logic::config::decode_private_key(b58)?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
+        Ok(bs58::encode(signing_key.verifying_key().as_bytes()).into_string())
+    };
+
+    if let Some(pk_b58) = supplied {
+        // Key supplied via flag, environment or prompt: derive the public key, keep the key out of .env
+        let pub_b58 = public_key_of(pk_b58)?;
+        if env_value("PARTY_AGENT_PUBLIC_KEY").is_some_and(|existing| existing != pub_b58) {
+            anyhow::bail!(
+                "the supplied private key does not match PARTY_AGENT_PUBLIC_KEY in {}",
+                env_file.display()
+            );
+        }
+        match env_value("PARTY_AGENT_PRIVATE_KEY") {
+            Some(existing) if existing.trim() != pk_b58.trim() => anyhow::bail!(
+                "{} already holds a different PARTY_AGENT_PRIVATE_KEY — remove it or omit --private-key",
+                env_file.display()
+            ),
+            Some(_) => {}
+            None => println!(
+                "Private key not written to {} — pass --private-key or enter it when prompted.",
+                env_file.display()
+            ),
+        }
+        upsert_env_value(env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
+        upsert_env_value(env_file, "ORDERBOOK_GRPC_URL", rpc)?;
+        println!("Public key: {}", pub_b58);
+        Ok((pub_b58, pk_b58.clone()))
+    } else if let Some(pk) = env_value("PARTY_AGENT_PRIVATE_KEY") {
+        // Existing private key in .env
+        println!("Found existing private key in {}", env_file.display());
+        let pk = Zeroizing::new(pk);
+        let pub_b58 = public_key_of(&pk)?;
+        upsert_env_value(env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
+        println!("Public key: {}", pub_b58);
+        Ok((pub_b58, pk))
+    } else if env_value("PARTY_AGENT").is_some() || env_value("PARTY_AGENT_PUBLIC_KEY").is_some() {
+        anyhow::bail!(
+            "{} already records an identity but no PARTY_AGENT_PRIVATE_KEY — \
+             pass --private-key or run in a terminal to be prompted",
+            env_file.display()
+        );
+    } else {
+        // No key provided and none in .env — generate new keypair
+        println!("Generating new Ed25519 keypair...");
+        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair();
+        let priv_b58 = Zeroizing::new(priv_b58);
+        upsert_env_value(env_file, "PARTY_AGENT_PRIVATE_KEY", &priv_b58)?;
+        upsert_env_value(env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
+        upsert_env_value(env_file, "ORDERBOOK_GRPC_URL", rpc)?;
+        println!("Private key written to {}", env_file.display());
+        println!("Public key: {}", pub_b58);
+        Ok((pub_b58, priv_b58))
+    }
 }
 
 /// Minimal config for the `onboard` CLI path.
@@ -3566,7 +3606,7 @@ pub async fn run_onboard(
 pub struct OnboardConfig {
     pub party_id: String,
     pub role: String,
-    pub private_key_bytes: [u8; 32],
+    pub private_key: agent_logic::secret::Secret<32>,
     pub node_name: String,
     pub ledger_service_public_key: [u8; 32],
     pub token_ttl_secs: u64,
@@ -3575,12 +3615,27 @@ pub struct OnboardConfig {
 }
 
 impl OnboardConfig {
-    pub fn from_env() -> Result<Self> {
-        let party_id = std::env::var("PARTY_AGENT")
-            .map_err(|_| anyhow::anyhow!("PARTY_AGENT env var is required"))?;
-        let private_key_base58 = std::env::var("PARTY_AGENT_PRIVATE_KEY")
-            .map_err(|_| anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY env var is required"))?;
-        let private_key_bytes = agent_logic::config::decode_private_key(&private_key_base58)?;
+    /// Env-driven config; the overrides (flags, prompt, freshly written .env
+    /// values) win over `PARTY_AGENT` / `PARTY_AGENT_PRIVATE_KEY`.
+    pub fn from_env_with(
+        party_override: Option<&str>,
+        key_override: Option<&agent_logic::secret::Zeroizing<String>>,
+    ) -> Result<Self> {
+        let party_id = match party_override {
+            Some(p) => p.to_string(),
+            None => std::env::var("PARTY_AGENT")
+                .map_err(|_| anyhow::anyhow!("PARTY_AGENT env var is required"))?,
+        };
+        let private_key_base58 = match key_override {
+            Some(k) => agent_logic::secret::Zeroizing::new(k.to_string()),
+            None => agent_logic::secret::Zeroizing::new(
+                std::env::var("PARTY_AGENT_PRIVATE_KEY").map_err(|_| {
+                    anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY env var (or --private-key) is required")
+                })?,
+            ),
+        };
+        let mut private_key_bytes = agent_logic::config::decode_private_key(&private_key_base58)?;
+        let private_key = agent_logic::secret::Secret::seal(&mut private_key_bytes);
         let node_name = std::env::var("NODE_NAME")
             .map_err(|_| anyhow::anyhow!("NODE_NAME env var is required"))?;
         let ledger_service_public_key_base58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
@@ -3591,7 +3646,7 @@ impl OnboardConfig {
         Ok(Self {
             party_id,
             role: std::env::var("AGENT_ROLE").unwrap_or_else(|_| "agent".to_string()),
-            private_key_bytes,
+            private_key,
             node_name,
             ledger_service_public_key,
             token_ttl_secs: 3600,
@@ -3603,11 +3658,17 @@ impl OnboardConfig {
 
 /// Complete ledger onboarding (preapproval + user-service).
 /// Called after PARTY_AGENT is set in .env. Does not require `agent.toml`.
-pub async fn complete_ledger_onboarding(env_file: &std::path::Path, rpc: &str) -> Result<()> {
+pub async fn complete_ledger_onboarding(
+    env_file: &std::path::Path,
+    rpc: &str,
+    party_override: Option<&str>,
+    key_override: Option<&agent_logic::secret::Zeroizing<String>>,
+) -> Result<()> {
     // Ensure .env is loaded into process env
     let _ = dotenvy::from_path(env_file);
 
-    let cfg = OnboardConfig::from_env().context("Failed to load onboarding config from .env")?;
+    let cfg = OnboardConfig::from_env_with(party_override, key_override)
+        .context("Failed to load onboarding config from .env")?;
 
     println!(
         "\nCompleting ledger onboarding for party {}...",
@@ -3618,7 +3679,7 @@ pub async fn complete_ledger_onboarding(env_file: &std::path::Path, rpc: &str) -
         rpc,
         &cfg.party_id,
         &cfg.role,
-        &cfg.private_key_bytes,
+        &cfg.private_key,
         cfg.token_ttl_secs,
         Some(cfg.node_name.as_str()),
         &cfg.ledger_service_public_key,
@@ -3949,7 +4010,7 @@ pub async fn complete_ledger_onboarding(env_file: &std::path::Path, rpc: &str) -
                 rpc,
                 &cfg.party_id,
                 &cfg.role,
-                &cfg.private_key_bytes,
+                &cfg.private_key,
                 cfg.token_ttl_secs,
                 Some(cfg.node_name.as_str()),
                 &cfg.ledger_service_public_key,
@@ -4050,7 +4111,7 @@ pub async fn run_user_service(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -4106,21 +4167,21 @@ pub fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
     match command {
         SignCommands::Multihash { input, private_key } => {
             let key = agent_logic::sign::resolve_signing_key(
-                &config.private_key_bytes,
+                &config.private_key.expose(),
                 private_key.as_deref(),
             )?;
             println!("{}", agent_logic::sign::sign_multihash(&key, &input)?);
         }
         SignCommands::Message { input, private_key } => {
             let key = agent_logic::sign::resolve_signing_key(
-                &config.private_key_bytes,
+                &config.private_key.expose(),
                 private_key.as_deref(),
             )?;
             println!("{}", agent_logic::sign::sign_message(&key, &input));
         }
         SignCommands::Binary { input, private_key } => {
             let key = agent_logic::sign::resolve_signing_key(
-                &config.private_key_bytes,
+                &config.private_key.expose(),
                 private_key.as_deref(),
             )?;
             println!("{}", agent_logic::sign::sign_binary(&key, &input)?);
@@ -4138,7 +4199,7 @@ pub async fn run_faucet(config: BaseConfig, command: FaucetCommands, verbose: bo
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -4233,7 +4294,7 @@ pub async fn run_lock(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -4658,22 +4719,32 @@ pub async fn atomic_find_venues(
     Ok(venues)
 }
 
-/// The LP's secp256k1 quote-signing key, resolved from ATOMIC_QUOTE_PRIVATE_KEY
-/// ONLY (raw 32-byte scalar hex in .env). No keyfiles: the runtime agent and
-/// every CLI path share this single source, so the venue key and the signing
-/// key can never diverge.
-fn quote_key_from_env() -> Result<atomic_quote::QuoteKeyFile> {
-    let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "ATOMIC_QUOTE_PRIVATE_KEY is not set — run `atomic keygen` and add the \
-                 printed line to .env"
-            )
-        })?;
-    atomic_quote::keyfile_from_scalar(scalar.trim())
-        .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")
+/// The LP's secp256k1 quote-signing key and its source label:
+/// `--quote-private-key`, else ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex).
+fn resolve_quote_key(
+    cli_override: Option<&str>,
+) -> Result<(atomic_quote::QuoteKeyFile, &'static str)> {
+    use agent_logic::secret::Zeroizing;
+    let (scalar, source) = match cli_override {
+        Some(s) => (Zeroizing::new(s.to_string()), "--quote-private-key"),
+        None => (
+            Zeroizing::new(
+                std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "ATOMIC_QUOTE_PRIVATE_KEY is not set — run `atomic keygen` and add the \
+                             printed line to .env, or pass --quote-private-key"
+                        )
+                    })?,
+            ),
+            "ATOMIC_QUOTE_PRIVATE_KEY",
+        ),
+    };
+    let kf = atomic_quote::keyfile_from_scalar(scalar.trim())
+        .with_context(|| format!("{source} is not a valid secp256k1 scalar"))?;
+    Ok((kf, source))
 }
 
 /// Read + validate the AtomicDVPService disclosure file the provider exported
@@ -5148,7 +5219,9 @@ pub async fn run_atomic(
     dry_run: bool,
     force: bool,
     confirm: bool,
+    quote_key_override: Option<agent_logic::secret::Zeroizing<String>>,
 ) -> Result<()> {
+    let quote_override: Option<&str> = quote_key_override.as_deref().map(String::as_str);
     use orderbook_proto::rfqv2::{
         CancelTicketsParams, CreateAtomicDvpVenueParams, IssueTicketsParams,
         PrepareAtomicTransactionRequest, RetireVenueParams, UpdateVenueKeyParams,
@@ -5157,12 +5230,14 @@ pub async fn run_atomic(
 
     match command {
         AtomicCommands::Keygen => {
-            // Env-only key handling: never writes a file. Print material for .env.
-            match quote_key_from_env() {
-                Ok(kf) => {
-                    println!("ATOMIC_QUOTE_PRIVATE_KEY is set and valid.");
+            // Never writes a file: validates the configured key or prints material for .env.
+            match resolve_quote_key(quote_override) {
+                Ok((kf, source)) => {
+                    let verb = if source.starts_with("--") { "is valid" } else { "is set and valid" };
+                    println!("{source} {verb}.");
                     println!("SPKI public key: {}", kf.pub_spki_hex);
                 }
+                Err(e) if quote_override.is_some() => return Err(e),
                 Err(_) => {
                     let kf = atomic_quote::gen_keypair()?;
                     println!("Generated a new secp256k1 quote keypair (NOT persisted).");
@@ -5182,7 +5257,7 @@ pub async fn run_atomic(
             AtomicVenueCommands::Create { market } => {
                 let ((base_id, base_admin), (quote_id, quote_admin)) =
                     atomic_resolve_market_pair(&config, &market)?;
-                let kf = quote_key_from_env()?;
+                let (kf, _) = resolve_quote_key(quote_override)?;
                 let mut client = atomic_swap::create_atomic_client(&config).await?;
                 if let Some(existing) = atomic_find_venues(&mut client, &config.party_id)
                     .await?
@@ -5264,7 +5339,7 @@ pub async fn run_atomic(
                 );
             }
             AtomicVenueCommands::RotateKey { market } => {
-                let kf = quote_key_from_env()?;
+                let (kf, _) = resolve_quote_key(quote_override)?;
                 let mut client = atomic_swap::create_atomic_client(&config).await?;
                 let venue = atomic_find_venues(&mut client, &config.party_id)
                     .await?
@@ -5501,7 +5576,7 @@ pub async fn run_atomic(
 
         AtomicCommands::Status { market } => {
             let mut client = atomic_swap::create_atomic_client(&config).await?;
-            let local_key = quote_key_from_env().ok();
+            let local_key = resolve_quote_key(quote_override).ok().map(|(kf, _)| kf);
 
             println!("\n=== AtomicDVP venues ===\n");
             let venues = atomic_find_venues(&mut client, &config.party_id).await?;
@@ -5568,14 +5643,10 @@ pub async fn run_atomic(
         AtomicCommands::Setup { service_file } => {
             println!("=== Atomic (RFQ V2) setup for {} ===", config.party_id);
 
-            // 1. quote key from .env (ATOMIC_QUOTE_PRIVATE_KEY only — no
-            // keyfiles; the same resolution the runtime agent uses, so the
-            // venue key and the signing key can never diverge)
-            let kf = quote_key_from_env()?;
-            println!(
-                "[1/6] Quote key (from ATOMIC_QUOTE_PRIVATE_KEY): {}",
-                kf.pub_spki_hex
-            );
+            // 1. quote key: --quote-private-key, else ATOMIC_QUOTE_PRIVATE_KEY — the
+            // same resolution the runtime agent uses
+            let (kf, source) = resolve_quote_key(quote_override)?;
+            println!("[1/6] Quote key (from {source}): {}", kf.pub_spki_hex);
 
             let warnings =
                 atomic_setup_agent(&config, &kf, Some(&service_file), verbose, dry_run, force)
@@ -5902,4 +5973,104 @@ pub async fn atomic_setup_agent(
     }
 
     Ok(warnings)
+}
+
+#[cfg(test)]
+mod onboard_key_tests {
+    use super::*;
+    use agent_logic::secret::Zeroizing;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch_env(content: Option<&str>) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cloud-agent-onboard-key-{}-{n}.env",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        if let Some(c) = content {
+            std::fs::write(&path, c).unwrap();
+        }
+        path
+    }
+
+    fn keypair() -> (Zeroizing<String>, String) {
+        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair();
+        (Zeroizing::new(priv_b58), pub_b58)
+    }
+
+    #[test]
+    fn test_recorded_identity_without_key_is_refused() {
+        let env = scratch_env(Some("PARTY_AGENT=p::1220ee\n"));
+        let err = prepare_onboard_key(&env, None, "http://rpc").unwrap_err();
+        assert!(err.to_string().contains("already records an identity"));
+        assert!(!std::fs::read_to_string(&env).unwrap().contains("PARTY_AGENT_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn test_supplied_key_must_match_recorded_public_key() {
+        let (_, pub1) = keypair();
+        let (k2, _) = keypair();
+        let env = scratch_env(Some(&format!("PARTY_AGENT_PUBLIC_KEY={pub1}\n")));
+        let err = prepare_onboard_key(&env, Some(&k2), "http://rpc").unwrap_err();
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn test_supplied_key_rejects_stale_different_env_key() {
+        let (k1, _) = keypair();
+        let (k2, _) = keypair();
+        let env = scratch_env(Some(&format!("PARTY_AGENT_PRIVATE_KEY={}\n", &*k1)));
+        let err = prepare_onboard_key(&env, Some(&k2), "http://rpc").unwrap_err();
+        assert!(err.to_string().contains("different PARTY_AGENT_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn test_supplied_key_is_not_written() {
+        let (k1, pub1) = keypair();
+        let env = scratch_env(None);
+        let (pub_b58, key) = prepare_onboard_key(&env, Some(&k1), "http://rpc").unwrap();
+        assert_eq!(pub_b58, pub1);
+        assert_eq!(&*key, &*k1);
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert!(!content.contains("PARTY_AGENT_PRIVATE_KEY"));
+        assert!(content.contains(&format!("PARTY_AGENT_PUBLIC_KEY={pub1}")));
+    }
+
+    #[test]
+    fn test_env_key_is_reused() {
+        let (k1, pub1) = keypair();
+        let env = scratch_env(Some(&format!("PARTY_AGENT_PRIVATE_KEY={}\n", &*k1)));
+        let (pub_b58, key) = prepare_onboard_key(&env, None, "http://rpc").unwrap();
+        assert_eq!(pub_b58, pub1);
+        assert_eq!(&*key, &*k1);
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert_eq!(content.matches("PARTY_AGENT_PRIVATE_KEY=").count(), 1);
+        assert!(content.contains(&format!("PARTY_AGENT_PUBLIC_KEY={pub1}")));
+    }
+
+    #[test]
+    fn test_quote_key_override_precedence() {
+        let kf = atomic_quote::gen_keypair().unwrap();
+        let (resolved, source) = resolve_quote_key(Some(&kf.priv_scalar_hex)).unwrap();
+        assert_eq!(resolved.pub_spki_hex, kf.pub_spki_hex);
+        assert_eq!(source, "--quote-private-key");
+        let err = match resolve_quote_key(Some("zz")) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("--quote-private-key"), "got: {err}");
+    }
+
+    #[test]
+    fn test_fresh_env_generates_and_writes_key() {
+        let env = scratch_env(None);
+        let (pub_b58, key) = prepare_onboard_key(&env, None, "http://rpc").unwrap();
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert!(content.contains(&format!("PARTY_AGENT_PRIVATE_KEY={}", &*key)));
+        assert!(content.contains(&format!("PARTY_AGENT_PUBLIC_KEY={pub_b58}")));
+        assert!(content.contains("ORDERBOOK_GRPC_URL=http://rpc"));
+    }
 }
