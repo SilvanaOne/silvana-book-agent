@@ -13,6 +13,8 @@ use cloud_agent::{
     populate_instruments, run_cloud_agent, run_fill, run_info, run_preapproval,
     run_subscription, run_transfer, run_sign, run_user_service, run_faucet,
     run_lock, run_atomic, run_generate_private_key, run_onboard, read_env_value,
+    run_atomic_keygen, run_info_network_anonymous, run_info_party_from_env,
+    run_sign_standalone,
     fill_loop,
     config,
 };
@@ -30,16 +32,16 @@ struct Cli {
     config: PathBuf,
 
     /// Party ID (overrides PARTY_AGENT)
-    #[arg(long, value_name = "PARTY_ID")]
+    #[arg(long, global = true, value_name = "PARTY_ID")]
     party: Option<String>,
 
     /// Base58 Ed25519 private key (overrides PARTY_AGENT_PRIVATE_KEY; onboard keeps a key already in .env).
     /// Omit to be prompted when a party is set but no key is configured.
-    #[arg(long, value_name = "BASE58")]
+    #[arg(long, global = true, value_name = "BASE58")]
     private_key: Option<String>,
 
     /// Hex secp256k1 quote-signing key (overrides ATOMIC_QUOTE_PRIVATE_KEY; not used by onboard)
-    #[arg(long, value_name = "HEX")]
+    #[arg(long, global = true, value_name = "HEX")]
     quote_private_key: Option<String>,
 
     /// Path to env file to load (default: search for `.env` in CWD and parents).
@@ -275,6 +277,23 @@ async fn main() -> Result<()> {
         return run_onboard(rpc, party, key, invite_code, agent_name, email, env_file, poll_interval).await;
     }
 
+    // These read public network data or generate an unrelated key, so they must
+    // not demand — or prompt for — an agent private key.
+    match &cli.command {
+        Commands::Atomic { command: AtomicCommands::Keygen } => {
+            return run_atomic_keygen(top_quote.as_ref().map(|k| k.as_str()));
+        }
+        Commands::Info { command: InfoCommands::Party } => {
+            return run_info_party_from_env(top_party.as_deref(), top_key.as_ref().map(|k| k.as_str()));
+        }
+        Commands::Info { command: InfoCommands::Network } => {
+            let grpc_url = std::env::var("ORDERBOOK_GRPC_URL")
+                .context("ORDERBOOK_GRPC_URL env var is required")?;
+            return run_info_network_anonymous(&grpc_url, 30, 60).await;
+        }
+        _ => {}
+    }
+
     // `Agent` runs the full market-making loop and needs agent.toml to be present
     // and populated. All other subcommands work with serde defaults if the file
     // is missing (buy/sell/faucet/transfer/etc. only touch env-sourced fields).
@@ -286,6 +305,25 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // `sign` with its own key needs no agent identity at all.
+    if let Commands::Sign { command } = cli.command {
+        let local = match &command {
+            SignCommands::Multihash { private_key, .. }
+            | SignCommands::Message { private_key, .. }
+            | SignCommands::Binary { private_key, .. } => {
+                private_key.clone().and_then(nonblank).map(Zeroizing::new)
+            }
+        };
+        let key = local.or(top_key);
+        return match key {
+            Some(k) => run_sign_standalone(command, &k),
+            None => {
+                let overrides = resolve_key_overrides(top_party, None, top_quote)?;
+                run_sign(config::load_or_defaults_with(&cli.config, overrides)?, command)
+            }
+        };
+    }
+
     let overrides = resolve_key_overrides(top_party, top_key, top_quote)?;
 
     let mut base_config = if needs_agent_toml {

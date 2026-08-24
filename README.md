@@ -218,8 +218,8 @@ The `onboard` command performs 11 steps automatically:
 6. Fetch and sign the Canton topology multihash.
 7. Submit the signature (`SubmitOnboardingSignature`).
 8. Poll until `TOPOLOGY_CREATED`; write `PARTY_AGENT` to `.env`.
-9. Create Splice `TransferPreapproval` for CC (pending operator acceptance).
-10. Create one CIP-56 `TransferPreapproval` per non-DSO registrar discovered from `GetInstruments`.
+9. Create Splice `TransferPreapproval` for CC (pending featured-app acceptance).
+10. Create one CIP-56 `TransferPreapproval` per non-DSO registry advertised by the ledger service (`ListFaucetInstruments`). Preapprovals are per registry **admin**, so instruments sharing a registry are covered by a single preapproval, and an admin you already hold one for is skipped.
 11. Request a `UserService` and (on devnet) auto-faucet CC + USDC.
 
 Flags:
@@ -253,12 +253,13 @@ An explicit `--env-file` overrides variables already set in the shell. Without t
 The agent identity can also be passed on the command line, **before** the subcommand:
 
 ```bash
-cloud-agent --party <ID> --private-key <B58> info balance
+cloud-agent info balance --party <ID> --private-key <B58>
+cloud-agent --party <ID> --private-key <B58> info balance   # equivalent
 cloud-agent --party <ID> agent            # prompts for the key in a terminal
 cloud-agent --quote-private-key <HEX> agent
 ```
 
-`--party` overrides `PARTY_AGENT`, `--private-key` overrides `PARTY_AGENT_PRIVATE_KEY`, and `--quote-private-key` overrides `ATOMIC_QUOTE_PRIVATE_KEY`. Precedence is flag, then environment (`.env`/shell), then — for the private key only — a hidden terminal prompt when a party is known but no key is configured. Without a terminal the command exits with an error, so non-interactive runs need the variable or the flag. The quote key is never prompted for. Keys supplied this way are not written to `.env`.
+`--party` overrides `PARTY_AGENT`, `--private-key` overrides `PARTY_AGENT_PRIVATE_KEY`, and `--quote-private-key` overrides `ATOMIC_QUOTE_PRIVATE_KEY`. Precedence is flag, then environment (`.env`/shell), then — for the private key only — a hidden terminal prompt when a party is known but no key is configured. The flags may appear before or after the subcommand. Without a terminal the command exits with an error, so non-interactive runs need the variable or the flag. `info network`, `info party`, `atomic keygen` and `sign` with an explicit `--private-key` need no agent key at all. The quote key is never prompted for. Keys supplied this way are not written to `.env`.
 
 #### `.env` — Environment Variables
 
@@ -457,7 +458,7 @@ Flags (both `buy` and `sell`):
 | `agent`                                                                                       | Long-running LP agent (grid + RFQ + settlement)         |
 | `onboard`                                                                                     | Self-service onboarding                                 |
 | `generate-private-key`                                                                        | Generate a new Ed25519 keypair (no config needed)       |
-| `--party <ID> --private-key <B58> <command>`                                                  | Identity from flags instead of `.env` (flags go first)  |
+| `<command> --party <ID> --private-key <B58>`                                                  | Identity from flags instead of `.env` (either position) |
 | `--quote-private-key <HEX> <command>`                                                         | Quote key from a flag instead of `.env`                 |
 | `info balance`                                                                                | Show token balances                                     |
 | `info party`                                                                                  | Show party ID, public key, node name                    |
@@ -467,12 +468,15 @@ Flags (both `buy` and `sell`):
 | `sell --market <ID> --amount <N>`                                                             | Sell via RFQ until filled                               |
 | `faucet get --token <CC\|USDC\|…> [--admin <P>] [--amount <N>]`                               | Request tokens (devnet)                                 |
 | `transfer send-cc --receiver <P> --amount <N>`                                                | Send Canton Coin                                        |
-| `transfer send-cip56 --receiver <P> --instrument-id <ID> --instrument-admin <P> --amount <N>` | Send CIP-56 token                                       |
+| `transfer send-cip56 --receiver <P> --instrument-id <ID> [--instrument-admin <P>] --amount <N> [--count <N>]` | Send CIP-56 token                     |
 | `transfer accept-cip56 --contract-id <CID>`                                                   | Accept incoming CIP-56 transfer                         |
 | `transfer split-cc --output-amounts a,b,c --amulet-cids x,y`                                  | Split CC amulets                                        |
 | `transfer batch-pay --file payments.csv`                                                      | Batch CC payments (atomic multicall)                    |
+| `transfer prepay-traffic --amount <N>`                                                        | Top up the off-chain prepaid traffic balance            |
 | `preapproval request --instrument-admin <P>`                                                  | Create a `TransferPreapproval`                          |
 | `preapproval fetch`                                                                           | List existing preapprovals                              |
+| `preapproval check`                                                                           | Compare held preapprovals against the advertised targets |
+| `preapproval sync`                                                                            | Create any advertised preapproval this party lacks      |
 | `subscription request-prepaid`                                                                | Request a prepaid recurring payment                     |
 | `subscription request-payasyougo`                                                             | Request a pay-as-you-go subscription                    |
 | `user-service request`                                                                        | Request a `UserService` contract (one-time onboarding)  |

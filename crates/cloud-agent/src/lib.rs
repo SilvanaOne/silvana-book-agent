@@ -16,7 +16,7 @@ use agent_logic::config::BaseConfig;
 use agent_logic::runner::{AgentOptions, BalanceProvider, run_agent};
 use agent_logic::shutdown::Shutdown;
 use orderbook_proto::ledger::{
-    AcceptCip56Params, ExecuteMultiCallParams, FaucetInstrument, FaucetRequest,
+    AcceptCip56Params, ExecuteMultiCallParams, FaucetInstrument, FaucetRequest, PreapprovalInfo,
     GetAgentConfigRequest, GetAgentConfigResponse, GetOnboardingStatusRequest, LockHoldingsParams,
     McBatchPay, McPaymentTarget, MessageSignature, MultiCallOp,
     OnboardingStatus as ProtoOnboardingStatus, PrepareTransactionRequest, PrepayTrafficParams,
@@ -97,9 +97,17 @@ pub enum PreapprovalCommands {
         /// Instrument admin party (DSO for CC, registrar for tokens)
         #[arg(long)]
         instrument_admin: String,
+        /// Create even when a preapproval for this admin already exists
+        /// (use after an operator rotation)
+        #[arg(long)]
+        replace: bool,
     },
     /// Fetch existing preapprovals
     Fetch,
+    /// Compare held preapprovals against the server's preapproval targets
+    Check,
+    /// Create any CIP-56 preapproval the server advertises and this party lacks
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -119,23 +127,29 @@ pub enum TransferCommands {
         #[arg(long)]
         memo_uuid: bool,
     },
-    /// Send CIP-56 instrument token (creates TransferOffer)
+    /// Send a CIP-56 instrument token. Completes in one step when the receiver
+    /// holds a preapproval for the registry, else creates a TransferOffer.
     SendCip56 {
         /// Receiver party ID
         #[arg(long)]
         receiver: String,
-        /// Instrument name (e.g. "USDC", "CBTC")
+        /// Instrument name or on-chain wire id (e.g. "USDC", "CBTC")
         #[arg(long)]
         instrument_id: String,
-        /// Registrar party ID (InstrumentId.admin / instrument source)
+        /// Registrar party ID (InstrumentId.admin / instrument source).
+        /// Defaults to the registry recorded for the instrument.
         #[arg(long)]
-        instrument_admin: String,
+        instrument_admin: Option<String>,
         /// Amount to send (decimal string)
         #[arg(long)]
         amount: String,
         /// Optional transfer reference
         #[arg(long)]
         reference: Option<String>,
+        /// Use at most this many holdings as inputs, biggest first. Defaults to
+        /// the amulet protocol limit for CC and no cap for other instruments.
+        #[arg(long)]
+        count: Option<u32>,
     },
     /// Accept an incoming CIP-56 TransferOffer
     AcceptCip56 {
@@ -166,7 +180,8 @@ pub enum TransferCommands {
         /// Description applied to all payments
         #[arg(long)]
         description: Option<String>,
-        /// Comma-separated input amulet contract IDs (optional — server selects if empty)
+        /// Comma-separated input amulet contract IDs (optional — selected
+        /// automatically from the largest unlocked amulets when omitted)
         #[arg(long, value_delimiter = ',')]
         amulet_cids: Option<Vec<String>>,
     },
@@ -2351,67 +2366,7 @@ pub async fn run_info(config: BaseConfig, command: InfoCommands) -> Result<()> {
             println!("Total debited:     {} CC", pt.total_debited_cc);
         }
         InfoCommands::Network => {
-            let rates = client.get_dso_rates().await?;
-
-            println!("\n=== Network Info ===\n");
-            println!("DSO Party:             {}", rates.dso_party_id);
-            println!("Current Round:         {}", rates.current_round);
-            println!("CC/USD Rate:           {}", rates.cc_usd_rate);
-            if !rates.featured_app_issuance.is_empty() {
-                println!("Featured App Issuance: {}", rates.featured_app_issuance);
-            }
-
-            println!("\n=== Open Mining Rounds ===\n");
-            if rates.open_mining_rounds.is_empty() {
-                println!("No open mining rounds found.");
-            } else {
-                for round in &rates.open_mining_rounds {
-                    println!("Round {}:", round.round_number);
-                    println!("  Amulet Price:    {}", round.amulet_price);
-                    println!("  Opens At:        {}", round.opens_at);
-                    println!("  Target Closes:   {}", round.target_closes_at);
-                    println!("  Issuing For:     {}", round.issuing_for);
-                    println!("  Tick Duration:   {}", round.tick_duration);
-                    if !round.transfer_config_usd.is_empty() {
-                        println!("  Transfer Config: {}", round.transfer_config_usd);
-                    }
-                    if !round.issuance_config.is_empty() {
-                        println!("  Issuance Config: {}", round.issuance_config);
-                    }
-                    println!();
-                }
-            }
-
-            println!("=== Issuing Mining Rounds ===\n");
-            if rates.issuing_mining_rounds.is_empty() {
-                println!("No issuing mining rounds found.");
-            } else {
-                for round in &rates.issuing_mining_rounds {
-                    println!("Round {}:", round.round_number);
-                    println!(
-                        "  Featured App:     {}",
-                        round.issuance_per_featured_app_reward_coupon
-                    );
-                    println!(
-                        "  Unfeatured App:   {}",
-                        round.issuance_per_unfeatured_app_reward_coupon
-                    );
-                    println!(
-                        "  Validator:        {}",
-                        round.issuance_per_validator_reward_coupon
-                    );
-                    println!(
-                        "  SV:               {}",
-                        round.issuance_per_sv_reward_coupon
-                    );
-                    if let Some(faucet) = &round.opt_issuance_per_validator_faucet_coupon {
-                        println!("  Validator Faucet: {}", faucet);
-                    }
-                    println!("  Opens At:         {}", round.opens_at);
-                    println!("  Target Closes:    {}", round.target_closes_at);
-                    println!();
-                }
-            }
+            print_network_info(&client.get_dso_rates().await?);
         }
     }
 
@@ -2444,29 +2399,33 @@ pub async fn run_preapproval(
     .await?;
 
     match command {
-        PreapprovalCommands::Request { instrument_admin } => {
+        PreapprovalCommands::Request {
+            instrument_admin,
+            replace,
+        } => {
+            // An unscoped preapproval already covers every instrument of this
+            // admin; checked before resolving the operator so an unknown admin
+            // cannot mask "nothing to do".
+            if !replace
+                && client.get_preapprovals().await?.iter().any(|p| {
+                    p.receiver == config.party_id
+                        && p.instrument_admin == instrument_admin
+                        && p.instrument_allowances.is_empty()
+                })
+            {
+                println!(
+                    "Preapproval for admin {} already exists; nothing to do (pass --replace to create another).",
+                    instrument_admin
+                );
+                return Ok(());
+            }
             // Resolve the operator party from the faucet instrument list,
             // matching the requested registry/admin.
             let faucet_instruments = client
                 .list_faucet_instruments()
                 .await
                 .context("Failed to fetch faucet instruments from payments-rpc")?;
-            let operator = faucet_instruments
-                .iter()
-                .find(|inst| inst.registry == instrument_admin)
-                .map(|inst| inst.operator.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "No faucet instrument matches admin '{}'; cannot determine operator. \
-                     Available registries: [{}]",
-                        instrument_admin,
-                        faucet_instruments
-                            .iter()
-                            .map(|i| i.registry.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    )
-                })?;
+            let operator = operator_for_registry(&faucet_instruments, &instrument_admin)?;
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
@@ -2523,6 +2482,132 @@ pub async fn run_preapproval(
                         "{}: operator={} receiver={} admin={} instruments=[{}]",
                         p.contract_id, p.operator, p.receiver, p.instrument_admin, allowances
                     );
+                }
+            }
+        }
+        PreapprovalCommands::Check | PreapprovalCommands::Sync => {
+            let create = matches!(command, PreapprovalCommands::Sync);
+            let advertised = client
+                .list_faucet_instruments()
+                .await
+                .context("Failed to fetch preapproval targets")?;
+            let held = client.get_preapprovals().await?;
+            let (targets, warnings) =
+                preapproval_targets(&held, &advertised, &config.dso_party, &config.party_id);
+
+            // The state column is driven by `targets` so the table and the
+            // summary below can never disagree.
+            let needed: std::collections::HashSet<&str> =
+                targets.iter().map(|t| t.admin.as_str()).collect();
+            println!("Preapproval targets advertised by the server:");
+            for inst in &advertised {
+                let mine = |p: &&PreapprovalInfo| {
+                    p.receiver == config.party_id && p.instrument_admin == inst.registry
+                };
+                let scoped = held
+                    .iter()
+                    .filter(mine)
+                    .any(|p| !p.instrument_allowances.is_empty());
+                let state = if inst.token_name == "Amulet" || inst.registry == config.dso_party {
+                    "CC — Splice path, not checked here".to_string()
+                } else if needed.contains(inst.registry.as_str()) {
+                    if scoped {
+                        "MISSING (only a scoped preapproval is held)".to_string()
+                    } else {
+                        "MISSING".to_string()
+                    }
+                } else {
+                    "held".to_string()
+                };
+                println!(
+                    "  {:<10} admin={} operator={} -> {}",
+                    inst.token_name, inst.registry, inst.operator, state
+                );
+            }
+            let advertised_admins: std::collections::HashSet<&str> =
+                advertised.iter().map(|i| i.registry.as_str()).collect();
+            let stale: Vec<&PreapprovalInfo> = held
+                .iter()
+                .filter(|p| {
+                    p.receiver == config.party_id
+                        && !advertised_admins.contains(p.instrument_admin.as_str())
+                })
+                .collect();
+            if !stale.is_empty() {
+                println!("Held for admins the server does not advertise:");
+                for p in stale {
+                    println!("  admin={} operator={}", p.instrument_admin, p.operator);
+                }
+            }
+            for w in &warnings {
+                println!("Warning: {}", w);
+            }
+
+            if targets.is_empty() {
+                println!("\nNothing to create.");
+            } else if !create {
+                println!(
+                    "\n{} registry/registries need a CIP-56 preapproval; run `preapproval sync`.",
+                    targets.len()
+                );
+            } else {
+                if confirm && !dry_run {
+                    let lock = agent_logic::confirm::new_confirm_lock();
+                    agent_logic::confirm::confirm_transaction(
+                        &lock,
+                        "Create CIP-56 Preapprovals",
+                        &format!(
+                            "party: {}, admins: {}",
+                            config.party_id,
+                            targets
+                                .iter()
+                                .map(|t| t.admin.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
+                    .await?;
+                }
+                let mut failures: Vec<String> = Vec::new();
+                for t in &targets {
+                    println!(
+                        "Creating CIP-56 preapproval for admin={} (instruments: {})...",
+                        t.admin,
+                        t.labels.join(", ")
+                    );
+                    let expectation = OperationExpectation::RequestPreapproval {
+                        party: config.party_id.clone(),
+                    };
+                    match client
+                        .submit_transaction(
+                            PrepareTransactionRequest {
+                                operation: TransactionOperation::RequestPreapproval as i32,
+                                params: Some(Params::RequestPreapproval(
+                                    RequestPreapprovalParams {
+                                        instrument_admin: t.admin.clone(),
+                                        instrument_allowances: vec![],
+                                        operator: t.operator.clone(),
+                                    },
+                                )),
+                                request_signature: None,
+                            },
+                            &expectation,
+                            verbose,
+                            dry_run,
+                            force,
+                        )
+                        .await
+                    {
+                        Ok(r) if r.success => println!("Created (update {}).", r.update_id),
+                        Ok(_) => println!("Dry run — not submitted."),
+                        Err(e) => {
+                            println!("Warning: admin={} failed: {:#}", t.admin, e);
+                            failures.push(t.admin.clone());
+                        }
+                    }
+                }
+                if !failures.is_empty() {
+                    anyhow::bail!("{} preapproval(s) failed: {}", failures.len(), failures.join(", "));
                 }
             }
         }
@@ -2699,7 +2784,7 @@ pub async fn run_transfer(
                 )
                 .await?;
             }
-            let command_id = format!("cli-cc-{}", chrono::Utc::now().timestamp_millis());
+            let command_id = format!("cli-cc-{}", uuid::Uuid::now_v7());
             let expectation = OperationExpectation::TransferCc {
                 sender_party: config.party_id.clone(),
                 receiver_party: receiver.clone(),
@@ -2726,7 +2811,10 @@ pub async fn run_transfer(
                     force,
                 )
                 .await?;
-            println!("CC transfer sent: {}", result.update_id);
+            if !result.update_id.is_empty() {
+                println!("CC transfer sent: {}", result.update_id);
+                report_transfer_outcome(&result.created_contracts);
+            }
         }
         TransferCommands::SendCip56 {
             receiver,
@@ -2734,12 +2822,46 @@ pub async fn run_transfer(
             instrument_admin,
             amount,
             reference,
+            count,
         } => {
+            parse_payment_amount(&amount, &receiver, 1)?;
+            // The ledger only knows on-chain wire ids; operators think in names.
+            let resolved = config.resolve_instrument_or_wire(&instrument_id);
+            match &resolved.wire_id {
+                Some(wire) if *wire == instrument_id => println!("Instrument: {}", instrument_id),
+                Some(wire) => println!("Instrument: {} (wire id {})", instrument_id, wire),
+                None => eprintln!(
+                    "warning: '{}' is not in the instrument registry — sending it verbatim as the wire id",
+                    instrument_id
+                ),
+            }
+            let instrument_admin = match instrument_admin {
+                Some(admin) => admin,
+                None => match &resolved.registry {
+                    Some(registry) => {
+                        println!("Registry:   {} (from instrument registry)", registry);
+                        registry.clone()
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "no registry recorded for instrument '{}' — pass --instrument-admin",
+                            instrument_id
+                        ))
+                    }
+                },
+            };
+            let wire_instrument_id = resolved.wire_id.clone().unwrap_or_else(|| instrument_id.clone());
+
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
+                let label = if wire_instrument_id == instrument_id {
+                    format!("Transfer CIP-56 ({})", instrument_id)
+                } else {
+                    format!("Transfer CIP-56 ({} / wire {})", instrument_id, wire_instrument_id)
+                };
                 agent_logic::confirm::confirm_transaction(
                     &lock,
-                    &format!("Transfer CIP-56 ({})", instrument_id),
+                    &label,
                     &format!("receiver: {}, amount: {}", receiver, amount),
                 )
                 .await?;
@@ -2747,7 +2869,7 @@ pub async fn run_transfer(
             let expectation = OperationExpectation::TransferCip56 {
                 sender_party: config.party_id.clone(),
                 receiver_party: receiver.clone(),
-                instrument_id: instrument_id.clone(),
+                instrument_id: wire_instrument_id.clone(),
                 instrument_admin: instrument_admin.clone(),
                 amount: amount.clone(),
             };
@@ -2756,7 +2878,7 @@ pub async fn run_transfer(
                     PrepareTransactionRequest {
                         operation: TransactionOperation::TransferCip56 as i32,
                         params: Some(Params::TransferCip56(TransferCip56Params {
-                            instrument_id: instrument_id.clone(),
+                            instrument_id: wire_instrument_id.clone(),
                             instrument_admin,
                             receiver_party: receiver,
                             amount,
@@ -2764,6 +2886,7 @@ pub async fn run_transfer(
                             // CLI send: auto-select inputs (empty) — the merge
                             // worker is the only caller that passes explicit cids.
                             input_holding_cids: Vec::new(),
+                            max_input_holdings: count,
                         })),
                         request_signature: None,
                     },
@@ -2773,12 +2896,12 @@ pub async fn run_transfer(
                     force,
                 )
                 .await?;
-            println!(
-                "CIP-56 transfer sent ({}): {}",
-                instrument_id, result.update_id
-            );
-            if let Some(cid) = result.contract_id {
-                println!("TransferOffer contract: {}", cid);
+            if !result.update_id.is_empty() {
+                println!(
+                    "CIP-56 transfer sent ({}): {}",
+                    instrument_id, result.update_id
+                );
+                report_transfer_outcome(&result.created_contracts);
             }
         }
         TransferCommands::AcceptCip56 { contract_id } => {
@@ -2810,6 +2933,9 @@ pub async fn run_transfer(
                     force,
                 )
                 .await?;
+            if result.update_id.is_empty() {
+                return Ok(());
+            }
             println!(
                 "CIP-56 transfer accepted ({}): {}",
                 contract_id, result.update_id
@@ -2858,6 +2984,9 @@ pub async fn run_transfer(
                     force,
                 )
                 .await?;
+            if result.update_id.is_empty() {
+                return Ok(());
+            }
             println!("CC split completed: {}", result.update_id);
             for c in &result.created_contracts {
                 if !c.amount.is_empty() {
@@ -2890,11 +3019,11 @@ pub async fn run_transfer(
                 return Err(anyhow::anyhow!("No payment targets specified"));
             }
 
-            // Print summary
-            let total: rust_decimal::Decimal = targets
-                .iter()
-                .map(|(_, amt)| amt.parse::<rust_decimal::Decimal>().unwrap_or_default())
-                .sum();
+            // Parse strictly so the coverage check below sees real amounts.
+            let mut total = rust_decimal::Decimal::ZERO;
+            for (i, (party, amt)) in targets.iter().enumerate() {
+                total += parse_payment_amount(amt, party, i + 1)?;
+            }
             println!(
                 "Batch pay: {} recipients, total {:.4} CC",
                 targets.len(),
@@ -2909,7 +3038,8 @@ pub async fn run_transfer(
                 println!("  {:>3}. {} — {} CC", i + 1, short_party, amount);
             }
 
-            // Auto-select amulets if not provided (same strategy as select_amulets_for_allocation)
+            // Auto-select amulets if not provided. Shares the payment queue's
+            // selector so both paths keep the same ordering, cap and margin.
             let selected_amulet_cids = if let Some(cids) = amulet_cids {
                 cids
             } else {
@@ -2919,39 +3049,54 @@ pub async fn run_transfer(
                 };
                 amulets.sort_by(|a, b| a.amount.cmp(&b.amount));
 
-                // Prefer ONE amulet that covers the total (smallest-fit)
-                let indices: Vec<usize> =
-                    if let Some(i) = amulets.iter().position(|a| a.amount >= total) {
-                        vec![i]
-                    } else {
-                        // Accumulate smallest-first
-                        let mut acc = rust_decimal::Decimal::ZERO;
-                        let mut picked = Vec::new();
-                        for (i, a) in amulets.iter().enumerate() {
-                            picked.push(i);
-                            acc += a.amount;
-                            if acc >= total {
-                                break;
-                            }
-                        }
-                        picked
-                    };
+                let amounts: Vec<rust_decimal::Decimal> =
+                    amulets.iter().map(|a| a.amount).collect();
 
-                let selected_total: rust_decimal::Decimal =
-                    indices.iter().map(|&i| amulets[i].amount).sum();
-                if selected_total < total {
+                // The margin is a preference, not a requirement: a wallet that
+                // covers the payments themselves is still allowed to try.
+                let target = payment_queue::with_fee_margin(total);
+                let mut indices = payment_queue::select_amulet_indices(&amounts, target);
+                let mut tight = false;
+                if indices.is_empty() {
+                    indices = payment_queue::select_amulet_indices(&amounts, total);
+                    tight = !indices.is_empty();
+                }
+
+                if indices.is_empty() {
+                    let available: rust_decimal::Decimal =
+                        amounts.iter().copied().sum::<rust_decimal::Decimal>();
+                    let considered = payment_queue::MAX_AMULET_INPUTS.min(amounts.len());
+                    let best: rust_decimal::Decimal = {
+                        let mut sorted = amounts.clone();
+                        sorted.sort_by(|a, b| b.cmp(a));
+                        sorted.iter().take(considered).copied().sum()
+                    };
                     return Err(anyhow::anyhow!(
-                        "Insufficient CC: need {:.4} but only {:.4} available across {} amulets",
+                        "Insufficient CC: payments total {:.4} but the {} largest of {} amulet(s) \
+                         cover only {:.4} ({:.4} unlocked in total) — consolidate holdings or \
+                         lower the amounts",
                         total,
-                        selected_total,
-                        amulets.len()
+                        considered,
+                        amounts.len(),
+                        best,
+                        available
                     ));
                 }
 
+                let selected_total: rust_decimal::Decimal =
+                    indices.iter().map(|&i| amulets[i].amount).sum();
+                if tight {
+                    println!(
+                        "Note: selection covers the payments ({:.4} CC) but not the {:.4} CC fee \
+                         margin — fees will be tight.",
+                        total, target
+                    );
+                }
                 println!(
-                    "Auto-selected {} amulet(s) ({:.4} CC):",
+                    "Auto-selected {} amulet(s) ({:.4} CC, target {:.4} incl. fee margin):",
                     indices.len(),
-                    selected_total
+                    selected_total,
+                    target
                 );
                 for &i in &indices {
                     let a = &amulets[i];
@@ -3021,7 +3166,9 @@ pub async fn run_transfer(
                     force,
                 )
                 .await?;
-            println!("Batch pay completed: {}", result.update_id);
+            if !result.update_id.is_empty() {
+                println!("Batch pay completed: {}", result.update_id);
+            }
         }
         TransferCommands::PrepayTraffic {
             amount,
@@ -3036,7 +3183,7 @@ pub async fn run_transfer(
                 )
                 .await?;
             }
-            let command_id = format!("cli-prepay-{}", chrono::Utc::now().timestamp_millis());
+            let command_id = format!("cli-prepay-{}", uuid::Uuid::now_v7());
             let expectation = OperationExpectation::PrepayTraffic {
                 sender_party: config.party_id.clone(),
                 amount: amount.clone(),
@@ -3060,6 +3207,9 @@ pub async fn run_transfer(
                     force,
                 )
                 .await?;
+            if result.update_id.is_empty() {
+                return Ok(());
+            }
             println!("Prepaid traffic top-up sent: {}", result.update_id);
 
             // Show post-topup balance so the user can confirm the credit
@@ -3079,6 +3229,96 @@ pub async fn run_transfer(
     }
 
     Ok(())
+}
+
+/// A pending transfer contract left behind by the two-step path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PendingTransfer<'a> {
+    /// Registry-issued offer, acceptable with `transfer accept-cip56`.
+    RegistryOffer(&'a str),
+    /// Amulet instruction, which the CIP-56 accept path cannot consume.
+    AmuletInstruction(&'a str),
+}
+
+/// The pending transfer among a transaction's created contracts. A preapproved
+/// receiver settles inline, leaving no such contract.
+pub fn pending_transfer_offer(
+    created: &[orderbook_proto::ledger::CreatedContractInfo],
+) -> Option<PendingTransfer<'_>> {
+    created.iter().find_map(|c| {
+        if c.template_id.contains("AmuletTransferInstruction") {
+            Some(PendingTransfer::AmuletInstruction(&c.contract_id))
+        } else if c.template_id.contains("TransferOffer")
+            || c.template_id.contains("TransferInstruction")
+        {
+            Some(PendingTransfer::RegistryOffer(&c.contract_id))
+        } else {
+            None
+        }
+    })
+}
+
+/// What a transaction's created contracts say about a transfer's outcome.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransferOutcome<'a> {
+    /// The receiver was preapproved and the transfer settled inline.
+    CompletedInOneStep,
+    /// A pending contract is waiting on the receiver.
+    Pending(PendingTransfer<'a>),
+    /// No created contracts came back, so nothing can be concluded.
+    Unknown,
+}
+
+/// Classify a transfer's outcome. An empty `created` list is NOT evidence of
+/// completion: the ledger update detail behind it is fetched best-effort.
+pub fn transfer_outcome(
+    created: &[orderbook_proto::ledger::CreatedContractInfo],
+) -> TransferOutcome<'_> {
+    if created.is_empty() {
+        return TransferOutcome::Unknown;
+    }
+    match pending_transfer_offer(created) {
+        Some(pending) => TransferOutcome::Pending(pending),
+        None => TransferOutcome::CompletedInOneStep,
+    }
+}
+
+/// Print what the created contracts say about a transfer's outcome.
+fn report_transfer_outcome(created: &[orderbook_proto::ledger::CreatedContractInfo]) {
+    match transfer_outcome(created) {
+        TransferOutcome::Unknown => {
+            println!("Outcome not confirmed — the ledger returned no update detail")
+        }
+        TransferOutcome::Pending(PendingTransfer::RegistryOffer(cid)) => {
+            println!("Awaiting receiver acceptance — TransferOffer {}", cid);
+            println!("  Receiver accepts with: transfer accept-cip56 --contract-id {}", cid);
+        }
+        TransferOutcome::Pending(PendingTransfer::AmuletInstruction(cid)) => {
+            println!("Awaiting receiver acceptance — AmuletTransferInstruction {}", cid);
+            println!("  Acceptance for this instrument is not served by accept-cip56.");
+        }
+        TransferOutcome::CompletedInOneStep => {
+            println!("Completed in one step (receiver is preapproved)")
+        }
+    }
+}
+
+/// Parse one payment amount, naming the row so a bad value is actionable.
+/// Amounts must be positive: a zero or negative leg cannot settle.
+pub fn parse_payment_amount(
+    amount: &str,
+    party: &str,
+    row: usize,
+) -> Result<rust_decimal::Decimal> {
+    let parsed = amount
+        .parse::<rust_decimal::Decimal>()
+        .map_err(|e| anyhow::anyhow!("row {row}: invalid amount '{amount}' for '{party}': {e}"))?;
+    if parsed <= rust_decimal::Decimal::ZERO {
+        return Err(anyhow::anyhow!(
+            "row {row}: amount '{amount}' for '{party}' must be greater than zero"
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Parse a CSV file with batch payment targets.
@@ -3110,15 +3350,8 @@ pub fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String
             continue;
         }
 
-        // Validate amount is a number
-        if amount.parse::<rust_decimal::Decimal>().is_err() {
-            return Err(anyhow::anyhow!(
-                "CSV row {}: invalid amount '{}' for party '{}'",
-                i + 1,
-                amount,
-                party
-            ));
-        }
+        parse_payment_amount(&amount, &party, i + 1)
+            .with_context(|| format!("CSV file {}", path.display()))?;
 
         targets.push((party, amount));
     }
@@ -3141,7 +3374,188 @@ pub fn run_generate_private_key() -> Result<()> {
 // Onboard command — self-service agent onboarding
 // ============================================================================
 
-/// Read a key=value from .env file, returning None if not found or file doesn't exist
+/// Resolve the CIP-56 operator party for a registry from the advertised list.
+pub fn operator_for_registry(
+    advertised: &[FaucetInstrument],
+    registry: &str,
+) -> Result<String> {
+    advertised
+        .iter()
+        .find(|inst| inst.registry == registry)
+        .map(|inst| inst.operator.clone())
+        .filter(|op| !op.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "No preapproval target matches admin '{}'; cannot determine operator. \
+                 Available registries: [{}]",
+                registry,
+                advertised
+                    .iter()
+                    .map(|i| i.registry.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        })
+}
+
+/// One CIP-56 preapproval that still needs creating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreapprovalTarget {
+    admin: String,
+    operator: String,
+    /// Instrument labels served by this admin, for logging only.
+    labels: Vec<String>,
+}
+
+/// Advertised registries that still need a CIP-56 preapproval, plus warnings.
+/// Targets are per admin party; only an unscoped one received by `party` counts.
+fn preapproval_targets(
+    existing: &[PreapprovalInfo],
+    advertised: &[FaucetInstrument],
+    dso_party: &str,
+    party: &str,
+) -> (Vec<PreapprovalTarget>, Vec<String>) {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut targets: Vec<PreapprovalTarget> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for inst in advertised {
+        if inst.token_name == "Amulet" || (!dso_party.is_empty() && inst.registry == dso_party) {
+            continue;
+        }
+        if inst.registry.is_empty() {
+            warnings.push(format!(
+                "preapproval target '{}' has no registry; skipped",
+                inst.token_name
+            ));
+            continue;
+        }
+        if inst.operator.is_empty() {
+            warnings.push(format!(
+                "registry {} has no operator; skipped",
+                inst.registry
+            ));
+            continue;
+        }
+        if let Some(&i) = index.get(&inst.registry) {
+            if targets[i].operator != inst.operator {
+                warnings.push(format!(
+                    "registry {} is advertised with two operators ({} and {}); using the first",
+                    inst.registry, targets[i].operator, inst.operator
+                ));
+            }
+            targets[i].labels.push(inst.token_name.clone());
+        } else {
+            index.insert(inst.registry.clone(), targets.len());
+            targets.push(PreapprovalTarget {
+                admin: inst.registry.clone(),
+                operator: inst.operator.clone(),
+                labels: vec![inst.token_name.clone()],
+            });
+        }
+    }
+
+    targets.retain(|t| {
+        let mut scoped_only = false;
+        for p in existing
+            .iter()
+            .filter(|p| p.receiver == party && p.instrument_admin == t.admin)
+        {
+            if !p.instrument_allowances.is_empty() {
+                scoped_only = true;
+                continue;
+            }
+            if p.operator != t.operator {
+                warnings.push(format!(
+                    "registry {} is already preapproved with operator {} (advertised: {}); left as \
+                     is — use `preapproval request --instrument-admin {} --replace` to add one",
+                    t.admin, p.operator, t.operator, t.admin
+                ));
+            }
+            return false;
+        }
+        if scoped_only {
+            warnings.push(format!(
+                "registry {} is preapproved only for specific instruments; adding an unscoped one",
+                t.admin
+            ));
+        }
+        true
+    });
+
+    (targets, warnings)
+}
+
+/// What a Splice ACS snapshot says about CC preapproval coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcCoverage {
+    /// Accepted preapproval valid past the deadline.
+    Active,
+    /// Proposal still awaiting featured-app acceptance.
+    ProposalPending,
+    /// Absent, expired, or unreadable — treated as no coverage.
+    Missing,
+}
+
+/// Classify `(template_id, expiresAt)` pairs from a Splice ACS snapshot.
+fn classify_cc_coverage(
+    entries: &[(String, Option<String>)],
+    deadline: chrono::DateTime<chrono::Utc>,
+) -> CcCoverage {
+    let mut proposal = false;
+    let mut stale_accepted = false;
+    for (template_id, expires_at) in entries {
+        if template_id.contains("TransferPreapprovalProposal") {
+            proposal = true;
+        } else if template_id.contains("TransferPreapproval") {
+            if expires_at
+                .as_deref()
+                .and_then(parse_daml_timestamp)
+                .is_some_and(|t| t > deadline)
+            {
+                return CcCoverage::Active;
+            }
+            stale_accepted = true;
+        }
+    }
+    // A lingering proposal must not mask an expired preapproval.
+    if proposal && !stale_accepted {
+        CcCoverage::ProposalPending
+    } else {
+        CcCoverage::Missing
+    }
+}
+
+/// Renew a CC preapproval this far ahead of its on-chain expiry.
+fn cc_renewal_deadline(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    now + chrono::Duration::days(30)
+}
+
+/// Daml timestamps arrive as RFC 3339 or as microseconds since the epoch.
+fn parse_daml_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    raw.trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_micros)
+}
+
+/// Read a top-level string field off a contract's create arguments.
+fn struct_field_string(
+    contract: &orderbook_proto::ledger::ActiveContractInfo,
+    field: &str,
+) -> Option<String> {
+    match &contract.create_arguments.as_ref()?.fields.get(field)?.kind {
+        Some(prost_types::value::Kind::StringValue(s)) => Some(s.clone()),
+        Some(prost_types::value::Kind::NumberValue(n)) => Some(format!("{n:.0}")),
+        _ => None,
+    }
+}
+
+/// Read a key=value from .env file, returning None if not found or file doesn't exist.
+/// Surrounding quotes are stripped, matching what `write_server_config_to_env` writes.
 pub fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
     let content = std::fs::read_to_string(env_file).ok()?;
     for line in content.lines() {
@@ -3151,7 +3565,13 @@ pub fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
         }
         if let Some(val) = line.strip_prefix(key) {
             if let Some(val) = val.strip_prefix('=') {
-                return Some(val.trim().to_string());
+                let val = val.trim();
+                let val = val
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                    .unwrap_or(val);
+                return Some(val.to_string());
             }
         }
     }
@@ -3703,34 +4123,54 @@ pub async fn complete_ledger_onboarding(
         .await
         .context("Failed to fetch faucet instruments from payments-rpc")?;
 
+    // The Amulet entry carries both the CC admin (DSO) and the featured-app
+    // operator; the DSO party also keeps CC out of the CIP-56 loop below.
+    let amulet_entry = faucet_instruments
+        .iter()
+        .find(|i| i.token_name == "Amulet")
+        .filter(|i| !i.registry.is_empty() && !i.operator.is_empty());
+    let cc_dso_party = amulet_entry.map(|i| i.registry.clone()).unwrap_or_default();
+    // Every preapproval that could not be created, reported once at the end.
+    let mut preapproval_failures: Vec<String> = Vec::new();
+
     // 11a-CC: Create Splice TransferPreapproval for CC (required for CC auto-completion).
     // Check if Splice preapproval or proposal already exists.
     let splice_preapproval_templates = [
         "#splice-amulet:Splice.AmuletRules:TransferPreapproval".to_string(),
         "#splice-wallet:Splice.Wallet.TransferPreapproval:TransferPreapprovalProposal".to_string(),
     ];
-    let splice_contracts = client
-        .get_active_contracts(&splice_preapproval_templates)
-        .await
-        .unwrap_or_default();
-    if splice_contracts.is_empty() {
-        // DSO is the Amulet's instrument admin (issuer baked into the contract);
-        // operator is the featured-app provider used only for preapproval creation.
-        // They are distinct: DSO comes from the local .env, operator from the
-        // ListFaucetInstruments response (Amulet entry).
-        let dso_for_cc = read_env_value(env_file, "DSO").unwrap_or_default();
-        let amulet_operator = faucet_instruments
-            .iter()
-            .find(|i| i.token_name == "Amulet")
-            .map(|i| i.operator.clone())
-            .unwrap_or_default();
-        if dso_for_cc.is_empty() {
-            println!("Warning: DSO not set in .env; skipping CC preapproval.");
-        } else if amulet_operator.is_empty() {
+    // An unreadable snapshot must neither look like coverage nor drive a
+    // duplicate create, so the CC step is skipped and recorded instead.
+    let cc_coverage = match client.get_active_contracts(&splice_preapproval_templates).await {
+        Ok(contracts) => {
+            let entries: Vec<(String, Option<String>)> = contracts
+                .iter()
+                .map(|c| (c.template_id.clone(), struct_field_string(c, "expiresAt")))
+                .collect();
+            // Renew ahead of expiry: Splice asserts expiresAt when the transfer runs.
+            Some(classify_cc_coverage(&entries, cc_renewal_deadline(chrono::Utc::now())))
+        }
+        Err(e) => {
+            println!("Warning: could not query existing Splice CC preapprovals: {:#}", e);
+            preapproval_failures.push("CC (Splice): existing-preapproval query failed".to_string());
+            None
+        }
+    };
+    if cc_coverage == Some(CcCoverage::ProposalPending) {
+        println!(
+            "Splice CC preapproval proposal is pending featured-app acceptance; not creating another."
+        );
+    }
+    if cc_coverage == Some(CcCoverage::Missing) {
+        if amulet_entry.is_none() {
             println!(
-                "Warning: faucet returned no Amulet operator (PREAPPROVAL_FEATURED_APP); skipping CC preapproval."
+                "Warning: no usable Amulet entry in the preapproval target list; skipping CC preapproval."
             );
+            preapproval_failures.push("CC (Splice): no Amulet preapproval target".to_string());
         } else {
+            let amulet = amulet_entry.expect("checked above");
+            let dso_for_cc = amulet.registry.clone();
+            let amulet_operator = amulet.operator.clone();
             println!("Creating Splice preapproval for CC...");
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
@@ -3756,68 +4196,63 @@ pub async fn complete_ledger_onboarding(
                 Ok(_) => println!(
                     "Splice preapproval proposal created for CC (pending featured-app acceptance)."
                 ),
-                Err(e) => println!("Warning: failed to create CC preapproval: {}", e),
+                Err(e) => {
+                    println!("Warning: failed to create CC preapproval: {:#}", e);
+                    preapproval_failures.push("CC (Splice): creation failed".to_string());
+                }
             }
         }
-    } else {
-        println!(
-            "Splice CC preapproval already exists ({} found).",
-            splice_contracts.len()
-        );
+    } else if cc_coverage == Some(CcCoverage::Active) {
+        println!("Splice CC preapproval already exists and is current.");
     }
 
     // 11a-CIP56: Create CIP-56 TransferPreapprovals for utility tokens.
     let preapprovals = client.get_preapprovals().await?;
-    let existing_admins: std::collections::HashSet<&str> = preapprovals
-        .iter()
-        .map(|p| p.instrument_admin.as_str())
-        .collect();
-
-    let mut needed: Vec<(String, String, String)> = Vec::new(); // (registry, token_name, operator)
-    let mut seen_admins: std::collections::HashSet<String> =
-        existing_admins.iter().map(|s| s.to_string()).collect();
-    for inst in &faucet_instruments {
-        if inst.token_name == "Amulet" || inst.registry.is_empty() {
-            continue;
-        }
-        if seen_admins.insert(inst.registry.clone()) {
-            needed.push((
-                inst.registry.clone(),
-                inst.token_name.clone(),
-                inst.operator.clone(),
-            ));
-        }
+    let (targets, target_warnings) =
+        preapproval_targets(&preapprovals, &faucet_instruments, &cc_dso_party, &cfg.party_id);
+    for w in &target_warnings {
+        println!("Warning: {}", w);
     }
+    // Count registries, not entries: several instruments may share an admin.
+    let advertised_utility = faucet_instruments
+        .iter()
+        .filter(|i| i.token_name != "Amulet" && !i.registry.is_empty())
+        .map(|i| i.registry.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
-    if needed.is_empty() {
-        if preapprovals.is_empty() {
-            println!(
-                "Warning: faucet returned no utility instruments; no CIP-56 preapprovals to create."
-            );
-        } else {
-            println!(
-                "CIP-56 preapprovals up to date ({} found).",
-                preapprovals.len()
-            );
-        }
+    if advertised_utility == 0 {
+        println!(
+            "Warning: the server advertises no utility preapproval targets; none can be created."
+        );
+    } else if targets.is_empty() {
+        println!(
+            "CIP-56 preapprovals up to date ({} registry/registries advertised).",
+            advertised_utility
+        );
     } else {
-        for (admin, label, operator) in &needed {
+        println!(
+            "Creating {} CIP-56 preapproval(s) of {} advertised registry/registries...",
+            targets.len(),
+            advertised_utility
+        );
+        for t in &targets {
             println!(
-                "Creating CIP-56 preapproval for {} (admin={})...",
-                label, admin
+                "Creating CIP-56 preapproval for admin={} (instruments: {})...",
+                t.admin,
+                t.labels.join(", ")
             );
-            let label = label.as_str();
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
             };
-            client
+            match client
                 .submit_transaction(
                     PrepareTransactionRequest {
                         operation: TransactionOperation::RequestPreapproval as i32,
                         params: Some(Params::RequestPreapproval(RequestPreapprovalParams {
-                            instrument_admin: admin.clone(),
+                            instrument_admin: t.admin.clone(),
                             instrument_allowances: vec![],
-                            operator: operator.clone(),
+                            operator: t.operator.clone(),
                         })),
                         request_signature: None,
                     },
@@ -3827,8 +4262,16 @@ pub async fn complete_ledger_onboarding(
                     false,
                 )
                 .await
-                .context(format!("Failed to create CIP-56 preapproval for {}", label))?;
-            println!("CIP-56 preapproval created for {}.", label);
+            {
+                Ok(_) => println!("CIP-56 preapproval created for admin={}.", t.admin),
+                Err(e) => {
+                    println!(
+                        "Warning: failed to create CIP-56 preapproval for admin={}: {:#}",
+                        t.admin, e
+                    );
+                    preapproval_failures.push(t.admin.clone());
+                }
+            }
         }
     }
 
@@ -4091,6 +4534,17 @@ pub async fn complete_ledger_onboarding(
         }
     }
 
+    // Reported last so a single unreachable registry cannot cost the agent its
+    // user service, faucet and traffic seed.
+    if !preapproval_failures.is_empty() {
+        anyhow::bail!(
+            "onboarding finished, but {} CIP-56 preapproval(s) failed — retry with \
+             `preapproval request --instrument-admin <PARTY>` for: {}",
+            preapproval_failures.len(),
+            preapproval_failures.join(", ")
+        );
+    }
+
     println!("\n=== Onboarding complete! ===");
     Ok(())
 }
@@ -4160,6 +4614,165 @@ pub async fn run_user_service(
         }
     }
 
+    Ok(())
+}
+
+/// Generates or validates the secp256k1 quote key. Needs no agent identity.
+pub fn run_atomic_keygen(quote_override: Option<&str>) -> Result<()> {
+    // Never writes a file: validates the configured key or prints material for .env.
+    match resolve_quote_key(quote_override) {
+        Ok((kf, source)) => {
+            let verb = if source.starts_with("--") { "is valid" } else { "is set and valid" };
+            println!("{source} {verb}.");
+            println!("SPKI public key: {}", kf.pub_spki_hex);
+        }
+        Err(e) if quote_override.is_some() => return Err(e),
+        Err(_) => {
+            let kf = atomic_quote::gen_keypair()?;
+            println!("Generated a new secp256k1 quote keypair (NOT persisted).");
+            println!("Add this line to the agent's .env:");
+            println!();
+            println!("ATOMIC_QUOTE_PRIVATE_KEY={}", kf.priv_scalar_hex);
+            println!();
+            println!("SPKI public key: {}", kf.pub_spki_hex);
+            println!(
+                "⚠ Keep the .env safe: this key signs all quotes for venues created with it."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Shared by the identity-bound and anonymous `info network` paths.
+fn print_network_info(rates: &orderbook_proto::ledger::GetDsoRatesResponse) {
+
+    println!("\n=== Network Info ===\n");
+    println!("DSO Party:             {}", rates.dso_party_id);
+    println!("Current Round:         {}", rates.current_round);
+    println!("CC/USD Rate:           {}", rates.cc_usd_rate);
+    if !rates.featured_app_issuance.is_empty() {
+        println!("Featured App Issuance: {}", rates.featured_app_issuance);
+    }
+
+    println!("\n=== Open Mining Rounds ===\n");
+    if rates.open_mining_rounds.is_empty() {
+        println!("No open mining rounds found.");
+    } else {
+        for round in &rates.open_mining_rounds {
+            println!("Round {}:", round.round_number);
+            println!("  Amulet Price:    {}", round.amulet_price);
+            println!("  Opens At:        {}", round.opens_at);
+            println!("  Target Closes:   {}", round.target_closes_at);
+            println!("  Issuing For:     {}", round.issuing_for);
+            println!("  Tick Duration:   {}", round.tick_duration);
+            if !round.transfer_config_usd.is_empty() {
+                println!("  Transfer Config: {}", round.transfer_config_usd);
+            }
+            if !round.issuance_config.is_empty() {
+                println!("  Issuance Config: {}", round.issuance_config);
+            }
+            println!();
+        }
+    }
+
+    println!("=== Issuing Mining Rounds ===\n");
+    if rates.issuing_mining_rounds.is_empty() {
+        println!("No issuing mining rounds found.");
+    } else {
+        for round in &rates.issuing_mining_rounds {
+            println!("Round {}:", round.round_number);
+            println!(
+                "  Featured App:     {}",
+                round.issuance_per_featured_app_reward_coupon
+            );
+            println!(
+                "  Unfeatured App:   {}",
+                round.issuance_per_unfeatured_app_reward_coupon
+            );
+            println!(
+                "  Validator:        {}",
+                round.issuance_per_validator_reward_coupon
+            );
+            println!(
+                "  SV:               {}",
+                round.issuance_per_sv_reward_coupon
+            );
+            if let Some(faucet) = &round.opt_issuance_per_validator_faucet_coupon {
+                println!("  Validator Faucet: {}", faucet);
+            }
+            println!("  Opens At:         {}", round.opens_at);
+            println!("  Target Closes:    {}", round.target_closes_at);
+            println!();
+        }
+    }
+}
+
+/// `info network` without an agent identity: the RPC relays this query
+/// unauthenticated, so no token is sent.
+pub async fn run_info_network_anonymous(
+    grpc_url: &str,
+    connection_timeout_secs: u64,
+    request_timeout_secs: u64,
+) -> Result<()> {
+    let mut client = ledger_client::DAppProviderClient::new_anonymous(
+        grpc_url,
+        Some(connection_timeout_secs),
+        Some(request_timeout_secs),
+    )
+    .await?;
+    print_network_info(&client.get_dso_rates().await?);
+    Ok(())
+}
+
+/// `info party` without a private key: the identity is read from the
+/// environment, and the public key derived only when a key is configured.
+pub fn run_info_party_from_env(party_override: Option<&str>, key: Option<&str>) -> Result<()> {
+    let party = party_override
+        .map(str::to_string)
+        .or_else(|| std::env::var("PARTY_AGENT").ok())
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("PARTY_AGENT env var (or --party) is required"))?;
+    println!("Party ID: {}", party);
+
+    let configured_key = key
+        .map(str::to_string)
+        .or_else(|| std::env::var("PARTY_AGENT_PRIVATE_KEY").ok())
+        .filter(|k| !k.trim().is_empty());
+    let public_key_hex = match configured_key {
+        Some(k) => {
+            let bytes = agent_logic::config::decode_private_key(&k)?;
+            Some(agent_logic::auth::get_public_key_hex(&bytes))
+        }
+        None => std::env::var("PARTY_AGENT_PUBLIC_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .map(|b58| agent_logic::config::decode_public_key(&b58).map(hex::encode))
+            .transpose()?,
+    };
+    match public_key_hex {
+        Some(hex) => println!("Public key: {}", hex),
+        None => println!("Public key: (no key configured)"),
+    }
+    if let Ok(node) = std::env::var("NODE_NAME") {
+        println!("Node name: {}", node);
+    }
+    Ok(())
+}
+
+/// `sign` with an explicit key: signing needs no party and no agent config.
+pub fn run_sign_standalone(command: SignCommands, private_key: &str) -> Result<()> {
+    let key = agent_logic::sign::resolve_signing_key(&[0u8; 32], Some(private_key))?;
+    match command {
+        SignCommands::Multihash { input, .. } => {
+            println!("{}", agent_logic::sign::sign_multihash(&key, &input)?)
+        }
+        SignCommands::Message { input, .. } => {
+            println!("{}", agent_logic::sign::sign_message(&key, &input))
+        }
+        SignCommands::Binary { input, .. } => {
+            println!("{}", agent_logic::sign::sign_binary(&key, &input)?)
+        }
+    }
     Ok(())
 }
 
@@ -5229,30 +5842,7 @@ pub async fn run_atomic(
     };
 
     match command {
-        AtomicCommands::Keygen => {
-            // Never writes a file: validates the configured key or prints material for .env.
-            match resolve_quote_key(quote_override) {
-                Ok((kf, source)) => {
-                    let verb = if source.starts_with("--") { "is valid" } else { "is set and valid" };
-                    println!("{source} {verb}.");
-                    println!("SPKI public key: {}", kf.pub_spki_hex);
-                }
-                Err(e) if quote_override.is_some() => return Err(e),
-                Err(_) => {
-                    let kf = atomic_quote::gen_keypair()?;
-                    println!("Generated a new secp256k1 quote keypair (NOT persisted).");
-                    println!("Add this line to the agent's .env:");
-                    println!();
-                    println!("ATOMIC_QUOTE_PRIVATE_KEY={}", kf.priv_scalar_hex);
-                    println!();
-                    println!("SPKI public key: {}", kf.pub_spki_hex);
-                    println!(
-                        "⚠ Keep the .env safe: this key signs all quotes for venues created with it."
-                    );
-                }
-            }
-        }
-
+        AtomicCommands::Keygen => return run_atomic_keygen(quote_override),
         AtomicCommands::Venue { command } => match command {
             AtomicVenueCommands::Create { market } => {
                 let ((base_id, base_admin), (quote_id, quote_admin)) =
@@ -6001,6 +6591,286 @@ mod onboard_key_tests {
         (Zeroizing::new(priv_b58), pub_b58)
     }
 
+    fn advertised(token_name: &str, registry: &str, operator: &str) -> FaucetInstrument {
+        FaucetInstrument {
+            token_name: token_name.to_string(),
+            registry: registry.to_string(),
+            operator: operator.to_string(),
+            default_amount: String::new(),
+        }
+    }
+
+    fn held(admin: &str, operator: &str, allowances: &[&str]) -> PreapprovalInfo {
+        PreapprovalInfo {
+            contract_id: "cid".to_string(),
+            operator: operator.to_string(),
+            receiver: "me".to_string(),
+            instrument_admin: admin.to_string(),
+            instrument_allowances: allowances
+                .iter()
+                .map(|id| orderbook_proto::ledger::InstrumentAllowance { id: id.to_string() })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_shared_registry_yields_one_target() {
+        let (targets, warnings) = preapproval_targets(
+            &[],
+            &[
+                advertised("USD8", "reg-a", "op"),
+                advertised("USX", "reg-a", "op"),
+                advertised("CBTC", "reg-b", "op"),
+            ],
+            "dso",
+            "me",
+        );
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].admin, "reg-a");
+        assert_eq!(targets[0].labels, vec!["USD8", "USX"]);
+        assert_eq!(targets[1].admin, "reg-b");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn test_amulet_label_is_skipped_without_a_known_dso() {
+        // dso_party empty, so only the token_name clause can do the skipping.
+        let (targets, warnings) = preapproval_targets(
+            &[],
+            &[
+                advertised("Amulet", "dso", "featured"),
+                advertised("CBTC", "reg-b", "op"),
+            ],
+            "",
+            "me",
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].admin, "reg-b");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn test_dso_registry_is_skipped_under_any_label() {
+        // Labelled "CC", so only the dso_party clause can do the skipping.
+        let (targets, warnings) = preapproval_targets(
+            &[],
+            &[
+                advertised("CC", "dso", "op"),
+                advertised("CBTC", "reg-b", "op"),
+            ],
+            "dso",
+            "me",
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].admin, "reg-b");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn test_another_partys_preapproval_is_not_coverage() {
+        let mut theirs = held("reg-a", "op", &[]);
+        theirs.receiver = "someone-else".to_string();
+        let (targets, _) = preapproval_targets(
+            &[theirs],
+            &[advertised("USD8", "reg-a", "op")],
+            "dso",
+            "me",
+        );
+        assert_eq!(targets.len(), 1, "another party's preapproval must not count");
+    }
+
+    #[test]
+    fn test_operator_for_registry_rejects_blank_and_unknown() {
+        let list = [
+            advertised("USD8", "reg-a", "op"),
+            advertised("Blank", "reg-blank", ""),
+        ];
+        assert_eq!(operator_for_registry(&list, "reg-a").unwrap(), "op");
+
+        let err = format!("{:#}", operator_for_registry(&list, "reg-missing").unwrap_err());
+        assert!(err.contains("reg-missing"), "got: {err}");
+        assert!(err.contains("reg-a"), "lists what is available: {err}");
+
+        assert!(
+            operator_for_registry(&list, "reg-blank").is_err(),
+            "a blank operator is not usable"
+        );
+    }
+
+    #[test]
+    fn test_cc_renewal_margin_is_thirty_days() {
+        let now = chrono::Utc::now();
+        assert_eq!(cc_renewal_deadline(now) - now, chrono::Duration::days(30));
+    }
+
+    #[test]
+    fn test_expires_at_is_read_from_string_and_number_arguments() {
+        use orderbook_proto::ledger::ActiveContractInfo;
+        let field = |kind| {
+            let mut fields = std::collections::BTreeMap::new();
+            fields.insert(
+                "expiresAt".to_string(),
+                prost_types::Value { kind: Some(kind) },
+            );
+            ActiveContractInfo {
+                template_id: "#splice-amulet:Splice.AmuletRules:TransferPreapproval".to_string(),
+                create_arguments: Some(prost_types::Struct { fields }),
+                ..Default::default()
+            }
+        };
+
+        let as_string = field(prost_types::value::Kind::StringValue(
+            "2030-01-01T00:00:00Z".to_string(),
+        ));
+        assert_eq!(
+            struct_field_string(&as_string, "expiresAt").as_deref(),
+            Some("2030-01-01T00:00:00Z")
+        );
+        assert_eq!(struct_field_string(&as_string, "missing"), None);
+
+        let micros = 1_893_456_000_000_000i64;
+        let as_number = field(prost_types::value::Kind::NumberValue(micros as f64));
+        let read = struct_field_string(&as_number, "expiresAt").expect("number field");
+        assert_eq!(read, micros.to_string());
+        assert_eq!(
+            parse_daml_timestamp(&read),
+            chrono::DateTime::from_timestamp_micros(micros)
+        );
+
+        assert_eq!(
+            struct_field_string(&ActiveContractInfo::default(), "expiresAt"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_incomplete_entries_are_skipped_with_warnings() {
+        let (targets, warnings) = preapproval_targets(
+            &[],
+            &[
+                advertised("NoRegistry", "", "op"),
+                advertised("NoOperator", "reg-b", ""),
+            ],
+            "dso",
+            "me",
+        );
+        assert!(targets.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("no registry"));
+        assert!(warnings[1].contains("no operator"));
+    }
+
+    #[test]
+    fn test_unscoped_preapproval_counts_as_coverage() {
+        let (targets, warnings) = preapproval_targets(
+            &[held("reg-a", "op", &[])],
+            &[advertised("USD8", "reg-a", "op")],
+            "dso",
+            "me",
+        );
+        assert!(targets.is_empty());
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn test_scoped_preapproval_does_not_count_as_coverage() {
+        let (targets, warnings) = preapproval_targets(
+            &[held("reg-a", "op", &["USD8"])],
+            &[advertised("USD8", "reg-a", "op")],
+            "dso",
+            "me",
+        );
+        assert_eq!(targets.len(), 1);
+        assert!(warnings.iter().any(|w| w.contains("only for specific")));
+    }
+
+    #[test]
+    fn test_operator_mismatch_warns_and_leaves_coverage() {
+        let (targets, warnings) = preapproval_targets(
+            &[held("reg-a", "old-op", &[])],
+            &[advertised("USD8", "reg-a", "new-op")],
+            "dso",
+            "me",
+        );
+        assert!(targets.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("old-op")));
+    }
+
+    #[test]
+    fn test_conflicting_advertised_operators_warn() {
+        let (targets, warnings) = preapproval_targets(
+            &[],
+            &[
+                advertised("USD8", "reg-a", "op1"),
+                advertised("USX", "reg-a", "op2"),
+            ],
+            "dso",
+            "me",
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].operator, "op1");
+        assert!(warnings.iter().any(|w| w.contains("two operators")));
+    }
+
+    #[test]
+    fn test_cc_coverage_classification() {
+        let now = chrono::Utc::now();
+        let deadline = now + chrono::Duration::days(30);
+        let accepted = "#splice-amulet:Splice.AmuletRules:TransferPreapproval".to_string();
+        let proposal =
+            "#splice-wallet:Splice.Wallet.TransferPreapproval:TransferPreapprovalProposal"
+                .to_string();
+        let far = (now + chrono::Duration::days(365)).to_rfc3339();
+        let soon = (now + chrono::Duration::days(2)).to_rfc3339();
+
+        assert_eq!(
+            classify_cc_coverage(&[(accepted.clone(), Some(far.clone()))], deadline),
+            CcCoverage::Active
+        );
+        // Expiring inside the margin is renewed, not treated as coverage.
+        assert_eq!(
+            classify_cc_coverage(&[(accepted.clone(), Some(soon))], deadline),
+            CcCoverage::Missing
+        );
+        assert_eq!(
+            classify_cc_coverage(&[(accepted.clone(), None)], deadline),
+            CcCoverage::Missing
+        );
+        assert_eq!(
+            classify_cc_coverage(&[(proposal.clone(), None)], deadline),
+            CcCoverage::ProposalPending
+        );
+        // A live accepted contract wins over a stale proposal.
+        assert_eq!(
+            classify_cc_coverage(
+                &[(proposal, None), (accepted.clone(), Some(far))],
+                deadline
+            ),
+            CcCoverage::Active
+        );
+        assert_eq!(classify_cc_coverage(&[], deadline), CcCoverage::Missing);
+
+        // Microsecond timestamps parse too.
+        let micros = ((now + chrono::Duration::days(365)).timestamp_micros()).to_string();
+        assert_eq!(
+            classify_cc_coverage(&[(accepted, Some(micros))], deadline),
+            CcCoverage::Active
+        );
+    }
+
+    #[test]
+    fn test_read_env_value_strips_quotes() {
+        let env = scratch_env(Some(
+            "PLAIN=v\nDQ=\"v\"\nSQ='v'\nSPACED=  \"v\"  \nINNER=a\"b\n",
+        ));
+        for key in ["PLAIN", "DQ", "SQ", "SPACED"] {
+            assert_eq!(read_env_value(&env, key).as_deref(), Some("v"), "key {key}");
+        }
+        // Only a matched surrounding pair is stripped.
+        assert_eq!(read_env_value(&env, "INNER").as_deref(), Some("a\"b"));
+        assert_eq!(read_env_value(&env, "MISSING"), None);
+    }
+
     #[test]
     fn test_recorded_identity_without_key_is_refused() {
         let env = scratch_env(Some("PARTY_AGENT=p::1220ee\n"));
@@ -6072,5 +6942,164 @@ mod onboard_key_tests {
         assert!(content.contains(&format!("PARTY_AGENT_PRIVATE_KEY={}", &*key)));
         assert!(content.contains(&format!("PARTY_AGENT_PUBLIC_KEY={pub_b58}")));
         assert!(content.contains("ORDERBOOK_GRPC_URL=http://rpc"));
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use orderbook_proto::ledger::CreatedContractInfo;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    fn created(template_id: &str, contract_id: &str) -> CreatedContractInfo {
+        CreatedContractInfo {
+            contract_id: contract_id.to_string(),
+            template_id: template_id.to_string(),
+            amount: String::new(),
+        }
+    }
+
+    #[test]
+    fn one_amulet_covering_the_total_is_preferred_over_several() {
+        let ascending = vec![dec("1"), dec("5"), dec("40"), dec("100")];
+        // Smallest single amulet that covers it, not the biggest available.
+        let picked = payment_queue::select_amulet_indices(&ascending, dec("30"));
+        assert_eq!(picked, vec![2]);
+    }
+
+    #[test]
+    fn multi_amulet_fallback_takes_the_largest_first() {
+        let ascending = vec![dec("1"), dec("2"), dec("30"), dec("40")];
+        let picked = payment_queue::select_amulet_indices(&ascending, dec("65"));
+        assert_eq!(picked, vec![3, 2]);
+    }
+
+    #[test]
+    fn an_uncoverable_total_selects_nothing_rather_than_a_partial_set() {
+        let ascending = vec![dec("1"), dec("2"), dec("3")];
+        assert!(payment_queue::select_amulet_indices(&ascending, dec("100")).is_empty());
+    }
+
+    #[test]
+    fn a_total_reachable_only_beyond_the_cap_selects_nothing() {
+        // 150 x 1 covers 150 overall but only 100 within the cap, so a target
+        // between those two numbers must fail rather than over-select.
+        let ascending = vec![dec("1"); payment_queue::MAX_AMULET_INPUTS + 50];
+        assert!(payment_queue::select_amulet_indices(&ascending, dec("120")).is_empty());
+
+        // The same wallet funds anything the cap can reach.
+        let picked = payment_queue::select_amulet_indices(&ascending, dec("80"));
+        assert_eq!(picked.len(), 80);
+        assert!(picked.len() <= payment_queue::MAX_AMULET_INPUTS);
+    }
+
+    #[test]
+    fn allocation_selection_prefers_one_amulet_and_returns_largest_first() {
+        use crate::holdings_cache::CachedAmulet;
+        use std::time::Instant;
+        let cached = |cid: &str, amt: &str| CachedAmulet {
+            contract_id: cid.to_string(),
+            amount: dec(amt),
+            discovered_at: Instant::now(),
+        };
+        // Ascending, as the cache supplies them.
+        let selectable = vec![cached("a", "1"), cached("b", "20"), cached("c", "60")];
+
+        // 10 x 1.02 = 10.2 -> the smallest single amulet that covers it.
+        let one = payment_queue::select_amulets_for_allocation(&selectable, dec("10"));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].contract_id, "b");
+
+        // 70 x 1.02 = 71.4 -> no single amulet covers it; largest first.
+        let many = payment_queue::select_amulets_for_allocation(&selectable, dec("70"));
+        assert_eq!(
+            many.iter().map(|a| a.contract_id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "b"]
+        );
+
+        // Nothing can fund it, and a partial set must never be returned.
+        assert!(payment_queue::select_amulets_for_allocation(&selectable, dec("500")).is_empty());
+        assert!(payment_queue::select_amulets_for_allocation(&selectable, dec("0")).is_empty());
+    }
+
+    #[test]
+    fn the_fee_margin_raises_the_selection_target() {
+        assert_eq!(payment_queue::with_fee_margin(dec("100")), dec("102.00"));
+    }
+
+    #[test]
+    fn payment_amounts_must_parse_and_be_positive() {
+        assert_eq!(parse_payment_amount("10.5", "p", 1).unwrap(), dec("10.5"));
+
+        let bad = parse_payment_amount("1O.5", "p", 3).unwrap_err().to_string();
+        assert!(bad.contains("row 3"), "{bad}");
+        assert!(bad.contains("1O.5"), "{bad}");
+
+        assert!(parse_payment_amount("0", "p", 1).is_err());
+        assert!(parse_payment_amount("-5", "p", 1).is_err());
+        assert!(parse_payment_amount("", "p", 1).is_err());
+    }
+
+    #[test]
+    fn a_created_transfer_instruction_marks_the_transfer_as_pending() {
+        let created = vec![
+            created("#pkg:Splice.Api.Token.HoldingV1:Holding", "h1"),
+            created(
+                "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction",
+                "ti1",
+            ),
+        ];
+        assert_eq!(
+            pending_transfer_offer(&created),
+            Some(PendingTransfer::RegistryOffer("ti1"))
+        );
+    }
+
+    #[test]
+    fn a_registry_transfer_offer_is_recognised_as_pending() {
+        let created = vec![created(
+            "#utility-registry-app-v0:Utility.Registry.App.V0.Model.Transfer:TransferOffer",
+            "off1",
+        )];
+        assert_eq!(
+            pending_transfer_offer(&created),
+            Some(PendingTransfer::RegistryOffer("off1"))
+        );
+    }
+
+    #[test]
+    fn an_amulet_instruction_is_distinguished_from_a_registry_offer() {
+        // The CIP-56 accept path cannot consume this one, so it must not be
+        // reported as an accept-cip56 candidate.
+        let created = vec![created(
+            "#splice-amulet:Splice.AmuletTransferInstruction:AmuletTransferInstruction",
+            "ati1",
+        )];
+        assert_eq!(
+            pending_transfer_offer(&created),
+            Some(PendingTransfer::AmuletInstruction("ati1"))
+        );
+    }
+
+    #[test]
+    fn an_empty_created_list_is_not_treated_as_completion() {
+        // The update detail is fetched best-effort, so its absence proves nothing.
+        assert_eq!(transfer_outcome(&[]), TransferOutcome::Unknown);
+        assert_eq!(
+            transfer_outcome(&[created("#pkg:Splice.Amulet:Amulet", "a1")]),
+            TransferOutcome::CompletedInOneStep
+        );
+    }
+
+    #[test]
+    fn no_transfer_instruction_means_the_transfer_completed_outright() {
+        let created = vec![created("#pkg:Splice.Amulet:Amulet", "a1")];
+        assert_eq!(pending_transfer_offer(&created), None);
+        assert_eq!(pending_transfer_offer(&[]), None);
     }
 }

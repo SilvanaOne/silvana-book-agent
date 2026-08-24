@@ -656,6 +656,18 @@ impl BaseConfig {
 
         let mut private_key_bytes = decode_private_key(&private_key_b58)?;
         let public_key_hex = get_public_key_hex(&private_key_bytes);
+        // A mismatched pair is only rejected once the server sees the token, so
+        // check it here where the error can name both sides.
+        let public_key_bytes: [u8; 32] = hex::decode(&public_key_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| anyhow!("could not derive the public key for party {party_id}"))?;
+        if party_matches_public_key(&party_id, &public_key_bytes) == Some(false) {
+            return Err(anyhow!(
+                "the private key does not belong to party {party_id} \
+                 (its public key is {public_key_hex}); check --party and --private-key"
+            ));
+        }
         let private_key = Secret::seal(&mut private_key_bytes);
         drop(private_key_b58);
 
@@ -1168,20 +1180,21 @@ impl BaseConfig {
     /// Call this once at startup before running settlement / fill / transfer logic
     /// that uses [`BaseConfig::resolve_instrument`].
     ///
-    /// The Canton Coin instrument is identified by `instrument_type == "token"`;
-    /// its `instrument_id` drives the CC → Amulet translation and its `registry`
-    /// is the DSO party. Every other instrument simply maps id → registry.
+    /// Canton Coin is the instrument on the DSO registry (falling back to the
+    /// first `instrument_type == "token"`); its id drives the CC → Amulet
+    /// translation. Every other instrument simply maps id → registry.
     pub fn populate_instruments_from_rpc(&mut self, instruments: Vec<Instrument>) {
         let mut instrument_registries: HashMap<String, String> = HashMap::new();
         let mut instrument_wire_ids: HashMap<String, String> = HashMap::new();
         let mut cc_token_id: Option<String> = None;
+        let mut first_token_id: Option<String> = None;
         let mut onboarded_registries: HashSet<String> = HashSet::new();
 
         for inst in instruments {
             let registry = inst.registry.clone().unwrap_or_default();
             if !registry.is_empty() {
                 instrument_registries.insert(inst.instrument_id.clone(), registry.clone());
-                onboarded_registries.insert(registry);
+                onboarded_registries.insert(registry.clone());
             }
             // The ON-CHAIN wire id is `symbol` (== instrument_id for legacy
             // tokens; an opaque id, e.g. a UUID, for issuer-minted ones). Fall back to the
@@ -1192,8 +1205,25 @@ impl BaseConfig {
                 inst.symbol.clone()
             };
             instrument_wire_ids.insert(inst.instrument_id.clone(), wire_id);
-            if inst.instrument_type == "token" && cc_token_id.is_none() {
+            // CC is the instrument on the DSO registry; `instrument_type` is
+            // not unique, so it only serves as a fallback below.
+            if !self.dso_party.is_empty() && registry == self.dso_party && cc_token_id.is_none() {
                 cc_token_id = Some(inst.instrument_id.clone());
+            }
+            if inst.instrument_type == "token" && first_token_id.is_none() {
+                first_token_id = Some(inst.instrument_id.clone());
+            }
+        }
+
+        if cc_token_id.is_none() {
+            if self.dso_party.is_empty() {
+                cc_token_id = first_token_id;
+            } else if let Some(fallback) = first_token_id {
+                tracing::warn!(
+                    "No instrument is registered under the DSO party; falling back to '{}' for CC",
+                    fallback
+                );
+                cc_token_id = Some(fallback);
             }
         }
 
@@ -1244,6 +1274,45 @@ impl BaseConfig {
             .unwrap_or_default();
         (on_chain_id, registry)
     }
+
+    /// Resolve an instrument given EITHER its internal id or its wire id.
+    /// `wire_id` is `None` when neither key space knows the input.
+    pub fn resolve_instrument_or_wire(&self, input: &str) -> ResolvedInstrument {
+        if Some(input) == self.cc_token_id.as_deref() {
+            return ResolvedInstrument {
+                wire_id: Some("Amulet".to_string()),
+                registry: self.instrument_registries.get(input).cloned(),
+            };
+        }
+        if let Some(wire) = self.instrument_wire_ids.get(input) {
+            return ResolvedInstrument {
+                wire_id: Some(wire.clone()),
+                registry: self.instrument_registries.get(input).cloned(),
+            };
+        }
+        // Not an internal id — try it as a wire id, which is what every
+        // pre-existing invocation supplies.
+        if let Some((internal, _)) = self
+            .instrument_wire_ids
+            .iter()
+            .find(|(_, wire)| wire.as_str() == input)
+        {
+            return ResolvedInstrument {
+                wire_id: Some(input.to_string()),
+                registry: self.instrument_registries.get(internal).cloned(),
+            };
+        }
+        ResolvedInstrument { wire_id: None, registry: None }
+    }
+}
+
+/// Outcome of [`BaseConfig::resolve_instrument_or_wire`].
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedInstrument {
+    /// On-chain wire id, or `None` when the input matched no known instrument.
+    pub wire_id: Option<String>,
+    /// Registrar party, when the matched row carries one.
+    pub registry: Option<String>,
 }
 
 // ============================================================================
@@ -1251,6 +1320,22 @@ impl BaseConfig {
 // ============================================================================
 
 /// Decode base58 Ed25519 public key to 32 bytes
+/// Canton derives a party's namespace as `1220` + hex of
+/// `SHA256(0x0000000C || public_key)`. Returns `None` when the party id does
+/// not carry a namespace in that form, so nothing can be concluded.
+pub fn party_matches_public_key(party_id: &str, public_key: &[u8; 32]) -> Option<bool> {
+    use sha2::{Digest, Sha256};
+    let namespace = party_id.split("::").nth(1)?;
+    let expected = namespace.strip_prefix("1220")?;
+    if expected.len() != 64 {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update([0x00, 0x00, 0x00, 0x0C]);
+    hasher.update(public_key);
+    Some(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected))
+}
+
 pub fn decode_public_key(base58_key: &str) -> Result<[u8; 32]> {
     let key_bytes = bs58::decode(base58_key)
         .into_vec()
@@ -2438,6 +2523,29 @@ name = "LP test"
 
     /// Env-mutating assemble test. Single test fn so the process-global env
     /// is only touched from one thread; every scenario runs sequentially.
+    #[test]
+    fn a_party_is_matched_against_its_own_public_key() {
+        // Real devnet pair: the namespace is SHA256(0x0000000C || public key).
+        let public_key: [u8; 32] =
+            hex::decode("9895938290240e991e06356233ff0694fb3cb90e89443fd95f54048e64c2621f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let party = "99a24d3a73eb9a1c::1220dda5272ceb983cf00699447d878078c1df7dcdf1c64955e444b7483df3e8384b";
+        assert_eq!(party_matches_public_key(party, &public_key), Some(true));
+
+        let other = "bridge-1::12200c73731c0c8d94327e71e966ca6ff356732c3298797e5eb73eece523582c46dd";
+        assert_eq!(party_matches_public_key(other, &public_key), Some(false));
+    }
+
+    #[test]
+    fn a_party_without_a_derivable_namespace_is_not_judged() {
+        let key = [0u8; 32];
+        assert_eq!(party_matches_public_key("lp::1220bb", &key), None);
+        assert_eq!(party_matches_public_key("no-namespace", &key), None);
+        assert_eq!(party_matches_public_key("lp::abcd", &key), None);
+    }
+
     #[test]
     fn test_rfq_v2_assemble_env_overrides_and_validation() {
         fn set(k: &str, v: &str) {

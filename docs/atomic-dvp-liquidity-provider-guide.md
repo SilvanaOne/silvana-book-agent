@@ -112,7 +112,7 @@ ATOMIC_QUOTE_PRIVATE_KEY=<64-hex-character scalar printed by atomic keygen>
 
 Re‑running `atomic keygen` once the var is set just prints `ATOMIC_QUOTE_PRIVATE_KEY is set and
 valid.` plus the public key — a handy way to confirm `.env` is loaded. (`--quote-private-key <HEX>`
-before the subcommand supplies the key from the command line instead; keygen then validates that value.)
+supplies the key from the command line instead; keygen then validates that value.)
 
 ## A4. Check your balance (devnet)
 

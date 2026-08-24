@@ -23,6 +23,7 @@ rust_decimal = { version = "1.36", features = ["serde"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 toml = "0.8"

@@ -213,19 +213,31 @@ impl OrderbookClient {
     /// its `instrument_id` drives the CC → Amulet translation in
     /// `BaseConfig::resolve_instrument`, its `registry` is the DSO party.
     pub async fn get_instruments(&mut self) -> Result<Vec<Instrument>> {
-        let request = Request::new(GetInstrumentsRequest {
-            instrument_type: None,
-            limit: None,
-            offset: None,
-        });
+        // The server defaults to 50 per page and caps a request at 1000, so
+        // page until `total` is covered rather than silently truncating.
+        let mut collected: Vec<Instrument> = Vec::new();
+        loop {
+            let request = Request::new(GetInstrumentsRequest {
+                instrument_type: None,
+                limit: Some(1000),
+                offset: Some(collected.len() as u32),
+            });
 
-        let response = self
-            .orderbook_client
-            .get_instruments(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?;
+            let response = self
+                .orderbook_client
+                .get_instruments(request)
+                .await
+                .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?
+                .into_inner();
 
-        Ok(response.into_inner().instruments)
+            let total = response.total as usize;
+            let page = response.instruments.len();
+            collected.extend(response.instruments);
+            if page == 0 || collected.len() >= total {
+                break;
+            }
+        }
+        Ok(collected)
     }
 
     /// Submit a new order with pre-computed signature fields

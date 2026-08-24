@@ -215,6 +215,8 @@ async fn check_and_merge_instrument(
                     amount: amount_str.clone(),
                     reference: None,
                     input_holding_cids: cids.clone(),
+                    // Ignored: explicit cids take the pass-through path.
+                    max_input_holdings: None,
                 })),
                 request_signature: None,
             },
