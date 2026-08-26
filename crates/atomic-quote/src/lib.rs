@@ -4,8 +4,7 @@
 //! (`canonicalQuoteMessage` in atomic-dvp-v2) and what `DA.Crypto.Text.secp256k1`
 //! verifies: ECDSA/secp256k1 over SHA256(utf8(canonical_message)), ASN.1 DER
 //! signature (lowercase hex), X.509 SPKI public key with an uncompressed point
-//! (lowercase hex). Spec: atomic-dvp/plans/atomic-dvp-design.md §5 +
-//! atomic-dvp-fa-design.md §4 (v3/v4: line 3 is `provider=`); reference
+//! (lowercase hex). v3/v4 of the message put `provider=` on line 3. Reference
 //! implementations: the DAML module and tests/.../helpers/quoteSigner.ts.
 //! Proven against the committed cross-language golden vectors (see tests below).
 //!
@@ -193,9 +192,18 @@ pub fn build_canonical_message(f: &CanonicalQuoteFields) -> Result<String> {
 /// hash ONCE with SHA-256, then ECDSA-sign the 32-byte digest (RFC 6979
 /// deterministic nonces, low-s — k256's default). Returns ASN.1 DER, lowercase hex.
 pub fn sign_quote(priv_scalar_hex: &str, msg: &str) -> Result<String> {
-    let scalar = hex::decode(priv_scalar_hex)
-        .map_err(|e| anyhow!("invalid private scalar hex: {e}"))?;
+    let scalar = zeroize::Zeroizing::new(
+        hex::decode(priv_scalar_hex).map_err(|e| anyhow!("invalid private scalar hex: {e}"))?,
+    );
     let key = SigningKey::from_slice(&scalar)
+        .map_err(|e| anyhow!("invalid secp256k1 private key: {e}"))?;
+    let bytes: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(key.to_bytes().into());
+    sign_quote_scalar(&bytes, msg)
+}
+
+/// [`sign_quote`] taking the raw 32-byte scalar directly.
+pub fn sign_quote_scalar(scalar: &[u8; 32], msg: &str) -> Result<String> {
+    let key = SigningKey::from_slice(scalar)
         .map_err(|e| anyhow!("invalid secp256k1 private key: {e}"))?;
     let digest = Sha256::digest(msg.as_bytes());
     let sig: Signature = key
@@ -262,11 +270,13 @@ pub fn gen_keypair() -> Result<QuoteKeyFile> {
 /// Build a keyfile from a raw 32-byte scalar (lowercase hex) — the
 /// ATOMIC_QUOTE_PRIVATE_KEY env-override path for containerized deploys.
 pub fn keyfile_from_scalar(priv_scalar_hex: &str) -> Result<QuoteKeyFile> {
-    let key = SigningKey::from_slice(&hex::decode(priv_scalar_hex)?)
+    let scalar = zeroize::Zeroizing::new(hex::decode(priv_scalar_hex)?);
+    let key = SigningKey::from_slice(&scalar)
         .map_err(|e| anyhow!("invalid secp256k1 private key: {e}"))?;
     let point = key.verifying_key().to_encoded_point(false);
+    let bytes: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(key.to_bytes().into());
     Ok(QuoteKeyFile {
-        priv_scalar_hex: priv_scalar_hex.to_lowercase(),
+        priv_scalar_hex: hex::encode(bytes.as_slice()),
         pub_spki_hex: spki_from_point(&hex::encode(point.as_bytes()))?,
     })
 }
@@ -517,5 +527,19 @@ mod tests {
         assert_eq!(point_from_spki(&kf.pub_spki_hex).unwrap().len(), 130);
         let kf2 = keyfile_from_scalar(&kf.priv_scalar_hex).unwrap();
         assert_eq!(kf2.pub_spki_hex, kf.pub_spki_hex);
+    }
+
+    #[test]
+    fn keyfile_from_short_scalar_is_padded() {
+        let short = "01".repeat(24);
+        let kf = keyfile_from_scalar(&short).unwrap();
+        assert_eq!(kf.priv_scalar_hex.len(), 64);
+        assert_eq!(kf.priv_scalar_hex, format!("{}{short}", "0".repeat(16)));
+        let msg = "msg_type=silvana.atomic-dvp.quote.v3\nlp=lp\n";
+        let sig = sign_quote(&short, msg).unwrap();
+        assert!(verify_quote(&sig, msg, &kf.pub_spki_hex));
+        let padded: [u8; 32] = hex::decode(&kf.priv_scalar_hex).unwrap().try_into().unwrap();
+        assert_eq!(sign_quote_scalar(&padded, msg).unwrap(), sig);
+        assert!(keyfile_from_scalar(&"01".repeat(10)).is_err());
     }
 }

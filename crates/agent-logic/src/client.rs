@@ -30,13 +30,14 @@ use tracing::debug;
 
 use crate::auth::{generate_jwt, generate_jwt_with_branch};
 use crate::config::BaseConfig;
+use crate::secret::Secret;
 
 /// External account authentication data
 #[derive(Clone)]
 struct ExternalAuthData {
     party_id: String,
     public_key_hex: String,
-    private_key_bytes: [u8; 32],
+    private_key: Secret<32>,
     role: String,
     ttl_secs: u64,
     node_name: String,
@@ -71,7 +72,7 @@ impl OrderbookClient {
         let jwt = generate_jwt_with_branch(
             &config.party_id,
             &config.role,
-            &config.private_key_bytes,
+            &config.private_key.expose(),
             config.token_ttl_secs,
             Some(config.node_name.as_str()),
             config.venue_branch.as_deref(),
@@ -87,7 +88,7 @@ impl OrderbookClient {
         let auth_data = ExternalAuthData {
             party_id: config.party_id.clone(),
             public_key_hex: config.public_key_hex.clone(),
-            private_key_bytes: config.private_key_bytes,
+            private_key: config.private_key.clone(),
             role: config.role.clone(),
             ttl_secs: config.token_ttl_secs,
             node_name: config.node_name.clone(),
@@ -128,11 +129,8 @@ impl OrderbookClient {
         // Initialize Rustls crypto provider
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        // Per-RPC deadline + HTTP/2 keepalive: the whole no-price safety
-        // (grid teardown, RFQ mid eviction) keys off calls RETURNING — a
-        // server that accepts connections but never responds (the
-        // 2026-07-19 silent-freeze failure mode) must convert into an error,
-        // never an indefinite hang that leaves stale quotes standing.
+        // Per-RPC deadline + keepalive: safety keys off calls RETURNING, so a
+        // server that never responds must error rather than hang.
         let builder = |endpoint: tonic::transport::Endpoint| {
             endpoint
                 .timeout(std::time::Duration::from_secs(30))
@@ -215,19 +213,31 @@ impl OrderbookClient {
     /// its `instrument_id` drives the CC → Amulet translation in
     /// `BaseConfig::resolve_instrument`, its `registry` is the DSO party.
     pub async fn get_instruments(&mut self) -> Result<Vec<Instrument>> {
-        let request = Request::new(GetInstrumentsRequest {
-            instrument_type: None,
-            limit: None,
-            offset: None,
-        });
+        // The server defaults to 50 per page and caps a request at 1000, so
+        // page until `total` is covered rather than silently truncating.
+        let mut collected: Vec<Instrument> = Vec::new();
+        loop {
+            let request = Request::new(GetInstrumentsRequest {
+                instrument_type: None,
+                limit: Some(1000),
+                offset: Some(collected.len() as u32),
+            });
 
-        let response = self
-            .orderbook_client
-            .get_instruments(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?;
+            let response = self
+                .orderbook_client
+                .get_instruments(request)
+                .await
+                .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?
+                .into_inner();
 
-        Ok(response.into_inner().instruments)
+            let total = response.total as usize;
+            let page = response.instruments.len();
+            collected.extend(response.instruments);
+            if page == 0 || collected.len() >= total {
+                break;
+            }
+        }
+        Ok(collected)
     }
 
     /// Submit a new order with pre-computed signature fields
@@ -384,7 +394,7 @@ impl OrderbookClient {
         let jwt = generate_jwt(
             &self.auth_data.party_id,
             &self.auth_data.role,
-            &self.auth_data.private_key_bytes,
+            &self.auth_data.private_key.expose(),
             self.auth_data.ttl_secs,
             Some(self.auth_data.node_name.as_str()),
         )?;
@@ -527,11 +537,6 @@ impl OrderbookClient {
         &self.auth_data.party_id
     }
 
-    /// Get the private key bytes
-    pub fn private_key_bytes(&self) -> &[u8; 32] {
-        &self.auth_data.private_key_bytes
-    }
-
     /// Get the public key hex
     pub fn public_key_hex(&self) -> &str {
         &self.auth_data.public_key_hex
@@ -580,7 +585,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
             match generate_jwt_with_branch(
                 &self.auth_data.party_id,
                 &self.auth_data.role,
-                &self.auth_data.private_key_bytes,
+                &self.auth_data.private_key.expose(),
                 self.auth_data.ttl_secs,
                 Some(self.auth_data.node_name.as_str()),
                 self.auth_data.venue_branch.as_deref(),

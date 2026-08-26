@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use zeroize::Zeroize;
 
 use crate::auth::get_public_key_hex;
+use crate::secret::{Secret, Zeroizing};
 
 // ============================================================================
 // Agent TOML (agent.toml) — agent-specific settings only
@@ -40,6 +42,9 @@ struct AgentToml {
     canton_op_timeout_secs: u64,
     #[serde(default)]
     markets: Vec<MarketConfig>,
+    /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only).
+    #[serde(default)]
+    venue_overrides: Vec<VenueOverride>,
     /// LP configuration (only for liquidity provider agents)
     #[serde(default)]
     liquidity_provider: Option<LiquidityProviderConfig>,
@@ -122,8 +127,8 @@ pub struct BaseConfig {
     pub orderbook_grpc_url: String,
     pub synchronizer_id: String,
     pub party_id: String,
-    pub private_key_bytes: [u8; 32],
-    pub private_key_base58: String,
+    /// Ed25519 signing seed, stored sealed; decrypt via `.expose()`.
+    pub private_key: Secret<32>,
     pub public_key_hex: String,
     pub settlement_operator: String,
     pub fee_reserve_cc: f64,
@@ -165,6 +170,11 @@ pub struct BaseConfig {
     /// finite, so a stuck connection cannot hang shutdown forever.
     pub canton_op_timeout_secs: u64,
     pub markets: Vec<MarketConfig>,
+
+    /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only) —
+    /// TOML `[[venue_overrides]]`, resolved per request by
+    /// [`resolve_rfq_config`].
+    pub venue_overrides: Vec<VenueOverride>,
 
     // Multi-node routing
     pub node_name: String,
@@ -234,23 +244,48 @@ pub struct BaseConfig {
     pub atomic_quote_key: Option<AtomicQuoteKey>,
 }
 
-/// Wrapper around [`atomic_quote::QuoteKeyFile`] with a redacting `Debug`
-/// (the inner struct carries the private scalar and derives no Debug).
+/// RFQ V2 quote-signing key: public SPKI hex plus the sealed private scalar,
+/// with a redacting `Debug`.
 #[derive(Clone)]
-pub struct AtomicQuoteKey(pub atomic_quote::QuoteKeyFile);
+pub struct AtomicQuoteKey {
+    /// X.509 SPKI DER with uncompressed point, lowercase hex
+    pub pub_spki_hex: String,
+    scalar: Secret<32>,
+}
+
+impl AtomicQuoteKey {
+    /// Build from a raw 32-byte scalar (64 hex chars); derives the public key.
+    pub fn from_scalar_hex(scalar_hex: &str) -> Result<Self> {
+        let mut kf = atomic_quote::keyfile_from_scalar(scalar_hex.trim())?;
+        let decoded = hex::decode(&kf.priv_scalar_hex).map(Zeroizing::new);
+        kf.priv_scalar_hex.zeroize();
+        let decoded = decoded?;
+        let mut bytes: [u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("quote scalar must be 32 bytes"))?;
+        Ok(Self {
+            pub_spki_hex: kf.pub_spki_hex,
+            scalar: Secret::seal(&mut bytes),
+        })
+    }
+
+    /// Sealed scalar, exposed briefly for signing.
+    pub fn scalar(&self) -> crate::secret::Exposed<32> {
+        self.scalar.expose()
+    }
+
+    /// Lowercase hex of the scalar; the returned string is zeroed on drop.
+    pub fn scalar_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(self.scalar.expose().as_slice()))
+    }
+}
 
 impl std::fmt::Debug for AtomicQuoteKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomicQuoteKey")
-            .field("pub_spki_hex", &self.0.pub_spki_hex)
+            .field("pub_spki_hex", &self.pub_spki_hex)
             .finish_non_exhaustive()
-    }
-}
-
-impl std::ops::Deref for AtomicQuoteKey {
-    type Target = atomic_quote::QuoteKeyFile;
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -267,8 +302,7 @@ impl BaseConfig {
             orderbook_grpc_url: String::new(),
             synchronizer_id: String::new(),
             party_id: "test-party".to_string(),
-            private_key_bytes: [0u8; 32],
-            private_key_base58: String::new(),
+            private_key: Secret::seal(&mut [0u8; 32]),
             public_key_hex: String::new(),
             settlement_operator: String::new(),
             fee_reserve_cc: 5.0,
@@ -289,6 +323,7 @@ impl BaseConfig {
             request_timeout_secs: 10,
             canton_op_timeout_secs: 60,
             markets: Vec::new(),
+            venue_overrides: Vec::new(),
             node_name: String::new(),
             venue_branch: None,
             ledger_service_public_key: [0u8; 32],
@@ -309,15 +344,35 @@ impl BaseConfig {
     }
 }
 
+/// CLI-supplied values that take precedence over the corresponding env vars.
+#[derive(Default)]
+pub struct ConfigOverrides {
+    /// Overrides `PARTY_AGENT`.
+    pub party: Option<String>,
+    /// Overrides `PARTY_AGENT_PRIVATE_KEY` (base58).
+    pub private_key: Option<Zeroizing<String>>,
+    /// Overrides `ATOMIC_QUOTE_PRIVATE_KEY` (hex scalar).
+    pub quote_private_key: Option<Zeroizing<String>>,
+}
+
 impl BaseConfig {
     /// Strict loader — fails if `agent.toml` is missing or unparseable.
     /// Use from commands that actually consume market/LP settings (i.e. `agent`).
     pub fn load<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
+        Self::load_with(agent_toml_path, ConfigOverrides::default())
+    }
+
+    /// [`BaseConfig::load`] with CLI-supplied overrides for the env-sourced
+    /// identity fields.
+    pub fn load_with<P: AsRef<Path>>(
+        agent_toml_path: P,
+        overrides: ConfigOverrides,
+    ) -> Result<Self> {
         let agent_toml_str = fs::read_to_string(agent_toml_path.as_ref())
             .with_context(|| format!("Failed to read {}", agent_toml_path.as_ref().display()))?;
         let agent: AgentToml = toml::from_str(&agent_toml_str)
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
-        Self::assemble(agent)
+        Self::assemble(agent, overrides)
     }
 
     /// Lenient loader — if `agent.toml` is missing, use serde defaults
@@ -325,6 +380,15 @@ impl BaseConfig {
     /// exists but is malformed, and still requires the mandatory env vars.
     /// Use from commands that don't need market/LP config (faucet, transfer, etc.).
     pub fn load_or_defaults<P: AsRef<Path>>(agent_toml_path: P) -> Result<Self> {
+        Self::load_or_defaults_with(agent_toml_path, ConfigOverrides::default())
+    }
+
+    /// [`BaseConfig::load_or_defaults`] with CLI-supplied overrides for the
+    /// env-sourced identity fields.
+    pub fn load_or_defaults_with<P: AsRef<Path>>(
+        agent_toml_path: P,
+        overrides: ConfigOverrides,
+    ) -> Result<Self> {
         let agent: AgentToml = if agent_toml_path.as_ref().exists() {
             let s = fs::read_to_string(agent_toml_path.as_ref()).with_context(|| {
                 format!("Failed to read {}", agent_toml_path.as_ref().display())
@@ -336,7 +400,7 @@ impl BaseConfig {
             // Empty string round-trips to AgentToml with all serde defaults.
             toml::from_str("").expect("AgentToml serde defaults must parse")
         };
-        Self::assemble(agent)
+        Self::assemble(agent, overrides)
     }
 
     /// Programmatic constructor for embedding the agent as a LIBRARY — e.g. a
@@ -362,15 +426,15 @@ impl BaseConfig {
         node_name: &str,
         ledger_service_public_key_base58: &str,
     ) -> Result<Self> {
-        let private_key_bytes = decode_private_key(private_key_base58)?;
+        let mut private_key_bytes = decode_private_key(private_key_base58)?;
         let public_key_hex = get_public_key_hex(&private_key_bytes);
+        let private_key = Secret::seal(&mut private_key_bytes);
         let ledger_service_public_key = decode_public_key(ledger_service_public_key_base58)?;
         Ok(Self {
             orderbook_grpc_url: orderbook_grpc_url.to_string(),
             synchronizer_id: synchronizer_id.to_string(),
             party_id: party_id.to_string(),
-            private_key_bytes,
-            private_key_base58: private_key_base58.to_string(),
+            private_key,
             public_key_hex,
             settlement_operator: settlement_operator.to_string(),
             fee_reserve_cc: 5.0,
@@ -391,6 +455,7 @@ impl BaseConfig {
             request_timeout_secs: default_request_timeout_secs(),
             canton_op_timeout_secs: default_canton_op_timeout_secs(),
             markets: Vec::new(),
+            venue_overrides: Vec::new(),
             node_name: node_name.to_string(),
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
             ledger_service_public_key,
@@ -438,9 +503,10 @@ impl BaseConfig {
     /// the env path (`assemble`). For [`BaseConfig::for_party`] embedders that
     /// load per-agent keys from their own store instead of process env.
     pub fn set_atomic_quote_scalar(&mut self, scalar_hex: &str) -> Result<()> {
-        let kf = atomic_quote::keyfile_from_scalar(scalar_hex.trim())
-            .context("quote key is not a valid secp256k1 scalar")?;
-        self.atomic_quote_key = Some(AtomicQuoteKey(kf));
+        self.atomic_quote_key = Some(
+            AtomicQuoteKey::from_scalar_hex(scalar_hex)
+                .context("quote key is not a valid secp256k1 scalar")?,
+        );
         Ok(())
     }
 
@@ -561,7 +627,7 @@ impl BaseConfig {
     /// env vars. Instrument/registry info is populated later by
     /// [`BaseConfig::populate_instruments_from_rpc`]. Shared between
     /// strict/lenient loaders.
-    fn assemble(mut agent: AgentToml) -> Result<Self> {
+    fn assemble(mut agent: AgentToml, overrides: ConfigOverrides) -> Result<Self> {
         // Instrument registry placeholders — filled by populate_instruments_from_rpc
         // after the cloud-agent fetches them over gRPC at startup.
         let onboarded_registries: Vec<String> = Vec::new();
@@ -569,17 +635,41 @@ impl BaseConfig {
         let instrument_registries: HashMap<String, String> = HashMap::new();
         let instrument_wire_ids: HashMap<String, String> = HashMap::new();
 
-        // Read env vars
+        // Read env vars (CLI overrides win where provided)
         let dso_party = std::env::var("DSO").map_err(|_| anyhow!("DSO env var is required"))?;
 
-        let party_id =
-            std::env::var("PARTY_AGENT").map_err(|_| anyhow!("PARTY_AGENT env var is required"))?;
+        let party_id = match overrides.party.filter(|s| !s.trim().is_empty()) {
+            Some(p) => p,
+            None => std::env::var("PARTY_AGENT")
+                .map_err(|_| anyhow!("PARTY_AGENT env var (or --party) is required"))?,
+        };
 
-        let private_key_base58 = std::env::var("PARTY_AGENT_PRIVATE_KEY")
-            .map_err(|_| anyhow!("PARTY_AGENT_PRIVATE_KEY env var is required"))?;
+        let private_key_b58: Zeroizing<String> = match overrides
+            .private_key
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(k) => k,
+            None => Zeroizing::new(std::env::var("PARTY_AGENT_PRIVATE_KEY").map_err(|_| {
+                anyhow!("PARTY_AGENT_PRIVATE_KEY env var (or --private-key) is required")
+            })?),
+        };
 
-        let private_key_bytes = decode_private_key(&private_key_base58)?;
+        let mut private_key_bytes = decode_private_key(&private_key_b58)?;
         let public_key_hex = get_public_key_hex(&private_key_bytes);
+        // A mismatched pair is only rejected once the server sees the token, so
+        // check it here where the error can name both sides.
+        let public_key_bytes: [u8; 32] = hex::decode(&public_key_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| anyhow!("could not derive the public key for party {party_id}"))?;
+        if party_matches_public_key(&party_id, &public_key_bytes) == Some(false) {
+            return Err(anyhow!(
+                "the private key does not belong to party {party_id} \
+                 (its public key is {public_key_hex}); check --party and --private-key"
+            ));
+        }
+        let private_key = Secret::seal(&mut private_key_bytes);
+        drop(private_key_b58);
 
         let orderbook_grpc_url = std::env::var("ORDERBOOK_GRPC_URL")
             .map_err(|_| anyhow!("ORDERBOOK_GRPC_URL env var is required"))?;
@@ -643,6 +733,16 @@ impl BaseConfig {
         let ledger_service_public_key_b58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
             .map_err(|_| anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
         let ledger_service_public_key = decode_public_key(&ledger_service_public_key_b58)?;
+
+        // Clamp any out-of-range [markets.rfq.pool_impact] knobs — warn and
+        // run (the section is an additive protection, not a precondition).
+        for market in &mut agent.markets {
+            if let Some(rfq) = &mut market.rfq {
+                if let Some(pi) = &mut rfq.pool_impact {
+                    pi.sanitize(&market.market_id);
+                }
+            }
+        }
 
         // The quoted windows are stamped into the on-chain DVP terms, where the
         // DAML model requires 0 < allocateBefore < settleBefore — a misordered
@@ -826,6 +926,125 @@ impl BaseConfig {
             }
         }
 
+        // --- [[venue_overrides]] validation (RFQ V2 venue/branch overlays) ---
+        // Invalid slugs are hard errors: a typoed venue would otherwise just
+        // silently never match and the operator would ship pair-default
+        // pricing believing the override was live.
+        for (i, ov) in agent.venue_overrides.iter().enumerate() {
+            if !crate::auth::is_valid_venue_branch(&ov.venue) {
+                return Err(anyhow!(
+                    "[[venue_overrides]] #{}: venue '{}' is not a valid slug \
+                     (^[a-z0-9][a-z0-9-]{{1,19}}$) — it must equal the server's \
+                     swap-venue name (AtomicRfqRequest.venue_name)",
+                    i + 1,
+                    ov.venue
+                ));
+            }
+            if let Some(ref b) = ov.branch {
+                if !crate::auth::is_valid_venue_branch(b) {
+                    return Err(anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): branch '{}' is not a \
+                         valid slug (^[a-z0-9][a-z0-9-]{{1,19}}$)",
+                        i + 1,
+                        ov.venue,
+                        b
+                    ));
+                }
+            }
+            if let Some(ref markets) = ov.markets {
+                if markets.is_empty() {
+                    return Err(anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): markets = [] can never \
+                         match — omit the key entirely to target all markets",
+                        i + 1,
+                        ov.venue
+                    ));
+                }
+                for m in markets {
+                    if !agent.markets.iter().any(|mc| &mc.market_id == m) {
+                        tracing::warn!(
+                            "[[venue_overrides]] #{} (venue '{}'): market '{}' is not in \
+                             [[markets]] — that scope entry can never match",
+                            i + 1,
+                            ov.venue,
+                            m
+                        );
+                    }
+                    // The "open" direction is unsupported: a market whose own
+                    // [markets.rfq] is disabled is never subscribed on the V2
+                    // stream, so an override claiming to enable it would be a
+                    // policy that silently does not exist.
+                    if ov.rfq.enabled == Some(true) {
+                        let pair_enabled = agent
+                            .markets
+                            .iter()
+                            .find(|mc| &mc.market_id == m)
+                            .and_then(|mc| mc.rfq.as_ref())
+                            .map(|r| r.enabled)
+                            .unwrap_or(false);
+                        if !pair_enabled {
+                            return Err(anyhow!(
+                                "[[venue_overrides]] #{} (venue '{}'): enabled = true on \
+                                 market '{}' whose [markets.rfq] is disabled or absent — \
+                                 overrides cannot OPEN a pair-disabled market (the V2 \
+                                 stream never subscribes it); enable the pair and close \
+                                 the other venues instead",
+                                i + 1,
+                                ov.venue,
+                                m
+                            ));
+                        }
+                    }
+                }
+            }
+            if ov.rfq.is_empty() {
+                tracing::warn!(
+                    "[[venue_overrides]] #{} (venue '{}'): empty [venue_overrides.rfq] \
+                     overlay — entry has no effect",
+                    i + 1,
+                    ov.venue
+                );
+            }
+            // Bounds must PARSE (a typo would otherwise silently become
+            // min 0.0 / max f64::MAX at runtime), and be ordered when both set.
+            let min = match &ov.rfq.min_quantity {
+                Some(s) => Some(s.parse::<f64>().map_err(|_| {
+                    anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): min_quantity '{}' is not \
+                         a number — the runtime fallback would silently disable the floor",
+                        i + 1,
+                        ov.venue,
+                        s
+                    )
+                })?),
+                None => None,
+            };
+            let max = match &ov.rfq.max_quantity {
+                Some(s) => Some(s.parse::<f64>().map_err(|_| {
+                    anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): max_quantity '{}' is not \
+                         a number — the runtime fallback would silently remove the cap",
+                        i + 1,
+                        ov.venue,
+                        s
+                    )
+                })?),
+                None => None,
+            };
+            if let (Some(min), Some(max)) = (min, max) {
+                if min > max {
+                    return Err(anyhow!(
+                        "[[venue_overrides]] #{} (venue '{}'): min_quantity {} > \
+                         max_quantity {}",
+                        i + 1,
+                        ov.venue,
+                        min,
+                        max
+                    ));
+                }
+            }
+        }
+
         if let Some(v2) = agent
             .liquidity_provider
             .as_ref()
@@ -875,21 +1094,32 @@ impl BaseConfig {
             }
         }
 
-        // Quote key: required iff RFQ V2 is enabled. ENV-ONLY — no keyfiles:
-        // ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex) is the single
-        // source for the runtime AND the atomic CLI, so the venue key and the
-        // signing key can never diverge.
+        // Quote key: required iff RFQ V2 is enabled — `--quote-private-key`,
+        // else ATOMIC_QUOTE_PRIVATE_KEY (raw 32-byte scalar hex).
         let atomic_quote_key = if rfq_v2_enabled {
-            let scalar = std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
-                .ok()
+            let (scalar, source): (Zeroizing<String>, &str) = match overrides
+                .quote_private_key
                 .filter(|s| !s.trim().is_empty())
-                .context(
-                    "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
-                     run `atomic keygen` and add the printed line to .env",
-                )?;
-            let kf = atomic_quote::keyfile_from_scalar(scalar.trim())
-                .context("ATOMIC_QUOTE_PRIVATE_KEY is not a valid secp256k1 scalar")?;
-            Some(AtomicQuoteKey(kf))
+            {
+                Some(s) => (s, "--quote-private-key"),
+                None => (
+                    Zeroizing::new(
+                        std::env::var("ATOMIC_QUOTE_PRIVATE_KEY")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .context(
+                                "RFQ V2 is enabled but ATOMIC_QUOTE_PRIVATE_KEY is not set — \
+                                 run `atomic keygen` and add the printed line to .env, \
+                                 or pass --quote-private-key",
+                            )?,
+                    ),
+                    "ATOMIC_QUOTE_PRIVATE_KEY",
+                ),
+            };
+            Some(
+                AtomicQuoteKey::from_scalar_hex(&scalar)
+                    .with_context(|| format!("{source} is not a valid secp256k1 scalar"))?,
+            )
         } else {
             None
         };
@@ -898,8 +1128,7 @@ impl BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
             party_id,
-            private_key_bytes,
-            private_key_base58,
+            private_key,
             public_key_hex,
             settlement_operator,
             fee_reserve_cc,
@@ -920,6 +1149,7 @@ impl BaseConfig {
             request_timeout_secs: agent.request_timeout_secs,
             canton_op_timeout_secs: agent.canton_op_timeout_secs,
             markets: agent.markets,
+            venue_overrides: agent.venue_overrides,
             node_name,
             // Production cloud-agent deployments set VENUE_BRANCH=agent (VA13).
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
@@ -950,20 +1180,21 @@ impl BaseConfig {
     /// Call this once at startup before running settlement / fill / transfer logic
     /// that uses [`BaseConfig::resolve_instrument`].
     ///
-    /// The Canton Coin instrument is identified by `instrument_type == "token"`;
-    /// its `instrument_id` drives the CC → Amulet translation and its `registry`
-    /// is the DSO party. Every other instrument simply maps id → registry.
+    /// Canton Coin is the instrument on the DSO registry (falling back to the
+    /// first `instrument_type == "token"`); its id drives the CC → Amulet
+    /// translation. Every other instrument simply maps id → registry.
     pub fn populate_instruments_from_rpc(&mut self, instruments: Vec<Instrument>) {
         let mut instrument_registries: HashMap<String, String> = HashMap::new();
         let mut instrument_wire_ids: HashMap<String, String> = HashMap::new();
         let mut cc_token_id: Option<String> = None;
+        let mut first_token_id: Option<String> = None;
         let mut onboarded_registries: HashSet<String> = HashSet::new();
 
         for inst in instruments {
             let registry = inst.registry.clone().unwrap_or_default();
             if !registry.is_empty() {
                 instrument_registries.insert(inst.instrument_id.clone(), registry.clone());
-                onboarded_registries.insert(registry);
+                onboarded_registries.insert(registry.clone());
             }
             // The ON-CHAIN wire id is `symbol` (== instrument_id for legacy
             // tokens; an opaque id, e.g. a UUID, for issuer-minted ones). Fall back to the
@@ -974,8 +1205,25 @@ impl BaseConfig {
                 inst.symbol.clone()
             };
             instrument_wire_ids.insert(inst.instrument_id.clone(), wire_id);
-            if inst.instrument_type == "token" && cc_token_id.is_none() {
+            // CC is the instrument on the DSO registry; `instrument_type` is
+            // not unique, so it only serves as a fallback below.
+            if !self.dso_party.is_empty() && registry == self.dso_party && cc_token_id.is_none() {
                 cc_token_id = Some(inst.instrument_id.clone());
+            }
+            if inst.instrument_type == "token" && first_token_id.is_none() {
+                first_token_id = Some(inst.instrument_id.clone());
+            }
+        }
+
+        if cc_token_id.is_none() {
+            if self.dso_party.is_empty() {
+                cc_token_id = first_token_id;
+            } else if let Some(fallback) = first_token_id {
+                tracing::warn!(
+                    "No instrument is registered under the DSO party; falling back to '{}' for CC",
+                    fallback
+                );
+                cc_token_id = Some(fallback);
             }
         }
 
@@ -1026,6 +1274,45 @@ impl BaseConfig {
             .unwrap_or_default();
         (on_chain_id, registry)
     }
+
+    /// Resolve an instrument given EITHER its internal id or its wire id.
+    /// `wire_id` is `None` when neither key space knows the input.
+    pub fn resolve_instrument_or_wire(&self, input: &str) -> ResolvedInstrument {
+        if Some(input) == self.cc_token_id.as_deref() {
+            return ResolvedInstrument {
+                wire_id: Some("Amulet".to_string()),
+                registry: self.instrument_registries.get(input).cloned(),
+            };
+        }
+        if let Some(wire) = self.instrument_wire_ids.get(input) {
+            return ResolvedInstrument {
+                wire_id: Some(wire.clone()),
+                registry: self.instrument_registries.get(input).cloned(),
+            };
+        }
+        // Not an internal id — try it as a wire id, which is what every
+        // pre-existing invocation supplies.
+        if let Some((internal, _)) = self
+            .instrument_wire_ids
+            .iter()
+            .find(|(_, wire)| wire.as_str() == input)
+        {
+            return ResolvedInstrument {
+                wire_id: Some(input.to_string()),
+                registry: self.instrument_registries.get(internal).cloned(),
+            };
+        }
+        ResolvedInstrument { wire_id: None, registry: None }
+    }
+}
+
+/// Outcome of [`BaseConfig::resolve_instrument_or_wire`].
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedInstrument {
+    /// On-chain wire id, or `None` when the input matched no known instrument.
+    pub wire_id: Option<String>,
+    /// Registrar party, when the matched row carries one.
+    pub registry: Option<String>,
 }
 
 // ============================================================================
@@ -1033,6 +1320,22 @@ impl BaseConfig {
 // ============================================================================
 
 /// Decode base58 Ed25519 public key to 32 bytes
+/// Canton derives a party's namespace as `1220` + hex of
+/// `SHA256(0x0000000C || public_key)`. Returns `None` when the party id does
+/// not carry a namespace in that form, so nothing can be concluded.
+pub fn party_matches_public_key(party_id: &str, public_key: &[u8; 32]) -> Option<bool> {
+    use sha2::{Digest, Sha256};
+    let namespace = party_id.split("::").nth(1)?;
+    let expected = namespace.strip_prefix("1220")?;
+    if expected.len() != 64 {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update([0x00, 0x00, 0x00, 0x0C]);
+    hasher.update(public_key);
+    Some(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected))
+}
+
 pub fn decode_public_key(base58_key: &str) -> Result<[u8; 32]> {
     let key_bytes = bs58::decode(base58_key)
         .into_vec()
@@ -1052,9 +1355,11 @@ pub fn decode_public_key(base58_key: &str) -> Result<[u8; 32]> {
 
 /// Decode base58 Ed25519 private key to 32-byte seed
 pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
-    let key_bytes = bs58::decode(base58_key)
-        .into_vec()
-        .context("Invalid base58 private key")?;
+    let key_bytes = Zeroizing::new(
+        bs58::decode(base58_key.trim())
+            .into_vec()
+            .context("Invalid base58 private key")?,
+    );
 
     if key_bytes.len() < 32 {
         anyhow::bail!(
@@ -1066,6 +1371,13 @@ pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&key_bytes[..32]);
     Ok(arr)
+}
+
+/// Check that `base58_key` decodes to a usable private key.
+pub fn validate_private_key(base58_key: &str) -> Result<()> {
+    let mut bytes = decode_private_key(base58_key)?;
+    bytes.zeroize();
+    Ok(())
 }
 
 /// Load the optional `[ledger_interfaces]` section from `configuration.toml`.
@@ -1209,9 +1521,282 @@ pub struct RfqMarketConfig {
     /// When set, takes precedence over `[liquidity_provider].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: Option<f64>,
+    /// Size-aware pricing — `[markets.rfq.pool_impact]`. Applies to RFQ V2 and
+    /// this market's offer grid. Absent = no adjustment. Not per-venue.
+    #[serde(default)]
+    pub pool_impact: Option<PoolImpactConfig>,
     /// RFQ V2 (AtomicDVP) per-market configuration — TOML `[markets.rfq.v2]`.
     #[serde(default)]
     pub v2: Option<RfqV2MarketConfig>,
+}
+
+/// Size-aware pricing knobs (`[markets.rfq.pool_impact]`). The math lives in
+/// [`crate::pool_impact`], which clamps every field defensively.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolImpactConfig {
+    /// false (default) = SHADOW MODE: compute + log the would-be impact but
+    /// do not apply it to any price or grid rung. true = enforce.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hard cap on the applied impact, percent of mid.
+    #[serde(default = "default_max_impact_percent")]
+    pub max_impact_percent: f64,
+    /// Cap on the pool fraction the impact curve is evaluated at (u clamp).
+    #[serde(default = "default_max_pool_fraction")]
+    pub max_pool_fraction: f64,
+    /// Scales the marginal cost before the cap. >1 compensates for flow this
+    /// agent cannot observe.
+    #[serde(default = "default_impact_multiplier")]
+    pub impact_multiplier: f64,
+    /// Net position (base units) exempt from any charge, per counterparty.
+    #[serde(default)]
+    pub free_zone_base: f64,
+    /// Trailing-net decay window, hours. The tracker is per-token, so the
+    /// effective window is the max across markets sharing that token.
+    #[serde(default = "default_impact_window_hours")]
+    pub window_hours: f64,
+    /// Confirm-time re-check tolerance, percent: reject when the held price is
+    /// taker-favourable versus the current fair price by more than this.
+    #[serde(default = "default_confirm_tolerance_percent")]
+    pub confirm_tolerance_percent: f64,
+    /// Grid shaping: desk-net free zone for offer-rung shaping; falls back to
+    /// `free_zone_base` when absent.
+    #[serde(default)]
+    pub grid_free_zone_base: Option<f64>,
+    /// Grid shaping: desk-net span (base units) over which offer rungs scale to
+    /// zero past the grid free zone. Absent = derived from the size reference.
+    #[serde(default)]
+    pub grid_offer_scale_base: Option<f64>,
+    /// Grid: drop a shaped offer rung below this many base units — the server
+    /// rejects sub-minimum orders. Absent = `DEFAULT_MIN_RUNG_FRACTION`.
+    #[serde(default)]
+    pub grid_min_rung_base: Option<f64>,
+}
+
+fn default_max_impact_percent() -> f64 {
+    50.0
+}
+fn default_max_pool_fraction() -> f64 {
+    0.9
+}
+fn default_impact_multiplier() -> f64 {
+    1.0
+}
+fn default_impact_window_hours() -> f64 {
+    24.0
+}
+fn default_confirm_tolerance_percent() -> f64 {
+    0.25
+}
+
+impl Default for PoolImpactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_impact_percent: default_max_impact_percent(),
+            max_pool_fraction: default_max_pool_fraction(),
+            impact_multiplier: default_impact_multiplier(),
+            free_zone_base: 0.0,
+            window_hours: default_impact_window_hours(),
+            confirm_tolerance_percent: default_confirm_tolerance_percent(),
+            grid_free_zone_base: None,
+            grid_min_rung_base: None,
+            grid_offer_scale_base: None,
+        }
+    }
+}
+
+impl PoolImpactConfig {
+    /// Clamp out-of-range knobs, warning per change. Never panic over a
+    /// config typo: this section is additive, not a correctness precondition.
+    pub fn sanitize(&mut self, market_id: &str) {
+        let clamp = |name: &str, v: &mut f64, lo: f64, hi: f64| {
+            let c = if v.is_finite() { v.clamp(lo, hi) } else { lo };
+            if c != *v {
+                tracing::warn!(
+                    "Market {market_id}: [markets.rfq.pool_impact] {name}={v} out of range — clamped to {c}"
+                );
+                *v = c;
+            }
+        };
+        clamp("max_impact_percent", &mut self.max_impact_percent, 0.0, 95.0);
+        clamp("max_pool_fraction", &mut self.max_pool_fraction, 0.01, 0.99);
+        clamp("impact_multiplier", &mut self.impact_multiplier, 0.0, 100.0);
+        clamp("free_zone_base", &mut self.free_zone_base, 0.0, f64::MAX);
+        clamp("window_hours", &mut self.window_hours, 0.01, 720.0);
+        clamp(
+            "confirm_tolerance_percent",
+            &mut self.confirm_tolerance_percent,
+            0.0,
+            100.0,
+        );
+        if let Some(v) = &mut self.grid_free_zone_base {
+            clamp("grid_free_zone_base", v, 0.0, f64::MAX);
+        }
+        if let Some(v) = &mut self.grid_offer_scale_base {
+            clamp("grid_offer_scale_base", v, 0.0, f64::MAX);
+        }
+    }
+}
+
+/// A venue/branch-scoped override of `[markets.rfq]` parameters — TOML
+/// `[[venue_overrides]]`. RFQ V2 only: the venue arrives on the atomic
+/// stream as `AtomicRfqRequest.venue_name` (agents fall back to the VA2
+/// `quote_id_prefix` for servers predating that field) and the branch as
+/// `AtomicRfqRequest.venue_branch`; V1 RFQs carry no venue identity and
+/// always price at the pair defaults. Grid orders are the public
+/// venue-agnostic book and are never affected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VenueOverride {
+    /// Swap-venue slug this entry applies to (= `AtomicRfqRequest.venue_name`).
+    pub venue: String,
+    /// Restrict to one branch of the venue; absent = any branch. Branch-scoped
+    /// entries only ever match once the server sends `venue_branch` (older
+    /// servers omit it) — and the server forwards branches ONLY for delegated
+    /// venue traffic (platform-minted venue JWTs); self-asserted non-delegated
+    /// branches are never forwarded, so they can only match branch-less entries.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Restrict to these market_ids; absent = all markets.
+    #[serde(default)]
+    pub markets: Option<Vec<String>>,
+    /// The sparse `[venue_overrides.rfq]` overlay.
+    pub rfq: RfqOverlayConfig,
+}
+
+impl VenueOverride {
+    fn matches(&self, market_id: &str, venue: &str, branch: Option<&str>) -> bool {
+        if self.venue != venue {
+            return false;
+        }
+        if let Some(ref b) = self.branch {
+            if branch != Some(b.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref markets) = self.markets {
+            if !markets.iter().any(|m| m == market_id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// More constrained entries apply later (and therefore win) in
+    /// [`resolve_rfq_config`].
+    fn specificity(&self) -> u8 {
+        self.branch.is_some() as u8 + self.markets.is_some() as u8
+    }
+}
+
+/// Sparse all-`Option` mirror of [`RfqMarketConfig`]'s venue-effective
+/// scalars: a set field replaces the pair value, an unset one inherits it.
+/// Deliberately excluded — fields with NO effect on any venue-carrying
+/// request (offering them would be dead config that deceives the operator):
+/// `v2` (denomination ladders, structural), `min_notional_usd` (the floor is
+/// V1-only, and V1 carries no venue), `allocate_before_secs` /
+/// `settle_before_secs` (consumed only by the V1 quote message; V2 deadlines
+/// come from the atomic-quote globals).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RfqOverlayConfig {
+    /// `Some(false)` = do not quote this venue on the matched markets;
+    /// `Some(true)` re-opens after a broader matching entry's close (e.g.
+    /// venue-wide `enabled = false`, one branch re-enabled). It can NOT open
+    /// a market whose own `[markets.rfq]` is disabled — the V2 stream never
+    /// subscribes such markets, so no venue request ever reaches pricing
+    /// (assemble() rejects overrides that attempt it).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub min_quantity: Option<String>,
+    #[serde(default)]
+    pub max_quantity: Option<String>,
+    #[serde(default)]
+    pub bid_spread_percent: Option<f64>,
+    #[serde(default)]
+    pub offer_spread_percent: Option<f64>,
+    #[serde(default)]
+    pub disable_overload_spread_widening: Option<bool>,
+    #[serde(default)]
+    pub disable_depletion_spread_widening: Option<bool>,
+    #[serde(default)]
+    pub quote_valid_secs: Option<u32>,
+}
+
+impl RfqOverlayConfig {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.min_quantity.is_none()
+            && self.max_quantity.is_none()
+            && self.bid_spread_percent.is_none()
+            && self.offer_spread_percent.is_none()
+            && self.disable_overload_spread_widening.is_none()
+            && self.disable_depletion_spread_widening.is_none()
+            && self.quote_valid_secs.is_none()
+    }
+
+    fn apply(&self, cfg: &mut RfqMarketConfig) {
+        if let Some(v) = self.enabled {
+            cfg.enabled = v;
+        }
+        if let Some(ref v) = self.min_quantity {
+            cfg.min_quantity = v.clone();
+        }
+        if let Some(ref v) = self.max_quantity {
+            cfg.max_quantity = v.clone();
+        }
+        if let Some(v) = self.bid_spread_percent {
+            cfg.bid_spread_percent = v;
+        }
+        if let Some(v) = self.offer_spread_percent {
+            cfg.offer_spread_percent = v;
+        }
+        if let Some(v) = self.disable_overload_spread_widening {
+            cfg.disable_overload_spread_widening = v;
+        }
+        if let Some(v) = self.disable_depletion_spread_widening {
+            cfg.disable_depletion_spread_widening = v;
+        }
+        if let Some(v) = self.quote_valid_secs {
+            cfg.quote_valid_secs = Some(v);
+        }
+    }
+}
+
+/// Resolve the effective RFQ config for one request: the pair's
+/// `[markets.rfq]` plus every matching `[[venue_overrides]]` overlay.
+///
+/// Matching entries apply in ascending specificity (venue-wide first, then
+/// branch-/market-scoped; ties in file order, so a later entry wins), each
+/// `Some` field overwriting — a venue-wide entry can set spreads and a
+/// branch-specific one can tweak a single field on top. `venue = None` (V1
+/// requests, or a server that sent no prefix) borrows the pair config
+/// untouched; a clone happens only when an overlay actually matched.
+pub fn resolve_rfq_config<'a>(
+    pair: &'a RfqMarketConfig,
+    overrides: &[VenueOverride],
+    market_id: &str,
+    venue: Option<&str>,
+    branch: Option<&str>,
+) -> std::borrow::Cow<'a, RfqMarketConfig> {
+    let Some(venue) = venue else {
+        return std::borrow::Cow::Borrowed(pair);
+    };
+    let mut matching: Vec<&VenueOverride> = overrides
+        .iter()
+        .filter(|o| o.matches(market_id, venue, branch))
+        .collect();
+    if matching.is_empty() {
+        return std::borrow::Cow::Borrowed(pair);
+    }
+    // Stable sort: equal specificity keeps file order, so later entries
+    // apply later and win.
+    matching.sort_by_key(|o| o.specificity());
+    let mut cfg = pair.clone();
+    for o in &matching {
+        o.rfq.apply(&mut cfg);
+    }
+    std::borrow::Cow::Owned(cfg)
 }
 
 /// RFQ V2 per-market configuration (`[markets.rfq.v2]`)
@@ -1241,10 +1826,10 @@ pub struct LiquidityProviderConfig {
     pub default_quote_valid_secs: u32,
     /// Global minimum RFQ value in USD — RFQ V1 ONLY (the LP pays its own
     /// dvp+allocation fees on a V1 settle). V1 RFQs whose USD notional is
-    /// below this are rejected (AmountTooSmall). RFQ V2 ignores it
-    /// (2026-08-05 dust enablement): the user pays every V2 fee — 3x below
-    /// the server's `min_order_value_usd` — and the LP pays none, so the LP
-    /// quotes any size (the base `min_quantity` bound still applies).
+    /// below this are rejected (AmountTooSmall). RFQ V2 ignores it: the user
+    /// pays every V2 fee — 3x below the server's `min_order_value_usd` — and
+    /// the LP pays none, so the LP quotes any size (the base `min_quantity`
+    /// bound still applies).
     /// 0 = disabled. Overridden per-market by `[markets.rfq].min_notional_usd`.
     #[serde(default)]
     pub min_notional_usd: f64,
@@ -1304,6 +1889,20 @@ pub struct RfqV2Config {
     /// rung broken), else are swept as extra inputs into rung-funded settles.
     #[serde(default)]
     pub denominations: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl RfqV2Config {
+    /// How long a confirmed quote's count may stand before it is a leak.
+    /// DERIVED from the quote lifetime — a shorter backstop would reverse it.
+    pub fn stale_pending_after(&self) -> std::time::Duration {
+        const STALE_PENDING_SLACK_SECS: u64 = 600;
+        const STALE_PENDING_FLOOR_SECS: u64 = 900;
+        let lifetime = self
+            .atomic_quote_valid_secs
+            .saturating_add(self.settle_grace_secs)
+            .saturating_add(STALE_PENDING_SLACK_SECS);
+        std::time::Duration::from_secs(lifetime.max(STALE_PENDING_FLOOR_SECS))
+    }
 }
 
 impl Default for RfqV2Config {
@@ -1584,6 +2183,176 @@ min_notional_usd = 25.0
     }
 
     #[test]
+    fn test_venue_overrides_parse() {
+        // Omitted list → empty (no overrides), the deployed-toml default.
+        let agent: AgentToml = toml::from_str("").unwrap();
+        assert!(agent.venue_overrides.is_empty());
+
+        // A full and a sparse entry; unset overlay fields must parse to None
+        // (inherit the pair value), not to a default.
+        let agent: AgentToml = toml::from_str(
+            r#"
+[[venue_overrides]]
+venue = "walley"
+branch = "main"
+markets = ["HECTO-USDCx", "HECTO-CC"]
+
+[venue_overrides.rfq]
+enabled = true
+min_quantity = "100"
+max_quantity = "20000"
+bid_spread_percent = 2.0
+offer_spread_percent = 0.5
+disable_overload_spread_widening = true
+disable_depletion_spread_widening = true
+quote_valid_secs = 30
+
+[[venue_overrides]]
+venue = "lattice"
+
+[venue_overrides.rfq]
+offer_spread_percent = 1.0
+"#,
+        )
+        .unwrap();
+        assert_eq!(agent.venue_overrides.len(), 2);
+
+        let full = &agent.venue_overrides[0];
+        assert_eq!(full.venue, "walley");
+        assert_eq!(full.branch.as_deref(), Some("main"));
+        assert_eq!(
+            full.markets.as_deref(),
+            Some(&["HECTO-USDCx".to_string(), "HECTO-CC".to_string()][..])
+        );
+        assert_eq!(full.rfq.enabled, Some(true));
+        assert_eq!(full.rfq.min_quantity.as_deref(), Some("100"));
+        assert_eq!(full.rfq.bid_spread_percent, Some(2.0));
+        assert_eq!(full.rfq.disable_overload_spread_widening, Some(true));
+        assert_eq!(full.rfq.quote_valid_secs, Some(30));
+        assert!(!full.rfq.is_empty());
+
+        let sparse = &agent.venue_overrides[1];
+        assert_eq!(sparse.venue, "lattice");
+        assert_eq!(sparse.branch, None, "omitted branch = any branch");
+        assert_eq!(sparse.markets, None, "omitted markets = all markets");
+        assert_eq!(sparse.rfq.offer_spread_percent, Some(1.0));
+        assert_eq!(sparse.rfq.bid_spread_percent, None);
+        assert_eq!(sparse.rfq.enabled, None);
+        assert_eq!(sparse.rfq.disable_overload_spread_widening, None);
+    }
+
+    #[test]
+    fn test_resolve_rfq_config_matching_and_layering() {
+        let pair: RfqMarketConfig = serde_json::from_str(
+            r#"{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":0.5}"#,
+        )
+        .unwrap();
+        let overrides: Vec<VenueOverride> = toml::from_str::<AgentToml>(
+            r#"
+# venue-wide (specificity 0): sets both spreads
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+bid_spread_percent = 4.0
+offer_spread_percent = 4.0
+
+# branch-scoped (specificity 1): tweaks ONE field on top
+[[venue_overrides]]
+venue = "walley"
+branch = "main"
+[venue_overrides.rfq]
+offer_spread_percent = 1.0
+
+# market-scoped for another venue
+[[venue_overrides]]
+venue = "lattice"
+markets = ["CC-USDCx"]
+[venue_overrides.rfq]
+disable_overload_spread_widening = true
+"#,
+        )
+        .unwrap()
+        .venue_overrides;
+
+        // No venue (V1 / legacy server) → borrowed pair config untouched.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", None, None);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(r.bid_spread_percent, 2.5);
+
+        // Unknown venue → borrowed pair config.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("supa"), None);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+
+        // Venue-wide match, no branch sent: only the specificity-0 entry
+        // applies (branch-scoped needs the branch on the wire).
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), None);
+        assert!(matches!(r, std::borrow::Cow::Owned(_)));
+        assert_eq!(r.bid_spread_percent, 4.0);
+        assert_eq!(r.offer_spread_percent, 4.0);
+        assert_eq!(r.min_quantity, "50", "unset overlay fields inherit the pair");
+
+        // Branch sent: venue-wide applies first, branch-scoped overwrites the
+        // one field it sets.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), Some("main"));
+        assert_eq!(r.bid_spread_percent, 4.0, "kept from the venue-wide layer");
+        assert_eq!(r.offer_spread_percent, 1.0, "branch layer wins");
+
+        // Other branch: branch-scoped entry does not match.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), Some("beta"));
+        assert_eq!(r.offer_spread_percent, 4.0);
+
+        // Market scoping: lattice matches CC-USDCx only.
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("lattice"), None);
+        assert!(r.disable_overload_spread_widening);
+        let r = resolve_rfq_config(&pair, &overrides, "CBTC-USDCx", Some("lattice"), None);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// EQUAL-specificity tie rule: stable sort keeps file order, the later
+    /// entry applies later and wins. Pins the documented behavior against a
+    /// routine sort_by_key -> sort_unstable_by_key "optimization", which
+    /// would make live venue pricing implementation-defined.
+    #[test]
+    fn test_resolve_rfq_config_equal_specificity_later_entry_wins() {
+        let pair: RfqMarketConfig = serde_json::from_str(
+            r#"{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":2.5,"offer_spread_percent":0.5}"#,
+        )
+        .unwrap();
+        let overrides = toml::from_str::<AgentToml>(
+            r#"
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+bid_spread_percent = 3.0
+offer_spread_percent = 3.0
+
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+bid_spread_percent = 1.0
+"#,
+        )
+        .unwrap()
+        .venue_overrides;
+
+        let r = resolve_rfq_config(&pair, &overrides, "CC-USDCx", Some("walley"), None);
+        assert_eq!(r.bid_spread_percent, 1.0, "later same-specificity entry must win");
+        assert_eq!(r.offer_spread_percent, 3.0, "field untouched by the later entry keeps the earlier layer");
+    }
+
+    #[test]
+    fn test_venue_overrides_validation() {
+        // Invalid venue slug (uppercase) must fail assemble-time validation.
+        // Exercise the same predicate the validation uses.
+        assert!(crate::auth::is_valid_venue_branch("walley"));
+        assert!(crate::auth::is_valid_venue_branch("main"));
+        assert!(!crate::auth::is_valid_venue_branch("Walley"));
+        assert!(!crate::auth::is_valid_venue_branch(""));
+        assert!(!crate::auth::is_valid_venue_branch("x"));
+        assert!(!crate::auth::is_valid_venue_branch("-bad"));
+    }
+
+    #[test]
     fn test_rfq_v2_toml_defaults_and_parse() {
         // No [liquidity_provider.rfq_v2] / [markets.rfq.v2] → None
         let agent: AgentToml = toml::from_str(
@@ -1649,6 +2418,25 @@ denominations = ["25x20", "100x10"]
         assert!(v2m.enabled);
         assert_eq!(v2m.denominations, vec!["25x20", "100x10"]);
         assert_eq!(v2m.max_input_holdings, 100);
+        // The net-tracker backstop is DERIVED, so raising the quote validity
+        // cannot make it reverse the soft counts of quotes that are still open.
+        assert_eq!(v2.stale_pending_after().as_secs(), 900);
+
+        // ...and it outlives the quote at every plausible setting, including
+        // ones far past the 900 s the backstop used to hard-code.
+        for (valid, grace) in [(120, 30), (900, 300), (1800, 600), (3600, 3600)] {
+            let c = RfqV2Config {
+                atomic_quote_valid_secs: valid,
+                settle_grace_secs: grace,
+                ..Default::default()
+            };
+            let backstop = c.stale_pending_after().as_secs();
+            assert!(
+                backstop > valid + grace,
+                "backstop {backstop}s would reverse a still-live quote \
+                 ({valid}s validity + {grace}s grace)"
+            );
+        }
 
         // global per-instrument ladder map parses
         let agent: AgentToml = toml::from_str(
@@ -1736,6 +2524,29 @@ name = "LP test"
     /// Env-mutating assemble test. Single test fn so the process-global env
     /// is only touched from one thread; every scenario runs sequentially.
     #[test]
+    fn a_party_is_matched_against_its_own_public_key() {
+        // Real devnet pair: the namespace is SHA256(0x0000000C || public key).
+        let public_key: [u8; 32] =
+            hex::decode("9895938290240e991e06356233ff0694fb3cb90e89443fd95f54048e64c2621f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let party = "99a24d3a73eb9a1c::1220dda5272ceb983cf00699447d878078c1df7dcdf1c64955e444b7483df3e8384b";
+        assert_eq!(party_matches_public_key(party, &public_key), Some(true));
+
+        let other = "bridge-1::12200c73731c0c8d94327e71e966ca6ff356732c3298797e5eb73eece523582c46dd";
+        assert_eq!(party_matches_public_key(other, &public_key), Some(false));
+    }
+
+    #[test]
+    fn a_party_without_a_derivable_namespace_is_not_judged() {
+        let key = [0u8; 32];
+        assert_eq!(party_matches_public_key("lp::1220bb", &key), None);
+        assert_eq!(party_matches_public_key("no-namespace", &key), None);
+        assert_eq!(party_matches_public_key("lp::abcd", &key), None);
+    }
+
+    #[test]
     fn test_rfq_v2_assemble_env_overrides_and_validation() {
         fn set(k: &str, v: &str) {
             unsafe { std::env::set_var(k, v) }
@@ -1786,7 +2597,7 @@ enabled = true
 
         // A: market v2 enabled without the LP-level switch → error
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("liquidity_provider.rfq_v2"), "got: {err}");
 
         // B: RFQ_V2_ENABLED forces the LP switch; scalar env supplies the key;
@@ -1797,7 +2608,7 @@ enabled = true
         set("TICKET_THRESHOLD_USD", "250");
         set("TICKET_BATCH_SIZE", "77");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         let v2 = cfg
             .liquidity_provider
             .as_ref()
@@ -1820,7 +2631,7 @@ name = "LP test"
 "#,
         )
         .unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(cfg.atomic_quote_key.is_none());
 
         // D: max_input_holdings out of the 1..=100 protocol bound → error
@@ -1843,7 +2654,7 @@ max_input_holdings = 125
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("max_input_holdings"), "got: {err}");
 
         // E: ticket_batch_size == 0 → error
@@ -1859,7 +2670,7 @@ ticket_batch_size = 0
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("ticket_batch_size"), "got: {err}");
 
         // F: atomic_quote_valid_secs == 0 → error
@@ -1874,13 +2685,13 @@ atomic_quote_valid_secs = 0
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("atomic_quote_valid_secs"), "got: {err}");
 
         // G: enabled without the env key → error (env-only, no keyfile fallback)
         unset("ATOMIC_QUOTE_PRIVATE_KEY");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let err = format!("{:#}", BaseConfig::assemble(agent).unwrap_err());
+        let err = format!("{:#}", BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err());
         assert!(err.contains("ATOMIC_QUOTE_PRIVATE_KEY"), "got: {err}");
 
         // --- rfq_v2_only scenarios ---
@@ -1889,7 +2700,7 @@ atomic_quote_valid_secs = 0
         // H: rfq_v2_only without a [liquidity_provider] section → error
         unset("RFQ_V2_ENABLED");
         let agent: AgentToml = toml::from_str("rfq_v2_only = true\n").unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("[liquidity_provider]"), "got: {err}");
 
         // I: rfq_v2_only with the LP-level V2 switch off → error
@@ -1902,7 +2713,7 @@ name = "LP test"
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("rfq_v2].enabled"), "got: {err}");
 
         // J: rfq_v2_only with V2 enabled but no v2-enabled market → error
@@ -1920,25 +2731,25 @@ enabled = true
 "#,
         )
         .unwrap();
-        let err = BaseConfig::assemble(agent).unwrap_err().to_string();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
         assert!(err.contains("at least one enabled market"), "got: {err}");
 
         // K: happy path — toml switch + enabled V2 + v2 market → Ok
         let agent: AgentToml = toml::from_str(&only_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(cfg.rfq_v2_only);
 
         // L: env RFQ_V2_ONLY=true over a toml that omits the field
         set("RFQ_V2_ONLY", "true");
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(cfg.rfq_v2_only);
 
         // M: env RFQ_V2_ONLY=false disarms a toml `rfq_v2_only = true`
         // (validation then no longer applies, so this also passes without markets)
         set("RFQ_V2_ONLY", "false");
         let agent: AgentToml = toml::from_str(&only_toml).unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(!cfg.rfq_v2_only);
 
         // N: RFQ_V2_ONLY is LP-gated (RFQ_V2_ENABLED idiom) — with no
@@ -1946,8 +2757,70 @@ enabled = true
         // commands on the load_or_defaults path don't trip the validation
         set("RFQ_V2_ONLY", "true");
         let agent: AgentToml = toml::from_str("").unwrap();
-        let cfg = BaseConfig::assemble(agent).unwrap();
+        let cfg = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap();
         assert!(!cfg.rfq_v2_only);
+
+        // O: CLI overrides beat the env values; blank overrides are ignored; the
+        // quote override satisfies RFQ V2 with the env var unset
+        unset("RFQ_V2_ONLY");
+        set("RFQ_V2_ENABLED", "true");
+        set("ATOMIC_QUOTE_PRIVATE_KEY", &kf.priv_scalar_hex);
+        let kf2 = atomic_quote::gen_keypair().unwrap();
+        let (k2_b58, _) = crate::sign::generate_keypair();
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(
+            agent,
+            ConfigOverrides {
+                party: Some("other::1220ff".to_string()),
+                private_key: Some(Zeroizing::new(k2_b58.clone())),
+                quote_private_key: Some(Zeroizing::new(kf2.priv_scalar_hex.clone())),
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.party_id, "other::1220ff");
+        assert_eq!(
+            cfg.public_key_hex,
+            get_public_key_hex(&decode_private_key(&k2_b58).unwrap())
+        );
+        assert_eq!(cfg.atomic_quote_key.as_ref().unwrap().pub_spki_hex, kf2.pub_spki_hex);
+
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(
+            agent,
+            ConfigOverrides {
+                party: Some("   ".to_string()),
+                private_key: Some(Zeroizing::new(String::new())),
+                quote_private_key: Some(Zeroizing::new(" ".to_string())),
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.party_id, "lp::1220bb");
+        assert_eq!(cfg.atomic_quote_key.as_ref().unwrap().pub_spki_hex, kf.pub_spki_hex);
+
+        unset("ATOMIC_QUOTE_PRIVATE_KEY");
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let cfg = BaseConfig::assemble(
+            agent,
+            ConfigOverrides {
+                quote_private_key: Some(Zeroizing::new(kf2.priv_scalar_hex.clone())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.atomic_quote_key.as_ref().unwrap().pub_spki_hex, kf2.pub_spki_hex);
+        let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
+        let err = format!(
+            "{:#}",
+            BaseConfig::assemble(
+                agent,
+                ConfigOverrides {
+                    quote_private_key: Some(Zeroizing::new("zz".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("--quote-private-key"), "got: {err}");
 
         // cleanup
         for k in [
@@ -1959,6 +2832,27 @@ enabled = true
         ] {
             unset(k);
         }
+    }
+
+    #[test]
+    fn test_quote_key_from_short_scalar_hex() {
+        let short = "01".repeat(24);
+        let key = AtomicQuoteKey::from_scalar_hex(&short).unwrap();
+        assert_eq!(key.scalar_hex().len(), 64);
+        assert!(key.scalar_hex().starts_with(&"0".repeat(16)));
+        assert!(key.scalar_hex().ends_with(&short));
+        assert!(AtomicQuoteKey::from_scalar_hex(&"01".repeat(10)).is_err());
+    }
+
+    #[test]
+    fn test_quote_key_from_scalar_hex() {
+        let kf = atomic_quote::gen_keypair().unwrap();
+        let key = AtomicQuoteKey::from_scalar_hex(&kf.priv_scalar_hex).unwrap();
+        assert_eq!(key.pub_spki_hex, kf.pub_spki_hex);
+        assert_eq!(*key.scalar_hex(), kf.priv_scalar_hex.to_lowercase());
+        assert_eq!(hex::encode(key.scalar().as_slice()), kf.priv_scalar_hex.to_lowercase());
+        assert_eq!(format!("{key:?}"), format!("AtomicQuoteKey {{ pub_spki_hex: {:?}, .. }}", kf.pub_spki_hex));
+        assert!(AtomicQuoteKey::from_scalar_hex("zz").is_err());
     }
 
     /// Non-env mirror: the same rfq_v2_only requirements enforced by

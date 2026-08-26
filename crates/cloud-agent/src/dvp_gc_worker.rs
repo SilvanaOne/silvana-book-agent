@@ -533,7 +533,7 @@ async fn create_client(config: &BaseConfig) -> anyhow::Result<DAppProviderClient
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -629,7 +629,7 @@ mod tests {
 
     const LP: &str = "15c7a79bbb0dfb67::1220af9f";
     const OTHER: &str = "0b415857869e4865::122070e6";
-    const NOW: i64 = 1_784_405_386_000_000; // 2026-07-18
+    const NOW: i64 = 1_784_405_386_000_000; // a fixed instant, micros since epoch
     const HOUR: i64 = 3_600_000_000;
 
     /// Payload shaped like the real mainnet ACS dump (micros as integers).

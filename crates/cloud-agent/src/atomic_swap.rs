@@ -186,7 +186,7 @@ pub async fn create_atomic_client(config: &BaseConfig) -> Result<AtomicProviderC
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -201,7 +201,7 @@ pub async fn create_v1_client(config: &BaseConfig) -> Result<DAppProviderClient>
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -240,7 +240,10 @@ pub async fn ensure_receiver_preapproval(
     }
 
     let existing = client.get_preapprovals().await?;
-    if existing.iter().any(|p| p.instrument_admin == admin) {
+    if existing
+        .iter()
+        .any(|p| p.instrument_admin == admin && p.instrument_allowances.is_empty())
+    {
         info!(
             "Receiver preapproval for {} (admin {}) already present",
             on_chain_id, admin
@@ -254,16 +257,7 @@ pub async fn ensure_receiver_preapproval(
         .list_faucet_instruments()
         .await
         .context("failed to fetch faucet instruments for preapproval operator resolution")?;
-    let operator = faucet_instruments
-        .iter()
-        .find(|inst| inst.registry == admin)
-        .map(|inst| inst.operator.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "no faucet instrument matches admin '{}' — cannot determine preapproval operator",
-                admin
-            )
-        })?;
+    let operator = crate::operator_for_registry(&faucet_instruments, &admin)?;
 
     info!(
         "Creating receiver preapproval for {} (admin {}, operator {})",

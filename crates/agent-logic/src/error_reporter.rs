@@ -1,6 +1,5 @@
 //! Best-effort structured error reporting to the orderbook server
-//! (`SettlementService.ReportErrors` — see canton-agent
-//! plans/errors/2026-08-13-error-logging.md).
+//! (`SettlementService.ReportErrors`).
 //!
 //! The agent has no database; every error it wants recorded travels over
 //! gRPC. Design rules, in order:
@@ -92,7 +91,7 @@ pub fn init_from_config(config: &crate::config::BaseConfig) {
     let url = config.orderbook_grpc_url.clone();
     let party_id = config.party_id.clone();
     let role = config.role.clone();
-    let private_key_bytes = config.private_key_bytes;
+    let private_key = config.private_key.clone();
     let token_ttl_secs = config.token_ttl_secs;
     let node_name = config.node_name.clone();
     init(
@@ -101,7 +100,7 @@ pub fn init_from_config(config: &crate::config::BaseConfig) {
             crate::auth::generate_jwt(
                 &party_id,
                 &role,
-                &private_key_bytes,
+                &private_key.expose(),
                 token_ttl_secs,
                 Some(node_name.as_str()),
             )

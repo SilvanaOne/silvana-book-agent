@@ -445,7 +445,7 @@ impl MulticallSettler {
             &self.config.orderbook_grpc_url,
             &self.config.party_id,
             &self.config.role,
-            &self.config.private_key_bytes,
+            &self.config.private_key,
             self.config.token_ttl_secs,
             Some(self.config.node_name.as_str()),
             &self.config.ledger_service_public_key,

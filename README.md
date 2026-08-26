@@ -37,7 +37,7 @@ Binary at `target/release/cloud-agent`.
 
 ### Onboard
 
-Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. On success, it writes a `.env` (Canton party ID, private key, network parties, fee config) and a starter `agent.toml` (role, poll interval, empty `[[markets]]`) into the current directory. The command is idempotent — re-run safely; existing keys and party IDs are preserved.
+Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. On success, it writes a `.env` (Canton party ID, private key, network parties, fee config) and a starter `agent.toml` (role, poll interval, empty `[[markets]]`) into the current directory. The command can be re-run; an existing party ID and key in `.env` are reused. A key passed with `--private-key` or entered at the prompt is not written to `.env`: later commands for that identity read it from `--private-key`, from `PARTY_AGENT_PRIVATE_KEY` in the environment, or from a terminal prompt.
 
 ```bash
 cloud-agent onboard \
@@ -210,7 +210,7 @@ cargo run -p buy-cc-example -- --amount 10.0 --max-price 0.16 --poll-period 600
 
 The `onboard` command performs 11 steps automatically:
 
-1. Load or generate an Ed25519 keypair (written to `.env` as `PARTY_AGENT_PRIVATE_KEY`).
+1. Load an Ed25519 key (from `--private-key`, a prompt, or `.env`) or generate one; only a generated key is written to `.env` as `PARTY_AGENT_PRIVATE_KEY`.
 2. Connect to the orderbook RPC (raw gRPC, no auth yet).
 3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`.
 4. Register on the waiting list (`RegisterAgent`, signed).
@@ -218,8 +218,8 @@ The `onboard` command performs 11 steps automatically:
 6. Fetch and sign the Canton topology multihash.
 7. Submit the signature (`SubmitOnboardingSignature`).
 8. Poll until `TOPOLOGY_CREATED`; write `PARTY_AGENT` to `.env`.
-9. Create Splice `TransferPreapproval` for CC (pending operator acceptance).
-10. Create one CIP-56 `TransferPreapproval` per non-DSO registrar discovered from `GetInstruments`.
+9. Create Splice `TransferPreapproval` for CC (pending featured-app acceptance).
+10. Create one CIP-56 `TransferPreapproval` per non-DSO registry advertised by the ledger service (`ListFaucetInstruments`). Preapprovals are per registry **admin**, so instruments sharing a registry are covered by a single preapproval, and an admin you already hold one for is skipped.
 11. Request a `UserService` and (on devnet) auto-faucet CC + USDC.
 
 Flags:
@@ -230,21 +230,43 @@ Flags:
 | `--agent-name <NAME>`    | Display name (required)                          |
 | `--email <EMAIL>`        | Contact email (required)                         |
 | `--invite-code <CODE>`   | Waiting list invite code (required)              |
-| `--party <ID>`           | Skip waiting list (requires `--private-key`)     |
-| `--private-key <B58>`    | Base58-encoded Ed25519 private key               |
-| `--env-file <PATH>`      | Path to .env file (default: `.env`)              |
+| `--party <ID>`           | Skip the waiting list; prompts for the private key when none is configured |
+| `--private-key <B58>`    | Base58 Ed25519 private key for `--party` (optional in a terminal — prompted, input hidden) |
+| `--env-file <PATH>`      | Path to .env file (default: `.env`; global flag, works on every command) |
 | `--poll-interval <SECS>` | Polling interval during onboarding (default: 10) |
 
 ### Configuration
 
 `.env` and `agent.toml` are both created by `cloud-agent onboard` — you typically don't write them from scratch. The tables below describe each field so you can tune an existing config.
 
+Every command accepts a global `--env-file <PATH>` flag to load a specific env file instead of the default `.env` lookup — useful for running several agents (one env file per identity) that share a single `agent.toml`:
+
+```bash
+cloud-agent --env-file agent1.env -c agent.toml info balance
+cloud-agent --env-file agent2.env -c agent.toml agent
+```
+
+An explicit `--env-file` overrides variables already set in the shell. Without the flag, `.env` is searched for in the current directory and its parents, and already-set shell variables win.
+
+#### Identity flags
+
+The agent identity can also be passed on the command line, **before** the subcommand:
+
+```bash
+cloud-agent info balance --party <ID> --private-key <B58>
+cloud-agent --party <ID> --private-key <B58> info balance   # equivalent
+cloud-agent --party <ID> agent            # prompts for the key in a terminal
+cloud-agent --quote-private-key <HEX> agent
+```
+
+`--party` overrides `PARTY_AGENT`, `--private-key` overrides `PARTY_AGENT_PRIVATE_KEY`, and `--quote-private-key` overrides `ATOMIC_QUOTE_PRIVATE_KEY`. Precedence is flag, then environment (`.env`/shell), then — for the private key only — a hidden terminal prompt when a party is known but no key is configured. The flags may appear before or after the subcommand. Without a terminal the command exits with an error, so non-interactive runs need the variable or the flag. `info network`, `info party`, `atomic keygen` and `sign` with an explicit `--private-key` need no agent key at all. The quote key is never prompted for. Keys supplied this way are not written to `.env`.
+
 #### `.env` — Environment Variables
 
 | Variable                         | Description                                                            | Written by `onboard` |
 | -------------------------------- | ---------------------------------------------------------------------- | :------------------: |
 | `PARTY_AGENT`                    | Your Canton party ID                                                   |         yes          |
-| `PARTY_AGENT_PRIVATE_KEY`        | Base58 Ed25519 private key (32-byte seed)                              |         yes          |
+| `PARTY_AGENT_PRIVATE_KEY`        | Base58 Ed25519 private key (32-byte seed); alternatively `--private-key` or a terminal prompt | generated keys only |
 | `PARTY_AGENT_PUBLIC_KEY`         | Base58 Ed25519 public key (derived from the private key)               |         yes          |
 | `ORDERBOOK_GRPC_URL`             | Orderbook gRPC endpoint                                                |         yes          |
 | `CANTON_CHAIN`                   | `devnet` \| `testnet` \| `mainnet`                                     |         yes          |
@@ -436,6 +458,8 @@ Flags (both `buy` and `sell`):
 | `agent`                                                                                       | Long-running LP agent (grid + RFQ + settlement)         |
 | `onboard`                                                                                     | Self-service onboarding                                 |
 | `generate-private-key`                                                                        | Generate a new Ed25519 keypair (no config needed)       |
+| `<command> --party <ID> --private-key <B58>`                                                  | Identity from flags instead of `.env` (either position) |
+| `--quote-private-key <HEX> <command>`                                                         | Quote key from a flag instead of `.env`                 |
 | `info balance`                                                                                | Show token balances                                     |
 | `info party`                                                                                  | Show party ID, public key, node name                    |
 | `info network`                                                                                | Show DSO party, rates, mining rounds                    |
@@ -444,12 +468,15 @@ Flags (both `buy` and `sell`):
 | `sell --market <ID> --amount <N>`                                                             | Sell via RFQ until filled                               |
 | `faucet get --token <CC\|USDC\|…> [--admin <P>] [--amount <N>]`                               | Request tokens (devnet)                                 |
 | `transfer send-cc --receiver <P> --amount <N>`                                                | Send Canton Coin                                        |
-| `transfer send-cip56 --receiver <P> --instrument-id <ID> --instrument-admin <P> --amount <N>` | Send CIP-56 token                                       |
+| `transfer send-cip56 --receiver <P> --instrument-id <ID> [--instrument-admin <P>] --amount <N> [--count <N>]` | Send CIP-56 token                     |
 | `transfer accept-cip56 --contract-id <CID>`                                                   | Accept incoming CIP-56 transfer                         |
 | `transfer split-cc --output-amounts a,b,c --amulet-cids x,y`                                  | Split CC amulets                                        |
 | `transfer batch-pay --file payments.csv`                                                      | Batch CC payments (atomic multicall)                    |
+| `transfer prepay-traffic --amount <N>`                                                        | Top up the off-chain prepaid traffic balance            |
 | `preapproval request --instrument-admin <P>`                                                  | Create a `TransferPreapproval`                          |
 | `preapproval fetch`                                                                           | List existing preapprovals                              |
+| `preapproval check`                                                                           | Compare held preapprovals against the advertised targets |
+| `preapproval sync`                                                                            | Create any advertised preapproval this party lacks      |
 | `subscription request-prepaid`                                                                | Request a prepaid recurring payment                     |
 | `subscription request-payasyougo`                                                             | Request a pay-as-you-go subscription                    |
 | `user-service request`                                                                        | Request a `UserService` contract (one-time onboarding)  |

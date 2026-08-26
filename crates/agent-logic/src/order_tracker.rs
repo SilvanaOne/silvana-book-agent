@@ -58,7 +58,7 @@ pub struct SettlementOrderEntry {
 /// Order tracker with immutable start_time and Ed25519 key
 pub struct OrderTracker {
     start_time_ms: u64,
-    private_key_bytes: [u8; 32],
+    private_key: crate::secret::Secret<32>,
     orders: HashMap<u64, TrackedOrder>,
     /// Maps proposal_id → adoption record for active settlements
     settlement_orders: HashMap<String, SettlementOrderEntry>,
@@ -66,10 +66,10 @@ pub struct OrderTracker {
 
 impl OrderTracker {
     /// Create a new order tracker with immutable start time
-    pub fn new(start_time_ms: u64, private_key_bytes: [u8; 32]) -> Self {
+    pub fn new(start_time_ms: u64, private_key: crate::secret::Secret<32>) -> Self {
         Self {
             start_time_ms,
-            private_key_bytes,
+            private_key,
             orders: HashMap::new(),
             settlement_orders: HashMap::new(),
         }
@@ -96,7 +96,7 @@ impl OrderTracker {
         fields.insert("price", serde_json::Value::String(price.to_string()));
         fields.insert("quantity", serde_json::Value::String(quantity.to_string()));
         let signed_data_bytes = serde_json::to_vec(&fields).unwrap();
-        let signature = sign_order_data(&self.private_key_bytes, &signed_data_bytes);
+        let signature = sign_order_data(&self.private_key.expose(), &signed_data_bytes);
 
         (signature, signed_data_bytes, nonce)
     }
@@ -209,7 +209,7 @@ impl OrderTracker {
 
         // Verify signature
         if !verify_order_signature(
-            &self.private_key_bytes,
+            &self.private_key.expose(),
             &tracked.signed_data,
             &tracked.signature,
         ) {
@@ -265,7 +265,7 @@ impl OrderTracker {
 
         // Verify signature with our key
         if !verify_order_signature(
-            &self.private_key_bytes,
+            &self.private_key.expose(),
             &order.signed_data,
             &signature,
         ) {
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn test_sign_and_verify_order() {
         let key = test_private_key();
-        let tracker = OrderTracker::new(1000, key);
+        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "1.0");
 
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn test_settlement_matching_agent_order() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0");
 
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn test_quantity_tracking() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0");
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5.0", nonce, &signature, &signed_data);
@@ -634,7 +634,7 @@ mod tests {
     fn test_stale_nonce_rejected() {
         let key = test_private_key();
         let start_time = chrono::Utc::now().timestamp_millis() as u64;
-        let mut tracker = OrderTracker::new(start_time, key);
+        let mut tracker = OrderTracker::new(start_time, crate::secret::Secret::seal(&mut { key }));
 
         // Create signed data with old nonce
         let old_nonce = start_time - 1000; // Before start_time
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn test_unknown_order_needs_server_lookup() {
         let key = test_private_key();
-        let tracker = OrderTracker::new(1000, key);
+        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         // Order 42 is not in the tracker
         let proposal = make_proposal("our-party", "counterparty", "1.0", 42, 99);
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn test_invalid_signature_rejected() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let nonce = chrono::Utc::now().timestamp_millis() as u64;
         let signed_data = serde_json::to_vec(&serde_json::json!({
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn test_failed_settlement_releases_pending() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0");
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn test_record_does_not_consume_capacity() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0");
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
@@ -750,7 +750,7 @@ mod tests {
     #[test]
     fn test_try_reserve_pending_idempotent_and_missing() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0");
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5.0", nonce, &signature, &signed_data);
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn test_reserve_capacity_backstop() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, key);
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0");
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);

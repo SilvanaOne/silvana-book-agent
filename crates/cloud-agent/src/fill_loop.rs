@@ -118,7 +118,7 @@ pub async fn run_fill_loop(
         &config.orderbook_grpc_url,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,
@@ -138,7 +138,7 @@ pub async fn run_fill_loop(
     rpc_client.set_jwt(agent_logic::auth::generate_jwt(
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key.expose(),
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
     )?);
@@ -652,7 +652,7 @@ async fn monitor_settlement_progress(
         return;
     };
     if let Ok(jwt) = agent_logic::auth::generate_jwt(
-        &config.party_id, &config.role, &config.private_key_bytes,
+        &config.party_id, &config.role, &config.private_key.expose(),
         config.token_ttl_secs, Some(config.node_name.as_str()),
     ) {
         rpc.set_jwt(jwt);

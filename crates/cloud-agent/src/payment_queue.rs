@@ -622,6 +622,47 @@ fn estimate_cc_needed(request: &PaymentRequest) -> Decimal {
     }
 }
 
+/// Splice rejects amulet transfers above `transferConfig.maxNumInputs`.
+pub(crate) const MAX_AMULET_INPUTS: usize = 100;
+
+/// CC holding fees decay an amulet between selection and execution, so select
+/// against a slightly larger target than the amount actually being moved.
+pub(crate) fn with_fee_margin(amount: Decimal) -> Decimal {
+    amount * Decimal::new(102, 2) // 1.02
+}
+
+/// Indices into an ASCENDING-sorted amount list that cover `target`, one
+/// covering amulet if there is one, else largest-first. Empty means the target
+/// is unreachable within [`MAX_AMULET_INPUTS`]; a partial set never settles.
+pub(crate) fn select_amulet_indices(ascending: &[Decimal], target: Decimal) -> Vec<usize> {
+    if target <= Decimal::ZERO {
+        return vec![];
+    }
+
+    // Prefer ONE amulet that covers the amount (smallest such amulet).
+    if let Some(i) = ascending.iter().position(|amt| *amt >= target) {
+        return vec![i];
+    }
+
+    // Multi-amulet fallback: take the LARGEST first. Picking smallest-first
+    // would often produce a partial set whose total is below the target,
+    // causing the on-chain transaction to fail with ITR_InsufficientFunds.
+    let mut selected = Vec::new();
+    let mut total = Decimal::ZERO;
+    for i in (0..ascending.len()).rev() {
+        if selected.len() >= MAX_AMULET_INPUTS {
+            break;
+        }
+        selected.push(i);
+        total += ascending[i];
+        if total >= target {
+            return selected;
+        }
+    }
+
+    vec![]
+}
+
 /// Select amulets for CC allocations.
 /// Prefers ONE amulet that covers the full amount (smallest-fit single).
 /// Falls back to multiple amulets if no single one suffices.
@@ -630,40 +671,11 @@ pub(crate) fn select_amulets_for_allocation(selectable: &[CachedAmulet], estimat
     if estimated_cc <= Decimal::ZERO {
         return vec![];
     }
-
-    // Add 2% margin to account for CC holding fee decay between selection and execution
-    let target = estimated_cc * Decimal::new(102, 2); // 1.02
-
-    // Prefer ONE amulet that covers the amount (smallest such amulet)
-    // selectable is sorted ascending, so find first >= target
-    for amulet in selectable {
-        if amulet.amount >= target {
-            return vec![amulet.clone()];
-        }
-    }
-
-    // Multi-amulet fallback: take the LARGEST amulets first (selectable is sorted
-    // ascending, so iterate in reverse). This maximises coverage with the 100-input
-    // limit. Picking smallest-first would often produce a partial set whose total
-    // is below the target, causing the on-chain transaction to fail with
-    // ITR_InsufficientFunds.
-    const MAX_INPUTS: usize = 100;
-    let mut selected = Vec::new();
-    let mut total = Decimal::ZERO;
-    for amulet in selectable.iter().rev() {
-        if selected.len() >= MAX_INPUTS {
-            break;
-        }
-        selected.push(amulet.clone());
-        total += amulet.amount;
-        if total >= target {
-            return selected;
-        }
-    }
-
-    // 100 largest amulets still not enough — return empty so the scheduler defers.
-    // Submitting a partial set would be guaranteed to fail on chain.
-    vec![]
+    let amounts: Vec<Decimal> = selectable.iter().map(|a| a.amount).collect();
+    select_amulet_indices(&amounts, with_fee_margin(estimated_cc))
+        .into_iter()
+        .map(|i| selectable[i].clone())
+        .collect()
 }
 
 /// Process amulet cache updates after a successful transaction
@@ -721,7 +733,7 @@ fn create_client_from_channel(channel: Channel, config: &BaseConfig) -> Result<D
         channel,
         &config.party_id,
         &config.role,
-        &config.private_key_bytes,
+        &config.private_key,
         config.token_ttl_secs,
         Some(config.node_name.as_str()),
         &config.ledger_service_public_key,

@@ -263,6 +263,7 @@ pub fn canonical_params_transfer_cip56(
     amount: &str,
     reference: Option<&str>,
     input_holding_cids: &[String],
+    max_input_holdings: Option<u32>,
 ) -> String {
     let mut s = format!(
         "param_type=TransferCip56\ninstrument_id={}\ninstrument_admin={}\nreceiver_party={}\namount={}\n",
@@ -277,6 +278,10 @@ pub fn canonical_params_transfer_cip56(
     // append it identically (see ledger-service server canonical path).
     if !input_holding_cids.is_empty() {
         s.push_str(&format!("input_holding_cids={}\n", input_holding_cids.join(",")));
+    }
+    // Same append-only rule: absent unless the caller set a cap.
+    if let Some(n) = max_input_holdings {
+        s.push_str(&format!("max_input_holdings={}\n", n));
     }
     s
 }
@@ -1269,14 +1274,18 @@ mod tests {
         assert!(!canonical_params_request_recurring_prepaid("app", "10", "5", 30, None, None).is_empty());
         assert!(!canonical_params_request_recurring_payasyougo("app", "10", None, None).is_empty());
         assert!(!canonical_params_request_user_service(None, None).is_empty());
-        assert!(!canonical_params_transfer_cip56("USDC", "admin", "recv", "100", None, &[]).is_empty());
+        assert!(!canonical_params_transfer_cip56("USDC", "admin", "recv", "100", None, &[], None).is_empty());
         // Empty cids ⇒ legacy byte-identical canonical (no input_holding_cids line);
         // non-empty ⇒ the extra line is appended (self-transfer merge path).
-        let legacy = canonical_params_transfer_cip56("USDC", "a", "r", "100", None, &[]);
+        let legacy = canonical_params_transfer_cip56("USDC", "a", "r", "100", None, &[], None);
         assert!(!legacy.contains("input_holding_cids"));
         let merge = canonical_params_transfer_cip56(
-            "USDC", "a", "r", "100", None, &["c1".to_string(), "c2".to_string()],
+            "USDC", "a", "r", "100", None, &["c1".to_string(), "c2".to_string()], None,
         );
+        // A cap appends one more line and leaves the legacy prefix intact.
+        let capped = canonical_params_transfer_cip56("USDC", "a", "r", "100", None, &[], Some(7));
+        assert!(capped.starts_with(&legacy));
+        assert!(capped.contains("max_input_holdings=7\n"));
         assert!(merge.contains("input_holding_cids=c1,c2\n"));
         assert!(merge.starts_with(&legacy));
         assert!(!canonical_params_accept_cip56("cid").is_empty());
