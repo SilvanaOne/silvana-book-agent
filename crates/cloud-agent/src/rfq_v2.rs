@@ -685,6 +685,19 @@ impl RfqV2State {
         // first act is the LM release. (CC legs are conservatively excluded
         // twice — cache totals feed update_cc_balance AND this commitment —
         // for the bounded confirm→settle window; accepted.)
+        // Refuse to commit from a stale balance, mirroring the price
+        // staleness re-check above.
+        if let Some(age) = self.liquidity_manager.is_stale(&lp_pays_token).await {
+            self.release_on_reject(&quote_id, &[], false).await;
+            return Err(self.reject(
+                &req,
+                RfqConfirmRejectReason::QuoteExpired,
+                format!(
+                    "balances stale for {}s — quote withdrawn",
+                    age.as_secs()
+                ),
+            ));
+        }
         if let Err(e) = self
             .liquidity_manager
             .try_commit(&Self::lm_key(&quote_id), &lp_pays_token, lp_pays.1, Decimal::ZERO)

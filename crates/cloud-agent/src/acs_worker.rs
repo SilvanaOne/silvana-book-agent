@@ -86,6 +86,7 @@ async fn refresh_holdings(
     // this instant (updates watcher / own tx results racing the snapshot)
     // survive the refresh.
     let snapshot_start = std::time::Instant::now();
+    let mut cc_refreshed = true;
 
     match client
         .get_active_contracts_partial(&[TEMPLATE_AMULET.to_string(), TEMPLATE_HOLDING.to_string()])
@@ -113,13 +114,15 @@ async fn refresh_holdings(
                     holdings.len()
                 );
                 cache.add_created(holdings).await;
+                // A partial view must not stamp the CC balance as current.
+                cc_refreshed = false;
             }
         }
         Err(e) => {
             // CC fallback: the lightweight GetAmulets RPC (no blobs — CC never
             // needs blobs for v1; V2 CC disclosure waits for the next full refresh)
-            debug!(
-                "GetActiveContracts holdings refresh failed ({}), falling back to GetAmulets",
+            warn!(
+                "holdings refresh failed ({:#}); using amulet-only fallback this cycle",
                 e
             );
             let amulets = client.get_amulets().await?;
@@ -139,9 +142,12 @@ async fn refresh_holdings(
 
     // Update liquidity manager with total CC (available minus consumed minus
     // V2-reserved; v1-reserved amulets are still on the ledger and their
-    // commitment is tracked separately by LM).
-    let total_cc = cache.total_available_amount(CC_INSTRUMENT).await;
-    lm.update_cc_balance(total_cc).await;
+    // commitment is tracked separately by LM). Only after a full snapshot or
+    // a successful amulet refresh — never from a partial view.
+    if cc_refreshed {
+        let total_cc = cache.total_available_amount(CC_INSTRUMENT).await;
+        lm.update_cc_balance(total_cc).await;
+    }
 
     // Update CC/USD rate for fee estimation
     match client.get_dso_rates().await {

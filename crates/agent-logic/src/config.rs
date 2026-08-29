@@ -40,6 +40,9 @@ struct AgentToml {
     request_timeout_secs: u64,
     #[serde(default = "default_canton_op_timeout_secs")]
     canton_op_timeout_secs: u64,
+    /// Reject quoting/committing from balances older than this; 0 disables.
+    #[serde(default = "default_balance_stale_after_secs")]
+    balance_stale_after_secs: u64,
     #[serde(default)]
     markets: Vec<MarketConfig>,
     /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only).
@@ -169,6 +172,8 @@ pub struct BaseConfig {
     /// blockchain ops can legitimately take minutes. The point is that it is
     /// finite, so a stuck connection cannot hang shutdown forever.
     pub canton_op_timeout_secs: u64,
+    /// Reject quoting/committing from balances older than this; 0 disables.
+    pub balance_stale_after_secs: u64,
     pub markets: Vec<MarketConfig>,
 
     /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only) —
@@ -322,6 +327,7 @@ impl BaseConfig {
             connection_timeout_secs: 10,
             request_timeout_secs: 10,
             canton_op_timeout_secs: 60,
+            balance_stale_after_secs: 120,
             markets: Vec::new(),
             venue_overrides: Vec::new(),
             node_name: String::new(),
@@ -454,6 +460,7 @@ impl BaseConfig {
             connection_timeout_secs: default_connection_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             canton_op_timeout_secs: default_canton_op_timeout_secs(),
+            balance_stale_after_secs: default_balance_stale_after_secs(),
             markets: Vec::new(),
             venue_overrides: Vec::new(),
             node_name: node_name.to_string(),
@@ -1148,6 +1155,7 @@ impl BaseConfig {
             connection_timeout_secs: agent.connection_timeout_secs,
             request_timeout_secs: agent.request_timeout_secs,
             canton_op_timeout_secs: agent.canton_op_timeout_secs,
+            balance_stale_after_secs: agent.balance_stale_after_secs,
             markets: agent.markets,
             venue_overrides: agent.venue_overrides,
             node_name,
@@ -1978,6 +1986,10 @@ fn default_request_timeout_secs() -> u64 {
 /// still finite so a dead gRPC connection cannot trap the runner forever.
 fn default_canton_op_timeout_secs() -> u64 {
     600
+}
+
+fn default_balance_stale_after_secs() -> u64 {
+    120
 }
 
 fn default_enabled() -> bool {

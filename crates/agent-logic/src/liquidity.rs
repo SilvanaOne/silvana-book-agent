@@ -11,8 +11,9 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -22,6 +23,9 @@ use tracing::debug;
 
 /// CC token key used in the tokens map (distinct from instrument_id).
 pub const CC_TOKEN: &str = "CC";
+
+/// A balance not refreshed within this window is reported as stale.
+pub const DEFAULT_BALANCE_STALE_AFTER: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Per-token state
@@ -33,6 +37,8 @@ struct TokenState {
     balance: Decimal,
     /// CC committed to this token's allocations, keyed by proposal_id.
     allocation_commitments: HashMap<String, Decimal>,
+    /// When `balance` was last set from a fresh read; `None` until the first.
+    last_refreshed: Option<Instant>,
 }
 
 impl TokenState {
@@ -40,7 +46,13 @@ impl TokenState {
         Self {
             balance: Decimal::ZERO,
             allocation_commitments: HashMap::new(),
+            last_refreshed: None,
         }
+    }
+
+    fn set_balance(&mut self, balance: Decimal, now: Instant) {
+        self.balance = balance;
+        self.last_refreshed = Some(now);
     }
 
     fn committed(&self) -> Decimal {
@@ -164,6 +176,8 @@ pub struct LiquidityManager {
     depletion_max_hours: f64,
     /// Hours-to-depletion below which coefficient is 10.
     depletion_min_hours: f64,
+    /// Staleness window for balances, in seconds.
+    stale_after_secs: AtomicU64,
 }
 
 impl LiquidityManager {
@@ -198,7 +212,18 @@ impl LiquidityManager {
             ema_alpha: alpha,
             depletion_max_hours,
             depletion_min_hours,
+            stale_after_secs: AtomicU64::new(DEFAULT_BALANCE_STALE_AFTER.as_secs()),
         })
+    }
+
+    /// Override the staleness window (see [`DEFAULT_BALANCE_STALE_AFTER`]).
+    pub fn set_stale_after(&self, stale_after: Duration) {
+        self.stale_after_secs
+            .store(stale_after.as_secs(), Ordering::Relaxed);
+    }
+
+    fn stale_after(&self) -> Duration {
+        Duration::from_secs(self.stale_after_secs.load(Ordering::Relaxed))
     }
 
     /// Returns true once both CC and at least one non-CC balance have been loaded.
@@ -217,14 +242,83 @@ impl LiquidityManager {
 
     /// Update CC balance from AmuletCache selectable total.
     pub async fn update_cc_balance(&self, selectable_cc: Decimal) {
+        let now = Instant::now();
         let mut s = self.state.write().await;
-        s.tokens.entry(CC_TOKEN.to_string()).or_insert_with(TokenState::new).balance = selectable_cc;
+        s.tokens
+            .entry(CC_TOKEN.to_string())
+            .or_insert_with(TokenState::new)
+            .set_balance(selectable_cc, now);
     }
 
     /// Update a non-CC token balance from GetBalances RPC.
     pub async fn update_token_balance(&self, instrument_id: &str, unlocked: Decimal) {
+        let now = Instant::now();
         let mut s = self.state.write().await;
-        s.tokens.entry(instrument_id.to_string()).or_insert_with(TokenState::new).balance = unlocked;
+        s.tokens
+            .entry(instrument_id.to_string())
+            .or_insert_with(TokenState::new)
+            .set_balance(unlocked, now);
+    }
+
+    /// Update several token balances under one lock.
+    pub async fn update_token_balances(&self, updates: &[(String, Decimal)]) {
+        if updates.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut s = self.state.write().await;
+        for (instrument_id, unlocked) in updates {
+            s.tokens
+                .entry(instrument_id.clone())
+                .or_insert_with(TokenState::new)
+                .set_balance(*unlocked, now);
+        }
+    }
+
+    /// Clear the refresh stamp of every non-CC token absent from a full
+    /// balance snapshot, so its last value is no longer treated as current.
+    /// Balances are kept — a filtered or partial view must not blank them.
+    pub async fn mark_missing_unrefreshed(&self, present: &HashSet<String>) {
+        let mut s = self.state.write().await;
+        for (token, state) in s.tokens.iter_mut() {
+            if token != CC_TOKEN && !present.contains(token) {
+                state.last_refreshed = None;
+            }
+        }
+    }
+
+    /// Age of a token's balance beyond the staleness window, if it is stale.
+    ///
+    /// `None` for fresh balances and for tokens with no refresh recorded.
+    pub async fn is_stale(&self, token: &str) -> Option<Duration> {
+        let s = self.state.read().await;
+        Self::stale_age(&s, token, Instant::now(), self.stale_after())
+    }
+
+    /// Every token whose balance is stale, with its age.
+    pub async fn stale_tokens(&self) -> Vec<(String, Duration)> {
+        let s = self.state.read().await;
+        let now = Instant::now();
+        let stale_after = self.stale_after();
+        let mut out: Vec<(String, Duration)> = s
+            .tokens
+            .keys()
+            .filter_map(|k| Self::stale_age(&s, k, now, stale_after).map(|age| (k.clone(), age)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn stale_age(
+        s: &LiquidityState,
+        token: &str,
+        now: Instant,
+        stale_after: Duration,
+    ) -> Option<Duration> {
+        let resolved = Self::resolve_alias(&s.aliases, token);
+        let refreshed = s.tokens.get(resolved)?.last_refreshed?;
+        let age = now.saturating_duration_since(refreshed);
+        (age >= stale_after).then_some(age)
     }
 
     /// Register a short alias for a token (e.g. "USDCx" → instrument_id).
@@ -276,6 +370,9 @@ impl LiquidityManager {
         allocation_amount: Decimal,
         fee_cc: Decimal,
     ) -> Result<(), String> {
+        // Resolve aliases so commitment checks agree with `available()`.
+        let allocation_token = Self::resolve_alias(&s.aliases, allocation_token);
+
         // --- Check allocation token availability ---
         let token_available = s
             .tokens
@@ -360,10 +457,13 @@ impl LiquidityManager {
         // write lock so no other committer can slip in between check and insert.
         self.check_commit(&s, allocation_token, allocation_amount, fee_cc)?;
 
+        // Commit under the same resolved key the checks read.
+        let allocation_token = Self::resolve_alias(&s.aliases, allocation_token).to_string();
+
         // --- Commit ---
         // Re-borrow token_state (may be same as cc_state if CC)
         s.tokens
-            .entry(allocation_token.to_string())
+            .entry(allocation_token.clone())
             .or_insert_with(TokenState::new)
             .allocation_commitments
             .insert(proposal_id.to_string(), allocation_amount);
@@ -550,6 +650,7 @@ impl LiquidityManager {
 
         // Now collect stats (immutable borrows only)
         let fee_total = s.fee_commitments.total();
+        let now = Instant::now();
         let mut result = Vec::new();
 
         for (token, state) in &s.tokens {
@@ -585,6 +686,9 @@ impl LiquidityManager {
                 net_outflow_per_hour: net_outflow,
                 hours_to_depletion,
                 depletion_coefficient: coeff,
+                refreshed_secs_ago: state
+                    .last_refreshed
+                    .map(|t| now.saturating_duration_since(t).as_secs()),
             });
         }
 
@@ -636,6 +740,8 @@ pub struct TokenStats {
     pub net_outflow_per_hour: f64,
     pub hours_to_depletion: f64,
     pub depletion_coefficient: f64,
+    /// Seconds since the balance was last refreshed; `None` if never.
+    pub refreshed_secs_ago: Option<u64>,
 }
 
 impl std::fmt::Display for TokenStats {
@@ -667,6 +773,98 @@ impl std::fmt::Display for TokenStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_age_uses_the_configured_window() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        let s = lm.state.read().await;
+        let later = Instant::now() + Duration::from_secs(200);
+        assert!(
+            LiquidityManager::stale_age(&s, "USDCx", Instant::now(), Duration::from_secs(120))
+                .is_none()
+        );
+        assert!(
+            LiquidityManager::stale_age(&s, "USDCx", later, Duration::from_secs(120)).is_some()
+        );
+        // Unknown token: nothing to report.
+        assert!(LiquidityManager::stale_age(&s, "NOPE", later, Duration::from_secs(120)).is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_update_stamps_refresh() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_token_balances(&[
+            ("USDCx".to_string(), Decimal::from(5000)),
+            ("EDELx".to_string(), Decimal::from(100)),
+        ])
+        .await;
+        assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+        assert_eq!(lm.available("EDELx").await, Decimal::from(100));
+        assert!(lm.is_stale("USDCx").await.is_none());
+        assert!(lm.stale_tokens().await.is_empty());
+        let stats = lm.stats().await;
+        assert!(stats.iter().all(|s| s.refreshed_secs_ago == Some(0)));
+
+        lm.set_stale_after(Duration::ZERO);
+        assert!(lm.is_stale("USDCx").await.is_some());
+        assert_eq!(lm.stale_tokens().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_under_alias_matches_canonical_key() {
+        let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("internal-id", Decimal::from(5000)).await;
+        lm.register_alias("SYM", "internal-id").await;
+        lm.try_commit("p1", "SYM", Decimal::from(2000), Decimal::ZERO)
+            .await
+            .expect("alias-keyed commit");
+        // The commitment must land on the canonical entry, visible both ways.
+        assert_eq!(lm.available("internal-id").await, Decimal::from(3000));
+        assert_eq!(lm.available("SYM").await, Decimal::from(3000));
+        lm.release("p1").await;
+        assert_eq!(lm.available("internal-id").await, Decimal::from(5000));
+    }
+
+    #[tokio::test]
+    async fn missing_tokens_lose_refresh_stamp() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balances(&[
+            ("A".to_string(), Decimal::from(10)),
+            ("B".to_string(), Decimal::from(20)),
+        ])
+        .await;
+        let present: HashSet<String> = ["A".to_string()].into_iter().collect();
+        lm.mark_missing_unrefreshed(&present).await;
+        lm.set_stale_after(Duration::ZERO);
+        assert!(lm.is_stale("A").await.is_some(), "present token keeps its stamp");
+        assert!(lm.is_stale("B").await.is_none(), "absent token has no stamp");
+        assert_eq!(lm.available("B").await, Decimal::from(20), "balance is kept");
+        assert!(lm.is_stale(CC_TOKEN).await.is_some(), "CC stamp untouched");
+    }
+
+    #[tokio::test]
+    async fn unrefreshed_token_is_never_reported_stale() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        // A commit attempt on a token with no recorded balance must not
+        // create a refresh time or a staleness verdict for it.
+        let _ = lm
+            .try_commit("p1", "USDCx", Decimal::from(1), Decimal::ZERO)
+            .await;
+        lm.set_stale_after(Duration::ZERO);
+        assert!(lm.is_stale("USDCx").await.is_none());
+        assert!(
+            lm.stats()
+                .await
+                .iter()
+                .all(|s| s.token != "USDCx" || s.refreshed_secs_ago.is_none())
+        );
+        // The stamped CC entry, by contrast, is reported once the window is zero.
+        assert!(lm.is_stale(CC_TOKEN).await.is_some());
+    }
 
     #[tokio::test]
     async fn test_commit_and_release() {
