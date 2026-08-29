@@ -577,6 +577,12 @@ pub async fn run_cloud_agent(
         config.depletion_max_hours,
         config.depletion_min_hours,
     );
+    // 0 disables the balance-staleness gate.
+    liquidity_manager.set_stale_after(if config.balance_stale_after_secs == 0 {
+        std::time::Duration::MAX
+    } else {
+        std::time::Duration::from_secs(config.balance_stale_after_secs)
+    });
 
     // Register token aliases from server market data (symbol → instrument_id).
     // Also capture market_id → (base_instrument, quote_instrument) for the
@@ -590,12 +596,18 @@ pub async fn run_cloud_agent(
                 for market in &markets {
                     let parts: Vec<&str> = market.market_id.split('-').collect();
                     if parts.len() == 2 {
-                        liquidity_manager
-                            .register_alias(parts[0], &market.base_instrument)
-                            .await;
-                        liquidity_manager
-                            .register_alias(parts[1], &market.quote_instrument)
-                            .await;
+                        // The CC key is owned by its own balance feed; never
+                        // alias it to a market instrument.
+                        if parts[0] != agent_logic::liquidity::CC_TOKEN {
+                            liquidity_manager
+                                .register_alias(parts[0], &market.base_instrument)
+                                .await;
+                        }
+                        if parts[1] != agent_logic::liquidity::CC_TOKEN {
+                            liquidity_manager
+                                .register_alias(parts[1], &market.quote_instrument)
+                                .await;
+                        }
                     }
                     market_instrument_ids.insert(
                         market.market_id.clone(),
@@ -894,6 +906,26 @@ pub async fn run_cloud_agent(
         client: TokioMutex::new(ledger_client),
     };
 
+    // The background balance poller gets its own client so it never contends
+    // with the main loop's.
+    let poller_ledger_client = DAppProviderClient::new(
+        &config.orderbook_grpc_url,
+        &config.party_id,
+        &config.role,
+        &config.private_key,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+        &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
+    )
+    .await
+    .context("Failed to create balance poller client")?;
+    let poller_balance_provider: std::sync::Arc<dyn agent_logic::runner::BalanceProvider> =
+        std::sync::Arc::new(CloudBalanceProvider {
+            client: TokioMutex::new(poller_ledger_client),
+        });
+
     let result = run_agent(
         config,
         backend,
@@ -901,6 +933,7 @@ pub async fn run_cloud_agent(
         AgentOptions {
             settlement_only,
             orders_only,
+            poller_balance_provider: Some(poller_balance_provider),
             actionable_count: None,
             shutdown: None,
             accepted_rfq_trades: None,

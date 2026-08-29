@@ -26,6 +26,17 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+static STALE_WARN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Log a stale-balance rejection at most once per minute.
+fn warn_stale_rate_limited(token: &str, age_secs: u64) {
+    let mut last = STALE_WARN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+        *last = Some(std::time::Instant::now());
+        warn!("rejecting RFQs: {} balance stale for {}s", token, age_secs);
+    }
+}
+
 use orderbook_proto::settlement::{
     RfqRequest, RfqQuote, RfqReject, RfqRejectionReason,
 };
@@ -668,6 +679,15 @@ impl RfqHandler {
                 ));
             }
 
+            // Reject on a stale balance rather than quote from it.
+            if let Some(age) = lm.is_stale(alloc_token).await {
+                warn_stale_rate_limited(alloc_token, age.as_secs());
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "Balances stale",
+                ));
+            }
+
             // Fee headroom the LP itself needs for this settle:
             //  - V1 (enforce_min_notional): the LP pays its own dvp +
             //    allocation fees in CC. Worst non-dust share-count multiplier
@@ -1025,6 +1045,30 @@ mod price_rfq_tests {
         };
         assert!(matches!(err.reason, RfqRejectionReason::AmountTooSmall));
         assert!(err.reason_detail.as_deref().unwrap_or("").contains("Min quantity"));
+    }
+
+    /// A stale non-CC balance is rejected with its own reason, not quoted from.
+    #[tokio::test]
+    async fn stale_balances_rejected_with_distinct_reason() {
+        let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("EDELx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::new(1, 1)).await;
+        let mut h = handler();
+        h.liquidity_manager = Some(Arc::clone(&lm));
+
+        lm.set_stale_after(std::time::Duration::ZERO);
+        let err = match h.price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None, None).await {
+            Ok(_) => panic!("stale balance must reject"),
+            Err(e) => e,
+        };
+        assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(err.reason_detail.as_deref(), Some("Balances stale"));
+
+        lm.set_stale_after(agent_logic::liquidity::DEFAULT_BALANCE_STALE_AFTER);
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None, None).await {
+            panic!("fresh balance must quote: {:?}", e.reason_detail);
+        }
     }
 
     /// The liquidity gate's CC fee headroom is V1-only: the LP pays its own

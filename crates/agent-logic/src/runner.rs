@@ -76,6 +76,9 @@ pub trait BalanceProvider: Send + Sync {
 pub struct AgentOptions {
     pub settlement_only: bool,
     pub orders_only: bool,
+    /// Dedicated provider for the background balance poller, so it never
+    /// contends with the main loop's client. Falls back to the main provider.
+    pub poller_balance_provider: Option<Arc<dyn BalanceProvider>>,
     /// Optional shared counter for actionable settlements (used by fill loop)
     pub actionable_count: Option<Arc<AtomicUsize>>,
     /// Optional external shutdown signal (used by fill loop to stop the background agent).
@@ -152,6 +155,75 @@ fn spendable_under_configured_registry(
         .collect()
 }
 
+/// Apply the registry filter and push every non-CC balance into the liquidity
+/// manager in one batch. Returns the filtered balances for the order manager.
+pub(crate) async fn push_balances_to_lm(
+    config: &BaseConfig,
+    lm: Option<&Arc<crate::liquidity::LiquidityManager>>,
+    balances: Vec<TokenBalance>,
+) -> Vec<TokenBalance> {
+    let balances = spendable_under_configured_registry(config, balances);
+    if let Some(lm) = lm {
+        let updates: Vec<(String, rust_decimal::Decimal)> = balances
+            .iter()
+            .filter(|b| !b.is_canton_coin)
+            .filter_map(|b| {
+                b.unlocked_amount
+                    .parse::<rust_decimal::Decimal>()
+                    .ok()
+                    .map(|amount| (b.instrument_id.clone(), amount))
+            })
+            .collect();
+        // A token absent from this snapshot loses its freshness stamp so its
+        // last value is not quoted or committed as current.
+        let present: HashSet<String> = updates.iter().map(|(id, _)| id.clone()).collect();
+        lm.update_token_balances(&updates).await;
+        lm.mark_missing_unrefreshed(&present).await;
+    }
+    balances
+}
+
+/// Keep liquidity-manager balances fresh from a task of their own, so
+/// backpressure on the main loop cannot leave them unrefreshed.
+pub(crate) fn spawn_balance_poller(
+    config: BaseConfig,
+    provider: Arc<dyn BalanceProvider>,
+    lm: Arc<crate::liquidity::LiquidityManager>,
+    shutdown: Shutdown,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        info!("Balance poller started: interval={}s", period.as_secs());
+        let mut ticker = interval(period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_warn: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => {
+                    info!("Balance poller shutting down");
+                    break;
+                }
+                _ = ticker.tick() => {}
+            }
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(10), provider.fetch_balances()).await;
+            let err = match outcome {
+                Ok(Ok(balances)) => {
+                    push_balances_to_lm(&config, Some(&lm), balances).await;
+                    continue;
+                }
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(_) => "timed out".to_string(),
+            };
+            if last_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                last_warn = Some(std::time::Instant::now());
+                warn!("Balance poller fetch failed: {}", err);
+            }
+        }
+    })
+}
+
 /// This is the shared main loop for both the local and cloud agents.
 /// It handles:
 /// - Order placement and grid management
@@ -166,8 +238,10 @@ pub async fn run_agent<B, P>(
 ) -> Result<()>
 where
     B: SettlementBackend + 'static,
-    P: BalanceProvider,
+    P: BalanceProvider + 'static,
 {
+    let balance_provider = Arc::new(balance_provider);
+
     // Create orderbook client
     let mut orderbook_client = OrderbookClient::new(&config)
         .await
@@ -376,6 +450,8 @@ where
     settlement_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut result_collect_timer = interval(Duration::from_secs(2));
     result_collect_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Last time the order-update arm actually ran (see the heartbeat check).
+    let mut last_order_tick = std::time::Instant::now();
 
     // Check if we have markets configured for order placement
     let has_markets =
@@ -491,16 +567,9 @@ where
 
     match balances_res {
         Ok(Ok(balances)) => {
-            let balances = spendable_under_configured_registry(&config, balances);
-            if let Some(lm) = settlement_executor.liquidity_manager() {
-                for b in &balances {
-                    if !b.is_canton_coin {
-                        if let Ok(amount) = b.unlocked_amount.parse::<rust_decimal::Decimal>() {
-                            lm.update_token_balance(&b.instrument_id, amount).await;
-                        }
-                    }
-                }
-            }
+            let balances =
+                push_balances_to_lm(&config, settlement_executor.liquidity_manager(), balances)
+                    .await;
             let n = balances.len();
             order_manager.set_balances(balances);
             info!(
@@ -511,6 +580,21 @@ where
         }
         Ok(Err(e)) => warn!("Initial balance fetch failed: {:#}", e),
         Err(_) => warn!("Initial balance fetch timed out"),
+    }
+
+    if let Some(lm) = settlement_executor.liquidity_manager() {
+        let poller_provider: Arc<dyn BalanceProvider> = match options.poller_balance_provider.clone()
+        {
+            Some(p) => p,
+            None => balance_provider.clone(),
+        };
+        spawn_balance_poller(
+            config.clone(),
+            poller_provider,
+            Arc::clone(lm),
+            shutdown.clone(),
+            Duration::from_secs(10),
+        );
     }
 
     // Main event loop
@@ -596,6 +680,10 @@ where
                     };
                     info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees{}{}{}{}",
                         n, used, max, pct, in_backoff, waiting, alloc, fees, cache_str, worker_str, pause_str, forecast_str);
+                    let order_tick_age = last_order_tick.elapsed();
+                    if order_tick_age > Duration::from_secs(30) {
+                        warn!("order-update tick overdue: {}s since last run", order_tick_age.as_secs());
+                    }
                     settlement_executor.log_cid_waiting_summary();
                     // Liquidity stats
                     if let Some(lm) = settlement_executor.liquidity_manager() {
@@ -633,8 +721,13 @@ where
                                 ),
                                 None => String::new(),
                             };
+                            let refreshed_str = match s.refreshed_secs_ago {
+                                Some(secs) if lm.is_stale(&s.token).await.is_some() => format!(", STALE {}s", secs),
+                                Some(secs) => format!(", refreshed {}s ago", secs),
+                                None => ", never refreshed".to_string(),
+                            };
                             info!(
-                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}",
+                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}{}",
                                 s.token,
                                 fmt_sig4(s.balance),
                                 fmt_sig4(s.committed),
@@ -654,6 +747,7 @@ where
                                 s.depletion_coefficient,
                                 depl_str,
                                 holdings_str,
+                                refreshed_str,
                             );
                         }
                     }
@@ -706,7 +800,9 @@ where
                                             Duration::from_secs(10),
                                             balance_provider.fetch_balances(),
                                         ).await {
-                                            Ok(Ok(balances)) => order_manager.set_balances(balances),
+                                            Ok(Ok(balances)) => order_manager.set_balances(
+                                                push_balances_to_lm(&config, settlement_executor.liquidity_manager(), balances).await,
+                                            ),
                                             Ok(Err(e)) => warn!("Failed to fetch balances after settlement: {:#}", e),
                                             Err(_) => warn!("Balance fetch after settlement timed out"),
                                         }
@@ -772,7 +868,9 @@ where
                                     Duration::from_secs(10),
                                     balance_provider.fetch_balances(),
                                 ).await {
-                                    Ok(Ok(balances)) => order_manager.set_balances(balances),
+                                    Ok(Ok(balances)) => order_manager.set_balances(
+                                        push_balances_to_lm(&config, settlement_executor.liquidity_manager(), balances).await,
+                                    ),
                                     Ok(Err(e)) => warn!("Failed to fetch balances after settlement poll: {:#}", e),
                                     Err(_) => warn!("Balance fetch after settlement poll timed out"),
                                 }
@@ -796,6 +894,7 @@ where
                 }
 
                 _ = order_update_timer.tick() => {
+                    last_order_tick = std::time::Instant::now();
                     // Always refresh balances — LiquidityManager needs non-CC balances
                     // for settlement allocation gating even when the agent isn't
                     // placing orders (buyer/seller / settlement_only mode).
@@ -804,16 +903,8 @@ where
                         balance_provider.fetch_balances(),
                     ).await {
                         Ok(Ok(balances)) => {
-                            let balances = spendable_under_configured_registry(&config, balances);
-                            if let Some(lm) = settlement_executor.liquidity_manager() {
-                                for b in &balances {
-                                    if !b.is_canton_coin {
-                                        if let Ok(amount) = b.unlocked_amount.parse::<rust_decimal::Decimal>() {
-                                            lm.update_token_balance(&b.instrument_id, amount).await;
-                                        }
-                                    }
-                                }
-                            }
+                            let balances =
+                                push_balances_to_lm(&config, settlement_executor.liquidity_manager(), balances).await;
                             order_manager.set_balances(balances);
                         }
                         Ok(Err(e)) => warn!("Failed to fetch balances: {:#}", e),
@@ -860,25 +951,21 @@ where
 
                 _ = heartbeat_timer.tick() => {
                     info!("Heartbeat: orders-only mode");
+                    let order_tick_age = last_order_tick.elapsed();
+                    if has_markets && order_tick_age > Duration::from_secs(30) {
+                        warn!("order-update tick overdue: {}s since last run", order_tick_age.as_secs());
+                    }
                 }
 
                 _ = order_update_timer.tick(), if has_markets => {
+                    last_order_tick = std::time::Instant::now();
                     match tokio::time::timeout(
                         Duration::from_secs(10),
                         balance_provider.fetch_balances(),
                     ).await {
                         Ok(Ok(balances)) => {
-                            let balances = spendable_under_configured_registry(&config, balances);
-                            // Update non-CC token balances in liquidity manager
-                            if let Some(lm) = settlement_executor.liquidity_manager() {
-                                for b in &balances {
-                                    if !b.is_canton_coin {
-                                        if let Ok(amount) = b.unlocked_amount.parse::<rust_decimal::Decimal>() {
-                                            lm.update_token_balance(&b.instrument_id, amount).await;
-                                        }
-                                    }
-                                }
-                            }
+                            let balances =
+                                push_balances_to_lm(&config, settlement_executor.liquidity_manager(), balances).await;
                             order_manager.set_balances(balances);
                         }
                         Ok(Err(e)) => warn!("Failed to fetch balances: {:#}", e),
@@ -1035,6 +1122,68 @@ mod balance_filter_tests {
             is_canton_coin: is_cc,
             ..Default::default()
         }
+    }
+
+    /// Non-CC rows reach the liquidity manager; CC is left to its own feed.
+    #[tokio::test]
+    async fn push_balances_to_lm_updates_non_cc_only() {
+        let config = BaseConfig::test_minimal();
+        let lm = crate::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        let balances = vec![
+            tb("HECTO", "issuer::1", "14000000", false),
+            tb("CC", "dso::whatever", "100", true),
+            tb("EDELx", "edel::abc", "not-a-number", false),
+        ];
+        let out = push_balances_to_lm(&config, Some(&lm), balances).await;
+        assert_eq!(
+            out.len(),
+            3,
+            "filtered rows are returned for the order manager"
+        );
+        assert_eq!(
+            lm.available("HECTO").await,
+            rust_decimal::Decimal::from(14_000_000)
+        );
+        assert_eq!(lm.available_cc().await, rust_decimal::Decimal::ZERO);
+        assert!(lm.is_stale("HECTO").await.is_none());
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BalanceProvider for CountingProvider {
+        async fn fetch_balances(&self) -> Result<Vec<TokenBalance>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(vec![tb("HECTO", "issuer::1", &n.to_string(), false)])
+        }
+    }
+
+    /// The poller keeps the liquidity manager current on its own and stops on shutdown.
+    #[tokio::test]
+    async fn balance_poller_refreshes_lm() {
+        let config = BaseConfig::test_minimal();
+        let lm = crate::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider { calls: Arc::clone(&calls) });
+        let shutdown = Shutdown::new();
+        let handle = spawn_balance_poller(
+            config,
+            provider,
+            Arc::clone(&lm),
+            shutdown.clone(),
+            Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(n >= 2, "expected repeated fetches, got {n}");
+        assert!(lm.available("HECTO").await >= rust_decimal::Decimal::from(2));
+        shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("poller exits on shutdown")
+            .expect("poller task joins");
     }
 
     /// Dual-registry cETH: only the row under the configured registry survives;

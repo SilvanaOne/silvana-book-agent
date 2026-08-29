@@ -1038,6 +1038,12 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             }
             let (allocation_token, allocation_amount, my_fees_usd) =
                 reservation_inputs(&proposal, is_buyer, &self.config.cc_token_id);
+            // A stale balance defers preconfirmation the same way an unloaded
+            // one does — never commit to a settlement from an aged number.
+            if lm.is_stale(&allocation_token).await.is_some() {
+                info!("[{}] Balances stale, deferring preconfirmation", proposal_id);
+                return Ok(());
+            }
             let fee_cc = lm.estimate_fee_cc(my_fees_usd).await;
 
             if let Err(reason) = lm.can_commit(&allocation_token, allocation_amount, fee_cc).await {

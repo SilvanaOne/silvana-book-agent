@@ -25,6 +25,21 @@ pub struct GridAffordability {
     pub can_offer: bool,
 }
 
+/// Whether a balance snapshot taken at `set_at` may still size the grid.
+/// `stale_after_secs == 0` disables the age check (a snapshot is still
+/// required). Pure so it can be unit-tested.
+fn balances_usable(
+    set_at: Option<std::time::Instant>,
+    stale_after_secs: u64,
+    now: std::time::Instant,
+) -> bool {
+    match set_at {
+        None => false,
+        Some(_) if stale_after_secs == 0 => true,
+        Some(t) => now.saturating_duration_since(t).as_secs() < stale_after_secs,
+    }
+}
+
 /// Order manager handles order placement and tracking
 pub struct OrderManager {
     config: BaseConfig,
@@ -52,6 +67,10 @@ pub struct OrderManager {
     /// Shaped offer set at the last placement, so a desk-net move can act as
     /// a refresh trigger.
     last_shaped_offers: HashMap<String, Vec<PriceLevel>>,
+    /// When `balances` was last replaced; grid sizing refuses aged data.
+    balances_set_at: Option<std::time::Instant>,
+    /// Rate limit for the aged-balances warning.
+    balance_age_warned_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// Shaped rungs below this fraction of their configured size are dropped, not
@@ -79,6 +98,8 @@ impl OrderManager {
             net_positions: None,
             pool_depths: HashMap::new(),
             last_shaped_offers: HashMap::new(),
+            balances_set_at: None,
+            balance_age_warned_at: std::sync::Mutex::new(None),
         }
     }
 
@@ -138,6 +159,7 @@ impl OrderManager {
             }
         }
         self.balances = balances;
+        self.balances_set_at = Some(std::time::Instant::now());
     }
 
     /// Place a bid order (signed and tracked)
@@ -411,8 +433,26 @@ impl OrderManager {
         mid_price: f64,
         offer_levels: &[PriceLevel],
     ) -> GridAffordability {
-        if self.balances.is_empty() {
-            return GridAffordability { can_bid: true, can_offer: true };
+        // Grid sizing must come from a recent balance read; missing or aged
+        // data pauses placement rather than sizing from it.
+        if !balances_usable(
+            self.balances_set_at,
+            self.config.balance_stale_after_secs,
+            std::time::Instant::now(),
+        ) || self.balances.is_empty()
+        {
+            let mut warned = self
+                .balance_age_warned_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if warned.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+                *warned = Some(std::time::Instant::now());
+                warn!(
+                    "Grid paused for {}: balances missing or aged",
+                    market_config.market_id
+                );
+            }
+            return GridAffordability { can_bid: false, can_offer: false };
         }
 
         let parts: Vec<&str> = market_config.market_id.split('-').collect();
@@ -847,6 +887,25 @@ pub fn shaped_sets_differ_materially(prev: &[PriceLevel], now: &[PriceLevel]) ->
         };
         qty_moved || (a.delta_percent - b.delta_percent).abs() > SHAPE_REFRESH_DELTA_PCT
     })
+}
+
+#[cfg(test)]
+mod balance_age_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn balances_usable_requires_a_snapshot_and_respects_the_window() {
+        let now = Instant::now();
+        assert!(!balances_usable(None, 120, now), "no snapshot: unusable");
+        assert!(!balances_usable(None, 0, now), "no snapshot even when disabled");
+        let old = now.checked_sub(Duration::from_secs(200));
+        assert!(balances_usable(Some(now), 120, now), "fresh snapshot usable");
+        if let Some(old) = old {
+            assert!(!balances_usable(Some(old), 120, now), "aged snapshot unusable");
+            assert!(balances_usable(Some(old), 0, now), "0 disables the age check");
+        }
+    }
 }
 
 #[cfg(test)]
