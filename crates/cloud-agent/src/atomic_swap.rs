@@ -9,7 +9,7 @@
 //! failure passes through the mandatory reconciliation gate before anything
 //! is released or re-quoted (see [`AtomicSwapper::settle_envelope`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::ConfirmLock;
@@ -65,6 +65,24 @@ const MAX_PREPARE_RETRIES: u32 = 5;
 /// passive wait. On timeout the round falls through to the passive re-poll,
 /// whose deadline stays anchored on the signed window.
 const BACKFILL_BUDGET: Duration = Duration::from_secs(10);
+
+/// Registry pre-check rejections and builder pre-check bails are deterministic
+/// within a quote window: re-preparing the same inputs cannot succeed.
+fn is_deterministic_prepare_rejection(msg: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "holdings are invalid",
+        "not found or may already be archived",
+        "different instrument ids",
+        "no holdings provided",
+        "cannot be pre-checked",
+        "no representative holding could provide",
+        "could represent the settlement fee",
+        "cannot complete one-step",
+        "not direct",
+    ];
+    let lower = msg.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
 
 /// A committed atomic fill.
 #[derive(Debug, Clone)]
@@ -558,6 +576,11 @@ impl AtomicSwapper {
             picks.extend(fee_picks);
         }
         let own_cids: Vec<String> = picks.iter().map(|h| h.contract_id.clone()).collect();
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for h in &picks {
+            *counts.entry(h.instrument.as_str()).or_default() += 1;
+        }
+        debug!(quote = %env.quote.quote_id, pool = ?counts, "own input holdings by instrument");
 
         // Fresh timestamp: now_micros is from the pre-check, and the bounded
         // selection re-poll may have slept since — anchoring on it would
@@ -753,6 +776,17 @@ impl AtomicSwapper {
                                 ),
                             }),
                         };
+                    }
+
+                    // Deterministic prepare rejections: the same inputs would
+                    // be rejected again — release + re-quote without retrying.
+                    if msg.contains("PrepareAtomicTransaction")
+                        && is_deterministic_prepare_rejection(&msg)
+                    {
+                        self.cache.release_reservations(&own_cids).await;
+                        return Ok(SwapOutcome::Requote {
+                            reason: format!("prepare rejected (not retried): {msg}"),
+                        });
                     }
 
                     // Prepare-stage errors: nothing was submitted — retry
@@ -1046,5 +1080,65 @@ impl AtomicSwapper {
             info!("Adopted {} settle-created holdings into the cache", adopted.len());
             self.cache.add_created(adopted).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_prepare_rejections_are_classified() {
+        // Registry pre-check rejections, as surfaced through the prepare RPC.
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): transfer-factory \
+             https://x/registry/transfer-instruction/v1/transfer-factory -> HTTP 400 Bad Request: \
+             {\"error\":\"Given input holdings have different instrument IDs\"}"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): transfer-factory \
+             https://x/registry/transfer-instruction/v1/transfer-factory -> HTTP 400 Bad Request: \
+             {\"error\":\"One or more input holdings were not found or may already be archived: 00aa\"}"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): transfer-factory \
+             https://x/registry/transfer-instruction/v1/transfer-factory -> HTTP 400 Bad Request: \
+             {\"error\":\"Given holdings are invalid\"}"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): transfer-factory \
+             https://x/registry/transfer-instruction/v1/transfer-factory -> HTTP 400 Bad Request: \
+             {\"error\":\"No holdings provided\"}"
+        ));
+        // Builder pre-check bails.
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): settlement fee in TOK \
+             cannot be pre-checked: no listed TOK input"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): registry rejected the TOK \
+             inputs of p::1 and no representative holding could provide a factory context"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): no usable TOK holding \
+             could represent the settlement fee (5 LP inputs probed)"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): fee receiver fees has no \
+             utility TransferPreapproval for TOK (transferKind=offer) — the fee cannot \
+             complete one-step (H18)"
+        ));
+        assert!(is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Internal error): LP input 00aa resolved \
+             transferKind=self, not direct"
+        ));
+
+        // Ledger-side and transport failures keep their existing handling.
+        assert!(!is_deterministic_prepare_rejection("INACTIVE_CONTRACTS"));
+        assert!(!is_deterministic_prepare_rejection("QUOTE_WINDOW_CLOSED"));
+        assert!(!is_deterministic_prepare_rejection("connection reset by peer"));
+        assert!(!is_deterministic_prepare_rejection(
+            "PrepareAtomicTransaction RPC failed (Unavailable): transport error"
+        ));
     }
 }

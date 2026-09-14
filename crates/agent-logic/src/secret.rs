@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use rand::RngCore;
 use zeroize::Zeroize;
 
@@ -45,8 +45,9 @@ impl<const N: usize> Secret<N> {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut sealed.key);
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let ciphertext = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&sealed.key))
-            .encrypt(Nonce::from_slice(&nonce), bytes.as_slice())
+        let ciphertext = Aes256Gcm::new_from_slice(&sealed.key)
+            .expect("cipher key is 32 bytes")
+            .encrypt(&Nonce::from(nonce), bytes.as_slice())
             .expect("in-memory AES-GCM encryption is infallible");
         bytes.zeroize();
         sealed.payload.reserve_exact(NONCE_LEN + ciphertext.len());
@@ -58,11 +59,12 @@ impl<const N: usize> Secret<N> {
     /// Decrypt into a guard; the plaintext copy is zeroed when the guard
     /// drops. Panics only if the sealed buffer was altered (program bug).
     pub fn expose(&self) -> Exposed<N> {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.inner.key));
+        let cipher = Aes256Gcm::new_from_slice(&self.inner.key).expect("cipher key is 32 bytes");
         let (nonce, ct) = self.inner.payload.split_at(NONCE_LEN);
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("sealed secret failed to open");
         let plaintext = Zeroizing::new(
             cipher
-                .decrypt(Nonce::from_slice(nonce), ct)
+                .decrypt(&Nonce::from(nonce), ct)
                 .expect("sealed secret failed to open"),
         );
         let mut bytes = Box::new([0u8; N]);

@@ -285,12 +285,9 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                 }
                 Err(e) => {
                     let msg = format!("{:#}", e);
-                    // Only the archived-contract error ids count as "already
-                    // gone" — a bare NOT_FOUND substring would also swallow
-                    // systemic USER_NOT_FOUND / PACKAGE_NOT_FOUND failures and
-                    // defeat the consecutive-failure breaker. A skip leaves the
-                    // failure counter untouched: neither success nor failure.
-                    if msg.contains("CONTRACT_NOT_FOUND") || msg.contains("CONTRACT_NOT_ACTIVE") {
+                    // A skip leaves the failure counter untouched: neither
+                    // success nor failure.
+                    if is_already_gone(&msg) {
                         skipped_gone += 1;
                         debug!(
                             "DvpProposal GC: {} already gone: {}",
@@ -575,6 +572,20 @@ async fn scan(
     Ok((queue, scanned))
 }
 
+/// Archived-contract error ids only — a broader match (e.g. bare NOT_FOUND)
+/// would swallow systemic failures and defeat the consecutive-failure breaker.
+fn is_already_gone(msg: &str) -> bool {
+    [
+        "CONTRACT_NOT_FOUND",
+        "CONTRACT_NOT_ACTIVE",
+        "INACTIVE_CONTRACTS",
+        "LOCKED_CONTRACTS",
+        "UNKNOWN_CONTRACT_SYNCHRONIZERS",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+}
+
 async fn archive_one(
     client: &mut DAppProviderClient,
     config: &BaseConfig,
@@ -688,6 +699,32 @@ mod tests {
         // Missing terms.settleBefore → never archive
         let p = json!({ "proposer": LP, "counterparty": OTHER, "terms": {} });
         assert_eq!(classify_proposal(&p, LP, NOW, HOUR, true), None);
+    }
+
+    #[test]
+    fn already_gone_matches_archived_contract_errors_only() {
+        for msg in [
+            "PrepareTransaction RPC failed (Internal error): Prepare submission failed \
+             (HTTP 404 Not Found): {\"code\":\"CONTRACT_NOT_FOUND\",\"cause\":\"...\"}",
+            "Transaction failed: CONTRACT_NOT_ACTIVE(11,abcd1234): ...",
+            "Transaction failed: LOCAL_VERDICT_LOCKED_CONTRACTS(2,4e650fc9): Rejected \
+             transaction is referring to locked contracts",
+            "Transaction failed: LOCAL_VERDICT_INACTIVE_CONTRACTS(2,aaaa0000): ...",
+            "INACTIVE_CONTRACTS after 5 attempts: ...",
+            "Prepare submission failed (HTTP 400 Bad Request): \
+             {\"code\":\"UNKNOWN_CONTRACT_SYNCHRONIZERS\",\"cause\":\"The following \
+             contracts have been archived: List(00c78595...)\"}",
+        ] {
+            assert!(is_already_gone(msg), "should be already-gone: {msg}");
+        }
+        for msg in [
+            "Prepare submission failed (HTTP 404 Not Found): {\"code\":\"USER_NOT_FOUND\"}",
+            "PACKAGE_NOT_FOUND: package 34ab886e is not known",
+            "SEQUENCER_BACKPRESSURE: sequencer is overloaded",
+            "connection refused",
+        ] {
+            assert!(!is_already_gone(msg), "should NOT be already-gone: {msg}");
+        }
     }
 
     // --- gate ---

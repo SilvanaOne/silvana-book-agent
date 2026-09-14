@@ -848,9 +848,23 @@ impl DAppProviderClient {
                     if unreachable {
                         agent_logic::ledger_health::record_submit_failure();
                     }
+                    // Background archival ops routinely race the counterparty's
+                    // archive; an archived-contract refusal there is expected.
+                    let label = classify_submit_error(&msg);
+                    let background_gone = is_background_op(req.operation)
+                        && matches!(
+                            label,
+                            "CONTRACT_NOT_FOUND" | "INACTIVE_CONTRACTS" | "LOCKED_CONTRACTS"
+                        );
                     report_submit_error(
-                        if unreachable { "CONNECTION_ERROR" } else { "SERVER_ERROR" },
-                        "error",
+                        if unreachable {
+                            "CONNECTION_ERROR"
+                        } else if background_gone {
+                            label
+                        } else {
+                            "SERVER_ERROR"
+                        },
+                        if background_gone { "warning" } else { "error" },
                         "ledger_client.prepare",
                         &self.party_id,
                         None,
@@ -1084,6 +1098,22 @@ impl DAppProviderClient {
                 // INACTIVE_CONTRACTS: contract was consumed/archived between
                 // prepare and execute. Re-prepare to get fresh CIDs from ACS.
                 if error_msg.contains("INACTIVE_CONTRACTS") {
+                    // Background archival ops pin their contract id, so a
+                    // re-prepare cannot help — give up on the first failure.
+                    if is_background_op(req.operation) {
+                        report_submit_error(
+                            "INACTIVE_CONTRACTS",
+                            "warning",
+                            "ledger_client.execute",
+                            &self.party_id,
+                            Some(&prepared.command_id),
+                            expectation,
+                            req.operation,
+                            attempt + 1,
+                            error_msg,
+                        );
+                        anyhow::bail!("Transaction failed: {}", error_msg);
+                    }
                     if attempt < max_retries - 1 {
                         warn!(
                             "INACTIVE_CONTRACTS (attempt {}/{}), re-preparing with fresh CIDs in 2s [{}]",
@@ -1104,6 +1134,23 @@ impl DAppProviderClient {
                         error_msg,
                     );
                     anyhow::bail!("INACTIVE_CONTRACTS after {} attempts: {}", max_retries, error_msg);
+                }
+
+                // A locked contract is being consumed by a competing transaction;
+                // background archival ops give up rather than re-contend.
+                if error_msg.contains("LOCKED_CONTRACTS") && is_background_op(req.operation) {
+                    report_submit_error(
+                        "LOCKED_CONTRACTS",
+                        "warning",
+                        "ledger_client.execute",
+                        &self.party_id,
+                        Some(&prepared.command_id),
+                        expectation,
+                        req.operation,
+                        attempt + 1,
+                        error_msg,
+                    );
+                    anyhow::bail!("Transaction failed: {}", error_msg);
                 }
 
                 if attempt < max_retries - 1 {
@@ -1483,10 +1530,13 @@ fn classify_submit_error(msg: &str) -> &'static str {
         ("SEQUENCER_BACKPRESSURE", "SEQUENCER_BACKPRESSURE"),
         ("LOCAL_VERDICT_INACTIVE_CONTRACTS", "INACTIVE_CONTRACTS"),
         ("INACTIVE_CONTRACTS", "INACTIVE_CONTRACTS"),
+        ("LOCAL_VERDICT_LOCKED_CONTRACTS", "LOCKED_CONTRACTS"),
+        ("LOCKED_CONTRACTS", "LOCKED_CONTRACTS"),
         ("DUPLICATE_COMMAND", "DUPLICATE_COMMAND"),
         ("MEDIATOR_SAYS_TX_TIMED_OUT", "MEDIATOR_TX_TIMED_OUT"),
         ("SUBMISSION_ALREADY_IN_FLIGHT", "ALREADY_IN_FLIGHT"),
         ("CONTRACT_NOT_FOUND", "CONTRACT_NOT_FOUND"),
+        ("UNKNOWN_CONTRACT_SYNCHRONIZERS", "CONTRACT_NOT_FOUND"),
         ("LOCAL_VERDICT_MALFORMED", "MALFORMED_TRANSACTION"),
         ("SEQUENCER_REQUEST_REFUSED", "SEQUENCER_REQUEST_REFUSED"),
         ("SEQUENCER_REQUEST_FAILED", "SEQUENCER_REQUEST_FAILED"),
