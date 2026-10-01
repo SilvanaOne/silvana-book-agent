@@ -4,7 +4,10 @@
 //! including authentication, price fetching, order submission, cancellation,
 //! and settlement streaming.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use orderbook_proto::{
     orderbook::{
         AcceptQuoteRequest, AcceptQuoteResponse, CancelOrderRequest, CancelOrderResponse,
@@ -21,7 +24,7 @@ use orderbook_proto::{
     },
 };
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::Stream;
 use tonic::Request;
@@ -31,6 +34,12 @@ use tracing::debug;
 use crate::auth::{generate_jwt, generate_jwt_with_branch};
 use crate::config::BaseConfig;
 use crate::secret::Secret;
+
+/// Bound on a TLS handshake, including on reconnect; the per-RPC deadline does not cover it.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-RPC deadline on the orderbook and pricing channels.
+pub(crate) const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// External account authentication data
 #[derive(Clone)]
@@ -66,8 +75,22 @@ pub struct OrderbookClient {
 impl OrderbookClient {
     /// Create a new orderbook client with external account authentication
     pub async fn new(config: &BaseConfig) -> Result<Self> {
-        let channel = Self::create_channel(&config.orderbook_grpc_url).await?;
+        let channel = Self::create_channel(&config.orderbook_grpc_url, TLS_HANDSHAKE_TIMEOUT).await?;
+        Self::with_channel(channel, config)
+    }
 
+    /// Client whose channel connects on first use, so tests need no server.
+    #[cfg(test)]
+    pub(crate) fn lazy_for_tests(config: &BaseConfig) -> Result<Self> {
+        let endpoint = Channel::from_shared(config.orderbook_grpc_url.clone())
+            .context("Invalid gRPC URL")?
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(2));
+        Self::with_channel(endpoint.connect_lazy(), config)
+    }
+
+    /// Build the service clients over a channel.
+    fn with_channel(channel: Channel, config: &BaseConfig) -> Result<Self> {
         // Generate initial JWT for interceptor
         let jwt = generate_jwt_with_branch(
             &config.party_id,
@@ -80,7 +103,7 @@ impl OrderbookClient {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let token_arc = Arc::new(RwLock::new(jwt));
         let expires_at = Arc::new(RwLock::new(now + config.token_ttl_secs));
@@ -125,7 +148,7 @@ impl OrderbookClient {
     }
 
     /// Create gRPC channel with TLS
-    async fn create_channel(grpc_url: &str) -> Result<Channel> {
+    async fn create_channel(grpc_url: &str, tls_handshake: std::time::Duration) -> Result<Channel> {
         // Initialize Rustls crypto provider
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -133,7 +156,7 @@ impl OrderbookClient {
         // server that never responds must error rather than hang.
         let builder = |endpoint: tonic::transport::Endpoint| {
             endpoint
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(RPC_TIMEOUT)
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .http2_keep_alive_interval(std::time::Duration::from_secs(30))
                 .keep_alive_timeout(std::time::Duration::from_secs(10))
@@ -149,7 +172,8 @@ impl OrderbookClient {
                     .split(':')
                     .next()
                     .unwrap_or("localhost"),
-            );
+            )
+            .timeout(tls_handshake);
 
             builder(
                 Channel::from_shared(grpc_url.to_string())
@@ -276,7 +300,7 @@ impl OrderbookClient {
             .orderbook_client
             .submit_order(request)
             .await
-            .map_err(|e| anyhow::anyhow!("submit_order failed: {}", e.message()))?;
+            .map_err(submit_order_error)?;
 
         Ok(response.into_inner())
     }
@@ -296,7 +320,7 @@ impl OrderbookClient {
 
     /// Get live orders for a market (Active + Partial)
     pub async fn get_active_orders(&mut self, market_id: &str) -> Result<Vec<Order>> {
-        let mut orders = Vec::new();
+        let mut pages = Vec::new();
 
         for status in [OrderStatus::Active, OrderStatus::Partial] {
             let request = Request::new(GetOrdersRequest {
@@ -315,15 +339,15 @@ impl OrderbookClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("get_orders failed: {}", e.message()))?;
 
-            orders.extend(response.into_inner().orders);
+            pages.push(response.into_inner().orders);
         }
 
-        Ok(orders)
+        Ok(merge_status_pages(pages))
     }
 
     /// Get ALL live orders for this party (across all markets)
     pub async fn get_all_active_orders(&mut self) -> Result<Vec<Order>> {
-        let mut orders = Vec::new();
+        let mut pages = Vec::new();
 
         for status in [OrderStatus::Active, OrderStatus::Partial] {
             let request = Request::new(GetOrdersRequest {
@@ -342,10 +366,10 @@ impl OrderbookClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("get_all_active_orders failed: {}", e.message()))?;
 
-            orders.extend(response.into_inner().orders);
+            pages.push(response.into_inner().orders);
         }
 
-        Ok(orders)
+        Ok(merge_status_pages(pages))
     }
 
     /// Get pending settlement proposals for this party (paginated, fetches all)
@@ -554,6 +578,26 @@ impl OrderbookClient {
     }
 }
 
+/// Displays as "submit_order failed: `<message>`" and keeps the status for its code.
+pub(crate) fn submit_order_error(status: tonic::Status) -> anyhow::Error {
+    let msg = format!("submit_order failed: {}", status.message());
+    anyhow::Error::new(status).context(msg)
+}
+
+/// One list from the per-status pages, each order id once.
+fn merge_status_pages(pages: Vec<Vec<Order>>) -> Vec<Order> {
+    dedup_orders(pages.into_iter().flatten().collect())
+}
+
+/// Drop repeated order ids; the later copy wins (Partial is fetched after Active).
+fn dedup_orders(orders: Vec<Order>) -> Vec<Order> {
+    let mut by_id: IndexMap<u64, Order> = IndexMap::with_capacity(orders.len());
+    for order in orders {
+        by_id.insert(order.order_id, order);
+    }
+    by_id.into_values().collect()
+}
+
 /// Human-readable name for an RFQ V2 LP confirm-reject reason code
 /// (`AcceptQuoteAtomicResponse.reject_reason`).
 pub fn atomic_reject_reason_name(code: i32) -> &'static str {
@@ -577,9 +621,9 @@ impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
-        let expires_at = *self.expires_at.read().unwrap();
+        let expires_at = *self.expires_at.read().unwrap_or_else(PoisonError::into_inner);
 
         if now + REFRESH_BEFORE_EXPIRY_SECS >= expires_at {
             match generate_jwt_with_branch(
@@ -595,8 +639,9 @@ impl tonic::service::Interceptor for AuthInterceptor {
                         "JWT token refreshed (was expiring in {}s)",
                         expires_at.saturating_sub(now)
                     );
-                    *self.token.write().unwrap() = new_jwt;
-                    *self.expires_at.write().unwrap() = now + self.auth_data.ttl_secs;
+                    *self.token.write().unwrap_or_else(PoisonError::into_inner) = new_jwt;
+                    *self.expires_at.write().unwrap_or_else(PoisonError::into_inner) =
+                        now + self.auth_data.ttl_secs;
                 }
                 Err(e) => {
                     tracing::error!("Failed to refresh JWT: {}", e);
@@ -604,7 +649,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
             }
         }
 
-        let token = self.token.read().unwrap().clone();
+        let token = self.token.read().unwrap_or_else(PoisonError::into_inner).clone();
         request.metadata_mut().insert(
             "authorization",
             format!("Bearer {}", token)
@@ -612,5 +657,50 @@ impl tonic::service::Interceptor for AuthInterceptor {
                 .map_err(|_| tonic::Status::internal("Failed to parse JWT token"))?,
         );
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order(order_id: u64, filled: &str) -> Order {
+        Order { order_id, filled_quantity: filled.to_string(), ..Default::default() }
+    }
+
+    // A server that accepts TCP but never answers the TLS handshake fails the connect
+    #[tokio::test]
+    async fn a_stalled_tls_handshake_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let connect = OrderbookClient::create_channel(&url, std::time::Duration::from_millis(200));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), connect).await;
+        assert!(matches!(result, Ok(Err(_))), "the handshake bound should end the connect");
+        drop(listener);
+    }
+
+    #[test]
+    fn dedup_orders_prefers_later_copy() {
+        let out = dedup_orders(vec![order(1, "0"), order(2, "0"), order(1, "0.5"), order(3, "0")]);
+        let ids: Vec<u64> = out.iter().map(|o| o.order_id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "first-seen order kept, no duplicates");
+        assert_eq!(out[0].filled_quantity, "0.5", "the later (Partial) copy wins");
+    }
+
+    #[test]
+    fn dedup_orders_keeps_distinct_orders() {
+        let out = dedup_orders(vec![order(5, "0"), order(4, "1")]);
+        assert_eq!(out.len(), 2);
+        assert!(dedup_orders(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn merge_status_pages_drops_id_in_both_pages() {
+        let active = vec![order(7, "0")];
+        let partial = vec![order(7, "0.5"), order(8, "0")];
+        let out = merge_status_pages(vec![active, partial]);
+        let ids: Vec<u64> = out.iter().map(|o| o.order_id).collect();
+        assert_eq!(ids, vec![7, 8]);
+        assert_eq!(out[0].filled_quantity, "0.5", "the Partial copy wins");
     }
 }

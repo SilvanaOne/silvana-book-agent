@@ -390,7 +390,7 @@ Each level is defined by:
 - **`delta_percent`** — signed offset from mid price in percent. Bids use negative values (below mid), offers use positive values (above mid). E.g. `-0.5` on a bid = 0.5% below mid; `0.3` on an offer = 0.3% above mid.
 - **`quantity`** — order size at this level
 
-When the mid price moves by more than `price_change_threshold_percent`, all grid orders are cancelled and re-placed at updated levels.
+Each side (bids, offers) is re-placed on its own when the mid moves by `price_change_threshold_percent` or more from the price that side was last placed at, when one of its rungs is missing, extra or partially filled, or when re-placing only one side would cross the other side's resting orders (both sides are then re-placed). After a restart, or once a lost price feed recovers, both sides are re-placed. A side the current unlocked balance cannot fund has its resting orders withdrawn until it can be funded again. A market with neither side fundable and nothing resting is re-checked every 60s.
 
 ### RFQ (Request for Quote)
 

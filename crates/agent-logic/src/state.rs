@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_state() {
-        let dir = std::env::temp_dir().join("silvana-test-state");
+        let dir = std::env::temp_dir().join(format!("silvana-test-state-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-state.json");
 

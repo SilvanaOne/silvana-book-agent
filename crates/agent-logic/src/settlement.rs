@@ -20,14 +20,16 @@
 //!       → WAIT → sleep (counterparty's turn)
 //!       → NONE → done (settled/failed/cancelled)
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,6 +88,84 @@ const MAX_ADVANCE_SPAWNS_PER_CYCLE: usize = 50;
 /// watchdog) within ~30s, without the 2s-tick hammering a full bypass would
 /// cause, and without burning through retries in seconds during an RPC outage.
 const EXPIRED_RETRY_SECS: u64 = 30;
+
+/// Stream-touched proposals spawned without start jitter; the rest are staggered.
+const STREAM_IMMEDIATE_SPAWNS: usize = 4;
+
+/// Upper bound for one on-chain contract sync.
+const SYNC_CONTRACTS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Minimum spacing of on-chain syncs while no proposal is waiting for a CID.
+const SYNC_MIN_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Poll re-feed delay for a held proposal; doubles per hold up to `HOLD_MAX`.
+const HOLD_INITIAL: Duration = Duration::from_secs(30);
+const HOLD_MAX: Duration = Duration::from_secs(300);
+
+/// Most stream updates taken into one batch.
+pub const STREAM_BATCH_MAX: usize = 64;
+
+/// Time budget for handling one stream batch; the remainder stays queued.
+pub const STREAM_BATCH_BUDGET: Duration = Duration::from_secs(2);
+
+/// Summary of one `apply_stream_batch` call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamBatchOutcome {
+    /// Updates taken from the backlog, whatever their result
+    pub handled: usize,
+    /// Distinct proposals the batch tried to advance
+    pub touched: usize,
+    /// Advancement tasks spawned for them
+    pub spawned: usize,
+    /// True when any handled update can change the order grid
+    pub affects_grid: bool,
+}
+
+/// True for stream events that can free inventory or fill grid orders.
+pub fn affects_grid(update: &SettlementUpdate) -> bool {
+    match EventType::try_from(update.event_type) {
+        Ok(EventType::Settled | EventType::Failed | EventType::Cancelled) => true,
+        Ok(EventType::ProposalCreated) => update
+            .proposal
+            .as_ref()
+            .is_some_and(|p| p.order_match.is_some()),
+        _ => false,
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch; 0 if the clock is before it.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Seconds from `created` to `now`, saturating on out-of-range server values.
+fn age_secs(now: i64, created: i64) -> i64 {
+    now.saturating_sub(created)
+}
+
+/// Stages before the agent's own allocation.
+fn is_pre_allocation_stage(stage: SettlementStage) -> bool {
+    matches!(
+        stage,
+        SettlementStage::ProposalReceived
+            | SettlementStage::DvpFeePaid
+            | SettlementStage::DvpProposed
+            | SettlementStage::DvpAccepted
+            | SettlementStage::AllocationFeePaid
+    )
+}
+
+/// True when `result` is the transient missing-CID error for a CID merged in since.
+fn cid_since_found(result: &AdvanceResult, gained_proposal_cid: bool, gained_dvp_cid: bool) -> bool {
+    let AdvanceResult::Error { error, .. } = result else {
+        return false;
+    };
+    (gained_proposal_cid && error.contains("No DvpProposal CID found"))
+        || (gained_dvp_cid && error.contains("No Dvp contract ID found"))
+}
 
 /// rfq_v2_only disposition for an encountered V1 settlement: true = leave it
 /// alone (do NOT cancel). The server's CancelSettlement guard only refuses
@@ -271,6 +351,8 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     task_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Settlements that completed a step inline and need re-advancing on the next tick
     needs_readvance: HashSet<String>,
+    /// Stream-touched while a task was running; a Wait result re-advances them
+    rearm_on_result: HashSet<String>,
     /// Shared log for consolidating NextAction entries across parallel tasks
     action_log: Arc<Mutex<Vec<(String, &'static str)>>>,
     /// Shared counter of settlements where this agent must act (not waiting/terminal)
@@ -286,6 +368,22 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     no_reject: bool,
     /// Liquidity manager for balance tracking and commitment gating
     liquidity_manager: Option<Arc<LiquidityManager>>,
+    /// Held proposals the poll skips until the instant; the delay doubles per hold
+    held_until: HashMap<String, (Instant, Duration)>,
+    /// Start of the last on-chain contract sync
+    last_sync: Option<Instant>,
+    /// User-order lookups attempted against the server
+    #[cfg(test)]
+    server_lookups: usize,
+    /// Answers user-order lookups in place of the server
+    #[cfg(test)]
+    stub_orders: Option<Vec<orderbook_proto::orderbook::Order>>,
+    /// User-order lookups never answer
+    #[cfg(test)]
+    stub_lookup_hangs: bool,
+    /// Rejects never complete, as against a server that never answers
+    #[cfg(test)]
+    reject_black_hole: bool,
 }
 
 impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
@@ -307,6 +405,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             pending_results: Vec::new(),
             task_handles: Vec::new(),
             needs_readvance: HashSet::new(),
+            rearm_on_result: HashSet::new(),
             action_log: Arc::new(Mutex::new(Vec::new())),
             actionable_count: Arc::new(AtomicUsize::new(0)),
             accepted_rfq_trades: None,
@@ -314,6 +413,16 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             quoted_rfq_trades: None,
             no_reject: false,
             liquidity_manager: None,
+            held_until: HashMap::new(),
+            last_sync: None,
+            #[cfg(test)]
+            server_lookups: 0,
+            #[cfg(test)]
+            stub_orders: None,
+            #[cfg(test)]
+            stub_lookup_hangs: false,
+            #[cfg(test)]
+            reject_black_hole: false,
         }
     }
 
@@ -522,11 +631,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let Some(created_at) = &state.proposal.created_at else {
             return false;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let age = now - created_at.seconds;
+        let age = age_secs(unix_now_secs(), created_at.seconds);
         let (allocate_window, settle_window) = expiry_windows(
             &state.proposal.origin,
             self.config.allocate_before_secs,
@@ -699,7 +804,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         if self.query_client.is_none() {
             self.query_client = Some(OrderbookClient::new(&self.config).await?);
         }
-        Ok(self.query_client.as_mut().unwrap())
+        self.query_client
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("query client unavailable"))
     }
 
     /// Signal that we are shutting down — reject new proposals, drain confirmed ones
@@ -761,6 +868,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             self.release_commitment(proposal_id);
             self.active_settlements.shift_remove(proposal_id);
             self.in_progress.remove(proposal_id);
+            self.rearm_on_result.remove(proposal_id);
         }
         Ok(())
     }
@@ -802,6 +910,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     self.active_settlements.shift_remove(&proposal.proposal_id);
                     self.in_progress.remove(&proposal.proposal_id);
                     self.failed_settlements.remove(&proposal.proposal_id);
+                    self.rearm_on_result.remove(&proposal.proposal_id);
+                    self.held_until.remove(&proposal.proposal_id);
                 }
             }
             EventType::Failed | EventType::Cancelled => {
@@ -819,6 +929,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     self.active_settlements.shift_remove(&proposal.proposal_id);
                     self.in_progress.remove(&proposal.proposal_id);
                     self.failed_settlements.remove(&proposal.proposal_id);
+                    self.rearm_on_result.remove(&proposal.proposal_id);
+                    self.held_until.remove(&proposal.proposal_id);
                 }
             }
             _ => {}
@@ -830,6 +942,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Handle a new settlement proposal
     async fn handle_proposal_created(&mut self, proposal: SettlementProposal) -> Result<()> {
+        // Only the hold arms below re-arm a hold; every other outcome ends it
+        let prior_hold = self.held_until.remove(&proposal.proposal_id).map(|(_, delay)| delay);
+
         // Deduplicate: ignore if already processing, completed, or rejected (stream replay)
         if self.active_settlements.contains_key(&proposal.proposal_id) {
             debug!("[{}] Duplicate ProposalCreated, ignoring", proposal.proposal_id);
@@ -863,6 +978,21 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         let proposal_id = proposal.proposal_id.clone();
+
+        // Amounts no real trade carries are refused before any path can adopt them
+        if let Some((field, raw)) = implausible_amount(&proposal) {
+            warn!("[{}] Rejecting proposal: implausible {} {}", proposal_id, field, raw);
+            // A proposal restored from saved state releases what it reserved
+            self.tracker.lock().await.mark_failed(&proposal_id);
+            self.release_commitment(&proposal_id);
+            if let Err(e) = self.reject_proposal(&proposal_id).await {
+                warn!("[{}] Failed to reject: {}", proposal_id, e);
+            }
+            if let Some(ref rejected) = self.rejected_rfq_trades {
+                rejected.lock().await.insert(proposal_id.clone());
+            }
+            return Ok(());
+        }
 
         // rfq_v2_only: never adopt V1 settlements — every proposal reaching
         // this pipeline is V1 by construction (RFQ V2 / AtomicDVP settles
@@ -900,14 +1030,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         self.config.allocate_before_secs,
                         self.config.settle_before_secs,
                     );
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-                    if now - created_at.seconds > settle_window as i64 {
+                    let age = age_secs(unix_now_secs(), created_at.seconds);
+                    if age > settle_window as i64 {
                         info!(
                             "[{}] Restored proposal past settle deadline ({}s old, max {}s) — abandoning instead of re-advancing",
-                            proposal_id, now - created_at.seconds, settle_window
+                            proposal_id, age, settle_window
                         );
                         // Release the order's pending_quantity + drop the
                         // settlement_orders entry, exactly as the exhausted-abandon
@@ -979,11 +1106,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         // Reject new proposals during shutdown
         if self.shutdown.is_shutting_down() {
             info!("[{}] Rejecting proposal (shutting down)", proposal_id);
-            let state = SettlementState::new(proposal, is_buyer);
-            self.active_settlements.insert(proposal_id.clone(), state);
             if let Err(e) = self.reject_proposal(&proposal_id).await {
                 warn!("[{}] Failed to reject proposal during shutdown: {}", proposal_id, e);
-                self.active_settlements.shift_remove(&proposal_id);
             }
             return Ok(());
         }
@@ -1011,11 +1135,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             // Mirror the liquidity-gate reject below (incl. the RFQ feedback
             // insert — a cap-rejected buyer-RFQ proposal must revert the fill
             // loop's optimistic accounting).
-            let state = SettlementState::new(proposal, is_buyer);
-            self.active_settlements.insert(proposal_id.clone(), state);
             if let Err(e) = self.reject_proposal(&proposal_id).await {
                 warn!("[{}] Failed to reject: {}", proposal_id, e);
-                self.active_settlements.shift_remove(&proposal_id);
             }
             if let Some(ref rejected) = self.rejected_rfq_trades {
                 rejected.lock().await.insert(proposal_id.clone());
@@ -1031,9 +1152,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         // i.e. once the counterparty has preconfirmed. One-sided proposals from
         // a counterparty that never commits therefore reserve nothing.
         // Don't reject based on zero balances at startup — wait for ACS worker to load them
-        if let Some(ref lm) = self.liquidity_manager {
+        if let Some(lm) = self.liquidity_manager.clone() {
             if !lm.is_ready().await {
                 info!("[{}] Balances not loaded yet, deferring preconfirmation", proposal_id);
+                self.hold(&proposal_id, prior_hold);
                 return Ok(());
             }
             let (allocation_token, allocation_amount, my_fees_usd) =
@@ -1042,17 +1164,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             // one does — never commit to a settlement from an aged number.
             if lm.is_stale(&allocation_token).await.is_some() {
                 info!("[{}] Balances stale, deferring preconfirmation", proposal_id);
+                self.hold(&proposal_id, prior_hold);
                 return Ok(());
             }
             let fee_cc = lm.estimate_fee_cc(my_fees_usd).await;
 
             if let Err(reason) = lm.can_commit(&allocation_token, allocation_amount, fee_cc).await {
                 warn!("[{}] Rejecting proposal: {}", proposal_id, reason);
-                let state = SettlementState::new(proposal, is_buyer);
-                self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
                     warn!("[{}] Failed to reject: {}", proposal_id, e);
-                    self.active_settlements.shift_remove(&proposal_id);
                 }
                 if let Some(ref rejected) = self.rejected_rfq_trades {
                     rejected.lock().await.insert(proposal_id.clone());
@@ -1066,11 +1186,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let rfq_verified = self.verify_rfq_proposal(&proposal).await;
             if !rfq_verified {
                 warn!("[{}] RFQ proposal rejected: not in agent's tracked RFQ state", proposal_id);
-                let state = SettlementState::new(proposal, is_buyer);
-                self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
                     warn!("[{}] Failed to reject: {}", proposal_id, e);
-                    self.active_settlements.shift_remove(&proposal_id);
                 }
                 if let Some(ref rejected) = self.rejected_rfq_trades {
                     rejected.lock().await.insert(proposal_id.clone());
@@ -1103,27 +1220,32 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             VerifyResult::Accepted { order_id } => order_id,
             VerifyResult::Rejected { reason } => {
                 warn!("[{}] Settlement rejected: {}", proposal_id, reason);
-                let state = SettlementState::new(proposal, is_buyer);
-                self.active_settlements.insert(proposal_id.clone(), state);
                 if let Err(e) = self.reject_proposal(&proposal_id).await {
                     warn!("[{}] Failed to reject: {}", proposal_id, e);
-                    self.active_settlements.shift_remove(&proposal_id);
                 }
+                return Ok(());
+            }
+            VerifyResult::PlacementInFlight { order_id: pending_id } => {
+                // Neither adopted nor rejected; the next poll re-feeds it once tracked
+                info!("[{proposal_id}] Order {pending_id} placement in flight, holding proposal");
                 return Ok(());
             }
             VerifyResult::NeedServerLookup { order_id: lookup_id } => {
                 // Path B: User order — fetch from server and verify
                 info!("[{}] Order {} not in tracker, fetching from server", proposal_id, lookup_id);
+                // Held across the lookup, so a cancelled handler keeps its backoff
+                self.hold(&proposal_id, prior_hold);
                 let market_id = proposal.market_id.clone();
                 match self.verify_user_order(&proposal, lookup_id, &market_id).await {
-                    UserOrderVerdict::Verified(oid) => oid,
+                    UserOrderVerdict::Verified(oid) => {
+                        self.held_until.remove(&proposal_id);
+                        oid
+                    }
                     UserOrderVerdict::Rejected(reason) => {
+                        self.held_until.remove(&proposal_id);
                         warn!("[{}] User order verification failed: {}", proposal_id, reason);
-                        let state = SettlementState::new(proposal, is_buyer);
-                        self.active_settlements.insert(proposal_id.clone(), state);
                         if let Err(e) = self.reject_proposal(&proposal_id).await {
                             warn!("[{}] Failed to reject: {}", proposal_id, e);
-                            self.active_settlements.shift_remove(&proposal_id);
                         }
                         return Ok(());
                     }
@@ -1164,6 +1286,19 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         Ok(())
     }
 
+    /// Keep a held proposal out of poll re-feeds: `HOLD_INITIAL`, doubling up to `HOLD_MAX`.
+    fn hold(&mut self, proposal_id: &str, prior: Option<Duration>) {
+        let delay = prior.map_or(HOLD_INITIAL, |d| d.saturating_mul(2).min(HOLD_MAX));
+        let now = Instant::now();
+        let until = now.checked_add(delay).unwrap_or(now);
+        self.held_until.insert(proposal_id.to_string(), (until, delay));
+    }
+
+    /// Proposals currently held (neither adopted nor rejected yet).
+    pub fn held_count(&self) -> usize {
+        self.held_until.len()
+    }
+
     /// Handle status change for an existing settlement
     async fn handle_status_changed(&mut self, proposal: &SettlementProposal) -> Result<()> {
         if let Some(state) = self.active_settlements.get(&proposal.proposal_id) {
@@ -1191,7 +1326,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Results are collected on the next call via `collect_results()`.
     pub async fn advance_all_settlements(&mut self) {
         // First, collect results from previously spawned tasks
-        let _ = self.collect_results().await;
+        let readvance_ids = self.collect_results().await;
+        self.needs_readvance.extend(readvance_ids);
 
         // Drain needs_readvance: these settlements have actual work to do
         // (on-chain state change detected, step completed in-task, etc.).
@@ -1244,7 +1380,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             if let Some(f) = self.failed_settlements.get(&proposal_id) {
                 if Instant::now() < f.next_retry {
                     let cut_short = f.next_retry
-                        > Instant::now() + Duration::from_secs(EXPIRED_RETRY_SECS)
+                        > crate::order_manager::deadline_after(Duration::from_secs(EXPIRED_RETRY_SECS))
                         && self.past_deadline(&proposal_id);
                     if !cut_short {
                         skipped_backoff += 1;
@@ -1282,8 +1418,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 }
             };
 
-            self.spawn_settlement_task(proposal_id, permit, true);
-            spawned += 1;
+            if self.spawn_settlement_task(proposal_id, permit, true) {
+                spawned = spawned.saturating_add(1);
+            }
 
             // No spawn-site stagger: spawned tasks each do 0–2s jitter inside
             // before any Canton tx (see spawn_settlement_task initial_jitter),
@@ -1305,40 +1442,107 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
     }
 
-    /// Advance a single settlement immediately (triggered by stream update).
-    /// Clears backoff, checks preconditions, spawns task if eligible.
-    /// Unlike advance_all_settlements(), does NOT iterate all settlements.
-    pub async fn advance_proposal(&mut self, proposal_id: &str) {
-        // Collect finished results first (frees semaphore permits)
-        let _ = self.collect_results().await;
+    /// Handle queued stream updates in order within `budget`, then advance
+    /// each proposal they touched once. Unhandled updates stay in `backlog`.
+    pub async fn apply_stream_batch(
+        &mut self,
+        backlog: &mut VecDeque<SettlementUpdate>,
+        per_update: Duration,
+        budget: Duration,
+    ) -> StreamBatchOutcome {
+        let started = Instant::now();
+        let mut outcome = StreamBatchOutcome::default();
+        let mut touched: IndexSet<String> = IndexSet::new();
 
-        // Must be active and not already in-progress
-        if !self.active_settlements.contains_key(proposal_id) { return; }
-        if self.in_progress.contains_key(proposal_id) { return; }
+        while !self.shutdown.is_shutting_down() {
+            // The first update always runs, so a zero budget still progresses
+            if outcome.handled > 0 && started.elapsed() >= budget {
+                break;
+            }
+            let Some(update) = backlog.pop_front() else { break };
+            outcome.handled = outcome.handled.saturating_add(1);
+            outcome.affects_grid |= affects_grid(&update);
 
-        // Clear backoff — stream update means new state to process
-        self.failed_settlements.remove(proposal_id);
-        self.needs_readvance.remove(proposal_id);
+            let update_proposal_id = update.proposal.as_ref().map(|p| p.proposal_id.clone());
+            let update_desc = format!(
+                "{} event={} market={}",
+                update.proposal.as_ref().map(|p| p.proposal_id.as_str()).unwrap_or("?"),
+                update.event_type,
+                update.proposal.as_ref().map(|p| p.market_id.as_str()).unwrap_or("?"),
+            );
+            match tokio::time::timeout(per_update, self.handle_settlement_update(update)).await {
+                Ok(Ok(())) => {
+                    if let Some(pid) = update_proposal_id {
+                        touched.insert(pid);
+                    }
+                }
+                Ok(Err(e)) => error!("[{}] Error handling settlement update: {:#}", update_desc, e),
+                Err(_) => warn!(
+                    "[{}] Settlement update handling timed out after {}s",
+                    update_desc,
+                    per_update.as_secs()
+                ),
+            }
+        }
 
-        // Try semaphore permit (non-blocking)
-        let permit = match self.semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => return, // All threads busy, poll cycle will pick it up
-        };
-
-        // Spawn without jitter — stream update means act NOW
-        self.spawn_settlement_task(proposal_id.to_string(), permit, false);
+        outcome.touched = touched.len();
+        outcome.spawned = self.advance_proposals(touched).await;
+        outcome
     }
 
-    /// Spawn a single settlement advancement task.
-    /// Shared by advance_all_settlements() and advance_proposal().
+    /// Advance the given proposals now (stream-driven), each at most once.
+    /// Busy permits or the spawn cap defer the rest to `needs_readvance`.
+    pub async fn advance_proposals(&mut self, proposal_ids: IndexSet<String>) -> usize {
+        // Collect finished results first (frees semaphore permits)
+        let readvance_ids = self.collect_results().await;
+        self.needs_readvance.extend(readvance_ids);
+
+        let mut spawned = 0usize;
+        for proposal_id in proposal_ids {
+            // Must be active and not already in-progress
+            if !self.active_settlements.contains_key(&proposal_id) {
+                continue;
+            }
+            if self.in_progress.contains_key(&proposal_id) {
+                // The running task may return a Wait from state older than this event
+                self.rearm_on_result.insert(proposal_id);
+                continue;
+            }
+
+            // Clear backoff — stream update means new state to process
+            self.failed_settlements.remove(&proposal_id);
+            self.needs_readvance.remove(&proposal_id);
+
+            if spawned >= MAX_ADVANCE_SPAWNS_PER_CYCLE || self.shutdown.is_shutting_down() {
+                self.needs_readvance.insert(proposal_id);
+                continue;
+            }
+            let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                self.needs_readvance.insert(proposal_id);
+                continue;
+            };
+
+            // Act now for the first few; stagger the rest of a large batch
+            let jitter = spawned >= STREAM_IMMEDIATE_SPAWNS;
+            if self.spawn_settlement_task(proposal_id, permit, jitter) {
+                spawned = spawned.saturating_add(1);
+            }
+        }
+        spawned
+    }
+
+    /// Spawn a single settlement advancement task; false if the proposal is gone.
+    /// Shared by advance_all_settlements() and advance_proposals().
     fn spawn_settlement_task(
         &mut self,
         proposal_id: String,
         permit: tokio::sync::OwnedSemaphorePermit,
         initial_jitter: bool,
-    ) {
-        let state = self.active_settlements.get(&proposal_id).unwrap().clone();
+    ) -> bool {
+        let Some(state) = self.active_settlements.get(&proposal_id).cloned() else {
+            drop(permit);
+            return false;
+        };
         let config = self.config.clone();
         let backend = Arc::clone(&self.backend);
         let tracker = Arc::clone(&self.tracker);
@@ -1471,6 +1675,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             }
         });
         self.task_handles.push(handle);
+        true
     }
 
 
@@ -1485,10 +1690,21 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let mut orphaned: Vec<String> = Vec::new();
         for (proposal_id, mut rx) in self.pending_results.drain(..) {
             match rx.try_recv() {
-                Ok((result, final_state)) => {
+                Ok((result, mut final_state)) => {
                     self.in_progress.remove(&proposal_id);
+                    let mut gained = (false, false);
                     // Update active_settlements with accumulated state from the task
                     if let Some(state) = self.active_settlements.get_mut(&proposal_id) {
+                        gained = (
+                            final_state.dvp_proposal_cid.is_none() && state.dvp_proposal_cid.is_some(),
+                            final_state.dvp_cid.is_none() && state.dvp_cid.is_some(),
+                        );
+                        // Keep CIDs that sync discovered while the task was in flight
+                        final_state.dvp_proposal_cid =
+                            final_state.dvp_proposal_cid.or(state.dvp_proposal_cid.take());
+                        final_state.dvp_cid = final_state.dvp_cid.or(state.dvp_cid.take());
+                        final_state.allocation_cid =
+                            final_state.allocation_cid.or(state.allocation_cid.take());
                         *state = final_state;
                     } else {
                         // Stream-terminal race: a Settled/Cancelled stream event
@@ -1501,7 +1717,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         // persisted across restarts).
                         orphaned.push(proposal_id.clone());
                     }
-                    completed.push(result);
+                    completed.push((result, gained));
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     // Still running
@@ -1511,6 +1727,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     // Task panicked or was cancelled
                     warn!("[{}] Settlement task dropped without sending result", proposal_id);
                     self.in_progress.remove(&proposal_id);
+                    self.rearm_on_result.remove(&proposal_id);
                 }
             }
         }
@@ -1540,11 +1757,23 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         // Apply all completed results
-        for result in completed {
+        for (result, (gained_proposal_cid, gained_dvp_cid)) in completed {
+            let pid = result.proposal_id().to_string();
+            let is_wait = matches!(result, AdvanceResult::Wait { .. });
+            let cid_found = cid_since_found(&result, gained_proposal_cid, gained_dvp_cid);
             if result.should_readvance() {
-                readvance_ids.push(result.proposal_id().to_string());
+                readvance_ids.push(pid.clone());
             }
             self.apply_result(result).await;
+            // Touched while running: drop the cooldown a stale Wait just set
+            if self.rearm_on_result.remove(&pid) && is_wait && self.active_settlements.contains_key(&pid) {
+                self.failed_settlements.remove(&pid);
+                readvance_ids.push(pid);
+            } else if cid_found && self.active_settlements.contains_key(&pid) {
+                // Sync merged the missing CID while the task ran: retry without the CID backoff
+                self.failed_settlements.remove(&pid);
+                readvance_ids.push(pid);
+            }
         }
 
         // Warn about long-running tasks (may be stuck, holding semaphore permit)
@@ -1627,7 +1856,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 // 480, 600 (capped). Without this, Wait settlements are re-polled
                 // every 2s, consuming semaphore permits and starving actionable
                 // settlements. When counterparty acts, sync_on_chain_contracts
-                // / stream-driven advance_proposal / step completion all
+                // / stream-driven advance_proposals / step completion all
                 // `.remove()` the entry — so `or_insert` creates a fresh one with
                 // wait_count=0, resetting the backoff naturally.
                 let expired = self.past_deadline(&proposal_id);
@@ -1647,7 +1876,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     // deadline watchdog can conclude and release the reservation.
                     delay = delay.min(Duration::from_secs(EXPIRED_RETRY_SECS));
                 }
-                entry.next_retry = Instant::now() + delay;
+                entry.next_retry = crate::order_manager::deadline_after(delay);
                 entry.cid_waiting = None;
                 debug!(
                     "[{}] Wait #{}: cooldown {}s",
@@ -1717,7 +1946,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     // outage doesn't burn through retries in seconds.
                     delay = delay.min(Duration::from_secs(EXPIRED_RETRY_SECS));
                 }
-                entry.next_retry = Instant::now() + delay;
+                entry.next_retry = crate::order_manager::deadline_after(delay);
                 if is_transient {
                     let is_cid_waiting = error.contains("No Dvp contract ID found")
                         || error.contains("No DvpProposal CID found");
@@ -1802,7 +2031,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 }
 
                 // Short backoff for timeouts (likely transient sequencer backpressure)
-                entry.next_retry = Instant::now() + Duration::from_secs(10);
+                entry.next_retry = crate::order_manager::deadline_after(Duration::from_secs(10));
                 warn!(
                     "[{}] Settlement timed out (retry {}/{} in 10s)",
                     proposal_id, entry.retry_count, FailedSettlement::max_retries()
@@ -1860,6 +2089,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 return false;
             }
         };
+        self.feed_polled_proposals(proposals).await;
+        true
+    }
+
+    /// Feed polled proposals through the normal handler, skipping held ones;
+    /// holds on ids the server no longer returns are dropped.
+    async fn feed_polled_proposals(&mut self, proposals: Vec<SettlementProposal>) {
+        let returned: HashSet<&str> = proposals.iter().map(|p| p.proposal_id.as_str()).collect();
+        self.held_until.retain(|id, _| returned.contains(id.as_str()));
 
         for proposal in proposals {
             if self.active_settlements.contains_key(&proposal.proposal_id) {
@@ -1869,6 +2107,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 continue;
             }
             if self.completed_proposals.contains(&proposal.proposal_id) {
+                continue;
+            }
+            let now = Instant::now();
+            if self.held_until.get(&proposal.proposal_id).is_some_and(|(until, _)| now < *until) {
                 continue;
             }
             info!("Discovered pending proposal via polling: {}", proposal.proposal_id);
@@ -1881,20 +2123,48 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 warn!("Error processing polled proposal: {}", e);
             }
         }
-        true
+    }
+
+    /// True when a sync can help: every call while a proposal waits for a CID, else
+    /// at most every `SYNC_MIN_INTERVAL` while a pre-allocation settlement lacks its Dvp CID.
+    fn sync_due(&self, now: Instant) -> bool {
+        let cid_waiting = self.failed_settlements.iter().any(|(id, f)| {
+            f.cid_waiting.is_some() && self.active_settlements.contains_key(id)
+        });
+        if cid_waiting {
+            return true;
+        }
+        let lacks_cid = self.active_settlements.values().any(|s| {
+            is_pre_allocation_stage(s.stage) && s.dvp_cid.is_none()
+        });
+        lacks_cid
+            && self
+                .last_sync
+                .is_none_or(|t| now.saturating_duration_since(t) >= SYNC_MIN_INTERVAL)
     }
 
     /// Sync on-chain DvpProposal and Dvp contracts with local state.
     pub async fn sync_on_chain_contracts(&mut self) {
-        if self.active_settlements.is_empty() {
+        let now = Instant::now();
+        if self.active_settlements.is_empty() || !self.sync_due(now) {
             return;
         }
+        self.last_sync = Some(now);
 
         let settlement_ids: Vec<String> = self.active_settlements.keys().cloned().collect();
-        let contracts = match self.backend.sync_contracts(&settlement_ids).await {
-            Ok(c) => c,
-            Err(e) => {
+        let sync = self.backend.sync_contracts(&settlement_ids);
+        let contracts = match tokio::time::timeout(SYNC_CONTRACTS_TIMEOUT, sync).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 warn!("sync_on_chain_contracts: {} ({} active settlements)", e, settlement_ids.len());
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    "sync_on_chain_contracts: timed out after {}s ({} active settlements)",
+                    SYNC_CONTRACTS_TIMEOUT.as_secs(),
+                    settlement_ids.len()
+                );
                 return;
             }
         };
@@ -1966,21 +2236,13 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         // in-flight settlement on what is an infra/lookup condition. Held
         // proposals are retried on the next server notification or cleaned up
         // by the server's expiry cancel; both are recoverable, a reject is not.
-        let client = match self.get_query_client().await {
-            Ok(c) => c,
-            Err(e) => {
-                return UserOrderVerdict::LookupFailed(format!(
-                    "Failed to create query client: {}",
-                    e
-                ))
-            }
-        };
-
-        let orders = match client.get_active_orders(market_id).await {
+        #[cfg(test)]
+        {
+            self.server_lookups = self.server_lookups.saturating_add(1);
+        }
+        let orders = match self.lookup_active_orders(market_id).await {
             Ok(o) => o,
-            Err(e) => {
-                return UserOrderVerdict::LookupFailed(format!("Failed to fetch orders: {}", e))
-            }
+            Err(reason) => return UserOrderVerdict::LookupFailed(reason),
         };
 
         // The server answered — an absent order is a definitive verdict.
@@ -1989,13 +2251,49 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         };
 
         let mut tracker = self.tracker.lock().await;
+        // Our own order booked by a submit that errored: capacity starts fresh, as for any agent order
+        if tracker.adopt_failed_submit(&order, Instant::now()) {
+            return match tracker.verify_settlement(proposal, &self.config.party_id) {
+                VerifyResult::Accepted { order_id } => UserOrderVerdict::Verified(order_id),
+                VerifyResult::Rejected { reason } => UserOrderVerdict::Rejected(reason),
+                VerifyResult::NeedServerLookup { .. } | VerifyResult::PlacementInFlight { .. } => {
+                    UserOrderVerdict::LookupFailed("adopted order not tracked".to_string())
+                }
+            };
+        }
         match tracker.verify_and_import_order(&order, proposal) {
             VerifyResult::Accepted { order_id } => UserOrderVerdict::Verified(order_id),
             VerifyResult::Rejected { reason } => UserOrderVerdict::Rejected(reason),
             VerifyResult::NeedServerLookup { .. } => {
                 UserOrderVerdict::Rejected("Unexpected NeedServerLookup".to_string())
             }
+            VerifyResult::PlacementInFlight { .. } => {
+                UserOrderVerdict::LookupFailed("order placement still in flight".to_string())
+            }
         }
+    }
+
+    /// Live orders in `market_id` for a user-order lookup; Err carries the failure reason.
+    async fn lookup_active_orders(
+        &mut self,
+        market_id: &str,
+    ) -> Result<Vec<orderbook_proto::orderbook::Order>, String> {
+        #[cfg(test)]
+        if self.stub_lookup_hangs {
+            std::future::pending::<()>().await;
+        }
+        #[cfg(test)]
+        if let Some(orders) = self.stub_orders.clone() {
+            return Ok(orders);
+        }
+        let client = self
+            .get_query_client()
+            .await
+            .map_err(|e| format!("Failed to create query client: {e}"))?;
+        client
+            .get_active_orders(market_id)
+            .await
+            .map_err(|e| format!("Failed to fetch orders: {e}"))
     }
 
     /// Verify an RFQ proposal against agent's own in-memory state.
@@ -2058,8 +2356,13 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     // Step handlers
     // ========================================================================
 
-    /// Reject a proposal (send preconfirmation with accept=false) and remove it
+    /// Reject a proposal (send preconfirmation with accept=false) and remove it.
+    /// New proposals are never made active before this, so a dropped reject leaves nothing to accept.
     async fn reject_proposal(&mut self, proposal_id: &str) -> Result<()> {
+        #[cfg(test)]
+        if self.reject_black_hole {
+            std::future::pending::<()>().await;
+        }
         let jwt = self.create_jwt()?;
         let mut rpc_client = OrderbookRpcClient::connect(&self.config.orderbook_grpc_url, Some(jwt)).await?;
         rpc_client.submit_preconfirmation(
@@ -2249,15 +2552,36 @@ fn reservation_inputs(
         _ => my_instrument.clone(),
     };
 
-    let my_fees_usd = if is_buyer {
-        Decimal::from_str(&proposal.dvp_processing_fee_buyer).unwrap_or_default()
-            + Decimal::from_str(&proposal.allocation_processing_fee_buyer).unwrap_or_default()
+    let (dvp_fee, allocation_fee) = if is_buyer {
+        (&proposal.dvp_processing_fee_buyer, &proposal.allocation_processing_fee_buyer)
     } else {
-        Decimal::from_str(&proposal.dvp_processing_fee_seller).unwrap_or_default()
-            + Decimal::from_str(&proposal.allocation_processing_fee_seller).unwrap_or_default()
+        (&proposal.dvp_processing_fee_seller, &proposal.allocation_processing_fee_seller)
     };
+    // An overflowing sum reads as unaffordable
+    let my_fees_usd = Decimal::from_str(dvp_fee)
+        .unwrap_or_default()
+        .checked_add(Decimal::from_str(allocation_fee).unwrap_or_default())
+        .unwrap_or(Decimal::MAX);
 
     (allocation_token, allocation_amount, my_fees_usd)
+}
+
+/// Largest amount a proposal may carry in any quantity or fee field.
+const MAX_PROPOSAL_AMOUNT: u64 = 1_000_000_000_000_000_000;
+
+/// First quantity or fee that parses but is negative or above [`MAX_PROPOSAL_AMOUNT`].
+fn implausible_amount(proposal: &SettlementProposal) -> Option<(&'static str, &str)> {
+    let max = Decimal::from(MAX_PROPOSAL_AMOUNT);
+    [
+        ("base_quantity", proposal.base_quantity.as_str()),
+        ("quote_quantity", proposal.quote_quantity.as_str()),
+        ("dvp_processing_fee_buyer", proposal.dvp_processing_fee_buyer.as_str()),
+        ("dvp_processing_fee_seller", proposal.dvp_processing_fee_seller.as_str()),
+        ("allocation_processing_fee_buyer", proposal.allocation_processing_fee_buyer.as_str()),
+        ("allocation_processing_fee_seller", proposal.allocation_processing_fee_seller.as_str()),
+    ]
+    .into_iter()
+    .find(|(_, raw)| Decimal::from_str(raw).is_ok_and(|v| v < Decimal::ZERO || v > max))
 }
 
 /// Reserve the resources for a settlement whose counterparty has committed
@@ -2296,15 +2620,16 @@ async fn ensure_reserved(
     // cleanly. Skipped when a commitment already exists (its own commitment
     // counts against availability, so a bare re-commit would spuriously fail;
     // and this is the restart lazy-recommit path). Idempotent.
-    if let Some(lm) = liquidity_manager {
+    if let (Some(lm), Some((allocation_token, allocation_amount, my_fees_usd))) =
+        (liquidity_manager, inputs.as_ref())
+    {
         if !lm.has_commitment(proposal_id).await {
-            let (allocation_token, allocation_amount, my_fees_usd) = inputs.as_ref().unwrap();
             let fee_cc = lm.estimate_fee_cc(*my_fees_usd).await;
             lm.try_commit(proposal_id, allocation_token, *allocation_amount, fee_cc)
                 .await?;
             info!(
                 "[{}] Reserved {} {} + {:.4} CC fees (counterparty committed)",
-                proposal_id, allocation_amount, allocation_token, fee_cc
+                proposal_id, allocation_amount, allocation_token, liquidity::shown(fee_cc)
             );
         }
     }
@@ -2374,7 +2699,7 @@ fn deadline_expiry_error(
     if my_action == NextAction::None {
         return None;
     }
-    let age = now_secs - created_at_secs;
+    let age = age_secs(now_secs, created_at_secs);
     if age > settle_before_secs as i64 {
         return Some(format!(
             "Settlement expired: deadline-exceeded (created {}s ago, max {}s)",
@@ -2475,10 +2800,7 @@ async fn advance_single<B: SettlementBackend>(
     // removes the entry. `None` is excluded so an already-terminal proposal is
     // handled by the terminal arm below instead of being marked failed.
     if let Some(created_at) = &state.proposal.created_at {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = unix_now_secs();
         let (allocate_window, settle_window) = expiry_windows(
             &state.proposal.origin,
             config.allocate_before_secs,
@@ -3095,8 +3417,8 @@ mod tests {
         }
 
         // Third proposal from cp-x: hits the cap → refused. (reject_proposal's
-        // RPC fails in tests — empty URL — so the entry is removed instead of
-        // landing in rejected_proposals; either way it is NOT adopted.)
+        // RPC fails in tests — empty URL — so it never lands in
+        // rejected_proposals; either way it is NOT adopted.)
         let mut p3 = test_proposal("p3");
         p3.buyer = "cp-x".to_string();
         p3.seller = "test-party".to_string();
@@ -3447,5 +3769,924 @@ mod tests {
         assert_eq!(in_progress, 1);
         assert_eq!(in_backoff, 0); // a1 excluded (in-progress); ghost excluded (not active)
         assert_eq!(waiting, 1);    // a2 is genuinely runnable — must not be hidden
+    }
+
+    fn status_update(pid: &str) -> SettlementUpdate {
+        SettlementUpdate {
+            event_type: EventType::StatusChanged as i32,
+            proposal: Some(test_proposal(pid)),
+            ..Default::default()
+        }
+    }
+
+    fn executor_with_active(threads: usize, pids: &[&str]) -> SettlementExecutor<MockBackend> {
+        let mut config = BaseConfig::test_minimal();
+        config.settlement_thread_count = threads;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        for pid in pids {
+            exec.active_settlements
+                .insert(pid.to_string(), SettlementState::new(test_proposal(pid), false));
+        }
+        exec
+    }
+
+    const LONG: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn test_stream_batch_advances_each_proposal_once() {
+        let mut exec = executor_with_active(8, &["p1", "p2"]);
+        let mut backlog: VecDeque<SettlementUpdate> =
+            ["p1", "p1", "p2", "p1"].into_iter().map(status_update).collect();
+
+        let outcome = exec.apply_stream_batch(&mut backlog, LONG, LONG).await;
+
+        assert!(backlog.is_empty());
+        assert_eq!(
+            outcome,
+            StreamBatchOutcome { handled: 4, touched: 2, spawned: 2, affects_grid: false }
+        );
+        // One task per proposal, each started after the whole batch was handled
+        let spawns = |id: &str| exec.pending_results.iter().filter(|(pid, _)| pid == id).count();
+        assert_eq!((spawns("p1"), spawns("p2")), (1, 1));
+        assert_eq!(exec.pending_results.len(), 2);
+        assert!(exec.rearm_on_result.is_empty(), "no update was handled while its task ran");
+        assert!(exec.in_progress.contains_key("p1"));
+        assert!(exec.in_progress.contains_key("p2"));
+    }
+
+    // A stuck update is cut off at `per_update`; the rest of the batch still runs
+    #[tokio::test]
+    async fn test_stream_batch_times_out_a_stuck_update() {
+        let mut exec = executor_with_active(8, &["p1", "p2"]);
+        let cancelled = SettlementUpdate {
+            event_type: EventType::Cancelled as i32,
+            proposal: Some(test_proposal("p1")),
+            ..Default::default()
+        };
+        let mut backlog = VecDeque::from([cancelled, status_update("p2")]);
+
+        // A terminal event needs the tracker lock, held here for the whole batch
+        let tracker = Arc::clone(&exec.tracker);
+        let held = tracker.lock().await;
+        let batch = exec.apply_stream_batch(&mut backlog, Duration::from_millis(100), LONG);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), batch)
+            .await
+            .expect("each update is bounded");
+        drop(held);
+
+        assert!(backlog.is_empty());
+        assert_eq!(
+            outcome,
+            StreamBatchOutcome { handled: 2, touched: 1, spawned: 1, affects_grid: true }
+        );
+        // The cut-off handler removed nothing and its proposal was not advanced
+        assert!(exec.active_settlements.contains_key("p1"));
+        assert!(!exec.rejected_proposals.contains("p1"));
+        assert!(!exec.in_progress.contains_key("p1"));
+        assert!(exec.in_progress.contains_key("p2"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_batch_respects_budget() {
+        let mut exec = executor_with_active(8, &["p1", "p2", "p3"]);
+        let mut backlog: VecDeque<SettlementUpdate> =
+            ["p1", "p2", "p3"].into_iter().map(status_update).collect();
+
+        // An exhausted budget still handles one update; the rest stay queued in order
+        let outcome = exec.apply_stream_batch(&mut backlog, LONG, Duration::ZERO).await;
+        assert_eq!(outcome.handled, 1);
+        assert_eq!(outcome.spawned, 1);
+        let queued: Vec<String> = backlog
+            .iter()
+            .filter_map(|u| u.proposal.as_ref().map(|p| p.proposal_id.clone()))
+            .collect();
+        assert_eq!(queued, ["p2", "p3"]);
+
+        let outcome = exec.apply_stream_batch(&mut backlog, LONG, LONG).await;
+        assert_eq!(outcome.handled, 2);
+        assert!(backlog.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stream_batch_defers_to_needs_readvance_without_permit() {
+        let mut exec = executor_with_active(1, &["p1", "p2"]);
+        // p2 sits in a long backoff; the stream event must clear it
+        exec.failed_settlements.insert("p2".to_string(), FailedSettlement {
+            retry_count: 0, wait_count: 3, next_retry: Instant::now() + Duration::from_secs(300),
+            first_transient_at: None, cid_waiting: None,
+        });
+        let mut backlog: VecDeque<SettlementUpdate> =
+            ["p1", "p2"].into_iter().map(status_update).collect();
+
+        let outcome = exec.apply_stream_batch(&mut backlog, LONG, LONG).await;
+
+        assert_eq!(outcome.touched, 2);
+        assert_eq!(outcome.spawned, 1);
+        assert!(exec.in_progress.contains_key("p1"));
+        assert!(!exec.needs_readvance.contains("p1"));
+        // No free permit: deferred, not dropped, and its backoff is cleared
+        assert!(!exec.in_progress.contains_key("p2"));
+        assert!(exec.needs_readvance.contains("p2"));
+        assert!(!exec.failed_settlements.contains_key("p2"));
+    }
+
+    #[tokio::test]
+    async fn test_affects_grid_by_event() {
+        use orderbook_proto::orderbook::OrderMatch;
+        let event = |event_type: EventType, proposal: SettlementProposal| SettlementUpdate {
+            event_type: event_type as i32,
+            proposal: Some(proposal),
+            ..Default::default()
+        };
+        let mut matched = test_proposal("p1");
+        matched.order_match = Some(OrderMatch::default());
+
+        for terminal in [EventType::Settled, EventType::Failed, EventType::Cancelled] {
+            assert!(affects_grid(&event(terminal, test_proposal("p1"))), "{terminal:?}");
+        }
+        assert!(affects_grid(&event(EventType::ProposalCreated, matched)));
+        // RFQ proposals carry no order match and never touch the grid
+        assert!(!affects_grid(&event(EventType::ProposalCreated, test_proposal("p1"))));
+        assert!(!affects_grid(&event(EventType::StatusChanged, test_proposal("p1"))));
+        assert!(!affects_grid(&event(EventType::Unspecified, test_proposal("p1"))));
+
+        // The batch outcome carries the flag for a terminal event
+        let mut exec = executor_with_active(8, &["p1", "p2"]);
+        let mut backlog = VecDeque::from([
+            status_update("p2"),
+            event(EventType::Cancelled, test_proposal("p1")),
+        ]);
+        let outcome = exec.apply_stream_batch(&mut backlog, LONG, LONG).await;
+        assert!(outcome.affects_grid);
+        assert_eq!(outcome.touched, 2);
+        assert_eq!(outcome.spawned, 1); // p1 is terminal and no longer active
+        assert!(!exec.active_settlements.contains_key("p1"));
+    }
+
+    #[tokio::test]
+    async fn test_placement_in_flight_proposal_held_then_adopted() {
+        use orderbook_proto::orderbook::{OrderMatch, OrderType};
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+
+        let mut proposal = test_proposal("p-grid");
+        proposal.market_id = "USDCx-CCY".to_string();
+        proposal.seller = "test-party".to_string();
+        proposal.buyer = "cp-x".to_string();
+        proposal.order_match = Some(OrderMatch {
+            settlement_proposal_id: "p-grid".to_string(),
+            bid_order_id: 7,
+            offer_order_id: 42,
+            matched_quantity: "1000".to_string(),
+            matched_price: "0.5".to_string(),
+            created_at: None,
+        });
+
+        // Order 42 matched before the placing task tracked it
+        let placement = tracker.lock().await.begin_placement("USDCx-CCY");
+        exec.handle_settlement_update(created_update(proposal.clone())).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p-grid"));
+        assert!(!exec.rejected_proposals.contains("p-grid"));
+        assert!(!exec.tracker.lock().await.has_settlement_order("p-grid"));
+        assert_eq!(exec.server_lookups, 0, "held without a server lookup");
+        assert_eq!(exec.held_count(), 0, "no poll backoff while placement is in flight");
+
+        // The guard covers its own market only; elsewhere the order is looked up
+        let mut elsewhere = proposal.clone();
+        elsewhere.proposal_id = "p-other".to_string();
+        elsewhere.market_id = "OTHER-CCY".to_string();
+        exec.handle_settlement_update(created_update(elsewhere)).await.unwrap();
+        assert_eq!(exec.server_lookups, 1);
+
+        // Placement completes: tracked, then the guard is released under the same lock
+        {
+            let mut t = tracker.lock().await;
+            let (signature, signed_data, nonce) =
+                t.sign_order("USDCx-CCY", "offer", "0.5", "1000").unwrap();
+            t.track_order(42, "USDCx-CCY", OrderType::Offer as i32, "0.5", "1000", nonce, &signature, &signed_data);
+            drop(placement);
+        }
+
+        // The next poll re-feeds the held proposal, which now adopts
+        exec.handle_settlement_update(created_update(proposal)).await.unwrap();
+        assert!(exec.active_settlements.contains_key("p-grid"));
+        assert!(exec.tracker.lock().await.has_settlement_order("p-grid"));
+        assert!(!exec.rejected_proposals.contains("p-grid"));
+        assert_eq!(exec.server_lookups, 1, "adopted from the tracker, not the server");
+    }
+
+    // A user-order reject cut off mid-flight leaves nothing a later advance could accept
+    #[tokio::test]
+    async fn test_dropped_user_order_reject_leaves_nothing_active() {
+        use orderbook_proto::orderbook::OrderMatch;
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        // The server answers without the order: a definitive verdict
+        exec.stub_orders = Some(Vec::new());
+        exec.reject_black_hole = true;
+
+        let mut proposal = our_sale("p-user");
+        proposal.market_id = "USDCx-CCY".to_string();
+        proposal.order_match = Some(OrderMatch {
+            settlement_proposal_id: "p-user".to_string(),
+            bid_order_id: 7,
+            offer_order_id: 42,
+            matched_quantity: "1000".to_string(),
+            matched_price: "0.5".to_string(),
+            created_at: None,
+        });
+        let handled =
+            tokio::time::timeout(Duration::from_millis(200), exec.handle_settlement_update(created_update(proposal)))
+                .await;
+        assert!(handled.is_err(), "the reject was still in flight when dropped");
+        assert_eq!(exec.server_lookups, 1);
+        assert!(!exec.active_settlements.contains_key("p-user"), "left active");
+        assert!(!exec.rejected_proposals.contains("p-user"), "a later delivery retries it");
+    }
+
+    #[tokio::test]
+    async fn test_collect_results_keeps_cid_found_during_task() {
+        let (mut exec, _lm) = committed_executor().await;
+        {
+            // Sync found these while the task was in flight
+            let state = exec.active_settlements.get_mut("p1").unwrap();
+            state.dvp_cid = Some("dvp-sync".to_string());
+            state.dvp_proposal_cid = Some("proposal-sync".to_string());
+        }
+        // The task ran from an older snapshot and found its own CIDs
+        let mut task_state = SettlementState::new(test_proposal("p1"), false);
+        task_state.dvp_proposal_cid = Some("proposal-task".to_string());
+        task_state.allocation_cid = Some("alloc-task".to_string());
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
+        assert!(tx
+            .send((AdvanceResult::Wait { proposal_id: "p1".to_string() }, task_state))
+            .is_ok());
+        exec.in_progress.insert("p1".to_string(), Instant::now());
+        exec.pending_results.push(("p1".to_string(), rx));
+
+        exec.collect_results().await;
+
+        let state = exec.active_settlements.get("p1").unwrap();
+        assert_eq!(state.dvp_cid.as_deref(), Some("dvp-sync"));
+        assert_eq!(state.dvp_proposal_cid.as_deref(), Some("proposal-task"));
+        assert_eq!(state.allocation_cid.as_deref(), Some("alloc-task"));
+        assert!(!exec.in_progress.contains_key("p1"));
+    }
+
+    /// Marks `pid` as running with a result channel that has not been sent yet.
+    fn park_in_flight(
+        exec: &mut SettlementExecutor<MockBackend>,
+        pid: &str,
+    ) -> tokio::sync::oneshot::Sender<(AdvanceResult, SettlementState)> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
+        exec.in_progress.insert(pid.to_string(), Instant::now());
+        exec.pending_results.push((pid.to_string(), rx));
+        tx
+    }
+
+    fn send_result(tx: tokio::sync::oneshot::Sender<(AdvanceResult, SettlementState)>, result: AdvanceResult) {
+        let pid = result.proposal_id().to_string();
+        assert!(tx.send((result, SettlementState::new(test_proposal(&pid), false))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stream_touch_during_task_rearms_after_wait() {
+        let mut exec = executor_with_active(8, &["p1"]);
+        let tx = park_in_flight(&mut exec, "p1");
+
+        let mut backlog = VecDeque::from([status_update("p1")]);
+        let outcome = exec.apply_stream_batch(&mut backlog, LONG, LONG).await;
+        assert_eq!(outcome.touched, 1);
+        assert_eq!(outcome.spawned, 0);
+        assert!(exec.rearm_on_result.contains("p1"));
+
+        // The task finishes with a Wait from older state; the touch undoes its cooldown
+        send_result(tx, AdvanceResult::Wait { proposal_id: "p1".to_string() });
+        let ids = exec.collect_results().await;
+        assert!(ids.iter().any(|id| id == "p1"));
+        assert!(!exec.failed_settlements.contains_key("p1"));
+        assert!(exec.rearm_on_result.is_empty());
+
+        // Control: an untouched Wait keeps its cooldown
+        let tx = park_in_flight(&mut exec, "p1");
+        send_result(tx, AdvanceResult::Wait { proposal_id: "p1".to_string() });
+        let ids = exec.collect_results().await;
+        assert!(!ids.iter().any(|id| id == "p1"));
+        assert!(exec.failed_settlements.contains_key("p1"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_touch_during_task_keeps_error_backoff() {
+        let mut exec = executor_with_active(8, &["p1"]);
+        let tx = park_in_flight(&mut exec, "p1");
+
+        let touched: IndexSet<String> = ["p1".to_string()].into_iter().collect();
+        assert_eq!(exec.advance_proposals(touched).await, 0);
+        assert!(exec.rearm_on_result.contains("p1"));
+
+        let error = AdvanceResult::Error { proposal_id: "p1".to_string(), error: "boom".to_string() };
+        send_result(tx, error);
+        let ids = exec.collect_results().await;
+        assert!(!ids.iter().any(|id| id == "p1"));
+        assert!(exec.failed_settlements.get("p1").is_some_and(|f| f.retry_count == 1));
+        assert!(exec.rearm_on_result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stream_terminal_clears_rearm() {
+        let mut exec = executor_with_active(8, &["p1"]);
+        let _tx = park_in_flight(&mut exec, "p1");
+        exec.rearm_on_result.insert("p1".to_string());
+
+        exec.handle_settlement_update(SettlementUpdate {
+            event_type: EventType::Cancelled as i32,
+            proposal: Some(test_proposal("p1")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(exec.rearm_on_result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_advance_all_prioritises_collected_readvance() {
+        // A UUIDv7-shaped id sorts newest in the tail; "p1" (ms 0) sorts oldest
+        let newer = "ffffffff-ffff-7fff-8fff-ffffffffffff";
+        let mut exec = executor_with_active(1, &["p1", newer]);
+        let tx = park_in_flight(&mut exec, "p1");
+        let step = AdvanceResult::Preconfirmed { proposal_id: "p1".to_string() };
+        assert!(step.should_readvance());
+        send_result(tx, step);
+
+        exec.advance_all_settlements().await;
+
+        // The collected readvance id takes the only permit ahead of the newer tail entry
+        assert!(exec.in_progress.contains_key("p1"));
+        assert!(!exec.in_progress.contains_key(newer));
+    }
+
+    #[tokio::test]
+    async fn test_advance_proposals_defers_past_spawn_cap() {
+        let ids: Vec<String> =
+            (0..MAX_ADVANCE_SPAWNS_PER_CYCLE + 2).map(|i| format!("p{i}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut exec = executor_with_active(64, &refs);
+
+        let spawned = exec.advance_proposals(ids.iter().cloned().collect()).await;
+
+        assert_eq!(spawned, MAX_ADVANCE_SPAWNS_PER_CYCLE);
+        for id in ids.iter().skip(MAX_ADVANCE_SPAWNS_PER_CYCLE) {
+            assert!(exec.needs_readvance.contains(id));
+            assert!(!exec.in_progress.contains_key(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_age_saturates_on_extreme_created_at() {
+        assert_eq!(age_secs(0, i64::MIN), i64::MAX);
+        assert_eq!(age_secs(i64::MIN, i64::MAX), i64::MIN);
+
+        let (mut exec, _lm) = committed_executor().await;
+        exec.active_settlements.get_mut("p1").unwrap().proposal.created_at =
+            Some(prost_types::Timestamp { seconds: i64::MIN, nanos: 0 });
+        assert!(exec.past_deadline("p1"));
+        exec.active_settlements.get_mut("p1").unwrap().proposal.created_at =
+            Some(prost_types::Timestamp { seconds: i64::MAX, nanos: 0 });
+        assert!(!exec.past_deadline("p1"));
+
+        assert!(deadline_expiry_error(i64::MIN, 0, NextAction::Wait, 900, 1800).is_some());
+        assert!(deadline_expiry_error(i64::MAX, i64::MIN, NextAction::Allocate, 900, 1800).is_none());
+
+        // A restored proposal with such a timestamp is abandoned, not re-adopted
+        exec.tracker.lock().await.record_settlement_order("p9", 0, Decimal::from(1000));
+        let mut p9 = test_proposal("p9");
+        p9.seller = "test-party".to_string();
+        p9.created_at = Some(prost_types::Timestamp { seconds: i64::MIN, nanos: 0 });
+        exec.handle_settlement_update(created_update(p9)).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p9"));
+        assert!(exec.rejected_proposals.contains("p9"));
+    }
+
+    #[tokio::test]
+    async fn test_collect_results_retries_cid_error_once_sync_found_it() {
+        let (mut exec, _lm) = committed_executor().await;
+        // Sync found the Dvp while the task ran from a snapshot without it
+        exec.active_settlements.get_mut("p1").unwrap().dvp_cid = Some("dvp-sync".to_string());
+        let tx = park_in_flight(&mut exec, "p1");
+        let error = "No Dvp contract ID found (not yet accepted?)".to_string();
+        send_result(tx, AdvanceResult::Error { proposal_id: "p1".to_string(), error });
+
+        let ids = exec.collect_results().await;
+
+        assert!(ids.iter().any(|id| id == "p1"), "re-advanced at once");
+        assert!(!exec.failed_settlements.contains_key("p1"), "no CID backoff left");
+        assert_eq!(exec.active_settlements.get("p1").unwrap().dvp_cid.as_deref(), Some("dvp-sync"));
+
+        // Control: an error for a CID still unknown keeps its backoff
+        let tx = park_in_flight(&mut exec, "p1");
+        let error = "No DvpProposal CID found (not yet proposed?)".to_string();
+        send_result(tx, AdvanceResult::Error { proposal_id: "p1".to_string(), error });
+        let ids = exec.collect_results().await;
+        assert!(!ids.iter().any(|id| id == "p1"));
+        assert!(exec.failed_settlements.get("p1").is_some_and(|f| f.cid_waiting.is_some()));
+    }
+
+    fn our_sale(id: &str) -> SettlementProposal {
+        let mut p = test_proposal(id);
+        p.seller = "test-party".to_string();
+        p.buyer = "cp-x".to_string();
+        p
+    }
+
+    fn hold_delay(exec: &SettlementExecutor<MockBackend>, id: &str) -> Option<Duration> {
+        exec.held_until.get(id).map(|(_, delay)| *delay)
+    }
+
+    fn expire_hold(exec: &mut SettlementExecutor<MockBackend>, id: &str) {
+        let entry = exec.held_until.get_mut(id).unwrap();
+        entry.0 = Instant::now();
+    }
+
+    #[tokio::test]
+    async fn test_held_proposal_backs_off_poll_refeeds() {
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        // No balances yet: every proposal is held
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        exec.set_liquidity_manager(lm.clone());
+
+        exec.feed_polled_proposals(vec![our_sale("p1")]).await;
+        assert_eq!(hold_delay(&exec, "p1"), Some(HOLD_INITIAL));
+        assert_eq!(exec.held_count(), 1);
+
+        // Still held: the poll skips it, so the hold is not re-armed
+        exec.feed_polled_proposals(vec![our_sale("p1")]).await;
+        assert_eq!(hold_delay(&exec, "p1"), Some(HOLD_INITIAL));
+
+        // Each expired hold is re-verified and doubles, up to the cap
+        for secs in [60, 120, 240, 300, 300] {
+            expire_hold(&mut exec, "p1");
+            exec.feed_polled_proposals(vec![our_sale("p1")]).await;
+            assert_eq!(hold_delay(&exec, "p1"), Some(Duration::from_secs(secs)));
+        }
+
+        // The server no longer returns it: the hold is dropped
+        exec.feed_polled_proposals(Vec::new()).await;
+        assert_eq!(exec.held_count(), 0);
+
+        // A terminal stream event ends a hold
+        exec.feed_polled_proposals(vec![our_sale("p2")]).await;
+        assert_eq!(exec.held_count(), 1);
+        exec.handle_settlement_update(SettlementUpdate {
+            event_type: EventType::Cancelled as i32,
+            proposal: Some(our_sale("p2")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(exec.held_count(), 0);
+        exec.feed_polled_proposals(vec![our_sale("p4")]).await;
+        assert_eq!(exec.held_count(), 1);
+        exec.handle_settlement_update(SettlementUpdate {
+            event_type: EventType::Settled as i32,
+            proposal: Some(our_sale("p4")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(exec.held_count(), 0);
+
+        // A reject ends a hold
+        exec.feed_polled_proposals(vec![our_sale("p3")]).await;
+        assert_eq!(exec.held_count(), 1);
+        exec.config.max_pending_per_counterparty = 0;
+        expire_hold(&mut exec, "p3");
+        exec.feed_polled_proposals(vec![our_sale("p3")]).await;
+        assert_eq!(exec.held_count(), 0);
+        exec.config.max_pending_per_counterparty = 1000;
+
+        // Balances load: the next re-feed adopts and ends the hold
+        exec.feed_polled_proposals(vec![our_sale("p1")]).await;
+        assert_eq!(hold_delay(&exec, "p1"), Some(HOLD_INITIAL));
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        exec.set_quoted_rfq_trades(Arc::new(Mutex::new(vec![QuotedTrade {
+            market_id: String::new(),
+            price: String::new(),
+            base_quantity: "1000".to_string(),
+            quote_quantity: "500".to_string(),
+        }])));
+
+        // Loaded but stale balances hold it as well
+        lm.set_stale_after(Duration::ZERO);
+        expire_hold(&mut exec, "p1");
+        exec.feed_polled_proposals(vec![our_sale("p1")]).await;
+        assert_eq!(hold_delay(&exec, "p1"), Some(HOLD_INITIAL * 2));
+        lm.set_stale_after(Duration::from_secs(120));
+
+        expire_hold(&mut exec, "p1");
+        exec.feed_polled_proposals(vec![our_sale("p1")]).await;
+        assert!(exec.active_settlements.contains_key("p1"));
+        assert_eq!(exec.held_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_user_order_lookup_is_held_with_backoff() {
+        use orderbook_proto::orderbook::OrderMatch;
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let mut proposal = our_sale("p-user");
+        proposal.market_id = "USDCx-CCY".to_string();
+        proposal.order_match = Some(OrderMatch {
+            settlement_proposal_id: "p-user".to_string(),
+            bid_order_id: 7,
+            offer_order_id: 42,
+            matched_quantity: "1000".to_string(),
+            matched_price: "0.5".to_string(),
+            created_at: None,
+        });
+
+        // Order 42 is not tracked and the server lookup cannot run: held, not rejected
+        exec.feed_polled_proposals(vec![proposal.clone()]).await;
+        assert!(!exec.active_settlements.contains_key("p-user"));
+        assert!(!exec.rejected_proposals.contains("p-user"));
+        assert_eq!(hold_delay(&exec, "p-user"), Some(HOLD_INITIAL));
+
+        exec.feed_polled_proposals(vec![proposal.clone()]).await;
+        assert_eq!(hold_delay(&exec, "p-user"), Some(HOLD_INITIAL), "skipped while held");
+        expire_hold(&mut exec, "p-user");
+        exec.feed_polled_proposals(vec![proposal]).await;
+        assert_eq!(hold_delay(&exec, "p-user"), Some(HOLD_INITIAL * 2));
+    }
+
+    // A handler dropped during the lookup (a caller's timeout) keeps the proposal held
+    #[tokio::test]
+    async fn test_hold_survives_a_lookup_cut_short_by_a_timeout() {
+        use orderbook_proto::orderbook::OrderMatch;
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let mut proposal = our_sale("p-user");
+        proposal.market_id = "USDCx-CCY".to_string();
+        proposal.order_match = Some(OrderMatch {
+            settlement_proposal_id: "p-user".to_string(),
+            bid_order_id: 7,
+            offer_order_id: 42,
+            matched_quantity: "1000".to_string(),
+            matched_price: "0.5".to_string(),
+            created_at: None,
+        });
+
+        exec.feed_polled_proposals(vec![proposal.clone()]).await;
+        assert_eq!(hold_delay(&exec, "p-user"), Some(HOLD_INITIAL));
+
+        expire_hold(&mut exec, "p-user");
+        exec.stub_lookup_hangs = true;
+        let fed = tokio::time::timeout(Duration::from_millis(50), exec.feed_polled_proposals(vec![proposal])).await;
+        assert!(fed.is_err(), "the lookup should still be pending");
+        assert_eq!(hold_delay(&exec, "p-user"), Some(HOLD_INITIAL * 2));
+        assert!(!exec.active_settlements.contains_key("p-user"));
+        assert!(!exec.rejected_proposals.contains("p-user"));
+    }
+
+    // A submit that errored may still book the order; its match is adopted, not rejected
+    #[tokio::test]
+    async fn test_order_booked_by_a_failed_submit_is_adopted() {
+        use orderbook_proto::orderbook::{Order, OrderMatch, OrderStatus, OrderType};
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+
+        // The submit fails at the transport, so the order id never comes back
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut grid_config = BaseConfig::test_minimal();
+        grid_config.orderbook_grpc_url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let client = OrderbookClient::lazy_for_tests(&grid_config).unwrap();
+        let mut om = crate::order_manager::OrderManager::new(grid_config, client, tracker.clone());
+        assert!(om.place_offer("USDCx-CCY", "0.5", "1000", None).await.is_err());
+        let submit = tracker.lock().await.failed_submits().pop().unwrap();
+
+        // Yet the server booked it as order 42, with all of it matched and pending
+        exec.stub_orders = Some(vec![Order {
+            order_id: 42,
+            market_id: "USDCx-CCY".to_string(),
+            order_type: OrderType::Offer as i32,
+            price: "0.5".to_string(),
+            quantity: "1000".to_string(),
+            filled_quantity: "0".to_string(),
+            pending_quantity: "1000".to_string(),
+            status: OrderStatus::Partial as i32,
+            nonce: submit.nonce,
+            signature: Some(submit.signature.clone()),
+            signed_data: submit.signed_data.clone(),
+            ..Default::default()
+        }]);
+        let mut proposal = our_sale("p-booked");
+        proposal.market_id = "USDCx-CCY".to_string();
+        proposal.order_match = Some(OrderMatch {
+            settlement_proposal_id: "p-booked".to_string(),
+            bid_order_id: 7,
+            offer_order_id: 42,
+            matched_quantity: "1000".to_string(),
+            matched_price: "0.5".to_string(),
+            created_at: None,
+        });
+
+        // Held while the failure is fresh
+        exec.handle_settlement_update(created_update(proposal.clone())).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p-booked"));
+        assert_eq!(exec.server_lookups, 0);
+
+        // Past the hold the lookup finds our own order and adopts it once
+        tracker.lock().await.expire_submit_holds();
+        exec.handle_settlement_update(created_update(proposal)).await.unwrap();
+        assert_eq!(exec.server_lookups, 1);
+        assert!(exec.active_settlements.contains_key("p-booked"));
+        assert_eq!(exec.held_count(), 0, "a lookup adoption ends the hold");
+        assert!(tracker.lock().await.has_settlement_order("p-booked"));
+        assert!(tracker.lock().await.failed_submits().is_empty());
+    }
+
+    // The grid lists a booked failed submit before it can cancel it; its match is accepted after the hold
+    #[tokio::test]
+    async fn test_failed_submit_listed_by_the_grid_is_adopted_before_its_cancel() {
+        use crate::config::{MarketConfig, PriceLevel};
+        use orderbook_proto::ledger::TokenBalance;
+        use orderbook_proto::orderbook::{Order, OrderMatch, OrderStatus, OrderType};
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut grid_config = BaseConfig::test_minimal();
+        grid_config.orderbook_grpc_url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let level = |delta_percent: f64| PriceLevel { delta_percent, quantity: "1000".to_string() };
+        grid_config.markets = vec![MarketConfig {
+            market_id: "USDCx-CCY".to_string(),
+            enabled: true,
+            base_order_size: None,
+            bid_levels: vec![level(-1.0), level(-2.0)],
+            offer_levels: vec![level(1.0), level(2.0)],
+            price_change_threshold_percent: 1.0,
+            rfq: None,
+        }];
+        let client = OrderbookClient::lazy_for_tests(&grid_config).unwrap();
+        let mut om = crate::order_manager::OrderManager::new(grid_config, client, tracker.clone());
+        assert!(om.place_offer("USDCx-CCY", "0.5", "1000", None).await.is_err());
+        let submit = tracker.lock().await.failed_submits().pop().unwrap();
+        let booked = Order {
+            order_id: 42,
+            market_id: "USDCx-CCY".to_string(),
+            order_type: OrderType::Offer as i32,
+            price: "0.5".to_string(),
+            quantity: "1000".to_string(),
+            filled_quantity: "0".to_string(),
+            pending_quantity: "1000".to_string(),
+            status: OrderStatus::Partial as i32,
+            nonce: submit.nonce,
+            signature: Some(submit.signature.clone()),
+            signed_data: submit.signed_data.clone(),
+            ..Default::default()
+        };
+        let mut proposal = our_sale("p-booked");
+        proposal.market_id = "USDCx-CCY".to_string();
+        proposal.order_match = Some(OrderMatch {
+            settlement_proposal_id: "p-booked".to_string(),
+            bid_order_id: 7,
+            offer_order_id: 42,
+            matched_quantity: "1000".to_string(),
+            matched_price: "0.5".to_string(),
+            created_at: None,
+        });
+        exec.handle_settlement_update(created_update(proposal.clone())).await.unwrap();
+        assert!(!exec.active_settlements.contains_key("p-booked"));
+
+        // A grid visit lists order 42 and re-places the side, cancelling it
+        let balance = |id: &str, amount: &str, cc: bool| TokenBalance {
+            instrument_id: id.to_string(),
+            unlocked_amount: amount.to_string(),
+            is_canton_coin: cc,
+            ..Default::default()
+        };
+        om.set_balances(vec![balance("Amulet", "100", true), balance("USDCx", "10000", false), balance("CCY", "10000", false)]);
+        om.stub_book(0.5, vec![booked]);
+        let stop = Shutdown::new();
+        let report = om.update_cycle(&stop, Instant::now() + Duration::from_secs(30)).await.unwrap();
+        assert_eq!(report.refreshed, 1);
+        assert!(matches!(
+            tracker.lock().await.verify_settlement(&proposal, &config.party_id),
+            VerifyResult::Accepted { order_id: 42 }
+        ));
+
+        // Cancelled, the order is gone from the live listing; the tracked order is still accepted
+        exec.stub_orders = Some(Vec::new());
+        tracker.lock().await.expire_submit_holds();
+        exec.handle_settlement_update(created_update(proposal)).await.unwrap();
+        assert_eq!(exec.server_lookups, 0);
+        assert!(exec.active_settlements.contains_key("p-booked"));
+        assert!(!exec.rejected_proposals.contains("p-booked"));
+    }
+
+    // Amounts that would overflow the fee or capacity arithmetic are refused, never adopted
+    #[tokio::test]
+    async fn test_implausible_amounts_are_rejected_without_panic() {
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.15").unwrap()).await;
+        exec.set_liquidity_manager(lm);
+        let rejected = Arc::new(Mutex::new(HashSet::new()));
+        exec.set_rejected_rfq_trades(rejected.clone());
+
+        let mut fees = our_sale("p-fees");
+        fees.dvp_processing_fee_seller = Decimal::MAX.to_string();
+        fees.allocation_processing_fee_seller = Decimal::MAX.to_string();
+        assert_eq!(reservation_inputs(&fees, false, &None).2, Decimal::MAX);
+
+        // A negative CC sale that a quoted trade would otherwise adopt
+        let mut negative = our_sale("p-negative");
+        negative.base_instrument = liquidity::CC_TOKEN.to_string();
+        negative.base_quantity = "-5".to_string();
+        exec.set_quoted_rfq_trades(Arc::new(Mutex::new(vec![QuotedTrade {
+            market_id: String::new(),
+            price: String::new(),
+            base_quantity: "-5".to_string(),
+            quote_quantity: "500".to_string(),
+        }])));
+
+        for proposal in [fees, negative] {
+            let id = proposal.proposal_id.clone();
+            exec.handle_settlement_update(created_update(proposal)).await.unwrap();
+            assert!(!exec.active_settlements.contains_key(&id), "{id}");
+            assert!(!tracker.lock().await.has_settlement_order(&id), "{id}");
+            assert!(rejected.lock().await.contains(&id), "{id}");
+        }
+    }
+
+    // A restored proposal refused as implausible gives back what it reserved
+    #[tokio::test]
+    async fn test_implausible_restored_proposal_releases_its_reservation() {
+        use crate::state::{SavedSettlementOrder, SavedTrackedOrder};
+        use orderbook_proto::orderbook::OrderType;
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let lm = ready_lm().await;
+        exec.set_liquidity_manager(lm.clone());
+        tracker.lock().await.import_state(
+            vec![SavedTrackedOrder {
+                order_id: 42,
+                market_id: "USDCx-CCY".to_string(),
+                order_type: OrderType::Offer as i32,
+                price: "0.5".to_string(),
+                quantity: "5000".to_string(),
+                settled_quantity: "0".to_string(),
+                pending_quantity: "1500".to_string(),
+                nonce: 1,
+                signature: String::new(),
+                signed_data: String::new(),
+                placed_by: "test-party".to_string(),
+                is_active: true,
+            }],
+            vec![SavedSettlementOrder {
+                proposal_id: "p-restored".to_string(),
+                order_id: 42,
+                quantity: "1000".to_string(),
+                reserved: true,
+            }],
+        );
+        lm.try_commit("p-restored", "USDCx", Decimal::from(1000), Decimal::ZERO).await.unwrap();
+
+        let mut proposal = our_sale("p-restored");
+        proposal.dvp_processing_fee_seller = "-1".to_string();
+        exec.feed_polled_proposals(vec![proposal]).await;
+        drain_spawned().await;
+
+        assert!(!exec.active_settlements.contains_key("p-restored"));
+        let (_, orders, settlement_orders) = tracker.lock().await.export_state();
+        assert!(settlement_orders.is_empty());
+        assert_eq!(orders[0].pending_quantity, "500");
+        assert!(!lm.has_commitment("p-restored").await);
+    }
+
+    // A fee too large for fixed-precision formatting is logged capped
+    #[tokio::test]
+    async fn test_reserving_a_huge_fee_logs_without_panicking() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let config = BaseConfig::test_minimal();
+        let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::MAX).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.0000000001").unwrap()).await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        tracker.lock().await.record_settlement_order("p1", 0, Decimal::from(1000));
+        let mut proposal = test_proposal("p1");
+        proposal.dvp_processing_fee_seller = "100000000000000000".to_string();
+        let state = SettlementState::new(proposal, false);
+        assert!(lm.estimate_fee_cc(Decimal::from(100_000_000_000_000_000u64)).await >= Decimal::from_scientific("1e27").unwrap());
+
+        ensure_reserved(&state, &config, &Some(lm.clone()), &tracker, "p1").await.unwrap();
+        assert!(lm.has_commitment("p1").await);
+        assert_eq!(logs.count("18446744073709551615.0000 CC fees (counterparty committed)"), 1);
+    }
+
+    /// Counts on-chain syncs; every other method is unused.
+    struct SyncCounter(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl SettlementBackend for SyncCounter {
+        async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn accept_dvp(
+            &self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str,
+        ) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn queue_depth(&self) -> (u64, u64) {
+            (0, 0)
+        }
+    }
+
+    fn cid_wait(cid: CidWaitingType) -> FailedSettlement {
+        FailedSettlement {
+            retry_count: 0,
+            wait_count: 0,
+            next_retry: Instant::now() + Duration::from_secs(10),
+            first_transient_at: Some(Instant::now()),
+            cid_waiting: Some(cid),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_runs_only_while_a_cid_is_missing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = BaseConfig::test_minimal();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let mut exec = SettlementExecutor::new(&config, tracker, SyncCounter(Arc::clone(&calls)));
+        let syncs = || calls.load(Ordering::SeqCst);
+
+        // Allocated, or holding both CIDs: nothing left to discover
+        let mut allocated = SettlementState::new(test_proposal("p-alloc"), false);
+        allocated.stage = SettlementStage::Allocated;
+        exec.active_settlements.insert("p-alloc".to_string(), allocated);
+        let mut both = SettlementState::new(test_proposal("p-both"), true);
+        both.stage = SettlementStage::AllocationFeePaid;
+        both.dvp_proposal_cid = Some("proposal".to_string());
+        both.dvp_cid = Some("dvp".to_string());
+        exec.active_settlements.insert("p-both".to_string(), both);
+        exec.sync_on_chain_contracts().await;
+        assert_eq!(syncs(), 0);
+
+        // Restored past the accept: the Dvp is known and its proposal is gone
+        let mut restored = SettlementState::new(test_proposal("p-restored"), false);
+        restored.dvp_cid = Some("dvp".to_string());
+        exec.active_settlements.insert("p-restored".to_string(), restored);
+        exec.sync_on_chain_contracts().await;
+        assert_eq!(syncs(), 0);
+
+        // A pre-allocation settlement lacking a CID: at most once per interval
+        exec.active_settlements
+            .insert("p1".to_string(), SettlementState::new(test_proposal("p1"), false));
+        exec.sync_on_chain_contracts().await;
+        exec.sync_on_chain_contracts().await;
+        assert_eq!(syncs(), 1);
+        exec.last_sync = Instant::now().checked_sub(SYNC_MIN_INTERVAL);
+        exec.sync_on_chain_contracts().await;
+        assert_eq!(syncs(), 2);
+
+        // A CID-waiting entry for a proposal no longer active changes nothing
+        exec.failed_settlements.insert("ghost".to_string(), cid_wait(CidWaitingType::DvpContract));
+        exec.sync_on_chain_contracts().await;
+        assert_eq!(syncs(), 2);
+
+        // A proposal waiting for a CID syncs on every call
+        exec.failed_settlements.insert("p1".to_string(), cid_wait(CidWaitingType::DvpProposal));
+        exec.sync_on_chain_contracts().await;
+        exec.sync_on_chain_contracts().await;
+        assert_eq!(syncs(), 4);
     }
 }

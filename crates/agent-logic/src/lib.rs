@@ -16,6 +16,7 @@ pub mod config;
 pub mod error_reporter;
 pub mod fees;
 pub mod forecast;
+pub mod grid_task;
 pub mod ledger_health;
 pub mod liquidity;
 pub mod logging;
@@ -30,4 +31,6 @@ pub mod settlement;
 pub mod shutdown;
 pub mod sign;
 pub mod state;
+#[cfg(test)]
+mod test_logs;
 pub mod types;

@@ -1,10 +1,12 @@
 //! Trailing signed net flow per (counterparty, token) and per token, decayed
 //! over a window and checkpointed to JSON. Reads are pure; file IO is lock-free.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -104,6 +106,11 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Whole milliseconds of `d`, saturating at `i64::MAX`.
+fn millis_i64(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
 /// Whether a reversal may recreate an aggregate that is no longer present.
 /// The two callers need opposite answers.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -170,12 +177,12 @@ impl NetPositionTracker {
                     // Never prune an aggregate a still-restorable pending needs:
                     // the two clocks are independent. sweep_decayed evicts it.
                     let max_age_ms =
-                        ((window_hours * 3_600_000.0) as i64).max(stale_pending_after.as_millis() as i64);
-                    let mut inner = tracker.inner.lock().unwrap();
+                        ((window_hours * 3_600_000.0) as i64).max(millis_i64(stale_pending_after));
+                    let mut inner = tracker.inner.lock().unwrap_or_else(PoisonError::into_inner);
                     for e in saved.entries {
                         if e.net.is_finite()
                             && e.net.abs() > EPSILON_BASE
-                            && now - e.updated_at_ms <= max_age_ms
+                            && now.saturating_sub(e.updated_at_ms) <= max_age_ms
                         {
                             inner.nets.insert(
                                 (e.party, e.token),
@@ -186,7 +193,7 @@ impl NetPositionTracker {
                     for e in saved.desk {
                         if e.net.is_finite()
                             && e.net.abs() > EPSILON_BASE
-                            && now - e.updated_at_ms <= max_age_ms
+                            && now.saturating_sub(e.updated_at_ms) <= max_age_ms
                         {
                             inner.desk.insert(
                                 e.token,
@@ -207,7 +214,7 @@ impl NetPositionTracker {
                             delta: p.delta,
                             at_ms: p.at_ms,
                         };
-                        if now - p.at_ms > stale_pending_after.as_millis() as i64 {
+                        if now.saturating_sub(p.at_ms) > millis_i64(stale_pending_after) {
                             dead.push(pend);
                         } else {
                             inner.pending.insert(p.quote_id, pend);
@@ -239,7 +246,7 @@ impl NetPositionTracker {
 
     /// Decay factor from an entry's timestamp to `now`.
     fn decay(&self, from_ms: i64, to_ms: i64) -> f64 {
-        let dt_hours = ((to_ms - from_ms).max(0) as f64) / 3_600_000.0;
+        let dt_hours = (to_ms.saturating_sub(from_ms).max(0) as f64) / 3_600_000.0;
         (-dt_hours / self.window_hours).exp()
     }
 
@@ -254,14 +261,14 @@ impl NetPositionTracker {
     /// mutation, lock held only for the lookup.
     pub fn net(&self, party: &str, token: &str) -> f64 {
         let now = now_ms();
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         self.read_entry(inner.nets.get(&(party.to_string(), token.to_string())), now)
     }
 
     /// Current decayed desk-level signed net for a token (all counterparties).
     pub fn desk_net(&self, token: &str) -> f64 {
         let now = now_ms();
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         self.read_entry(inner.desk.get(token), now)
     }
 
@@ -275,7 +282,7 @@ impl NetPositionTracker {
     ) {
         let now = now_ms();
         let rebase = |e: &mut DecayedNet| {
-            let dt_hours = ((now - e.updated_at_ms).max(0) as f64) / 3_600_000.0;
+            let dt_hours = (now.saturating_sub(e.updated_at_ms).max(0) as f64) / 3_600_000.0;
             e.value = e.value * (-dt_hours / window_hours).exp() + delta;
             e.updated_at_ms = now;
         };
@@ -310,10 +317,10 @@ impl NetPositionTracker {
         let now = now_ms();
         // Undo the delta AS IT NOW STANDS — `delta · exp(−age/window)`. The raw
         // value over-reverses and drives the net negative out of nothing.
-        let age_hours = ((now - p.at_ms).max(0) as f64) / 3_600_000.0;
+        let age_hours = (now.saturating_sub(p.at_ms).max(0) as f64) / 3_600_000.0;
         let remaining = p.delta * (-age_hours / window_hours).exp();
         let rebase = |e: &mut DecayedNet| {
-            let dt_hours = ((now - e.updated_at_ms).max(0) as f64) / 3_600_000.0;
+            let dt_hours = (now.saturating_sub(e.updated_at_ms).max(0) as f64) / 3_600_000.0;
             e.value = e.value * (-dt_hours / window_hours).exp() - remaining;
             e.updated_at_ms = now;
         };
@@ -349,17 +356,17 @@ impl NetPositionTracker {
     /// Drop aggregates whose decayed value has fallen to nothing. Decay is
     /// lazy, so a one-off party is never otherwise evicted. Returns the count.
     pub fn sweep_decayed(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let now = now_ms();
         let w = self.window_hours;
         let decayed = |e: &DecayedNet| -> f64 {
-            let dt_hours = ((now - e.updated_at_ms).max(0) as f64) / 3_600_000.0;
+            let dt_hours = (now.saturating_sub(e.updated_at_ms).max(0) as f64) / 3_600_000.0;
             e.value * (-dt_hours / w).exp()
         };
-        let before = inner.nets.len() + inner.desk.len();
+        let before = inner.nets.len().saturating_add(inner.desk.len());
         inner.nets.retain(|_, e| decayed(e).abs() > EPSILON_BASE);
         inner.desk.retain(|_, e| decayed(e).abs() > EPSILON_BASE);
-        let dropped = before - (inner.nets.len() + inner.desk.len());
+        let dropped = before.saturating_sub(inner.nets.len().saturating_add(inner.desk.len()));
         if dropped > 0 {
             inner.dirty = true;
         }
@@ -378,7 +385,7 @@ impl NetPositionTracker {
         if !signed_base_delta.is_finite() || signed_base_delta == 0.0 || token.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.pending.contains_key(quote_id) {
             return; // idempotent re-confirm
         }
@@ -397,7 +404,7 @@ impl NetPositionTracker {
     /// Settle observed: drop the pending marker, keep the applied value. An
     /// unknown quote is a debug no-op.
     pub fn settle(&self, quote_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.pending.remove(quote_id).is_some() {
             inner.dirty = true;
         } else {
@@ -407,7 +414,7 @@ impl NetPositionTracker {
 
     /// The quote expired unfilled: reverse the confirm-time delta.
     pub fn release(&self, quote_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(p) = inner.pending.remove(quote_id) {
             // Live: the aggregate may be absent because offsetting flow
             // cancelled it to zero, and the reversal must still restore it.
@@ -418,8 +425,8 @@ impl NetPositionTracker {
     /// Backstop for pendings the sweep will never see again (restart races):
     /// reverse anything older than `stale_pending_after`.
     pub fn expire_stale_pending(&self) {
-        let cutoff = now_ms() - self.stale_pending_after.as_millis() as i64;
-        let mut inner = self.inner.lock().unwrap();
+        let cutoff = now_ms().saturating_sub(millis_i64(self.stale_pending_after));
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let stale: Vec<(String, PendingNet)> = inner
             .pending
             .iter()
@@ -493,7 +500,7 @@ impl NetPositionTracker {
         // grow without bound.
         let dropped = self.sweep_decayed();
         let snap = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             if !inner.dirty || inner.last_checkpoint.elapsed() < CHECKPOINT_EVERY {
                 return;
             }
@@ -516,7 +523,7 @@ impl NetPositionTracker {
             if let Err(e) = me.write_snapshot(&snap) {
                 warn!("Net-position checkpoint to {} failed: {}", me.path.display(), e);
                 // Keep the data eligible for the next attempt.
-                me.inner.lock().unwrap().dirty = true;
+                me.inner.lock().unwrap_or_else(PoisonError::into_inner).dirty = true;
             }
         };
         // Synchronous fs IO on a tokio worker can stall the runtime: hand it to
@@ -532,7 +539,7 @@ impl NetPositionTracker {
     /// Unconditional save (graceful shutdown).
     pub fn save(&self) {
         let snap = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             inner.dirty = false;
             Self::snapshot_locked(&inner, self.window_hours)
         };
@@ -894,6 +901,61 @@ mod tests {
             (v - expect).abs() / expect < 0.01,
             "one-window-old 100k should read ≈{expect:.0}, got {v:.0}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Timestamps at the i64 extremes in a state file must load without overflow.
+    #[test]
+    fn extreme_timestamps_load_without_overflow() {
+        let path = scratch("extreme-ts");
+        let saved = serde_json::json!({
+            "version": NET_STATE_VERSION,
+            "saved_at": FIXTURE_SAVED_AT,
+            "window_hours": 24.0,
+            "entries": [
+                { "party": "old", "token": "TOKEN", "net": 1.0, "updated_at_ms": i64::MIN },
+                { "party": "future", "token": "TOKEN", "net": 1.0, "updated_at_ms": i64::MAX }
+            ],
+            "desk": [{ "token": "TOKEN", "net": 1.0, "updated_at_ms": i64::MIN }],
+            "pending": [{
+                "quote_id": "q-old", "party": "old", "token": "TOKEN",
+                "delta": 1.0, "at_ms": i64::MIN
+            }]
+        });
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+
+        let t = NetPositionTracker::load_or_new(path.clone(), 24.0, TEST_STALE_AFTER);
+        assert_eq!(t.net("old", "TOKEN"), 0.0);
+        assert_eq!(t.desk_net("TOKEN"), 0.0);
+        assert!((t.net("future", "TOKEN") - 1.0).abs() < 1e-9);
+        t.sweep_decayed();
+        t.expire_stale_pending();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A panic while the lock was held must not take later readers and writers down.
+    #[test]
+    fn a_poisoned_lock_keeps_working() {
+        let path = scratch("poison");
+        let t = NetPositionTracker::load_or_new(path.clone(), 24.0, TEST_STALE_AFTER);
+        t.record_confirm("q1", Some("alice"), "TOKEN", 1_000.0);
+        let t2 = Arc::clone(&t);
+        let _ = std::thread::spawn(move || {
+            let _held = t2.inner.lock().unwrap();
+            panic!("poisoning the net-position lock for the test");
+        })
+        .join();
+        assert!(t.inner.is_poisoned());
+
+        assert!((t.desk_net("TOKEN") - 1_000.0).abs() < 1.0);
+        t.record_confirm("q2", Some("alice"), "TOKEN", 500.0);
+        t.release("q2");
+        t.settle("q1");
+        t.expire_stale_pending();
+        t.sweep_decayed();
+        t.checkpoint_if_dirty();
+        t.save();
+        assert!((t.net("alice", "TOKEN") - 1_000.0).abs() < 1.0);
         let _ = std::fs::remove_file(&path);
     }
 

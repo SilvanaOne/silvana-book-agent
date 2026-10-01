@@ -316,7 +316,7 @@ pub fn spawn_forecast_poller(config: crate::config::BaseConfig, shutdown: crate:
                     // to surface at warn level (once per outage, like
                     // note_poll_failure; a real prediction re-arms it).
                     failures = 0;
-                    let stale = forecast_age_secs().is_none_or(|age| age > *POLL_SECS * 10);
+                    let stale = forecast_age_secs().is_none_or(|age| age > POLL_SECS.saturating_mul(10));
                     if stale && !warned {
                         let age = forecast_age_secs()
                             .map(|a| format!("{}s old", a))
