@@ -27,10 +27,13 @@ pub const CC_TOKEN: &str = "CC";
 /// A balance not refreshed within this window is reported as stale.
 pub const DEFAULT_BALANCE_STALE_AFTER: Duration = Duration::from_secs(120);
 
+/// Display bounds: `±u64::MAX`.
+const SHOWN_MAX: Decimal = Decimal::from_parts(u32::MAX, u32::MAX, 0, false, 0);
+const SHOWN_MIN: Decimal = Decimal::from_parts(u32::MAX, u32::MAX, 0, true, 0);
+
 /// `amount` capped to what `{:.4}` can print; Decimal formatting panics near its maximum.
 pub(crate) fn shown(amount: Decimal) -> Decimal {
-    let limit = Decimal::from(u64::MAX);
-    amount.max(-limit).min(limit)
+    amount.max(SHOWN_MIN).min(SHOWN_MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,12 +707,7 @@ impl LiquidityManager {
             });
         }
 
-        // Sort: CC first, then alphabetical
-        result.sort_by(|a, b| {
-            if a.token == CC_TOKEN { std::cmp::Ordering::Less }
-            else if b.token == CC_TOKEN { std::cmp::Ordering::Greater }
-            else { a.token.cmp(&b.token) }
-        });
+        result.sort_by(|a, b| stats_order(&a.token, &b.token));
 
         result
     }
@@ -740,6 +738,11 @@ impl LiquidityManager {
     }
 }
 
+/// CC first, then alphabetical; a total order, as `sort_by` requires.
+fn stats_order(a: &str, b: &str) -> std::cmp::Ordering {
+    (a != CC_TOKEN).cmp(&(b != CC_TOKEN)).then_with(|| a.cmp(b))
+}
+
 /// Stats for a single token (returned by `LiquidityManager::stats()`).
 pub struct TokenStats {
     pub token: String,
@@ -768,7 +771,7 @@ impl std::fmt::Display for TokenStats {
             "{} {:.2} bal / {:.2} committed / {:.2} avail ({} stlmts), flow {:.1}/hr, depl={:.1} ({})",
             self.token,
             self.balance,
-            self.committed + self.fee_committed,
+            self.committed.saturating_add(self.fee_committed),
             self.available,
             self.num_commitments,
             self.net_outflow_per_hour,
@@ -785,6 +788,44 @@ impl std::fmt::Display for TokenStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_caps_at_the_u64_bounds() {
+        assert_eq!(shown(Decimal::MAX), Decimal::from(u64::MAX));
+        assert_eq!(shown(Decimal::MIN), -Decimal::from(u64::MAX));
+        assert_eq!(shown(Decimal::new(-15, 1)), Decimal::new(-15, 1));
+    }
+
+    #[test]
+    fn stats_order_is_total_with_cc_first() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(stats_order(CC_TOKEN, CC_TOKEN), Equal);
+        assert_eq!(stats_order(CC_TOKEN, "AAA"), Less);
+        assert_eq!(stats_order("AAA", CC_TOKEN), Greater);
+        assert_eq!(stats_order("USDC", "CBTC"), Greater);
+        let mut tokens = vec!["USDC", CC_TOKEN, "CBTC", "CC1"];
+        tokens.sort_by(|a, b| stats_order(a, b));
+        assert_eq!(tokens, [CC_TOKEN, "CBTC", "CC1", "USDC"]);
+    }
+
+    #[test]
+    fn stats_display_survives_extreme_commitments() {
+        let stats = TokenStats {
+            token: CC_TOKEN.to_string(),
+            balance: Decimal::MAX,
+            committed: Decimal::MAX,
+            fee_committed: Decimal::MAX,
+            fee_reserve: Decimal::ZERO,
+            available: Decimal::MIN,
+            num_commitments: 1,
+            net_outflow_per_hour: 0.0,
+            hours_to_depletion: f64::INFINITY,
+            depletion_coefficient: 0.0,
+            refreshed_secs_ago: None,
+        };
+        let shown = stats.to_string();
+        assert!(shown.starts_with("CC 79228162514264337593543950335.00 bal"), "{shown}");
+    }
 
     #[tokio::test]
     async fn stale_age_uses_the_configured_window() {

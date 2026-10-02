@@ -13,7 +13,8 @@
 //!   The splitter-reserve holding is consumed ONLY here, so split-vs-quote
 //!   contention is impossible by construction.
 
-use std::str::FromStr;
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,8 +23,10 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tracing::{debug, error, info, warn};
 
+use agent_logic::clock;
 use agent_logic::config::{BaseConfig, RfqV2Config};
 use agent_logic::shutdown::Shutdown;
+use agent_logic::supervise::{self, Policy, Watch};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, PrepareTransactionRequest, SplitCcParams,
     TransactionOperation,
@@ -50,6 +53,15 @@ pub(crate) const MAX_SPLIT_OUTPUTS_PER_TX: u32 = 90;
 
 /// Budget window for the per-instrument fail-stop split cap.
 const SPLIT_BUDGET_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Largest accepted split amount, decimal places and count per spec.
+const MAX_SPLIT_AMOUNT: u64 = 1_000_000_000_000_000;
+const MAX_SPLIT_SCALE: u32 = 10;
+const MAX_SPLIT_COUNT: u32 = 10_000;
+
+/// Wait on one maintenance tick; a slower tick keeps running and later ticks
+/// are skipped until it ends.
+const TICK_BUDGET: Duration = Duration::from_secs(300);
 
 /// One LP-pays instrument, resolved for splitting.
 #[derive(Debug, Clone)]
@@ -105,6 +117,15 @@ pub fn parse_splits(specs: &[String]) -> Result<Vec<(Decimal, u32)>> {
             if amount <= Decimal::ZERO || count == 0 {
                 return Err(anyhow!("split spec '{s}' must be positive"));
             }
+            if amount > Decimal::from(MAX_SPLIT_AMOUNT) {
+                return Err(anyhow!("split spec '{s}': amount must be at most {MAX_SPLIT_AMOUNT}"));
+            }
+            if amount.normalize().scale() > MAX_SPLIT_SCALE {
+                return Err(anyhow!("split spec '{s}': amount has more than {MAX_SPLIT_SCALE} decimal places"));
+            }
+            if count > MAX_SPLIT_COUNT {
+                return Err(anyhow!("split spec '{s}': count must be at most {MAX_SPLIT_COUNT}"));
+            }
             Ok((amount, count))
         })
         .collect()
@@ -121,12 +142,12 @@ pub(crate) fn cap_split_outputs(splits: &[(Decimal, u32)], max: u32) -> Vec<(Dec
         if used >= max {
             break;
         }
-        let take = (*count).min(max - used);
+        let take = (*count).min(max.saturating_sub(used));
         if take == 0 {
             continue;
         }
         out.push((*denom, take));
-        used += take;
+        used = used.saturating_add(take);
     }
     out
 }
@@ -142,17 +163,18 @@ pub(crate) fn subtract_split_chunk(
 ) -> Vec<(Decimal, u32)> {
     let mut spent: std::collections::HashMap<Decimal, u32> = std::collections::HashMap::new();
     for (denom, count) in chunk {
-        *spent.entry(*denom).or_default() += *count;
+        let total = spent.entry(*denom).or_default();
+        *total = total.saturating_add(*count);
     }
     remaining
         .iter()
         .filter_map(|(denom, count)| {
             let used = spent.get_mut(denom).map_or(0, |avail| {
                 let take = (*count).min(*avail);
-                *avail -= take;
+                *avail = avail.saturating_sub(take);
                 take
             });
-            (*count > used).then(|| (*denom, count - used))
+            (*count > used).then(|| (*denom, count.saturating_sub(used)))
         })
         .collect()
 }
@@ -167,13 +189,25 @@ pub(crate) fn rung_deficits(
     rungs
         .iter()
         .filter_map(|(denom, count)| {
+            let top = band_top(*denom);
             let have = holding_amounts
                 .iter()
-                .filter(|a| **a >= *denom && **a < *denom * Decimal::TWO)
-                .count() as u32;
-            (have < *count).then(|| (*denom, count - have))
+                .filter(|a| **a >= *denom && **a < top)
+                .count();
+            let have = u32::try_from(have).unwrap_or(u32::MAX);
+            (have < *count).then(|| (*denom, count.saturating_sub(have)))
         })
         .collect()
+}
+
+/// Upper end of a rung's coverage band `[denom, 2*denom)`.
+fn band_top(denom: Decimal) -> Decimal {
+    denom.saturating_mul(Decimal::TWO)
+}
+
+/// Sum of counts, saturating.
+fn count_sum<'a>(counts: impl IntoIterator<Item = &'a u32>) -> u32 {
+    counts.into_iter().fold(0, |acc, c| acc.saturating_add(*c))
 }
 
 /// Low-water hysteresis (split-storm guard): a rung refills only once it
@@ -189,7 +223,7 @@ fn plan_ladder_refill(
 ) -> Vec<(Decimal, u32)> {
     let divisor = low_water_divisor.max(1);
     let triggered = rungs.iter().zip(haves).any(|((_, count), have)| {
-        *have < (*count / divisor).max(1)
+        *have < count.checked_div(divisor).unwrap_or(*count).max(1)
     });
     if !triggered {
         return Vec::new();
@@ -198,7 +232,7 @@ fn plan_ladder_refill(
         .iter()
         .zip(haves)
         .filter(|((_, count), have)| **have < *count)
-        .map(|((denom, count), have)| (*denom, count - have))
+        .map(|((denom, count), have)| (*denom, count.saturating_sub(*have)))
         .collect()
 }
 
@@ -206,8 +240,8 @@ fn plan_ladder_refill(
 /// the coverage counter and the ledger disagree, so adding MORE rungs can
 /// only feed a runaway. Pure so it can be unit-tested.
 fn ladder_overfull(rungs: &[(Decimal, u32)], haves: &[u32]) -> bool {
-    let target: u32 = rungs.iter().map(|(_, c)| c).sum();
-    let have: u32 = haves.iter().sum();
+    let target = count_sum(rungs.iter().map(|(_, c)| c));
+    let have = count_sum(haves);
     target > 0 && have >= target.saturating_mul(2)
 }
 
@@ -232,13 +266,13 @@ fn split_gate(
 ) -> SplitGate {
     let ops_in_window = op_times
         .iter()
-        .filter(|t| now.duration_since(**t) < SPLIT_BUDGET_WINDOW)
+        .filter(|t| now.saturating_duration_since(**t) < SPLIT_BUDGET_WINDOW)
         .count();
     if ops_in_window >= max_ops_per_window as usize {
         return SplitGate::BudgetExhausted { ops_in_window };
     }
     if let Some(last) = op_times.iter().max() {
-        let since = now.duration_since(*last);
+        let since = now.saturating_duration_since(*last);
         if since < min_interval {
             return SplitGate::Cooldown { secs_since_last: since.as_secs() };
         }
@@ -246,7 +280,17 @@ fn split_gate(
     SplitGate::Allow
 }
 
-/// Spawn the maintenance worker (LP mode with rfq_v2 enabled only).
+/// Everything one maintenance tick reads.
+struct Maintenance {
+    config: BaseConfig,
+    cache: Arc<HoldingsCache>,
+    ticket_pool: Option<Arc<TicketPool>>,
+    targets: Vec<SplitTarget>,
+    v2: RfqV2Config,
+}
+
+/// Spawn the maintenance worker (LP mode with rfq_v2 enabled only); it
+/// restarts if it fails.
 pub fn spawn_maintenance_worker(
     config: BaseConfig,
     cache: Arc<HoldingsCache>,
@@ -254,39 +298,56 @@ pub fn spawn_maintenance_worker(
     targets: Vec<SplitTarget>,
     v2: RfqV2Config,
     shutdown: Shutdown,
-) {
-    tokio::spawn(async move {
-        info!(
-            "V2 maintenance worker started (tick {}s, {} split target(s), tickets={})",
-            v2.split_poll_interval_secs,
-            targets.len(),
-            ticket_pool.is_some(),
-        );
+) -> Result<()> {
+    let ctx = Arc::new(Maintenance { config, cache, ticket_pool, targets, v2 });
+    let s = shutdown.clone();
+    supervise::spawn_supervised("V2 maintenance worker", shutdown, Policy::Restart, move || {
+        run(Arc::clone(&ctx), s.clone())
+    })?;
+    Ok(())
+}
 
-        // Small initial delay so the first ACS refresh can populate the cache
-        if shutdown.sleep(Duration::from_secs(10)).await {
-            return;
-        }
+async fn run(ctx: Arc<Maintenance>, shutdown: Shutdown) {
+    info!(
+        "V2 maintenance worker started (tick {}s, {} split target(s), tickets={})",
+        ctx.v2.split_poll_interval_secs,
+        ctx.targets.len(),
+        ctx.ticket_pool.is_some(),
+    );
 
-        loop {
-            if shutdown.is_shutting_down() {
-                info!("V2 maintenance worker shutting down");
-                return;
-            }
+    // Small initial delay so the first ACS refresh can populate the cache
+    if shutdown.sleep(Duration::from_secs(10)).await {
+        return;
+    }
 
-            if let Err(e) = tick(&config, &cache, &ticket_pool, &targets, &v2).await {
+    let interval = Duration::from_secs(ctx.v2.split_poll_interval_secs);
+    let work = || {
+        let ctx = Arc::clone(&ctx);
+        async move {
+            if let Err(e) = tick(&ctx.config, &ctx.cache, &ctx.ticket_pool, &ctx.targets, &ctx.v2).await {
                 warn!("V2 maintenance tick failed: {:#}", e);
             }
-
-            if shutdown
-                .sleep(Duration::from_secs(v2.split_poll_interval_secs))
-                .await
-            {
-                info!("V2 maintenance worker shutting down");
-                return;
-            }
         }
-    });
+    };
+    supervise::run_watched("V2 maintenance tick", TICK_BUDGET, interval, &shutdown, report_tick, work).await;
+    info!("V2 maintenance worker shutting down");
+}
+
+fn report_tick(watch: Watch<()>) {
+    match watch {
+        Watch::Done(()) => {}
+        Watch::Slow => warn!(
+            "V2 maintenance tick still running after {}s; it continues and the next tick waits for it",
+            TICK_BUDGET.as_secs()
+        ),
+        Watch::Busy => debug!("V2 maintenance tick skipped: the previous tick is still running"),
+        Watch::Failed(why) => warn!("V2 maintenance tick failed: {why}"),
+    }
+}
+
+/// `n` fresh ticket ids.
+fn new_ticket_ids(n: usize) -> Result<Vec<String>> {
+    (0..n).map(|_| clock::uuid_v7().map(|u| u.to_string())).collect()
 }
 
 async fn tick(
@@ -304,9 +365,7 @@ async fn tick(
 
         let free = pool.free_count();
         if free < v2.ticket_low_water {
-            let ticket_ids: Vec<String> = (0..v2.ticket_batch_size)
-                .map(|_| uuid::Uuid::now_v7().to_string())
-                .collect();
+            let ticket_ids = new_ticket_ids(v2.ticket_batch_size).context("ticket refill")?;
             info!(
                 "Ticket refill: free={} < low_water={} — issuing {} tickets",
                 free,
@@ -396,7 +455,7 @@ pub(crate) async fn ensure_denominations(
     for (denom, _) in rungs {
         haves.push(
             cache
-                .count_in_band(&instrument.key, *denom, *denom * Decimal::TWO)
+                .count_in_band(&instrument.key, *denom, band_top(*denom))
                 .await,
         );
     }
@@ -413,8 +472,8 @@ pub(crate) async fn ensure_denominations(
             "{}: REFUSING split — {} holdings in-band vs ladder target {} (>= 2x): \
              coverage counter and ledger disagree (haves={:?}, rungs={:?})",
             instrument.key,
-            haves.iter().sum::<u32>(),
-            rungs.iter().map(|(_, c)| c).sum::<u32>(),
+            count_sum(&haves),
+            count_sum(rungs.iter().map(|(_, c)| c)),
             haves,
             rungs,
         );
@@ -451,27 +510,12 @@ pub(crate) async fn ensure_denominations(
         return Ok(());
     };
 
-    // Cap counts to what the reserve can fund, keeping ~5% as change so the
-    // reserve keeps existing.
-    let mut budget = reserve.amount * Decimal::from_str("0.95").unwrap();
-    let mut splits: Vec<(Decimal, u32)> = Vec::new();
-    for (denom, deficit) in deficits {
-        if budget < denom {
-            continue;
-        }
-        let affordable = (budget / denom).trunc().to_u32().unwrap_or(0);
-        let count = deficit.min(affordable);
-        if count == 0 {
-            continue;
-        }
-        budget -= denom * Decimal::from(count);
-        splits.push((denom, count));
-    }
+    let mut splits = fund_splits(reserve.amount, deficits);
 
     // Cap outputs per transaction under the Amulet `maxNumOutputs` limit. A
     // deficit larger than the cap fills over successive ticks rather than in one
     // over-large (and rejected) transfer.
-    let total_out: u32 = splits.iter().map(|(_, c)| c).sum();
+    let total_out = count_sum(splits.iter().map(|(_, c)| c));
     if total_out > MAX_SPLIT_OUTPUTS_PER_TX {
         splits = cap_split_outputs(&splits, MAX_SPLIT_OUTPUTS_PER_TX);
         debug!(
@@ -488,7 +532,7 @@ pub(crate) async fn ensure_denominations(
         return Ok(());
     }
 
-    let job_id = format!("split-{}", uuid::Uuid::now_v7());
+    let job_id = format!("split-{}", clock::uuid_v7()?);
     let input_cids = vec![reserve.contract_id.clone()];
     if !cache.reserve_split(&input_cids, &job_id).await {
         debug!("Splitter reserve for {} busy — skipping this tick", instrument.key);
@@ -533,6 +577,37 @@ pub(crate) async fn ensure_denominations(
             Err(e)
         }
     }
+}
+
+/// Cap rung counts to what `reserve_amount` can fund, keeping ~5% as change so
+/// the reserve keeps existing.
+fn fund_splits(reserve_amount: Decimal, deficits: Vec<(Decimal, u32)>) -> Vec<(Decimal, u32)> {
+    let mut budget = reserve_amount
+        .checked_mul(Decimal::new(95, 2))
+        .unwrap_or(reserve_amount);
+    let mut splits: Vec<(Decimal, u32)> = Vec::new();
+    for (denom, deficit) in deficits {
+        if denom <= Decimal::ZERO || budget < denom {
+            continue;
+        }
+        let affordable = budget
+            .checked_div(denom)
+            .and_then(|q| q.trunc().to_u32())
+            .unwrap_or(u32::MAX);
+        let count = deficit.min(affordable);
+        if count == 0 {
+            continue;
+        }
+        let Some(rest) = denom
+            .checked_mul(Decimal::from(count))
+            .and_then(|cost| budget.checked_sub(cost))
+        else {
+            break;
+        };
+        budget = rest;
+        splits.push((denom, count));
+    }
+    splits
 }
 
 /// CC split via the existing v1 SplitCc operation (mirror of merge_worker).
@@ -686,6 +761,69 @@ async fn create_v1_client(config: &BaseConfig) -> Result<DAppProviderClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn parse_splits_bounds_amount_places_and_count() {
+        let one = |s: &str| parse_splits(&[s.to_string()]);
+        assert!(one("1000000000000000x1").is_ok());
+        assert!(one("1000000000000000.1x1").is_err());
+        assert!(one("79228162514264337593543950335x1").is_err());
+        assert!(one("1.1234567890x1").is_ok());
+        assert!(one("1.12345678901x1").is_err());
+        assert!(one("25.000000000000x2").is_ok(), "trailing zeros are not decimal places");
+        assert!(one("25x10000").is_ok());
+        assert!(one("25x10001").is_err());
+    }
+
+    // Counts and band edges at the type limits saturate instead of overflowing
+    #[test]
+    fn ladder_math_saturates_at_the_limits() {
+        let one = Decimal::ONE;
+        assert_eq!(rung_deficits(&[(Decimal::MAX, 2)], &[Decimal::MAX]), vec![(Decimal::MAX, 2)]);
+        assert!(ladder_overfull(&[(one, u32::MAX), (one, 1)], &[u32::MAX, u32::MAX]));
+        assert!(subtract_split_chunk(&[(one, 5)], &[(one, u32::MAX), (one, 1)]).is_empty());
+        assert_eq!(cap_split_outputs(&[(one, u32::MAX), (one, 1)], u32::MAX), vec![(one, u32::MAX)]);
+        assert_eq!(count_sum(&[u32::MAX, 1]), u32::MAX);
+        assert_eq!(plan_ladder_refill(&[(one, u32::MAX)], &[0], u32::MAX), vec![(one, u32::MAX)]);
+    }
+
+    #[test]
+    fn fund_splits_keeps_change_and_handles_large_reserves() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        assert_eq!(fund_splits(d("100"), vec![(d("30"), 5), (d("10"), 3)]), vec![(d("30"), 3)]);
+        assert_eq!(
+            fund_splits(d("100"), vec![(d("30"), 2), (d("10"), 3)]),
+            vec![(d("30"), 2), (d("10"), 3)],
+        );
+        // More affordable outputs than a u32 holds still funds the deficit
+        assert_eq!(fund_splits(d("10000000000000"), vec![(d("0.001"), 5)]), vec![(d("0.001"), 5)]);
+        assert_eq!(fund_splits(Decimal::MAX, vec![(d("1"), 7)]), vec![(d("1"), 7)]);
+        assert!(fund_splits(d("100"), vec![(Decimal::ZERO, 3)]).is_empty());
+        assert!(fund_splits(d("5"), vec![(d("10"), 3)]).is_empty());
+    }
+
+    #[test]
+    fn ticket_ids_are_distinct_uuid_v7() {
+        let ids = new_ticket_ids(3).unwrap();
+        assert_eq!(ids.len(), 3);
+        let parsed: std::collections::HashSet<uuid::Uuid> = ids.iter().map(|i| i.parse().unwrap()).collect();
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.iter().all(|u| u.get_version_num() == 7));
+    }
+
+    #[test]
+    fn spawning_outside_a_runtime_is_an_error() {
+        let spawned = spawn_maintenance_worker(
+            BaseConfig::test_minimal().unwrap(),
+            HoldingsCache::new(true),
+            None,
+            Vec::new(),
+            RfqV2Config::default(),
+            Shutdown::new(),
+        );
+        assert!(spawned.is_err());
+    }
 
     #[test]
     fn parse_splits_specs() {

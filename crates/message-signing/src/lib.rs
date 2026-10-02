@@ -13,6 +13,8 @@
 //!
 //! `ed25519-sha256-v1`: Sign(Ed25519, SHA-256(canonical_payload))
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -97,16 +99,12 @@ pub fn parse_public_key(public_key_b64url: &str) -> Result<[u8; 32]> {
         .decode(public_key_b64url)
         .map_err(|e| anyhow!("Invalid public key base64url: {}", e))?;
 
-    if bytes.len() != 32 {
-        return Err(anyhow!(
+    bytes.try_into().map_err(|b: Vec<u8>| {
+        anyhow!(
             "Invalid public key length: expected 32 bytes, got {}",
-            bytes.len()
-        ));
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
+            b.len()
+        )
+    })
 }
 
 // ============================================================================
@@ -1262,6 +1260,18 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode(public_key);
         let decoded = parse_public_key(&encoded).expect("Should decode");
         assert_eq!(decoded, public_key);
+    }
+
+    #[test]
+    fn test_parse_public_key_rejects_wrong_length() {
+        for len in [0usize, 31, 33, 64] {
+            let encoded = URL_SAFE_NO_PAD.encode(vec![7u8; len]);
+            let err = parse_public_key(&encoded).expect_err("wrong length must be rejected");
+            assert_eq!(
+                err.to_string(),
+                format!("Invalid public key length: expected 32 bytes, got {len}")
+            );
+        }
     }
 
     #[test]

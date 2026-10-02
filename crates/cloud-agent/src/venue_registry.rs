@@ -8,9 +8,12 @@
 //! service — fa-design G2). Any validation failure disables rfq_v2 for that
 //! market only (logged loudly, never crashes); v1 keeps working.
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use agent_logic::sync;
 use tracing::{info, warn};
 
 use crate::ledger_client::DAppProviderClient;
@@ -75,6 +78,7 @@ impl VenueRegistry {
     /// Refresh venues from the ACS: `AtomicDVP` contracts with `lp == party_id`,
     /// keyed by pairName. Called at startup and whenever the updates watcher
     /// sees an AtomicDVP create/archive (key rotation = archive+create).
+    /// The ACS fetch carries the ledger client's call and stream deadlines.
     pub async fn refresh(&self, client: &mut DAppProviderClient) -> anyhow::Result<()> {
         let contracts = client
             .get_active_contracts(&[TEMPLATE_ATOMIC_DVP.to_string()])
@@ -109,8 +113,13 @@ impl VenueRegistry {
         }
 
         info!("Venue registry refreshed: {} venue(s) for {}", found.len(), self.party_id);
-        *self.venues.lock().unwrap() = found;
+        *sync::lock(&self.venues) = found;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_tests(&self, venue: VenueEntry) {
+        sync::lock(&self.venues).insert(venue.pair_name.clone(), venue);
     }
 
     /// The venue for a market, only if it passes validation:
@@ -118,7 +127,7 @@ impl VenueRegistry {
     /// quotePublicKey matches the local SPKI (case-insensitive).
     pub fn validated(&self, market_id: &str) -> Option<VenueEntry> {
         let expected = self.expected.get(market_id)?;
-        let venues = self.venues.lock().unwrap();
+        let venues = sync::lock(&self.venues);
         let venue = venues.get(market_id)?;
         if venue.base_id != expected.base_id
             || venue.base_admin != expected.base_admin
@@ -159,5 +168,55 @@ impl VenueRegistry {
             .collect();
         ids.sort();
         ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> VenueRegistry {
+        let expected = HashMap::from([(
+            "EDELx-USDCx".to_string(),
+            ExpectedVenue {
+                base_id: "EDELx".to_string(),
+                base_admin: "reg::1".to_string(),
+                quote_id: "USDCx".to_string(),
+                quote_admin: "reg::2".to_string(),
+            },
+        )]);
+        VenueRegistry::new("lp::1".to_string(), "abcd".to_string(), expected)
+    }
+
+    fn venue() -> VenueEntry {
+        VenueEntry {
+            contract_id: "00venue".to_string(),
+            template_id: TEMPLATE_ATOMIC_DVP.to_string(),
+            created_event_blob: "blob".to_string(),
+            payload: serde_json::Value::Null,
+            synchronizer_id: "sync::1".to_string(),
+            provider: "provider::1".to_string(),
+            pair_name: "EDELx-USDCx".to_string(),
+            base_admin: "reg::1".to_string(),
+            base_id: "EDELx".to_string(),
+            quote_admin: "reg::2".to_string(),
+            quote_id: "USDCx".to_string(),
+            quote_public_key: "ABCD".to_string(),
+        }
+    }
+
+    // Lookups keep working after a panic poisoned the venue lock
+    #[test]
+    fn poisoned_lock_is_tolerated() {
+        let reg = registry();
+        reg.venues.lock().unwrap().insert("EDELx-USDCx".to_string(), venue());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = reg.venues.lock().unwrap();
+            panic!("poison the venue lock");
+        }));
+        assert!(reg.venues.is_poisoned());
+
+        assert!(reg.validated("EDELx-USDCx").is_some());
+        assert_eq!(reg.validated_market_ids(), vec!["EDELx-USDCx".to_string()]);
     }
 }

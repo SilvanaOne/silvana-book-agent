@@ -1,9 +1,7 @@
 //! Order-grid task: refreshes the grid on its own cadence, apart from the
 //! settlement loop, and hands the grid back when it stops.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
@@ -208,8 +206,9 @@ pub fn spawn_grid_task<G: GridCycle>(
     wake: Arc<Notify>,
     stats: GridStats,
     timing: GridTiming,
-) -> JoinHandle<G> {
-    tokio::spawn(async move {
+) -> Result<JoinHandle<G>> {
+    let rt = tokio::runtime::Handle::try_current().map_err(|_| anyhow!("no tokio runtime to run the grid task"))?;
+    Ok(rt.spawn(async move {
         info!("Grid task started: interval={}s", timing.period.as_secs());
         // A zero period would make interval() panic
         let mut ticker = interval(timing.period.max(Duration::from_millis(1)));
@@ -266,7 +265,7 @@ pub fn spawn_grid_task<G: GridCycle>(
         }
         info!("Grid task stopped");
         grid
-    })
+    }))
 }
 
 /// Wait up to `limit` for the grid task to return the grid. On timeout or a

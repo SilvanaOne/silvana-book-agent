@@ -39,14 +39,21 @@
 //! `DVP_GC_MAX_PAUSE_SECS` instead of parking forever holding a queue of
 //! contract IDs that is aging out from under it.
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
+use std::future::Future;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use anyhow::{bail, Context};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use agent_logic::clock;
 use agent_logic::config::BaseConfig;
+use agent_logic::num::short;
 use agent_logic::shutdown::Shutdown;
+use agent_logic::supervise::{self, Bounded, Policy};
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use orderbook_proto::ledger::{
     CancelDvpProposalParams, PrepareTransactionRequest, RejectDvpProposalParams,
@@ -66,45 +73,128 @@ const REJECT_REASON: &str = "expired";
 /// remaining queue is retried on the next refresh cycle.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
+/// Bound on one ACS scan.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Characters of a contract id shown in logs.
+const CID_LOG_CHARS: usize = 16;
+
+/// An on/off setting: unset or blank gives `default`; anything but 1/true/yes/on
+/// or 0/false/no/off is an error naming the variable.
+fn parse_switch(name: &str, raw: Option<&str>, default: bool) -> anyhow::Result<bool> {
+    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{name}={raw:?} must be one of 1, true, yes, on, 0, false, no, off"),
+    }
+}
+
+/// A switch's value; an unrecognised one warns and gives the default.
+fn switch_or_default(name: &str, raw: Option<&str>, default: bool) -> bool {
+    parse_switch(name, raw, default).unwrap_or_else(|e| {
+        warn!("{e:#}; using {default}");
+        default
+    })
+}
+
 fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
+    let raw = std::env::var(name).ok();
+    switch_or_default(name, raw.as_deref(), default)
+}
+
+const ENABLED_ENV: &str = "DVP_GC_ENABLED";
+const REJECT_ENABLED_ENV: &str = "DVP_GC_REJECT_ENABLED";
+
+/// A whole-seconds setting: unset or blank gives `default`; anything else must
+/// be a whole number of at least `min`.
+#[derive(Clone, Copy)]
+struct SecsSetting {
+    name: &'static str,
+    default: u64,
+    min: u64,
+}
+
+impl SecsSetting {
+    fn parse(self, raw: Option<&str>) -> anyhow::Result<u64> {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(self.default);
+        };
+        let secs: u64 = raw
+            .parse()
+            .with_context(|| format!("{}={raw:?} is not a whole number of seconds", self.name))?;
+        if secs < self.min {
+            bail!("{}={secs} must be at least {}", self.name, self.min);
+        }
+        Ok(secs)
+    }
+
+    /// The environment's value; one the startup check would refuse warns and gives the default.
+    fn env_value(self) -> u64 {
+        let raw = std::env::var(self.name).ok();
+        self.parse(raw.as_deref()).unwrap_or_else(|e| {
+            warn!("{e:#}; using {}", self.default);
+            self.default
         })
-        .unwrap_or(default)
+    }
 }
 
-fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
+const DELAY: SecsSetting = SecsSetting { name: "DVP_GC_DELAY_SECS", default: 2, min: 1 };
+const REFRESH: SecsSetting = SecsSetting { name: "DVP_GC_REFRESH_SECS", default: 3600, min: 1 };
+const SAFETY_MARGIN: SecsSetting = SecsSetting { name: "DVP_GC_SAFETY_MARGIN_SECS", default: 3600, min: 0 };
+const MAX_PAUSE: SecsSetting = SecsSetting { name: "DVP_GC_MAX_PAUSE_SECS", default: 900, min: 60 };
+const STALE_FORECAST: SecsSetting = SecsSetting { name: "DVP_GC_STALE_FORECAST_SECS", default: 300, min: 0 };
+
+const MIN_COEFFICIENT_ENV: &str = "DVP_GC_MIN_COEFFICIENT";
+const DEFAULT_MIN_COEFFICIENT: f64 = 0.68;
+
+/// `DVP_GC_MIN_COEFFICIENT`: unset or blank gives the default; anything else must be a finite number.
+fn parse_min_coefficient(raw: Option<&str>) -> anyhow::Result<f64> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_MIN_COEFFICIENT);
+    };
+    let value: f64 = raw
+        .parse()
+        .with_context(|| format!("{MIN_COEFFICIENT_ENV}={raw:?} is not a number"))?;
+    if !value.is_finite() {
+        bail!("{MIN_COEFFICIENT_ENV}={raw} must be a finite number");
+    }
+    Ok(value)
 }
 
-static GC_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag("DVP_GC_ENABLED", true));
-static GC_MIN_COEFFICIENT: LazyLock<f64> =
-    LazyLock::new(|| env_parse("DVP_GC_MIN_COEFFICIENT", 0.68));
-static GC_DELAY_SECS: LazyLock<u64> = LazyLock::new(|| env_parse("DVP_GC_DELAY_SECS", 2));
-static GC_REJECT_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| env_flag("DVP_GC_REJECT_ENABLED", true));
-static GC_REFRESH_SECS: LazyLock<u64> = LazyLock::new(|| env_parse("DVP_GC_REFRESH_SECS", 3600));
-static GC_SAFETY_MARGIN_SECS: LazyLock<u64> =
-    LazyLock::new(|| env_parse("DVP_GC_SAFETY_MARGIN_SECS", 3600));
+/// Refuse an unparsable or out-of-range `DVP_GC_*` timer or gate setting; the
+/// two switches never stop startup.
+pub(crate) fn validate_env(get: &dyn Fn(&str) -> anyhow::Result<Option<String>>) -> anyhow::Result<()> {
+    for setting in [DELAY, REFRESH, SAFETY_MARGIN, MAX_PAUSE, STALE_FORECAST] {
+        setting.parse(get(setting.name)?.as_deref())?;
+    }
+    parse_min_coefficient(get(MIN_COEFFICIENT_ENV)?.as_deref())?;
+    Ok(())
+}
+
+static GC_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(ENABLED_ENV, true));
+static GC_MIN_COEFFICIENT: LazyLock<f64> = LazyLock::new(|| {
+    let raw = std::env::var(MIN_COEFFICIENT_ENV).ok();
+    parse_min_coefficient(raw.as_deref()).unwrap_or_else(|e| {
+        warn!("{e:#}; using {DEFAULT_MIN_COEFFICIENT}");
+        DEFAULT_MIN_COEFFICIENT
+    })
+});
+static GC_DELAY_SECS: LazyLock<u64> = LazyLock::new(|| DELAY.env_value());
+static GC_REJECT_ENABLED: LazyLock<bool> = LazyLock::new(|| env_flag(REJECT_ENABLED_ENV, true));
+static GC_REFRESH_SECS: LazyLock<u64> = LazyLock::new(|| REFRESH.env_value().max(1));
+static GC_SAFETY_MARGIN_SECS: LazyLock<u64> = LazyLock::new(|| SAFETY_MARGIN.env_value());
 /// Abandon the cycle and rescan after the gate has been shut this long. The
 /// queue is a snapshot of contract IDs; holding one for hours is worse than
 /// spending ~2s re-deriving it. Floored at 60: a value of 0 would mean
 /// "abandon instantly", turning the cap into a switch that disables the drain
 /// whenever the gate is shut — an operator trying to disable the CAP should
 /// set it large, not zero.
-static GC_MAX_PAUSE_SECS: LazyLock<u64> =
-    LazyLock::new(|| env_parse("DVP_GC_MAX_PAUSE_SECS", 900).max(60));
+static GC_MAX_PAUSE_SECS: LazyLock<u64> = LazyLock::new(|| MAX_PAUSE.env_value().max(60));
 /// Warn when the coefficient the gate is reading is older than this.
-static GC_STALE_FORECAST_SECS: LazyLock<u64> =
-    LazyLock::new(|| env_parse("DVP_GC_STALE_FORECAST_SECS", 300));
+static GC_STALE_FORECAST_SECS: LazyLock<u64> = LazyLock::new(|| STALE_FORECAST.env_value());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcAction {
@@ -130,7 +220,7 @@ fn classify_proposal(
     reject_enabled: bool,
 ) -> Option<(GcAction, i64)> {
     let settle_before = micros_value(args.pointer("/terms/settleBefore")?)?;
-    if settle_before >= now_micros - margin_micros {
+    if settle_before >= now_micros.saturating_sub(margin_micros) {
         return None; // still inside (or too close to) the settle window
     }
 
@@ -157,33 +247,36 @@ fn micros_value(v: &Value) -> Option<i64> {
     v.as_str()?.trim().parse::<i64>().ok()
 }
 
-fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+/// Safety margin in micros, saturating.
+fn margin_micros(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1_000_000)
 }
 
-/// Spawn the DvpProposal GC background task. Returns without spawning when
-/// `DVP_GC_ENABLED=false`.
-pub fn spawn_dvp_gc_worker(config: BaseConfig, shutdown: Shutdown) {
+/// Spawn the DvpProposal GC background task; it restarts if it fails.
+/// Returns without spawning when `DVP_GC_ENABLED=false`.
+pub fn spawn_dvp_gc_worker(config: BaseConfig, shutdown: Shutdown) -> anyhow::Result<()> {
     if !*GC_ENABLED {
         info!("DvpProposal GC disabled (DVP_GC_ENABLED=false)");
-        return;
+        return Ok(());
     }
-    tokio::spawn(async move {
-        info!(
-            "DvpProposal GC started: min_coefficient={:.2}, delay={}s, refresh={}s, \
-             safety_margin={}s, max_pause={}s, reject_enabled={}",
-            *GC_MIN_COEFFICIENT,
-            *GC_DELAY_SECS,
-            *GC_REFRESH_SECS,
-            *GC_SAFETY_MARGIN_SECS,
-            *GC_MAX_PAUSE_SECS,
-            *GC_REJECT_ENABLED,
-        );
-        run(config, shutdown).await;
-    });
+    let s = shutdown.clone();
+    supervise::spawn_supervised("DvpProposal GC", shutdown, Policy::Restart, move || {
+        let (config, shutdown) = (config.clone(), s.clone());
+        async move {
+            info!(
+                "DvpProposal GC started: min_coefficient={:.2}, delay={}s, refresh={}s, \
+                 safety_margin={}s, max_pause={}s, reject_enabled={}",
+                *GC_MIN_COEFFICIENT,
+                *GC_DELAY_SECS,
+                *GC_REFRESH_SECS,
+                *GC_SAFETY_MARGIN_SECS,
+                *GC_MAX_PAUSE_SECS,
+                *GC_REJECT_ENABLED,
+            );
+            run(config, shutdown).await;
+        }
+    })?;
+    Ok(())
 }
 
 async fn run(config: BaseConfig, shutdown: Shutdown) {
@@ -207,9 +300,13 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
         };
 
         // --- Scan: full DvpProposal ACS for this party, classify each ---
-        let (queue, scanned) = match scan(&mut client, &config).await {
-            Ok(r) => r,
-            Err(e) => {
+        let (queue, scanned) = match bounded_scan(&shutdown, SCAN_TIMEOUT, scan(&mut client, &config)).await {
+            None => {
+                info!("DvpProposal GC shutting down");
+                return;
+            }
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
                 warn!("DvpProposal GC: ACS scan failed: {:#}", e);
                 if shutdown.sleep(Duration::from_secs(*GC_REFRESH_SECS)).await {
                     return;
@@ -222,7 +319,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
             .iter()
             .filter(|i| i.action == GcAction::Cancel)
             .count();
-        let rejects = queue.len() - cancels;
+        let rejects = queue.len().saturating_sub(cancels);
         info!(
             "DvpProposal GC cycle: scanned={}, eligible={} (cancel={}, reject={}), coefficient={:.4}",
             scanned,
@@ -269,7 +366,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
 
             match archive_one(&mut client, &config, item).await {
                 Ok(()) => {
-                    done += 1;
+                    done = done.saturating_add(1);
                     consecutive_failures = 0;
                     info!(
                         "DvpProposal GC: {} {} ({}/{})",
@@ -278,7 +375,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                         } else {
                             "rejected"
                         },
-                        &item.cid[..item.cid.len().min(16)],
+                        short(&item.cid, CID_LOG_CHARS),
                         done,
                         queue.len(),
                     );
@@ -288,10 +385,10 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                     // A skip leaves the failure counter untouched: neither
                     // success nor failure.
                     if is_already_gone(&msg) {
-                        skipped_gone += 1;
+                        skipped_gone = skipped_gone.saturating_add(1);
                         debug!(
                             "DvpProposal GC: {} already gone: {}",
-                            &item.cid[..item.cid.len().min(16)],
+                            short(&item.cid, CID_LOG_CHARS),
                             msg,
                         );
                     } else if msg.contains("SEQUENCER_BACKPRESSURE") {
@@ -307,13 +404,13 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                         // background pause, so the next `await_gate` parks the
                         // drain until the sequencer has drained instead of
                         // walking straight into the next proposal.
-                        backpressured += 1;
+                        backpressured = backpressured.saturating_add(1);
                         debug!(
                             "DvpProposal GC: {} deferred by sequencer backpressure",
-                            &item.cid[..item.cid.len().min(16)],
+                            short(&item.cid, CID_LOG_CHARS),
                         );
                     } else {
-                        consecutive_failures += 1;
+                        consecutive_failures = consecutive_failures.saturating_add(1);
                         warn!(
                             "DvpProposal GC: archive failed ({} consecutive): {}",
                             consecutive_failures, msg,
@@ -346,7 +443,7 @@ async fn run(config: BaseConfig, shutdown: Shutdown) {
                 done,
                 skipped_gone,
                 backpressured,
-                queue.len() as u64 - done - skipped_gone,
+                remaining(queue.len(), done, skipped_gone),
             );
             // A cycle where everything was "already gone" but the scan still
             // returned it is only plausible when the prepare path is looking
@@ -540,6 +637,26 @@ async fn create_client(config: &BaseConfig) -> anyhow::Result<DAppProviderClient
     .await
 }
 
+/// Queue items neither archived nor already gone.
+fn remaining(queued: usize, done: u64, gone: u64) -> u64 {
+    u64::try_from(queued)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(done)
+        .saturating_sub(gone)
+}
+
+/// One scan within `budget`; `None` on shutdown.
+async fn bounded_scan<F, T>(shutdown: &Shutdown, budget: Duration, scan: F) -> Option<anyhow::Result<T>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match supervise::bounded(shutdown, budget, scan).await {
+        Bounded::Done(r) => Some(r),
+        Bounded::Elapsed => Some(Err(anyhow::anyhow!("no result within {}s", budget.as_secs()))),
+        Bounded::Shutdown => None,
+    }
+}
+
 /// Fetch the party's active DvpProposals and classify them. Returns the
 /// eligible queue (oldest settleBefore first) and the total scanned count.
 async fn scan(
@@ -551,8 +668,8 @@ async fn scan(
         .await?;
     let scanned = contracts.len();
 
-    let now = now_micros();
-    let margin = (*GC_SAFETY_MARGIN_SECS as i64).saturating_mul(1_000_000);
+    let now = clock::now_micros_i64();
+    let margin = margin_micros(*GC_SAFETY_MARGIN_SECS);
 
     let mut queue: Vec<GcItem> = contracts
         .into_iter()
@@ -903,6 +1020,121 @@ mod tests {
             await_gate(&shutdown, TEST_DELAY, 0, 10, above, paused).await,
             GateResult::Shutdown,
         );
+    }
+
+    // Clock and margin edges saturate instead of overflowing i64
+    #[test]
+    fn clock_and_margin_edges_saturate() {
+        let p = payload(LP, OTHER, NOW - 24 * HOUR);
+        assert_eq!(classify_proposal(&p, LP, i64::MIN + 5, HOUR, true), None);
+        assert_eq!(margin_micros(u64::MAX), i64::MAX);
+        assert_eq!(margin_micros(3600), HOUR);
+        assert_eq!(remaining(3, 5, 1), 0);
+        assert_eq!(remaining(10, 4, 1), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_that_never_answers_is_bounded() {
+        let shutdown = Shutdown::new();
+        let hung = std::future::pending::<anyhow::Result<()>>();
+        let err = bounded_scan(&shutdown, SCAN_TIMEOUT, hung).await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("no result within 600s"), "{err}");
+        shutdown.signal();
+        let hung = std::future::pending::<anyhow::Result<()>>();
+        assert!(bounded_scan(&shutdown, Duration::MAX, hung).await.is_none());
+    }
+
+    fn lookup(vars: Vec<(&'static str, &'static str)>) -> impl Fn(&str) -> anyhow::Result<Option<String>> {
+        move |name| Ok(vars.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string()))
+    }
+
+    // A zero refresh used to rescan back to back, and a NaN coefficient never closed the gate
+    #[test]
+    fn bad_timer_and_gate_settings_are_refused() {
+        let bad = [
+            ("DVP_GC_DELAY_SECS", "0"),
+            ("DVP_GC_DELAY_SECS", "2s"),
+            ("DVP_GC_REFRESH_SECS", "0"),
+            ("DVP_GC_REFRESH_SECS", "-1"),
+            ("DVP_GC_MAX_PAUSE_SECS", "59"),
+            ("DVP_GC_MAX_PAUSE_SECS", "0"),
+            ("DVP_GC_SAFETY_MARGIN_SECS", "abc"),
+            ("DVP_GC_STALE_FORECAST_SECS", "1.5"),
+            ("DVP_GC_MIN_COEFFICIENT", "NaN"),
+            ("DVP_GC_MIN_COEFFICIENT", "inf"),
+            ("DVP_GC_MIN_COEFFICIENT", "-inf"),
+            ("DVP_GC_MIN_COEFFICIENT", "abc"),
+        ];
+        for (name, value) in bad {
+            let err = validate_env(&lookup(vec![(name, value)])).unwrap_err().to_string();
+            assert!(err.contains(name), "{name}={value}: {err}");
+        }
+    }
+
+    // A typo or a blank used to turn a switch off without a word
+    #[test]
+    fn switches_take_on_or_off_words_and_otherwise_keep_the_default() {
+        for on in ["1", "true", "YES", " on "] {
+            assert!(parse_switch("S", Some(on), false).unwrap(), "{on}");
+        }
+        for off in ["0", "False", "no", "off"] {
+            assert!(!parse_switch("S", Some(off), true).unwrap(), "{off}");
+        }
+        assert!(parse_switch("S", None, true).unwrap());
+        assert!(!parse_switch("S", None, false).unwrap());
+        for blank in ["", " "] {
+            assert!(parse_switch("S", Some(blank), true).unwrap(), "{blank:?}");
+            assert!(!parse_switch("S", Some(blank), false).unwrap(), "{blank:?}");
+        }
+        for typo in ["ture", "enable"] {
+            assert!(parse_switch("S", Some(typo), true).is_err(), "{typo}");
+            assert!(switch_or_default("S", Some(typo), true), "{typo}");
+            assert!(!switch_or_default("S", Some(typo), false), "{typo}");
+        }
+    }
+
+    // No switch value stops startup; the timers and the gate are still checked
+    #[test]
+    fn a_blank_or_unknown_switch_does_not_stop_startup() {
+        for (name, value) in [
+            ("DVP_GC_ENABLED", "ture"),
+            ("DVP_GC_REJECT_ENABLED", "enable"),
+            ("DVP_GC_ENABLED", ""),
+            ("DVP_GC_REJECT_ENABLED", " "),
+            ("DVP_GC_ENABLED", "false"),
+            ("DVP_GC_REJECT_ENABLED", "on"),
+        ] {
+            assert!(validate_env(&lookup(vec![(name, value)])).is_ok(), "{name}={value:?}");
+        }
+        let with_bad_timer = vec![("DVP_GC_ENABLED", "ture"), ("DVP_GC_DELAY_SECS", "0")];
+        assert!(validate_env(&lookup(with_bad_timer)).is_err());
+    }
+
+    #[test]
+    fn unset_blank_and_in_range_settings_pass() {
+        assert!(validate_env(&lookup(vec![])).is_ok());
+        let blank = ["DVP_GC_DELAY_SECS", "DVP_GC_REFRESH_SECS", "DVP_GC_MAX_PAUSE_SECS", "DVP_GC_MIN_COEFFICIENT"];
+        for name in blank {
+            assert!(validate_env(&lookup(vec![(name, " ")])).is_ok(), "{name}");
+        }
+        let good = vec![
+            ("DVP_GC_DELAY_SECS", "1"),
+            ("DVP_GC_REFRESH_SECS", " 7200 "),
+            ("DVP_GC_MAX_PAUSE_SECS", "60"),
+            ("DVP_GC_SAFETY_MARGIN_SECS", "0"),
+            ("DVP_GC_STALE_FORECAST_SECS", "0"),
+            ("DVP_GC_MIN_COEFFICIENT", "0.5"),
+        ];
+        assert!(validate_env(&lookup(good)).is_ok());
+        assert_eq!(DELAY.parse(Some(" ")).unwrap(), 2);
+        assert_eq!(MAX_PAUSE.parse(None).unwrap(), 900);
+        assert_eq!(parse_min_coefficient(Some("-0.25")).unwrap(), -0.25);
+    }
+
+    #[test]
+    fn spawning_outside_a_runtime_is_an_error() {
+        let spawned = spawn_dvp_gc_worker(BaseConfig::test_minimal().unwrap(), Shutdown::new());
+        assert_eq!(spawned.is_err(), *GC_ENABLED);
     }
 
     #[test]

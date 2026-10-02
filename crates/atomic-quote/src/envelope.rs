@@ -170,7 +170,10 @@ pub fn pre_submit_check(
         bail!("H14: quote is for {} — not {}", envelope.quote.user, expected_user);
     }
     let valid_until: i64 = envelope.quote.valid_until_micros.parse()?;
-    if now_micros + min_validity_micros >= valid_until {
+    let Some(required_until) = now_micros.checked_add(min_validity_micros) else {
+        bail!("quote validity margin overflows (now {now_micros} µs, required margin {min_validity_micros} µs)");
+    };
+    if required_until >= valid_until {
         bail!(
             "quote expires at {valid_until} µs (now {now_micros} µs, required margin {min_validity_micros} µs)"
         );
@@ -276,5 +279,20 @@ mod tests {
         let mut bad3 = env.clone();
         bad3.quote.ticket_id = "t-1".into();
         assert!(pre_submit_check(&bad3, "user::1220ee", "sync::1", 2_000_000, 0).is_err());
+    }
+
+    #[test]
+    fn pre_check_margin_overflow_fails_closed() {
+        let (env, _kf) = sample_envelope();
+        for (now, margin) in [(i64::MAX, 1), (i64::MAX - 5, 10_000_000), (i64::MIN, -1)] {
+            let err = pre_submit_check(&env, "user::1220ee", "sync::1", now, margin)
+                .expect_err("overflowing margin must be rejected");
+            assert!(err.to_string().contains("margin overflows"), "{err}");
+        }
+        // the boundary itself is still a plain expiry rejection
+        let valid_until: i64 = env.quote.valid_until_micros.parse().unwrap();
+        let err = pre_submit_check(&env, "user::1220ee", "sync::1", valid_until - 10, 10).unwrap_err();
+        assert!(err.to_string().contains("quote expires at"), "{err}");
+        pre_submit_check(&env, "user::1220ee", "sync::1", valid_until - 11, 10).unwrap();
     }
 }

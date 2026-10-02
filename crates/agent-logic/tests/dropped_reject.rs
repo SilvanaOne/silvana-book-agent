@@ -79,9 +79,9 @@ fn created(proposal: SettlementProposal) -> SettlementUpdate {
 fn executor(config: &BaseConfig) -> SettlementExecutor<UnusedBackend> {
     let tracker = Arc::new(Mutex::new(OrderTracker::new(
         0,
-        Secret::seal(&mut [0u8; 32]),
+        Secret::seal(&mut [0u8; 32]).unwrap(),
     )));
-    SettlementExecutor::new(config, tracker, UnusedBackend)
+    SettlementExecutor::new(config, tracker, UnusedBackend).unwrap()
 }
 
 /// Deliver the proposal twice through the stream path; each reject is dropped mid-flight.
@@ -115,7 +115,7 @@ async fn assert_dropped_reject_leaves_nothing(
 async fn dropped_reject_leaves_the_proposal_inactive_and_retryable() {
     // Takes connections but never answers, so every reject stays in flight
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut config = BaseConfig::test_minimal();
+    let mut config = BaseConfig::test_minimal().unwrap();
     config.orderbook_grpc_url = format!("http://{}", listener.local_addr().unwrap());
 
     // Per-counterparty cap
@@ -146,7 +146,7 @@ async fn dropped_reject_leaves_the_proposal_inactive_and_retryable() {
     });
     let tracker = Arc::new(Mutex::new(OrderTracker::new(
         0,
-        Secret::seal(&mut [0u8; 32]),
+        Secret::seal(&mut [0u8; 32]).unwrap(),
     )));
     tracker.lock().await.track_order(
         42,
@@ -158,7 +158,7 @@ async fn dropped_reject_leaves_the_proposal_inactive_and_retryable() {
         "bad",
         b"bad",
     );
-    let mut exec = SettlementExecutor::new(&config, tracker, UnusedBackend);
+    let mut exec = SettlementExecutor::new(&config, tracker, UnusedBackend).unwrap();
     assert_dropped_reject_leaves_nothing(&mut exec, proposal).await;
 
     // Shutting down

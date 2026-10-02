@@ -10,11 +10,15 @@
 //! The pricing + gating pipeline is shared between RFQ v1
 //! (`handle_rfq_request`) and the RFQ V2 atomic stream (`price_rfq`).
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
+use agent_logic::clock;
 use agent_logic::config::{
     resolve_rfq_config, BaseConfig, LiquidityProviderConfig, MarketConfig, VenueOverride,
 };
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::net_position::NetPositionTracker;
+use agent_logic::num::Dp;
 use agent_logic::pool_impact::{self, ImpactSide, MarketMid};
 use agent_logic::runner::QuotedTrade;
 use rust_decimal::Decimal;
@@ -24,13 +28,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 static STALE_WARN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// Log a stale-balance rejection at most once per minute.
 fn warn_stale_rate_limited(token: &str, age_secs: u64) {
-    let mut last = STALE_WARN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last = agent_logic::sync::lock(&STALE_WARN_AT);
     if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
         *last = Some(std::time::Instant::now());
         warn!("rejecting RFQs: {} balance stale for {}s", token, age_secs);
@@ -148,6 +151,19 @@ fn stress_coefficient(spread_percent: f64, multiplier: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+/// V1 worst-case fee in USD: x4 on ($0.3 dvp + max($0.7, 0.1% of notional)).
+/// `None` when the notional is out of `Decimal` range.
+fn v1_fee_headroom_usd(notional_usd: Option<f64>) -> Option<Decimal> {
+    let alloc = match notional_usd {
+        Some(n) => Decimal::from_f64_retain(n * 0.001)?,
+        None => Decimal::ZERO,
+    }
+    .max(Decimal::new(7, 1));
+    Decimal::new(3, 1)
+        .checked_add(alloc)?
+        .checked_mul(Decimal::from(4))
 }
 
 impl RfqHandler {
@@ -373,10 +389,9 @@ impl RfqHandler {
 
         // Parse market_id into base/quote tokens (e.g. "CC-USDCx" → ["CC", "USDCx"])
         let market_parts: Vec<&str> = market_id.split('-').collect();
-        let (base_token, quote_token) = if market_parts.len() == 2 {
-            (market_parts[0], market_parts[1])
-        } else {
-            (market_id, "")
+        let (base_token, quote_token) = match market_parts.as_slice() {
+            [base, quote] => (*base, *quote),
+            _ => (market_id, ""),
         };
 
         // Compute price based on direction and spread.
@@ -603,7 +618,19 @@ impl RfqHandler {
         // quantity, so quote-denominated requests are validated too. (Reject
         // bounds stay base-denominated; the client converts for display.)
         let min_qty: f64 = rfq_config.min_quantity.parse().unwrap_or(0.0);
-        let max_qty: f64 = rfq_config.max_quantity.parse().unwrap_or(f64::MAX);
+        let max_qty: f64 = match rfq_config.max_quantity.parse::<f64>() {
+            Ok(m) if m.is_finite() && m > 0.0 => m,
+            _ => {
+                warn!(
+                    "RFQ {}: max_quantity '{}' for {} is not a positive number — rejecting",
+                    rfq_id, rfq_config.max_quantity, market_id
+                );
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::MarketNotSupported,
+                    "RFQ not available for this market",
+                ));
+            }
+        };
         if quantity < min_qty {
             return Err(RejectInfo {
                 reason: RfqRejectionReason::AmountTooSmall,
@@ -699,19 +726,54 @@ impl RfqHandler {
             //    requiring CC here would spuriously reject V2 quotes on a
             //    CC-poor LP.
             let fee_cc = if enforce_min_notional {
-                let alloc = Decimal::from_f64_retain(notional_usd.unwrap_or(0.0) * 0.001)
-                    .unwrap_or_default()
-                    .max(Decimal::new(7, 1));
-                lm.estimate_fee_cc(Decimal::from(4) * (Decimal::new(3, 1) + alloc))
-                    .await
+                let Some(fee_usd) = v1_fee_headroom_usd(notional_usd) else {
+                    warn!(
+                        "RFQ {}: rejected — fee headroom out of range (notional {:?} USD)",
+                        rfq_id, notional_usd
+                    );
+                    return Err(RejectInfo::new(
+                        RfqRejectionReason::AmountTooLarge,
+                        "Amount out of range",
+                    ));
+                };
+                lm.estimate_fee_cc(fee_usd).await
             } else {
                 Decimal::ZERO
             };
-            let alloc_dec = Decimal::from_f64_retain(alloc_amount).unwrap_or_default();
+            // Decimal::MAX is the unaffordable sentinel (unusable CC/USD rate)
+            if fee_cc == Decimal::MAX {
+                warn!("RFQ {}: rejected — CC fee estimate out of range", rfq_id);
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "Insufficient liquidity",
+                ));
+            }
+            let Some(alloc_dec) = Decimal::from_f64_retain(alloc_amount) else {
+                warn!(
+                    "RFQ {}: rejected — {} amount {} out of range",
+                    rfq_id, alloc_token, alloc_amount
+                );
+                return Err(RejectInfo::new(
+                    RfqRejectionReason::TemporarilyUnavailable,
+                    "Insufficient liquidity",
+                ));
+            };
 
             let available = lm.available(alloc_token).await;
             let needed = if alloc_token == agent_logic::liquidity::CC_TOKEN {
-                alloc_dec + fee_cc
+                match alloc_dec.checked_add(fee_cc) {
+                    Some(n) => n,
+                    None => {
+                        warn!(
+                            "RFQ {}: rejected — {} needed out of range ({} + {} fees)",
+                            rfq_id, alloc_token, alloc_dec, fee_cc
+                        );
+                        return Err(RejectInfo::new(
+                            RfqRejectionReason::TemporarilyUnavailable,
+                            "Insufficient liquidity",
+                        ));
+                    }
+                }
             } else {
                 alloc_dec
             };
@@ -725,18 +787,30 @@ impl RfqHandler {
             if available < needed || !cc_ok {
                 if available < needed && !cc_ok {
                     warn!(
-                        "RFQ {}: rejected — insufficient {} ({:.4} available, {:.4} needed) AND insufficient CC for fees ({:.4} available, {:.4} needed)",
-                        rfq_id, alloc_token, available, needed, lm.available_cc().await, fee_cc
+                        "RFQ {}: rejected — insufficient {} ({} available, {} needed) AND insufficient CC for fees ({} available, {} needed)",
+                        rfq_id,
+                        alloc_token,
+                        Dp(available, 4),
+                        Dp(needed, 4),
+                        Dp(lm.available_cc().await, 4),
+                        Dp(fee_cc, 4)
                     );
                 } else if !cc_ok {
                     warn!(
-                        "RFQ {}: rejected — insufficient CC for fees ({:.4} available, {:.4} needed), {} OK ({:.4} available)",
-                        rfq_id, lm.available_cc().await, fee_cc, alloc_token, available
+                        "RFQ {}: rejected — insufficient CC for fees ({} available, {} needed), {} OK ({} available)",
+                        rfq_id,
+                        Dp(lm.available_cc().await, 4),
+                        Dp(fee_cc, 4),
+                        alloc_token,
+                        Dp(available, 4)
                     );
                 } else {
                     warn!(
-                        "RFQ {}: rejected — insufficient {} ({:.4} available, {:.4} needed)",
-                        rfq_id, alloc_token, available, needed
+                        "RFQ {}: rejected — insufficient {} ({} available, {} needed)",
+                        rfq_id,
+                        alloc_token,
+                        Dp(available, 4),
+                        Dp(needed, 4)
                     );
                 }
                 return Err(RejectInfo::new(
@@ -749,6 +823,30 @@ impl RfqHandler {
         let valid_for_secs = rfq_config
             .quote_valid_secs
             .unwrap_or(self.lp_config.default_quote_valid_secs);
+
+        // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
+        let price_str = format!("{price:.10}");
+        let quantity_dec_str = format!("{quantity:.10}");
+        let quote_quantity_str = format!("{quote_quantity:.10}");
+        let (Ok(price_dec), Ok(quantity_dec), Ok(quote_quantity_dec)) = (
+            Decimal::from_str(&price_str),
+            Decimal::from_str(&quantity_dec_str),
+            Decimal::from_str(&quote_quantity_str),
+        ) else {
+            warn!(
+                "RFQ {}: amounts out of Decimal range (price {}, quantity {}, quote {})",
+                rfq_id, price_str, quantity_dec_str, quote_quantity_str
+            );
+            return Err(RejectInfo::new(
+                RfqRejectionReason::TemporarilyUnavailable,
+                "Price computation error",
+            ));
+        };
+        let lp_pays_amount = if direction == 1 {
+            quantity_dec
+        } else {
+            quote_quantity_dec
+        };
 
         // `effective_spread` (side_spread × applied coefficient) was computed with
         // the price above. Annotations reflect only the multiplier that was
@@ -780,22 +878,11 @@ impl RfqHandler {
             }
         );
 
-        // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
-        let price_str = format!("{:.10}", price);
-        let quantity_dec_str = format!("{:.10}", quantity);
-        let quote_quantity_str = format!("{:.10}", quote_quantity);
-        let lp_pays_amount = Decimal::from_str(if direction == 1 {
-            &quantity_dec_str
-        } else {
-            &quote_quantity_str
-        })
-        .unwrap_or_default();
-
         Ok(PricedQuote {
             market_id: market_id.to_string(),
-            price: Decimal::from_str(&price_str).unwrap_or_default(),
-            quantity: Decimal::from_str(&quantity_dec_str).unwrap_or_default(),
-            quote_quantity: Decimal::from_str(&quote_quantity_str).unwrap_or_default(),
+            price: price_dec,
+            quantity: quantity_dec,
+            quote_quantity: quote_quantity_dec,
             price_str,
             quantity_str: quantity_dec_str,
             quote_quantity_str,
@@ -826,12 +913,20 @@ impl RfqHandler {
             reason: r.reason as i32,
             reason_detail: r.reason_detail,
             rejected_at: Some(prost_types::Timestamp {
-                seconds: chrono::Utc::now().timestamp(),
+                seconds: clock::now_secs_i64(),
                 nanos: 0,
             }),
             min_quantity: r.min_quantity,
             max_quantity: r.max_quantity,
         }
+    }
+
+    /// Reject for an RFQ that could not be priced in time.
+    pub(crate) fn unavailable(&self, rfq_id: String) -> RfqResponse {
+        RfqResponse::Reject(self.build_reject(
+            rfq_id,
+            RejectInfo::new(RfqRejectionReason::TemporarilyUnavailable, "Temporarily unavailable"),
+        ))
     }
 
     /// LP display name (used by the V2 stream handshake / messages).
@@ -867,9 +962,21 @@ impl RfqHandler {
             Err(reject) => return RfqResponse::Reject(self.build_reject(rfq_id, reject)),
         };
 
-        let quote_id = Uuid::now_v7().to_string();
-        let now = chrono::Utc::now();
-        let valid_until = now + chrono::Duration::seconds(priced.valid_for_secs as i64);
+        let quote_id = match clock::uuid_v7() {
+            Ok(id) => id.to_string(),
+            Err(e) => {
+                warn!("RFQ {}: no quote id available: {:#}", rfq_id, e);
+                return RfqResponse::Reject(self.build_reject(
+                    rfq_id,
+                    RejectInfo::new(
+                        RfqRejectionReason::TemporarilyUnavailable,
+                        "Temporarily unavailable",
+                    ),
+                ));
+            }
+        };
+        let now_secs = clock::now_secs_i64();
+        let valid_until_secs = now_secs.saturating_add(i64::from(priced.valid_for_secs));
 
         // Record trade for settlement verification (v1 only — V2 settles are
         // watcher-verified, never proposal-verified)
@@ -890,13 +997,13 @@ impl RfqHandler {
             quote_quantity: priced.quote_quantity_str,
             valid_for_secs: priced.valid_for_secs,
             valid_until: Some(prost_types::Timestamp {
-                seconds: valid_until.timestamp(),
+                seconds: valid_until_secs,
                 nanos: 0,
             }),
             lp_party_id: self.party_id.clone(),
             lp_name: self.lp_config.name.clone(),
             quoted_at: Some(prost_types::Timestamp {
-                seconds: now.timestamp(),
+                seconds: now_secs,
                 nanos: 0,
             }),
             allocate_before_secs: Some(priced.allocate_before_secs),
@@ -908,6 +1015,8 @@ impl RfqHandler {
 #[cfg(test)]
 mod price_rfq_tests {
     use super::*;
+    use crate::test_util::warn_logging;
+    use uuid::Uuid;
 
     const MID: f64 = 0.0136; // EDELx ≈ $0.0136 (the pathological cheap-base case)
 
@@ -1581,5 +1690,215 @@ mod price_rfq_tests {
         // bid equals the raw 2.55% spread.
         let raw_bid = MID * (1.0 - 0.0255);
         assert!((f(&plain.price_str) - raw_bid).abs() < 1e-9);
+    }
+
+    // Garbage-rate and out-of-range inputs
+
+    /// handler() with a custom EDELx-USDC mid and max_quantity.
+    fn handler_at(mid: f64, max_quantity: &str) -> RfqHandler {
+        let mut h = handler();
+        h.markets = vec![serde_json::from_str(&format!(
+            r#"{{"market_id":"EDELx-USDC","rfq":{{"min_quantity":"50","max_quantity":"{max_quantity}","bid_spread_percent":0.0,"offer_spread_percent":0.0}}}}"#
+        ))
+        .unwrap()];
+        h.mid_prices = Arc::new(RwLock::new(HashMap::from([(
+            "EDELx-USDC".to_string(),
+            mm(mid),
+        )])));
+        h
+    }
+
+    async fn lm_with(
+        margin: f64,
+        tokens: &[(&str, Decimal)],
+        cc_usd_rate: Decimal,
+    ) -> Arc<LiquidityManager> {
+        let lm = LiquidityManager::new(5.0, margin, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        for (token, balance) in tokens {
+            lm.update_token_balance(token, *balance).await;
+        }
+        lm.update_cc_usd_rate(cc_usd_rate).await;
+        lm
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn v1_fee_headroom_follows_the_fee_rule() {
+        assert_eq!(v1_fee_headroom_usd(None), Some(Decimal::from(4)));
+        assert_eq!(v1_fee_headroom_usd(Some(13.6)), Some(Decimal::from(4)));
+        assert_eq!(v1_fee_headroom_usd(Some(1_000_000.0)), Some(dec("4001.2")));
+        assert_eq!(v1_fee_headroom_usd(Some(1e33)), None);
+        assert_eq!(v1_fee_headroom_usd(Some(3e31)), None);
+        assert_eq!(v1_fee_headroom_usd(Some(f64::NAN)), None);
+    }
+
+    // An unusable CC/USD rate gives the Decimal::MAX fee sentinel; V1 rejects
+    // before adding or formatting it
+    #[tokio::test]
+    async fn fee_sentinel_from_garbage_rate_rejects() {
+        let _logs = warn_logging();
+        let garbage = Decimal::new(1, 28);
+        let mut h = handler();
+        h.liquidity_manager =
+            Some(lm_with(2.0, &[("EDELx", Decimal::from(5000))], garbage).await);
+        let err = h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None)
+            .await
+            .err()
+            .expect("garbage rate must reject");
+        assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
+
+        // CC allocation: the fee sentinel would be added to the CC leg
+        let market: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"CC-USDC","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":0.0,"offer_spread_percent":0.0}}"#,
+        )
+        .unwrap();
+        let mut h = handler();
+        h.markets = vec![market];
+        h.mid_prices = Arc::new(RwLock::new(HashMap::from([("CC-USDC".to_string(), mm(0.15))])));
+        let lm = lm_with(2.0, &[("USDC", Decimal::from(1000))], garbage).await;
+        lm.update_cc_balance(Decimal::from(1_000_000)).await;
+        h.liquidity_manager = Some(lm);
+        let err = h
+            .price_rfq("t", "CC-USDC", 1, "1000", "", true, None, None, None)
+            .await
+            .err()
+            .expect("garbage rate must reject the CC leg");
+        assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
+    }
+
+    // A CC allocation plus a large (non-sentinel) fee past Decimal range rejects
+    #[tokio::test]
+    async fn cc_leg_plus_fee_overflow_rejects() {
+        let market: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"CC-USDC","rfq":{"min_quantity":"50","max_quantity":"1e30","bid_spread_percent":0.0,"offer_spread_percent":0.0}}"#,
+        )
+        .unwrap();
+        let mut h = handler();
+        h.markets = vec![market];
+        h.mid_prices = Arc::new(RwLock::new(HashMap::from([("CC-USDC".to_string(), mm(0.15))])));
+        let lm = lm_with(1.1, &[("USDC", Decimal::from(1000))], Decimal::new(1, 3)).await;
+        lm.update_cc_balance(Decimal::from(1_000_000)).await;
+        h.liquidity_manager = Some(lm.clone());
+        assert!(lm.estimate_fee_cc(Decimal::from_scientific("3e25").unwrap()).await < Decimal::MAX, "fee stays below the sentinel");
+        let err = h
+            .price_rfq("t", "CC-USDC", 1, "5e28", "", true, None, None, None)
+            .await
+            .err()
+            .expect("CC leg plus fees past Decimal range must reject");
+        assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
+    }
+
+    // Liquidity rejects log amounts at or above 1e27 without panicking
+    #[tokio::test]
+    async fn liquidity_reject_logs_huge_amounts_without_panic() {
+        let _logs = warn_logging();
+        let huge = dec("5000000000000000000000000000");
+        let mut h = handler_at(MID, "1e30");
+        h.liquidity_manager =
+            Some(lm_with(1.1, &[("EDELx", huge)], Decimal::new(1, 1)).await);
+        // base short (V2, no fee headroom), then base and CC short (V1)
+        for v1 in [false, true] {
+            let err = h
+                .price_rfq("t", "EDELx-USDC", 1, "6e27", "", v1, None, None, None)
+                .await
+                .err()
+                .expect("must reject on liquidity");
+            assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"), "v1={v1}");
+        }
+
+        // CC short only, with a fee estimate above 1e27
+        let mut h = handler();
+        h.liquidity_manager =
+            Some(lm_with(1.1, &[("EDELx", Decimal::from(5000))], Decimal::new(1, 28)).await);
+        let err = h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None)
+            .await
+            .err()
+            .expect("must reject on CC fee headroom");
+        assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
+    }
+
+    // An allocation that does not fit a Decimal fails closed instead of reading as zero
+    #[tokio::test]
+    async fn allocation_beyond_decimal_range_fails_closed() {
+        let mut h = handler_at(1e30, "10000");
+        h.liquidity_manager =
+            Some(lm_with(1.1, &[("USDC", Decimal::from(1000))], Decimal::new(1, 1)).await);
+        let err = h
+            .price_rfq("t", "EDELx-USDC", 2, "1000", "", false, None, None, None)
+            .await
+            .err()
+            .expect("a 1e33 quote leg must not pass the liquidity gate");
+        assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"));
+    }
+
+    // A V1 notional whose fee headroom is out of Decimal range is rejected as too large
+    #[tokio::test]
+    async fn v1_fee_headroom_out_of_range_rejects() {
+        for mid in [1e30, 3e28] {
+            let mut h = handler_at(mid, "10000");
+            h.liquidity_manager =
+                Some(lm_with(1.1, &[("EDELx", Decimal::from(5000))], Decimal::new(1, 1)).await);
+            let err = h
+                .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None)
+                .await
+                .err()
+                .expect("must reject");
+            assert!(matches!(err.reason, RfqRejectionReason::AmountTooLarge), "mid {mid}");
+        }
+    }
+
+    // Wire amounts beyond Decimal range reject instead of signing zero amounts
+    #[tokio::test]
+    async fn wire_amounts_beyond_decimal_range_reject() {
+        let h = handler_at(1e30, "10000");
+        let err = h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None, None)
+            .await
+            .err()
+            .expect("must reject");
+        assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(err.reason_detail.as_deref(), Some("Price computation error"));
+    }
+
+    // A max_quantity that is not a positive number closes the market instead of lifting the cap
+    #[tokio::test]
+    async fn unusable_max_quantity_rejects() {
+        for max in ["lots", "inf", "NaN", "0", "-5", ""] {
+            let err = handler_at(MID, max)
+                .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("max_quantity {max:?} must reject"));
+            assert!(matches!(err.reason, RfqRejectionReason::MarketNotSupported), "{max:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_quote_validity_matches_valid_for_secs() {
+        let req = RfqRequest {
+            rfq_id: "rfq-1".to_string(),
+            market_id: "EDELx-USDC".to_string(),
+            direction: 1,
+            quantity: "1000".to_string(),
+            ..Default::default()
+        };
+        match handler().handle_rfq_request(req).await {
+            RfqResponse::Quote(q) => {
+                let quoted = q.quoted_at.unwrap().seconds;
+                let until = q.valid_until.unwrap().seconds;
+                assert_eq!(until - quoted, i64::from(q.valid_for_secs));
+                assert!(quoted > 1_700_000_000);
+                assert_eq!(Uuid::parse_str(&q.quote_id).unwrap().get_version_num(), 7);
+            }
+            RfqResponse::Reject(r) => panic!("expected a quote: {:?}", r.reason_detail),
+        }
     }
 }

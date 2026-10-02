@@ -8,12 +8,15 @@
 //! This is the shared `BaseConfig` used by both the local agent and the cloud agent.
 //! The local agent wraps this with a `Config` that adds ledger API URLs.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use orderbook_proto::orderbook::Instrument;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::Path;
+use std::str::FromStr;
 use zeroize::Zeroize;
 
 use crate::auth::get_public_key_hex;
@@ -271,18 +274,18 @@ impl AtomicQuoteKey {
             .map_err(|_| anyhow!("quote scalar must be 32 bytes"))?;
         Ok(Self {
             pub_spki_hex: kf.pub_spki_hex,
-            scalar: Secret::seal(&mut bytes),
+            scalar: Secret::seal(&mut bytes)?,
         })
     }
 
     /// Sealed scalar, exposed briefly for signing.
-    pub fn scalar(&self) -> crate::secret::Exposed<32> {
+    pub fn scalar(&self) -> Result<crate::secret::Exposed<32>, crate::secret::SecretError> {
         self.scalar.expose()
     }
 
     /// Lowercase hex of the scalar; the returned string is zeroed on drop.
-    pub fn scalar_hex(&self) -> Zeroizing<String> {
-        Zeroizing::new(hex::encode(self.scalar.expose().as_slice()))
+    pub fn scalar_hex(&self) -> Result<Zeroizing<String>, crate::secret::SecretError> {
+        Ok(Zeroizing::new(hex::encode(self.scalar.expose()?.as_slice())))
     }
 }
 
@@ -302,18 +305,18 @@ impl BaseConfig {
     /// rfq_v2 tests) can build a state harness; hidden from docs — never use
     /// outside tests.
     #[doc(hidden)]
-    pub fn test_minimal() -> Self {
-        Self {
+    pub fn test_minimal() -> Result<Self> {
+        Ok(Self {
             orderbook_grpc_url: String::new(),
             synchronizer_id: String::new(),
             party_id: "test-party".to_string(),
-            private_key: Secret::seal(&mut [0u8; 32]),
+            private_key: Secret::seal(&mut [0u8; 32])?,
             public_key_hex: String::new(),
             settlement_operator: String::new(),
             fee_reserve_cc: 5.0,
             merge_threshold: None,
             merge_max_amulets: 0,
-            merge_poll_interval_sec: 0,
+            merge_poll_interval_sec: 600,
             settlement_thread_count: 1,
             dso_party: String::new(),
             onboarded_registries: Vec::new(),
@@ -346,7 +349,7 @@ impl BaseConfig {
             min_prepaid_traffic_balance_cc: None,
             prepaid_traffic_topup_cc: None,
             atomic_quote_key: None,
-        }
+        })
     }
 }
 
@@ -404,7 +407,7 @@ impl BaseConfig {
             })?
         } else {
             // Empty string round-trips to AgentToml with all serde defaults.
-            toml::from_str("").expect("AgentToml serde defaults must parse")
+            toml::from_str("").context("AgentToml serde defaults must parse")?
         };
         Self::assemble(agent, overrides)
     }
@@ -434,7 +437,7 @@ impl BaseConfig {
     ) -> Result<Self> {
         let mut private_key_bytes = decode_private_key(private_key_base58)?;
         let public_key_hex = get_public_key_hex(&private_key_bytes);
-        let private_key = Secret::seal(&mut private_key_bytes);
+        let private_key = Secret::seal(&mut private_key_bytes)?;
         let ledger_service_public_key = decode_public_key(ledger_service_public_key_base58)?;
         Ok(Self {
             orderbook_grpc_url: orderbook_grpc_url.to_string(),
@@ -519,8 +522,10 @@ impl BaseConfig {
 
     /// The RFQ V2 / market-window validation `assemble` runs on the env path,
     /// for configs built programmatically via [`BaseConfig::for_party`]. Call
-    /// after setting `markets` / `liquidity_provider` / the quote key.
+    /// after setting `markets` / `liquidity_provider` / the quote key. Also
+    /// runs the range checks of [`BaseConfig::validate_ranges`].
     pub fn validate_v2(&self) -> Result<()> {
+        self.validate_ranges()?;
         for market in &self.markets {
             if let Some(rfq) = &market.rfq {
                 if rfq.allocate_before_secs == 0
@@ -580,16 +585,7 @@ impl BaseConfig {
             .as_ref()
             .and_then(|lp| lp.rfq_v2.as_ref())
         {
-            if v2.ticket_batch_size == 0 {
-                return Err(anyhow!(
-                    "[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"
-                ));
-            }
-            if v2.atomic_quote_valid_secs == 0 {
-                return Err(anyhow!(
-                    "[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"
-                ));
-            }
+            validate_rfq_v2_ranges(v2)?;
         }
 
         if rfq_v2_enabled && self.atomic_quote_key.is_none() {
@@ -675,7 +671,7 @@ impl BaseConfig {
                  (its public key is {public_key_hex}); check --party and --private-key"
             ));
         }
-        let private_key = Secret::seal(&mut private_key_bytes);
+        let private_key = Secret::seal(&mut private_key_bytes)?;
         drop(private_key_b58);
 
         let orderbook_grpc_url = std::env::var("ORDERBOOK_GRPC_URL")
@@ -697,10 +693,7 @@ impl BaseConfig {
         // are also no longer read by the cloud-agent: traffic billing is
         // handled off-chain by the ledger via the prepaid pool.
 
-        let fee_reserve_cc = std::env::var("AGENT_FEE_RESERVE_CC")
-            .unwrap_or_else(|_| "5.0".to_string())
-            .parse::<f64>()
-            .unwrap_or(5.0);
+        let fee_reserve_cc: f64 = env_or("AGENT_FEE_RESERVE_CC", 5.0)?;
 
         // AGENT_FEE_CC / PARTICIPANT_FEE_CC / SIGNATURE_FEE_CC have moved to
         // the ledger-service config (`LedgerServiceConfig`). The ledger
@@ -714,15 +707,14 @@ impl BaseConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
-        let merge_poll_interval_sec = std::env::var("MERGE_POLL_INTERVAL_SEC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
+        let merge_poll_interval_sec: u64 = env_or("MERGE_POLL_INTERVAL_SEC", 600)?;
 
-        let settlement_thread_count = std::env::var("SETTLEMENT_THREAD_COUNT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(25);
+        let settlement_thread_count: usize = env_or("SETTLEMENT_THREAD_COUNT", 25)?;
+
+        // Process-wide knobs read by background modules; checked here so a bad
+        // value stops startup instead of falling back.
+        crate::forecast::poll_secs_from_env()?;
+        crate::ledger_health::cooldown_secs_from_env()?;
 
         let max_active_settlements = std::env::var("AGENT_MAX_SETTLEMENTS")
             .ok()
@@ -788,25 +780,10 @@ impl BaseConfig {
             .max()
             .unwrap_or(default_rfq_allocate_before_secs() as u64);
 
-        let liquidity_margin = std::env::var("LIQUIDITY_MARGIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.1);
-
-        let flow_ema_window_hours = std::env::var("FLOW_EMA_WINDOW_HOURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4.0);
-
-        let depletion_max_hours = std::env::var("DEPLETION_COEFF_MAX_HOURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(12.0);
-
-        let depletion_min_hours = std::env::var("DEPLETION_COEFF_MIN_HOURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0);
+        let liquidity_margin: f64 = env_or("LIQUIDITY_MARGIN", 1.1)?;
+        let flow_ema_window_hours: f64 = env_or("FLOW_EMA_WINDOW_HOURS", 4.0)?;
+        let depletion_max_hours: f64 = env_or("DEPLETION_COEFF_MAX_HOURS", 12.0)?;
+        let depletion_min_hours: f64 = env_or("DEPLETION_COEFF_MIN_HOURS", 1.0)?;
 
         // Auto-topup vars: both must be set together. If exactly one is set,
         // fail at startup so the operator gets a clear signal rather than
@@ -937,13 +914,13 @@ impl BaseConfig {
         // Invalid slugs are hard errors: a typoed venue would otherwise just
         // silently never match and the operator would ship pair-default
         // pricing believing the override was live.
-        for (i, ov) in agent.venue_overrides.iter().enumerate() {
+        for (n, ov) in (1usize..).zip(agent.venue_overrides.iter()) {
             if !crate::auth::is_valid_venue_branch(&ov.venue) {
                 return Err(anyhow!(
                     "[[venue_overrides]] #{}: venue '{}' is not a valid slug \
                      (^[a-z0-9][a-z0-9-]{{1,19}}$) — it must equal the server's \
                      swap-venue name (AtomicRfqRequest.venue_name)",
-                    i + 1,
+                    n,
                     ov.venue
                 ));
             }
@@ -952,7 +929,7 @@ impl BaseConfig {
                     return Err(anyhow!(
                         "[[venue_overrides]] #{} (venue '{}'): branch '{}' is not a \
                          valid slug (^[a-z0-9][a-z0-9-]{{1,19}}$)",
-                        i + 1,
+                        n,
                         ov.venue,
                         b
                     ));
@@ -963,7 +940,7 @@ impl BaseConfig {
                     return Err(anyhow!(
                         "[[venue_overrides]] #{} (venue '{}'): markets = [] can never \
                          match — omit the key entirely to target all markets",
-                        i + 1,
+                        n,
                         ov.venue
                     ));
                 }
@@ -972,7 +949,7 @@ impl BaseConfig {
                         tracing::warn!(
                             "[[venue_overrides]] #{} (venue '{}'): market '{}' is not in \
                              [[markets]] — that scope entry can never match",
-                            i + 1,
+                            n,
                             ov.venue,
                             m
                         );
@@ -996,7 +973,7 @@ impl BaseConfig {
                                  overrides cannot OPEN a pair-disabled market (the V2 \
                                  stream never subscribes it); enable the pair and close \
                                  the other venues instead",
-                                i + 1,
+                                n,
                                 ov.venue,
                                 m
                             ));
@@ -1008,7 +985,7 @@ impl BaseConfig {
                 tracing::warn!(
                     "[[venue_overrides]] #{} (venue '{}'): empty [venue_overrides.rfq] \
                      overlay — entry has no effect",
-                    i + 1,
+                    n,
                     ov.venue
                 );
             }
@@ -1019,7 +996,7 @@ impl BaseConfig {
                     anyhow!(
                         "[[venue_overrides]] #{} (venue '{}'): min_quantity '{}' is not \
                          a number — the runtime fallback would silently disable the floor",
-                        i + 1,
+                        n,
                         ov.venue,
                         s
                     )
@@ -1027,15 +1004,20 @@ impl BaseConfig {
                 None => None,
             };
             let max = match &ov.rfq.max_quantity {
-                Some(s) => Some(s.parse::<f64>().map_err(|_| {
-                    anyhow!(
-                        "[[venue_overrides]] #{} (venue '{}'): max_quantity '{}' is not \
-                         a number — the runtime fallback would silently remove the cap",
-                        i + 1,
-                        ov.venue,
-                        s
-                    )
-                })?),
+                Some(s) => Some(
+                    s.parse::<f64>()
+                        .ok()
+                        .filter(|m| m.is_finite() && *m > 0.0)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "[[venue_overrides]] #{} (venue '{}'): max_quantity '{}' is not \
+                                 a positive number",
+                                n,
+                                ov.venue,
+                                s
+                            )
+                        })?,
+                ),
                 None => None,
             };
             if let (Some(min), Some(max)) = (min, max) {
@@ -1043,7 +1025,7 @@ impl BaseConfig {
                     return Err(anyhow!(
                         "[[venue_overrides]] #{} (venue '{}'): min_quantity {} > \
                          max_quantity {}",
-                        i + 1,
+                        n,
                         ov.venue,
                         min,
                         max
@@ -1057,16 +1039,7 @@ impl BaseConfig {
             .as_ref()
             .and_then(|lp| lp.rfq_v2.as_ref())
         {
-            if v2.ticket_batch_size == 0 {
-                return Err(anyhow!(
-                    "[liquidity_provider.rfq_v2] ticket_batch_size must be > 0"
-                ));
-            }
-            if v2.atomic_quote_valid_secs == 0 {
-                return Err(anyhow!(
-                    "[liquidity_provider.rfq_v2] atomic_quote_valid_secs must be > 0"
-                ));
-            }
+            validate_rfq_v2_ranges(v2)?;
         }
 
         // rfq_v2_only sanity: with V1 and orders disabled, a config without a
@@ -1131,7 +1104,7 @@ impl BaseConfig {
             None
         };
 
-        Ok(BaseConfig {
+        let config = BaseConfig {
             orderbook_grpc_url,
             synchronizer_id,
             party_id,
@@ -1175,7 +1148,52 @@ impl BaseConfig {
             min_prepaid_traffic_balance_cc,
             prepaid_traffic_topup_cc,
             atomic_quote_key,
-        })
+        };
+        config.validate_ranges()?;
+        Ok(config)
+    }
+
+    /// Range checks for values that size pools or feed timers, deadlines and
+    /// timeouts: out of range is a startup error, never a silent clamp.
+    pub fn validate_ranges(&self) -> Result<()> {
+        check_range(
+            "settlement_thread_count (SETTLEMENT_THREAD_COUNT)",
+            self.settlement_thread_count,
+            1..=crate::sync::MAX_PERMITS,
+        )?;
+        check_positive("merge_poll_interval_sec (MERGE_POLL_INTERVAL_SEC)", self.merge_poll_interval_sec)?;
+        check_range("token_ttl_secs", self.token_ttl_secs, 60..=86_400)?;
+        check_range("connection_timeout_secs", self.connection_timeout_secs, 1..=300)?;
+        check_range("request_timeout_secs", self.request_timeout_secs, 1..=3600)?;
+        check_range("canton_op_timeout_secs", self.canton_op_timeout_secs, 1..=86_400)?;
+        for (name, value) in [
+            ("fee_reserve_cc (AGENT_FEE_RESERVE_CC)", self.fee_reserve_cc),
+            ("liquidity_margin (LIQUIDITY_MARGIN)", self.liquidity_margin),
+            ("flow_ema_window_hours (FLOW_EMA_WINDOW_HOURS)", self.flow_ema_window_hours),
+            ("depletion_max_hours (DEPLETION_COEFF_MAX_HOURS)", self.depletion_max_hours),
+            ("depletion_min_hours (DEPLETION_COEFF_MIN_HOURS)", self.depletion_min_hours),
+        ] {
+            if !value.is_finite() {
+                bail!("{name}={value} must be a finite number");
+            }
+        }
+        for market in &self.markets {
+            if let Some(rfq) = &market.rfq {
+                // Parsed exactly as the quoting path parses it
+                let max = rfq.max_quantity.parse::<f64>().ok();
+                if !max.is_some_and(|m| m.is_finite() && m > 0.0) {
+                    bail!(
+                        "Market {}: [markets.rfq] max_quantity '{}' must be a positive number",
+                        market.market_id,
+                        rfq.max_quantity
+                    );
+                }
+            }
+        }
+        if let Some(v2) = self.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()) {
+            validate_rfq_v2_ranges(v2)?;
+        }
+        Ok(())
     }
 
     /// Get list of enabled markets
@@ -1327,6 +1345,65 @@ pub struct ResolvedInstrument {
 // Helpers
 // ============================================================================
 
+/// `value` must lie in `range`.
+fn check_range<T: PartialOrd + Display>(name: &str, value: T, range: RangeInclusive<T>) -> Result<()> {
+    if range.contains(&value) {
+        return Ok(());
+    }
+    let (lo, hi) = range.into_inner();
+    bail!("{name}={value} is outside {lo}..={hi}")
+}
+
+/// `[liquidity_provider.rfq_v2]` values that feed timers and quote validity.
+fn validate_rfq_v2_ranges(v2: &RfqV2Config) -> Result<()> {
+    check_range("[liquidity_provider.rfq_v2] ticket_batch_size", v2.ticket_batch_size, 1..=1000)?;
+    check_range(
+        "[liquidity_provider.rfq_v2] atomic_quote_valid_secs",
+        v2.atomic_quote_valid_secs,
+        1..=RFQ_V2_MAX_QUOTE_VALID_SECS,
+    )?;
+    check_range(
+        "[liquidity_provider.rfq_v2] settle_grace_secs",
+        v2.settle_grace_secs,
+        0..=RFQ_V2_MAX_SETTLE_GRACE_SECS,
+    )?;
+    check_positive("[liquidity_provider.rfq_v2] updates_poll_interval_secs", v2.updates_poll_interval_secs)?;
+    check_positive("[liquidity_provider.rfq_v2] split_poll_interval_secs", v2.split_poll_interval_secs)
+}
+
+/// A poll interval of 0 would spin.
+fn check_positive(name: &str, value: u64) -> Result<()> {
+    if value == 0 {
+        bail!("{name} must be at least 1");
+    }
+    Ok(())
+}
+
+/// Env var `name` parsed as `T`; unset or blank gives `default`, and a set
+/// value that does not parse is an error.
+fn env_or<T>(name: &str, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match std::env::var(name) {
+        Ok(raw) => parse_env_value(name, Some(&raw), default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => bail!("{name}: {e}"),
+    }
+}
+
+fn parse_env_value<T>(name: &str, raw: Option<&str>, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(default),
+        Some(s) => s.parse().map_err(|e| anyhow!("{name}='{s}' is not valid: {e}")),
+    }
+}
+
 /// Decode base58 Ed25519 public key to 32 bytes
 /// Canton derives a party's namespace as `1220` + hex of
 /// `SHA256(0x0000000C || public_key)`. Returns `None` when the party id does
@@ -1349,16 +1426,10 @@ pub fn decode_public_key(base58_key: &str) -> Result<[u8; 32]> {
         .into_vec()
         .context("Invalid base58 public key")?;
 
-    if key_bytes.len() != 32 {
-        anyhow::bail!(
-            "Public key must be exactly 32 bytes, got {}",
-            key_bytes.len()
-        );
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&key_bytes);
-    Ok(arr)
+    let len = key_bytes.len();
+    key_bytes
+        .try_into()
+        .map_err(|_| anyhow!("Public key must be exactly 32 bytes, got {len}"))
 }
 
 /// Decode base58 Ed25519 private key to 32-byte seed
@@ -1369,16 +1440,13 @@ pub fn decode_private_key(base58_key: &str) -> Result<[u8; 32]> {
             .context("Invalid base58 private key")?,
     );
 
-    if key_bytes.len() < 32 {
-        anyhow::bail!(
+    let seed = key_bytes.first_chunk::<32>().ok_or_else(|| {
+        anyhow!(
             "Private key too short: expected at least 32 bytes, got {}",
             key_bytes.len()
-        );
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&key_bytes[..32]);
-    Ok(arr)
+        )
+    })?;
+    Ok(*seed)
 }
 
 /// Check that `base58_key` decodes to a usable private key.
@@ -1693,7 +1761,7 @@ impl VenueOverride {
     /// More constrained entries apply later (and therefore win) in
     /// [`resolve_rfq_config`].
     fn specificity(&self) -> u8 {
-        self.branch.is_some() as u8 + self.markets.is_some() as u8
+        u8::from(self.branch.is_some()).saturating_add(u8::from(self.markets.is_some()))
     }
 }
 
@@ -1845,6 +1913,11 @@ pub struct LiquidityProviderConfig {
     #[serde(default)]
     pub rfq_v2: Option<RfqV2Config>,
 }
+
+/// Largest accepted `atomic_quote_valid_secs`.
+pub const RFQ_V2_MAX_QUOTE_VALID_SECS: u64 = 3600;
+/// Largest accepted `settle_grace_secs`.
+pub const RFQ_V2_MAX_SETTLE_GRACE_SECS: u64 = 3600;
 
 /// RFQ V2 LP-level configuration (`[liquidity_provider.rfq_v2]`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2069,7 +2142,7 @@ mod tests {
         // Wire-id divergence: the RPC serves a readable instrument_id with the
         // on-chain wire id in `symbol` (an opaque UUID). resolve_instrument must
         // return the WIRE id — legacy tokens (symbol == id) and CC→Amulet unchanged.
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.populate_instruments_from_rpc(vec![
             Instrument {
                 instrument_id: "ACME".into(),
@@ -2778,7 +2851,7 @@ enabled = true
         set("RFQ_V2_ENABLED", "true");
         set("ATOMIC_QUOTE_PRIVATE_KEY", &kf.priv_scalar_hex);
         let kf2 = atomic_quote::gen_keypair().unwrap();
-        let (k2_b58, _) = crate::sign::generate_keypair();
+        let (k2_b58, _) = crate::sign::generate_keypair().unwrap();
         let agent: AgentToml = toml::from_str(market_v2_toml).unwrap();
         let cfg = BaseConfig::assemble(
             agent,
@@ -2834,6 +2907,45 @@ enabled = true
         );
         assert!(err.contains("--quote-private-key"), "got: {err}");
 
+        // P: knobs that size pools or feed timers are validated, never defaulted
+        unset("RFQ_V2_ENABLED");
+        for (k, v) in [
+            ("SETTLEMENT_THREAD_COUNT", "0"),
+            ("SETTLEMENT_THREAD_COUNT", "1025"),
+            ("SETTLEMENT_THREAD_COUNT", "many"),
+            ("MERGE_POLL_INTERVAL_SEC", "0"),
+            ("AGENT_FEE_RESERVE_CC", "NaN"),
+            ("LIQUIDITY_MARGIN", "1,1"),
+            ("DEPLETION_COEFF_MIN_HOURS", "inf"),
+        ] {
+            set(k, v);
+            let err = format!("{:#}", BaseConfig::assemble(toml::from_str::<AgentToml>("").unwrap(), ConfigOverrides::default()).unwrap_err());
+            assert!(err.contains(k), "{k}={v}: {err}");
+            unset(k);
+        }
+        set("SETTLEMENT_THREAD_COUNT", " 1024 ");
+        set("MERGE_POLL_INTERVAL_SEC", "");
+        let cfg = BaseConfig::assemble(toml::from_str::<AgentToml>("").unwrap(), ConfigOverrides::default()).unwrap();
+        assert_eq!((cfg.settlement_thread_count, cfg.merge_poll_interval_sec), (1024, 600));
+        unset("SETTLEMENT_THREAD_COUNT");
+        unset("MERGE_POLL_INTERVAL_SEC");
+
+        // Q: agent.toml timeouts and an overlay max_quantity of zero are rejected
+        let agent: AgentToml = toml::from_str("token_ttl_secs = 59").unwrap();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
+        assert!(err.contains("token_ttl_secs"), "got: {err}");
+        let agent: AgentToml = toml::from_str(
+            r#"
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+max_quantity = "0"
+"#,
+        )
+        .unwrap();
+        let err = BaseConfig::assemble(agent, ConfigOverrides::default()).unwrap_err().to_string();
+        assert!(err.contains("max_quantity '0' is not a positive number"), "got: {err}");
+
         // cleanup
         for k in [
             "RFQ_V2_ENABLED",
@@ -2841,19 +2953,136 @@ enabled = true
             "TICKET_THRESHOLD_USD",
             "TICKET_BATCH_SIZE",
             "ATOMIC_QUOTE_PRIVATE_KEY",
+            "SETTLEMENT_THREAD_COUNT",
+            "MERGE_POLL_INTERVAL_SEC",
+            "AGENT_FEE_RESERVE_CC",
+            "LIQUIDITY_MARGIN",
+            "DEPLETION_COEFF_MIN_HOURS",
         ] {
             unset(k);
         }
     }
 
     #[test]
+    fn validate_ranges_rejects_values_that_feed_pools_and_timers() {
+        fn with_v2(c: &mut BaseConfig) {
+            c.liquidity_provider = Some(LiquidityProviderConfig {
+                name: "LP test".to_string(),
+                max_concurrent_rfqs: 1,
+                default_quote_valid_secs: 30,
+                min_notional_usd: 0.0,
+                rfq_v2: Some(RfqV2Config::default()),
+            });
+        }
+        fn v2(c: &mut BaseConfig) -> &mut RfqV2Config {
+            c.liquidity_provider.as_mut().unwrap().rfq_v2.as_mut().unwrap()
+        }
+        let cases: Vec<(&str, fn(&mut BaseConfig))> = vec![
+            ("SETTLEMENT_THREAD_COUNT", |c| c.settlement_thread_count = 0),
+            ("SETTLEMENT_THREAD_COUNT", |c| c.settlement_thread_count = 1025),
+            ("MERGE_POLL_INTERVAL_SEC", |c| c.merge_poll_interval_sec = 0),
+            ("token_ttl_secs", |c| c.token_ttl_secs = 59),
+            ("token_ttl_secs", |c| c.token_ttl_secs = 86_401),
+            ("connection_timeout_secs", |c| c.connection_timeout_secs = 0),
+            ("connection_timeout_secs", |c| c.connection_timeout_secs = 301),
+            ("request_timeout_secs", |c| c.request_timeout_secs = 0),
+            ("request_timeout_secs", |c| c.request_timeout_secs = 3601),
+            ("canton_op_timeout_secs", |c| c.canton_op_timeout_secs = 0),
+            ("canton_op_timeout_secs", |c| c.canton_op_timeout_secs = 86_401),
+            ("AGENT_FEE_RESERVE_CC", |c| c.fee_reserve_cc = f64::NAN),
+            ("LIQUIDITY_MARGIN", |c| c.liquidity_margin = f64::INFINITY),
+            ("FLOW_EMA_WINDOW_HOURS", |c| c.flow_ema_window_hours = f64::NAN),
+            ("DEPLETION_COEFF_MAX_HOURS", |c| c.depletion_max_hours = f64::NEG_INFINITY),
+            ("DEPLETION_COEFF_MIN_HOURS", |c| c.depletion_min_hours = f64::NAN),
+            ("ticket_batch_size", |c| { with_v2(c); v2(c).ticket_batch_size = 0 }),
+            ("ticket_batch_size", |c| { with_v2(c); v2(c).ticket_batch_size = 1001 }),
+            ("atomic_quote_valid_secs", |c| { with_v2(c); v2(c).atomic_quote_valid_secs = 0 }),
+            ("atomic_quote_valid_secs", |c| { with_v2(c); v2(c).atomic_quote_valid_secs = 3601 }),
+            ("settle_grace_secs", |c| { with_v2(c); v2(c).settle_grace_secs = 3601 }),
+            ("updates_poll_interval_secs", |c| { with_v2(c); v2(c).updates_poll_interval_secs = 0 }),
+            ("split_poll_interval_secs", |c| { with_v2(c); v2(c).split_poll_interval_secs = 0 }),
+        ];
+        for (name, mutate) in &cases {
+            let mut config = BaseConfig::test_minimal().unwrap();
+            mutate(&mut config);
+            let err = config.validate_v2().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: {err}");
+        }
+
+        // The bounds themselves are accepted
+        let mut config = BaseConfig::test_minimal().unwrap();
+        with_v2(&mut config);
+        config.settlement_thread_count = 1024;
+        config.token_ttl_secs = 86_400;
+        config.connection_timeout_secs = 300;
+        config.request_timeout_secs = 3600;
+        config.canton_op_timeout_secs = 86_400;
+        let lp = v2(&mut config);
+        lp.ticket_batch_size = 1000;
+        lp.atomic_quote_valid_secs = 3600;
+        lp.settle_grace_secs = 3600;
+        config.validate_ranges().unwrap();
+    }
+
+    #[test]
+    fn every_rfq_market_needs_a_positive_max_quantity() {
+        let market = |max: &str| -> MarketConfig {
+            toml::from_str(&format!(
+                "market_id = \"CC-USDCx\"\n[rfq]\nmin_quantity = \"1\"\nmax_quantity = \"{max}\"\n"
+            ))
+            .unwrap()
+        };
+        for bad in ["", " 1", "abc", "0", "-1", "inf", "NaN"] {
+            let mut config = BaseConfig::test_minimal().unwrap();
+            config.markets = vec![market(bad)];
+            let err = config.validate_ranges().unwrap_err().to_string();
+            assert!(err.contains("max_quantity"), "{bad:?}: {err}");
+        }
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.markets = vec![market("0.1")];
+        config.validate_ranges().unwrap();
+    }
+
+    #[test]
+    fn env_values_parse_strictly_with_blank_as_unset() {
+        assert_eq!(parse_env_value("N", None, 25usize).unwrap(), 25);
+        assert_eq!(parse_env_value("N", Some("  "), 25usize).unwrap(), 25);
+        assert_eq!(parse_env_value("N", Some(" 7 "), 25usize).unwrap(), 7);
+        assert!(parse_env_value("N", Some("1.5"), 25usize).unwrap_err().to_string().starts_with("N='1.5'"));
+        assert!(parse_env_value("N", Some("-3"), 25usize).is_err());
+        assert!(parse_env_value("N", Some("NaN"), 1.0f64).unwrap().is_nan(), "finiteness is checked by validate_ranges");
+    }
+
+    #[test]
+    fn keys_of_the_wrong_length_are_errors() {
+        let short = bs58::encode([1u8; 31]).into_string();
+        let err = decode_public_key(&short).unwrap_err().to_string();
+        assert_eq!(err, "Public key must be exactly 32 bytes, got 31");
+        assert!(decode_public_key(&bs58::encode([1u8; 33]).into_string()).is_err());
+        assert_eq!(decode_public_key(&bs58::encode([5u8; 32]).into_string()).unwrap(), [5u8; 32]);
+        let err = decode_private_key(&short).unwrap_err().to_string();
+        assert_eq!(err, "Private key too short: expected at least 32 bytes, got 31");
+        let mut keypair = [9u8; 64];
+        keypair[..32].copy_from_slice(&[4u8; 32]);
+        assert_eq!(decode_private_key(&bs58::encode(keypair).into_string()).unwrap(), [4u8; 32]);
+    }
+
+    #[test]
     fn test_quote_key_from_short_scalar_hex() {
         let short = "01".repeat(24);
         let key = AtomicQuoteKey::from_scalar_hex(&short).unwrap();
-        assert_eq!(key.scalar_hex().len(), 64);
-        assert!(key.scalar_hex().starts_with(&"0".repeat(16)));
-        assert!(key.scalar_hex().ends_with(&short));
+        assert_eq!(key.scalar_hex().unwrap().len(), 64);
+        assert!(key.scalar_hex().unwrap().starts_with(&"0".repeat(16)));
+        assert!(key.scalar_hex().unwrap().ends_with(&short));
         assert!(AtomicQuoteKey::from_scalar_hex(&"01".repeat(10)).is_err());
+    }
+
+    // A quote key that cannot be opened is an error, not a panic
+    #[test]
+    fn a_quote_key_that_cannot_be_opened_is_an_error() {
+        let key = AtomicQuoteKey { pub_spki_hex: String::new(), scalar: Secret::corrupt_for_tests() };
+        assert!(key.scalar().is_err());
+        assert_eq!(key.scalar_hex().unwrap_err(), crate::secret::SecretError::Corrupt);
     }
 
     #[test]
@@ -2861,8 +3090,8 @@ enabled = true
         let kf = atomic_quote::gen_keypair().unwrap();
         let key = AtomicQuoteKey::from_scalar_hex(&kf.priv_scalar_hex).unwrap();
         assert_eq!(key.pub_spki_hex, kf.pub_spki_hex);
-        assert_eq!(*key.scalar_hex(), kf.priv_scalar_hex.to_lowercase());
-        assert_eq!(hex::encode(key.scalar().as_slice()), kf.priv_scalar_hex.to_lowercase());
+        assert_eq!(*key.scalar_hex().unwrap(), kf.priv_scalar_hex.to_lowercase());
+        assert_eq!(hex::encode(key.scalar().unwrap().as_slice()), kf.priv_scalar_hex.to_lowercase());
         assert_eq!(format!("{key:?}"), format!("AtomicQuoteKey {{ pub_spki_hex: {:?}, .. }}", kf.pub_spki_hex));
         assert!(AtomicQuoteKey::from_scalar_hex("zz").is_err());
     }
@@ -2871,7 +3100,7 @@ enabled = true
     /// `validate_v2` for `for_party` embedders.
     #[test]
     fn test_rfq_v2_only_validate_v2_mirror() {
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.rfq_v2_only = true;
 
         // No LP section

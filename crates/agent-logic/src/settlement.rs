@@ -20,13 +20,10 @@
 //!       → WAIT → sleep (counterparty's turn)
 //!       → NONE → done (settled/failed/cancelled)
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
-use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -44,6 +41,7 @@ use orderbook_proto::{
 };
 
 use crate::auth::generate_jwt;
+use crate::clock;
 use crate::client::OrderbookClient;
 use crate::config::BaseConfig;
 use crate::liquidity::{self, LiquidityManager};
@@ -51,6 +49,8 @@ use crate::order_tracker::{OrderTracker, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
 use crate::runner::{AcceptedRfqTrade, QuotedTrade};
 use crate::shutdown::Shutdown;
+use crate::supervise::try_spawn;
+use crate::sync;
 use crate::types::{AdvanceResult, CidWaitingType, FailedSettlement, SettlementStage, SettlementState};
 
 /// Outcome of the server-side user-order verification (Path B of proposal
@@ -102,6 +102,16 @@ const SYNC_MIN_INTERVAL: Duration = Duration::from_secs(15);
 const HOLD_INITIAL: Duration = Duration::from_secs(30);
 const HOLD_MAX: Duration = Duration::from_secs(300);
 
+/// Bound on waiting for in-flight settlement tasks at shutdown; the rest are aborted.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A settlement step still running after this long is logged; it is never cut short.
+#[cfg(not(test))]
+const STEP_SLOW_AFTER: Duration = Duration::from_secs(300);
+/// Short in unit tests, so a step can outlive it in real time.
+#[cfg(test)]
+const STEP_SLOW_AFTER: Duration = Duration::from_millis(100);
+
 /// Most stream updates taken into one batch.
 pub const STREAM_BATCH_MAX: usize = 64;
 
@@ -131,6 +141,17 @@ pub fn affects_grid(update: &SettlementUpdate) -> bool {
             .is_some_and(|p| p.order_match.is_some()),
         _ => false,
     }
+}
+
+/// A fresh JWT for the configured party.
+fn config_jwt(config: &BaseConfig) -> Result<String> {
+    generate_jwt(
+        &config.party_id,
+        &config.role,
+        &*config.private_key.expose()?,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+    )
 }
 
 /// Wall-clock seconds since the Unix epoch; 0 if the clock is before it.
@@ -261,7 +282,7 @@ pub trait SettlementBackend: Send + Sync {
 
     /// Get amulet cache stats: (available, consumed, reserved, selectable).
     /// Returns None if the backend doesn't use an amulet cache.
-    fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
+    async fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
         None
     }
 
@@ -275,7 +296,7 @@ pub trait SettlementBackend: Send + Sync {
     /// LiquidityManager token symbol. Returns None if the backend has no
     /// holdings cache. Computed in the backend (which owns the cache + USD
     /// prices) and returned as plain data.
-    fn holdings_histogram(&self, _token: &str) -> Option<HoldingsHistogram> {
+    async fn holdings_histogram(&self, _token: &str) -> Option<HoldingsHistogram> {
         None
     }
 
@@ -387,10 +408,11 @@ pub struct SettlementExecutor<B: SettlementBackend> {
 }
 
 impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
-    /// Create a new settlement executor with shared order tracker and backend
-    pub fn new(config: &BaseConfig, tracker: Arc<Mutex<OrderTracker>>, backend: B) -> Self {
-        let thread_count = config.settlement_thread_count;
-        Self {
+    /// Create a new settlement executor with shared order tracker and backend.
+    /// Fails when `settlement_thread_count` is outside the semaphore's range.
+    pub fn new(config: &BaseConfig, tracker: Arc<Mutex<OrderTracker>>, backend: B) -> Result<Self> {
+        let semaphore = sync::semaphore(config.settlement_thread_count)?;
+        Ok(Self {
             config: config.clone(),
             backend: Arc::new(backend),
             active_settlements: IndexMap::new(),
@@ -399,7 +421,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             shutdown: Shutdown::new(),
             tracker,
             query_client: None,
-            semaphore: Arc::new(Semaphore::new(thread_count)),
+            semaphore: Arc::new(semaphore),
             in_progress: HashMap::new(),
             failed_settlements: HashMap::new(),
             pending_results: Vec::new(),
@@ -423,7 +445,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             stub_lookup_hangs: false,
             #[cfg(test)]
             reject_black_hole: false,
-        }
+        })
     }
 
     /// Get the shared actionable settlement counter
@@ -468,7 +490,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         if let Some(ref lm) = self.liquidity_manager {
             let lm = lm.clone();
             let pid = proposal_id.to_string();
-            tokio::spawn(async move { lm.release(&pid).await });
+            try_spawn("liquidity release", async move { lm.release(&pid).await });
         }
     }
 
@@ -507,14 +529,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let config = self.config.clone();
         let pid = proposal_id.to_string();
         let reason = reason.to_string();
-        tokio::spawn(async move {
-            let jwt = match generate_jwt(
-                &config.party_id,
-                &config.role,
-                &config.private_key.expose(),
-                config.token_ttl_secs,
-                Some(config.node_name.as_str()),
-            ) {
+        try_spawn("best-effort settlement cancel", async move {
+            let jwt = match config_jwt(&config) {
                 Ok(j) => j,
                 Err(e) => {
                     debug!("[{}] Best-effort cancel: JWT generation failed: {}", pid, e);
@@ -679,7 +695,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             };
             if let Ok(amount) = received_amount.parse::<f64>() {
                 let lm = lm.clone();
-                tokio::spawn(async move { lm.record_inflow(&token_key, amount).await });
+                try_spawn("liquidity inflow record", async move { lm.record_inflow(&token_key, amount).await });
             }
         }
     }
@@ -700,8 +716,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     }
 
     /// Get amulet cache stats: (available, consumed, reserved, selectable).
-    pub fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
-        self.backend.cache_stats()
+    pub async fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
+        self.backend.cache_stats().await
     }
 
     /// Get per-pool worker utilization (delegated to backend).
@@ -710,8 +726,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     }
 
     /// Per-instrument RFQ V2 holdings histogram (delegated to backend).
-    pub fn holdings_histogram(&self, token: &str) -> Option<HoldingsHistogram> {
-        self.backend.holdings_histogram(token)
+    pub async fn holdings_histogram(&self, token: &str) -> Option<HoldingsHistogram> {
+        self.backend.holdings_histogram(token).await
     }
 
     /// Check if regular fees are paused (sequencer backpressure).
@@ -767,11 +783,11 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 .map(|t| t.elapsed().as_secs() > 600)
                 .unwrap_or(false)
             {
-                stuck_10m += 1;
+                stuck_10m = stuck_10m.saturating_add(1);
             }
         }
 
-        let total = no_proposal_ids.len() + no_dvp_ids.len();
+        let total = no_proposal_ids.len().saturating_add(no_dvp_ids.len());
         if total > 0 {
             warn!(
                 "CID waiting: {} proposals ({} no DvpProposal, {} no Dvp contract, {} stuck >10min)\n  \
@@ -854,13 +870,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     /// Calls the CancelSettlement RPC and removes from active settlements.
     /// The streaming event will also arrive via handle_settlement_update.
     pub async fn cancel_settlement(&mut self, proposal_id: &str, reason: &str, config: &BaseConfig) -> Result<()> {
-        let jwt = generate_jwt(
-            &config.party_id,
-            &config.role,
-            &config.private_key.expose(),
-            config.token_ttl_secs,
-            Some(config.node_name.as_str()),
-        )?;
+        let jwt = config_jwt(config)?;
         let mut rpc_client = OrderbookRpcClient::connect(&config.orderbook_grpc_url, Some(jwt)).await?;
         let success = rpc_client.cancel_settlement(proposal_id, reason).await?;
         if success {
@@ -1354,7 +1364,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         drop(seen);
         tail.sort_by(|a, b| uuid_v7_ms(b).cmp(&uuid_v7_ms(a)));
 
-        let mut proposal_ids: Vec<String> = Vec::with_capacity(priority_ids.len() + tail.len());
+        let mut proposal_ids: Vec<String> = Vec::with_capacity(priority_ids.len().saturating_add(tail.len()));
         proposal_ids.extend(priority_ids);
         proposal_ids.extend(tail);
 
@@ -1367,7 +1377,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         for proposal_id in proposal_ids {
             // Skip if already being processed by a spawned task
             if self.in_progress.contains_key(&proposal_id) {
-                skipped_in_progress += 1;
+                skipped_in_progress = skipped_in_progress.saturating_add(1);
                 continue;
             }
 
@@ -1383,7 +1393,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         > crate::order_manager::deadline_after(Duration::from_secs(EXPIRED_RETRY_SECS))
                         && self.past_deadline(&proposal_id);
                     if !cut_short {
-                        skipped_backoff += 1;
+                        skipped_backoff = skipped_backoff.saturating_add(1);
                         continue;
                     }
                 }
@@ -1552,128 +1562,96 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         let pid = proposal_id.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<(AdvanceResult, SettlementState)>();
 
-        self.in_progress.insert(proposal_id.clone(), Instant::now());
-        self.pending_results.push((proposal_id, rx));
-
-        let handle = tokio::spawn(async move {
+        let handle = try_spawn("settlement task", async move {
             let mut permit = Some(permit); // droppable before allocate
-            let mut local_state = state;
 
             if initial_jitter {
                 // Initial jitter to stagger threads (0-2s) — wakes early on shutdown
-                let jitter = rand::thread_rng().gen_range(0..2000u64);
+                let jitter = clock::jitter_ms(2000);
                 shutdown.sleep(Duration::from_millis(jitter)).await;
             }
 
-            loop {
-                // Check shutdown flag before each step
-                let is_shutting_down = shutdown.is_shutting_down();
+            let step = |local_state: SettlementState, is_shutting_down: bool| {
+                advance_single(
+                    pid.clone(),
+                    local_state,
+                    config.clone(),
+                    backend.clone(),
+                    tracker.clone(),
+                    liquidity_manager.clone(),
+                    is_shutting_down,
+                    action_log.clone(),
+                )
+            };
+            let (advance_result, local_state) = step_until_done(&pid, state, &shutdown, step).await;
+            // NeedsAllocate: release settlement permit before blocking on payment queue
+            if let AdvanceResult::NeedsAllocate {
+                ref proposal_id, ref dvp_cid, allocation_cc, is_buyer,
+            } = advance_result {
+                // Release settlement permit — allows other settlements to start
+                drop(permit.take());
 
-                let result = tokio::time::timeout(Duration::from_secs(300), async {
-                    advance_single(
-                        pid.clone(),
-                        local_state.clone(),
-                        config.clone(),
-                        backend.clone(),
-                        tracker.clone(),
-                        liquidity_manager.clone(),
-                        is_shutting_down,
-                        action_log.clone(),
-                    )
-                    .await
-                })
-                .await;
-
-                let advance_result = match result {
+                let alloc_result = tokio::time::timeout(
+                    Duration::from_secs(600),
+                    backend.allocate(proposal_id, dvp_cid, allocation_cc),
+                ).await;
+                let alloc_result = match alloc_result {
                     Ok(r) => r,
-                    Err(_) => {
-                        error!(
-                            "[{}] Settlement step timed out after 300s (role={}, stage={})",
-                            pid,
-                            if local_state.is_buyer { "buyer" } else { "seller" },
-                            local_state.stage,
-                        );
-                        AdvanceResult::Timeout { proposal_id: pid.clone() }
-                    }
+                    Err(_) => Err(anyhow::anyhow!("Allocate timed out after 600s")),
                 };
-
-                // NeedsAllocate: release settlement permit before blocking on payment queue
-                if let AdvanceResult::NeedsAllocate {
-                    ref proposal_id, ref dvp_cid, allocation_cc, is_buyer,
-                } = advance_result {
-                    // Release settlement permit — allows other settlements to start
-                    drop(permit.take());
-
-                    let alloc_result = tokio::time::timeout(
-                        Duration::from_secs(600),
-                        backend.allocate(proposal_id, dvp_cid, allocation_cc),
-                    ).await;
-                    let alloc_result = match alloc_result {
-                        Ok(r) => r,
-                        Err(_) => Err(anyhow::anyhow!("Allocate timed out after 600s")),
-                    };
-                    match alloc_result {
-                        Ok(step_result) => {
-                            // Record allocation completed event
-                            let event_type = if is_buyer {
-                                SettlementEventType::AllocationBuyerCompleted
-                            } else {
-                                SettlementEventType::AllocationSellerCompleted
-                            };
-                            let jwt = match generate_jwt(
-                                &config.party_id, &config.role, &config.private_key.expose(),
-                                config.token_ttl_secs, Some(config.node_name.as_str()),
-                            ) {
-                                Ok(j) => j,
-                                Err(e) => {
-                                    warn!("[{}] JWT gen for alloc event failed: {}", proposal_id, e);
-                                    String::new()
-                                }
-                            };
-                            if !jwt.is_empty() {
-                                if let Ok(mut rpc_client) = OrderbookRpcClient::connect(
-                                    &config.orderbook_grpc_url, Some(jwt),
-                                ).await {
-                                    record_step_completed(
-                                        &mut rpc_client, proposal_id, &config.party_id,
-                                        is_buyer, event_type,
-                                        &step_result.update_id, &step_result.contract_id,
-                                    ).await;
-                                }
+                match alloc_result {
+                    Ok(step_result) => {
+                        // Record allocation completed event
+                        let event_type = if is_buyer {
+                            SettlementEventType::AllocationBuyerCompleted
+                        } else {
+                            SettlementEventType::AllocationSellerCompleted
+                        };
+                        let jwt = match config_jwt(&config) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                warn!("[{}] JWT gen for alloc event failed: {}", proposal_id, e);
+                                String::new()
                             }
+                        };
+                        if !jwt.is_empty() {
+                            if let Ok(mut rpc_client) = OrderbookRpcClient::connect(
+                                &config.orderbook_grpc_url, Some(jwt),
+                            ).await {
+                                record_step_completed(
+                                    &mut rpc_client, proposal_id, &config.party_id,
+                                    is_buyer, event_type,
+                                    &step_result.update_id, &step_result.contract_id,
+                                ).await;
+                            }
+                        }
 
-                            let final_result = AdvanceResult::StepCompleted {
-                                proposal_id: proposal_id.clone(),
-                                stage: SettlementStage::Allocated,
-                                dvp_proposal_cid: None,
-                                dvp_cid: None,
-                                allocation_cid: Some(step_result.contract_id),
-                                pending_traffic: 0,
-                            };
-                            let _ = tx.send((final_result, local_state));
-                        }
-                        Err(e) => {
-                            let err_result = AdvanceResult::Error {
-                                proposal_id: proposal_id.clone(),
-                                error: format!("Allocate failed: {:#}", e),
-                            };
-                            let _ = tx.send((err_result, local_state));
-                        }
+                        let final_result = AdvanceResult::StepCompleted {
+                            proposal_id: proposal_id.clone(),
+                            stage: SettlementStage::Allocated,
+                            dvp_proposal_cid: None,
+                            dvp_cid: None,
+                            allocation_cid: Some(step_result.contract_id),
+                            pending_traffic: 0,
+                        };
+                        let _ = tx.send((final_result, local_state));
                     }
-                    break;
+                    Err(e) => {
+                        let err_result = AdvanceResult::Error {
+                            proposal_id: proposal_id.clone(),
+                            error: format!("Allocate failed: {:#}", e),
+                        };
+                        let _ = tx.send((err_result, local_state));
+                    }
                 }
-
-                if advance_result.should_readvance() && !shutdown.is_shutting_down() {
-                    advance_result.apply_to_state(&mut local_state);
-                    // Jitter between steps (200-1000ms) — wakes early on shutdown
-                    let step_jitter = 200 + rand::thread_rng().gen_range(0..800u64);
-                    shutdown.sleep(Duration::from_millis(step_jitter)).await;
-                } else {
-                    let _ = tx.send((advance_result, local_state));
-                    break;
-                }
+                return;
             }
+
+            let _ = tx.send((advance_result, local_state));
         });
+        let Some(handle) = handle else { return false };
+        self.in_progress.insert(proposal_id.clone(), Instant::now());
+        self.pending_results.push((proposal_id, rx));
         self.task_handles.push(handle);
         true
     }
@@ -1904,7 +1882,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 if is_permanent {
                     entry.retry_count = FailedSettlement::max_retries();
                 } else if !is_transient {
-                    entry.retry_count += 1;
+                    entry.retry_count = entry.retry_count.saturating_add(1);
                 }
 
                 if entry.is_exhausted() {
@@ -1999,7 +1977,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                         first_transient_at: None,
                         cid_waiting: None,
                     });
-                entry.retry_count += 1;
+                entry.retry_count = entry.retry_count.saturating_add(1);
 
                 if entry.is_exhausted() {
                     error!(
@@ -2047,11 +2025,23 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Drain all in-progress tasks (for graceful shutdown)
     pub async fn drain_tasks(&mut self) -> usize {
+        self.drain_tasks_within(DRAIN_TIMEOUT).await
+    }
+
+    /// Wait up to `limit` for in-progress tasks, then abort the ones still running.
+    async fn drain_tasks_within(&mut self, limit: Duration) -> usize {
         let handles: Vec<_> = self.task_handles.drain(..).collect();
         let count = handles.len();
         if count > 0 {
             info!("Waiting for {} in-progress settlement task(s)...", count);
-            let _ = tokio::time::timeout(Duration::from_secs(300), join_all(handles)).await;
+            let aborts: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+            if tokio::time::timeout(limit, join_all(handles)).await.is_err() {
+                let left = aborts.iter().filter(|a| !a.is_finished()).count();
+                warn!("{} settlement task(s) still running after {}s; aborting them", left, limit.as_secs());
+                for a in &aborts {
+                    a.abort();
+                }
+            }
             self.collect_results().await;
         }
         count
@@ -2180,17 +2170,17 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 debug!("[{}] Discovered DvpProposal on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.dvp_proposal_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
-                found_proposals += 1;
+                found_proposals = found_proposals.saturating_add(1);
             } else if contract.contract_type == "Dvp" && state.dvp_cid.is_none() {
                 debug!("[{}] Discovered Dvp on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.dvp_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
-                found_dvps += 1;
+                found_dvps = found_dvps.saturating_add(1);
             } else if contract.contract_type == "Allocation" && state.allocation_cid.is_none() {
                 debug!("[{}] Discovered Allocation on-chain: {}", contract.settlement_id, contract.contract_id);
                 state.allocation_cid = Some(contract.contract_id.clone());
                 self.failed_settlements.remove(&contract.settlement_id);
-                found_allocations += 1;
+                found_allocations = found_allocations.saturating_add(1);
             }
         }
 
@@ -2382,13 +2372,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
     // ========================================================================
 
     fn create_jwt(&self) -> Result<String> {
-        generate_jwt(
-            &self.config.party_id,
-            &self.config.role,
-            &self.config.private_key.expose(),
-            self.config.token_ttl_secs,
-            Some(self.config.node_name.as_str()),
-        )
+        config_jwt(&self.config)
     }
 
     /// Get list of active settlements
@@ -2725,6 +2709,55 @@ fn deadline_expiry_error(
     None
 }
 
+/// Run `step` until a result is not re-advanced or needs an allocation; every
+/// step runs to its end. Returns that result and the state it ended with.
+#[doc(hidden)]
+pub async fn step_until_done<S, F>(
+    pid: &str,
+    mut local_state: SettlementState,
+    shutdown: &Shutdown,
+    mut step: S,
+) -> (AdvanceResult, SettlementState)
+where
+    S: FnMut(SettlementState, bool) -> F,
+    F: std::future::Future<Output = AdvanceResult>,
+{
+    loop {
+        // Check shutdown flag before each step
+        let is_shutting_down = shutdown.is_shutting_down();
+        let next = step(local_state.clone(), is_shutting_down);
+        let advance_result = await_step(next, STEP_SLOW_AFTER, pid, &local_state).await;
+
+        let again = advance_result.should_readvance() && !shutdown.is_shutting_down();
+        if matches!(advance_result, AdvanceResult::NeedsAllocate { .. }) || !again {
+            return (advance_result, local_state);
+        }
+        advance_result.apply_to_state(&mut local_state);
+        // Jitter between steps (200-1000ms) — wakes early on shutdown
+        let step_jitter = 200u64.saturating_add(clock::jitter_ms(800));
+        shutdown.sleep(Duration::from_millis(step_jitter)).await;
+    }
+}
+
+/// Await one settlement step to its end, warning once it runs past `slow_after`.
+async fn await_step<T>(
+    step: impl std::future::Future<Output = T>,
+    slow_after: Duration,
+    pid: &str,
+    state: &SettlementState,
+) -> T {
+    let on_slow = || {
+        warn!(
+            "[{}] Settlement step still running after {}s (role={}, stage={}); waiting for it to finish",
+            pid,
+            slow_after.as_secs(),
+            state.role(),
+            state.stage,
+        );
+    };
+    crate::supervise::run_to_end(step, slow_after, on_slow).await.0
+}
+
 /// Advance a single settlement by checking NextAction from the server.
 ///
 /// This is the core settlement state machine, extracted as a free function
@@ -2751,13 +2784,7 @@ async fn advance_single<B: SettlementBackend>(
     );
 
     // Create RPC client (uses cached global channel — fast)
-    let jwt = match generate_jwt(
-        &config.party_id,
-        &config.role,
-        &config.private_key.expose(),
-        config.token_ttl_secs,
-        Some(config.node_name.as_str()),
-    ) {
+    let jwt = match config_jwt(&config) {
         Ok(j) => j,
         Err(e) => return AdvanceResult::Error {
             proposal_id,
@@ -3142,9 +3169,9 @@ mod tests {
         assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
         assert!(lm.available_cc().await < Decimal::from(95));
 
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         exec.set_liquidity_manager(lm.clone());
         exec.active_settlements
             .insert("p1".to_string(), SettlementState::new(test_proposal("p1"), false));
@@ -3259,6 +3286,50 @@ mod tests {
         assert!(!exec.active_settlements.contains_key("p1"));
         assert!(exec.rejected_proposals.contains("p1"));
         assert!(!exec.failed_settlements.contains_key("p1"));
+    }
+
+    // A step past 300s used to be cut, possibly mid-submit, and re-advanced blind
+    #[tokio::test]
+    async fn a_slow_settlement_step_runs_to_its_end() {
+        let state = SettlementState::new(test_proposal("p1"), false);
+        let step = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            AdvanceResult::Wait { proposal_id: "p1".to_string() }
+        };
+        let result = await_step(step, Duration::from_millis(50), "p1", &state).await;
+        assert!(matches!(result, AdvanceResult::Wait { .. }), "the step's own result comes back");
+    }
+
+    // The settlement task's own step loop: a step past the slow mark keeps its result
+    #[tokio::test]
+    async fn the_settlement_task_keeps_a_slow_steps_result() {
+        let shutdown = Shutdown::new();
+        let mut calls = 0u32;
+        let step = |state: SettlementState, _: bool| {
+            calls += 1;
+            let first = calls == 1;
+            async move {
+                if first {
+                    tokio::time::sleep(STEP_SLOW_AFTER * 4).await;
+                    return AdvanceResult::StepCompleted {
+                        proposal_id: "p1".to_string(),
+                        stage: SettlementStage::DvpProposed,
+                        dvp_proposal_cid: Some("cid-from-the-slow-step".to_string()),
+                        dvp_cid: None,
+                        allocation_cid: None,
+                        pending_traffic: 0,
+                    };
+                }
+                let error = format!("next step saw {:?}", state.dvp_proposal_cid);
+                AdvanceResult::Error { proposal_id: "p1".to_string(), error }
+            }
+        };
+        let state = SettlementState::new(test_proposal("p1"), false);
+        let (result, state) = step_until_done("p1", state, &shutdown, step).await;
+        assert_eq!(state.dvp_proposal_cid.as_deref(), Some("cid-from-the-slow-step"));
+        let AdvanceResult::Error { error, .. } = result else { panic!("the second step's result") };
+        assert_eq!(error, "next step saw Some(\"cid-from-the-slow-step\")");
+        assert_eq!(calls, 2);
     }
 
     // --- deadline_expiry_error: the watchdog verdict (pure) ---
@@ -3401,10 +3472,10 @@ mod tests {
     // counterparty (or the same one under the cap) still adopts.
     #[tokio::test]
     async fn test_per_counterparty_cap() {
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.max_pending_per_counterparty = 2;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
 
         // Two active settlements with counterparty "cp-x" (we are the seller,
         // so the counterparty is the buyer).
@@ -3508,10 +3579,10 @@ mod tests {
     // replayed delivery is equally inert.
     #[tokio::test]
     async fn test_rfq_v2_only_never_adopts_and_stays_retryable() {
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.rfq_v2_only = true;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
             market_id: String::new(),
             price: String::new(),
@@ -3538,10 +3609,10 @@ mod tests {
     // and --no-reject would otherwise adopt without verification.
     #[tokio::test]
     async fn test_rfq_v2_only_branch_precedes_restore_and_no_reject() {
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.rfq_v2_only = true;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
 
         // Case A: restored settlement order (state restore) — would re-adopt.
         {
@@ -3572,10 +3643,10 @@ mod tests {
     // and is safe to re-enter even under tight inventory.
     #[tokio::test]
     async fn test_adoption_defers_reservation_until_counterparty_commits() {
-        let config = BaseConfig::test_minimal();
+        let config = BaseConfig::test_minimal().unwrap();
         let lm = ready_lm().await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
         exec.set_liquidity_manager(lm.clone());
         let quoted = Arc::new(Mutex::new(vec![QuotedTrade {
             market_id: String::new(),
@@ -3631,12 +3702,12 @@ mod tests {
     // the proposal's own commitment).
     #[tokio::test]
     async fn test_ensure_reserved_reentry_under_tight_inventory() {
-        let config = BaseConfig::test_minimal();
+        let config = BaseConfig::test_minimal().unwrap();
         let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(10)).await;
         lm.update_token_balance("USDCx", Decimal::from(1000)).await; // exactly the leg
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
         tracker
             .lock()
             .await
@@ -3662,10 +3733,10 @@ mod tests {
     // reconciler).
     #[tokio::test]
     async fn test_collect_results_releases_orphaned_reservation() {
-        let config = BaseConfig::test_minimal();
+        let config = BaseConfig::test_minimal().unwrap();
         let lm = ready_lm().await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
         exec.set_liquidity_manager(lm.clone());
 
         // Task reserved both halves, then the stream terminal removed the
@@ -3704,13 +3775,13 @@ mod tests {
     // gated on the same tracker latch, is neither lost nor double-booked.
     #[tokio::test]
     async fn test_ensure_reserved_partial_failure_then_retry_reserves_once() {
-        let config = BaseConfig::test_minimal();
+        let config = BaseConfig::test_minimal().unwrap();
         let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(50)).await;
         lm.update_token_balance("USDCx", Decimal::from(500)).await; // < the 1000 leg
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
 
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [7u8; 32]))));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [7u8; 32]).unwrap())));
         tracker
             .lock()
             .await
@@ -3745,9 +3816,9 @@ mod tests {
     // genuinely runnable-but-blocked proposal is hidden.
     #[tokio::test]
     async fn test_thread_utilization_partitions_active_set() {
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
 
         // active: a1 (in-progress + stale backoff entry), a2 (runnable/waiting)
         exec.active_settlements.insert("a1".to_string(), SettlementState::new(test_proposal("a1"), false));
@@ -3780,10 +3851,10 @@ mod tests {
     }
 
     fn executor_with_active(threads: usize, pids: &[&str]) -> SettlementExecutor<MockBackend> {
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.settlement_thread_count = threads;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         for pid in pids {
             exec.active_settlements
                 .insert(pid.to_string(), SettlementState::new(test_proposal(pid), false));
@@ -3927,9 +3998,9 @@ mod tests {
     #[tokio::test]
     async fn test_placement_in_flight_proposal_held_then_adopted() {
         use orderbook_proto::orderbook::{OrderMatch, OrderType};
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
 
         let mut proposal = test_proposal("p-grid");
         proposal.market_id = "USDCx-CCY".to_string();
@@ -3981,9 +4052,9 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_user_order_reject_leaves_nothing_active() {
         use orderbook_proto::orderbook::OrderMatch;
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         // The server answers without the order: a definitive verdict
         exec.stub_orders = Some(Vec::new());
         exec.reject_black_hole = true;
@@ -4213,9 +4284,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_held_proposal_backs_off_poll_refeeds() {
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         // No balances yet: every proposal is held
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         exec.set_liquidity_manager(lm.clone());
@@ -4299,9 +4370,9 @@ mod tests {
     #[tokio::test]
     async fn test_failed_user_order_lookup_is_held_with_backoff() {
         use orderbook_proto::orderbook::OrderMatch;
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         let mut proposal = our_sale("p-user");
         proposal.market_id = "USDCx-CCY".to_string();
         proposal.order_match = Some(OrderMatch {
@@ -4330,9 +4401,9 @@ mod tests {
     #[tokio::test]
     async fn test_hold_survives_a_lookup_cut_short_by_a_timeout() {
         use orderbook_proto::orderbook::OrderMatch;
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
         let mut proposal = our_sale("p-user");
         proposal.market_id = "USDCx-CCY".to_string();
         proposal.order_match = Some(OrderMatch {
@@ -4360,13 +4431,13 @@ mod tests {
     #[tokio::test]
     async fn test_order_booked_by_a_failed_submit_is_adopted() {
         use orderbook_proto::orderbook::{Order, OrderMatch, OrderStatus, OrderType};
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
 
         // The submit fails at the transport, so the order id never comes back
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut grid_config = BaseConfig::test_minimal();
+        let mut grid_config = BaseConfig::test_minimal().unwrap();
         grid_config.orderbook_grpc_url = format!("http://{}", closed.local_addr().unwrap());
         drop(closed);
         let client = OrderbookClient::lazy_for_tests(&grid_config).unwrap();
@@ -4421,12 +4492,12 @@ mod tests {
         use crate::config::{MarketConfig, PriceLevel};
         use orderbook_proto::ledger::TokenBalance;
         use orderbook_proto::orderbook::{Order, OrderMatch, OrderStatus, OrderType};
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [3u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
 
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut grid_config = BaseConfig::test_minimal();
+        let mut grid_config = BaseConfig::test_minimal().unwrap();
         grid_config.orderbook_grpc_url = format!("http://{}", closed.local_addr().unwrap());
         drop(closed);
         let level = |delta_percent: f64| PriceLevel { delta_percent, quantity: "1000".to_string() };
@@ -4499,9 +4570,9 @@ mod tests {
     // Amounts that would overflow the fee or capacity arithmetic are refused, never adopted
     #[tokio::test]
     async fn test_implausible_amounts_are_rejected_without_panic() {
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
@@ -4540,9 +4611,9 @@ mod tests {
     async fn test_implausible_restored_proposal_releases_its_reservation() {
         use crate::state::{SavedSettlementOrder, SavedTrackedOrder};
         use orderbook_proto::orderbook::OrderType;
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend);
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
         let lm = ready_lm().await;
         exec.set_liquidity_manager(lm.clone());
         tracker.lock().await.import_state(
@@ -4586,12 +4657,12 @@ mod tests {
     async fn test_reserving_a_huge_fee_logs_without_panicking() {
         let logs = crate::test_logs::LogBuf::default();
         let _guard = logs.capture(tracing::Level::INFO);
-        let config = BaseConfig::test_minimal();
+        let config = BaseConfig::test_minimal().unwrap();
         let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::MAX).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.0000000001").unwrap()).await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
         tracker.lock().await.record_settlement_order("p1", 0, Decimal::from(1000));
         let mut proposal = test_proposal("p1");
         proposal.dvp_processing_fee_seller = "100000000000000000".to_string();
@@ -4644,9 +4715,9 @@ mod tests {
     #[tokio::test]
     async fn test_sync_runs_only_while_a_cid_is_missing() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let config = BaseConfig::test_minimal();
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]))));
-        let mut exec = SettlementExecutor::new(&config, tracker, SyncCounter(Arc::clone(&calls)));
+        let config = BaseConfig::test_minimal().unwrap();
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, SyncCounter(Arc::clone(&calls))).unwrap();
         let syncs = || calls.load(Ordering::SeqCst);
 
         // Allocated, or holding both CIDs: nothing left to discover
@@ -4688,5 +4759,87 @@ mod tests {
         exec.sync_on_chain_contracts().await;
         exec.sync_on_chain_contracts().await;
         assert_eq!(syncs(), 4);
+    }
+
+    fn plain_executor(config: &BaseConfig) -> Result<SettlementExecutor<MockBackend>> {
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        SettlementExecutor::new(config, tracker, MockBackend)
+    }
+
+    // A thread count the semaphore cannot hold is an error, not a panic or a stalled executor
+    #[test]
+    fn executor_rejects_a_thread_count_outside_the_semaphore_range() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        for bad in [0, crate::sync::MAX_PERMITS + 1, usize::MAX] {
+            config.settlement_thread_count = bad;
+            assert!(plain_executor(&config).is_err(), "count {bad}");
+        }
+        config.settlement_thread_count = crate::sync::MAX_PERMITS;
+        let exec = plain_executor(&config).unwrap();
+        assert_eq!(exec.semaphore.available_permits(), crate::sync::MAX_PERMITS);
+    }
+
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // Tasks still running when the drain bound passes are aborted, not left behind
+    #[tokio::test]
+    async fn drain_aborts_tasks_still_running_after_the_limit() {
+        let mut exec = plain_executor(&BaseConfig::test_minimal().unwrap()).unwrap();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        exec.task_handles.push(tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }));
+        exec.task_handles.push(tokio::spawn(async {}));
+        let started = Instant::now();
+        assert_eq!(exec.drain_tasks_within(Duration::from_millis(100)).await, 2);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(dropped.load(Ordering::SeqCst), "the stuck task must be aborted");
+        assert!(exec.task_handles.is_empty());
+    }
+
+    // Outside a runtime these spawns are skipped instead of panicking
+    #[test]
+    fn spawning_helpers_do_not_panic_without_a_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (mut exec, _lm) = rt.block_on(committed_executor());
+        drop(rt);
+        exec.release_commitment("p1");
+        exec.record_settlement_inflow("p1");
+        exec.notify_server_cancel("p1", "test");
+        let permit = exec.semaphore.clone().try_acquire_owned().unwrap();
+        assert!(!exec.spawn_settlement_task("p1".to_string(), permit, false));
+        assert!(exec.in_progress.is_empty() && exec.pending_results.is_empty() && exec.task_handles.is_empty());
+        assert_eq!(exec.semaphore.available_permits(), 1, "the permit is returned");
+    }
+
+    // A signing key that cannot be opened fails the JWT instead of panicking
+    #[test]
+    fn a_key_that_cannot_be_opened_fails_the_jwt() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.private_key = crate::secret::Secret::corrupt_for_tests();
+        let exec = plain_executor(&config).unwrap();
+        assert_eq!(exec.create_jwt().unwrap_err().to_string(), "sealed secret is corrupt");
+        assert!(config_jwt(&BaseConfig::test_minimal().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn backend_stats_are_awaited_and_default_to_none() {
+        let exec = plain_executor(&BaseConfig::test_minimal().unwrap()).unwrap();
+        assert!(exec.cache_stats().await.is_none());
+        assert!(exec.holdings_histogram("CC").await.is_none());
     }
 }

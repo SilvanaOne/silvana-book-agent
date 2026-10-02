@@ -3,8 +3,6 @@
 //! Handles order placement and cancellation via the orderbook service.
 //! All orders are signed and tracked for settlement verification.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -169,6 +167,8 @@ pub struct OrderManager {
     balance_age_warned_at: Option<Instant>,
     /// Rate limit for the CC fee-reserve warning.
     fee_warned_at: Option<Instant>,
+    /// Rate limit for the missing-order-id warning.
+    order_ref_warned_at: Option<Instant>,
     /// Last valid price per market, so the park check can size bids without an RPC.
     last_seen_price: HashMap<String, f64>,
     /// Resting counts from the last visit that took no action, or that emptied a
@@ -198,6 +198,8 @@ pub struct OrderManager {
     stop_on_cancel: Option<Shutdown>,
     #[cfg(test)]
     stop_on_price: Option<Shutdown>,
+    #[cfg(test)]
+    fail_order_ref: bool,
 }
 
 /// Shaped rungs below this fraction of their configured size are dropped, not
@@ -243,6 +245,7 @@ impl OrderManager {
             balances_set_at: None,
             balance_age_warned_at: None,
             fee_warned_at: None,
+            order_ref_warned_at: None,
             last_seen_price: HashMap::new(),
             last_resting: HashMap::new(),
             last_probe: HashMap::new(),
@@ -263,6 +266,30 @@ impl OrderManager {
             stop_on_cancel: None,
             #[cfg(test)]
             stop_on_price: None,
+            #[cfg(test)]
+            fail_order_ref: false,
+        }
+    }
+
+    /// Client reference for a new grid order; `None` (with a rate-limited
+    /// warning) when no id can be made, so the order is skipped this cycle.
+    fn new_order_ref(&mut self) -> Option<String> {
+        #[cfg(test)]
+        let made = if self.fail_order_ref {
+            Err(anyhow::anyhow!("order ids disabled for test"))
+        } else {
+            crate::clock::uuid_v7()
+        };
+        #[cfg(not(test))]
+        let made = crate::clock::uuid_v7();
+        match made {
+            Ok(id) => Some(id.to_string()),
+            Err(e) => {
+                if rate_limit(&mut self.order_ref_warned_at, FUNDING_WARN_EVERY) {
+                    warn!("Grid order skipped: cannot make an order id ({e:#})");
+                }
+                None
+            }
         }
     }
 
@@ -759,7 +786,8 @@ impl OrderManager {
                     }
                 },
                 GridOp::Place { side, price, quantity } => {
-                    let order_ref = Some(uuid::Uuid::now_v7().to_string());
+                    let Some(order_ref) = self.new_order_ref() else { continue };
+                    let order_ref = Some(order_ref);
                     let (label, result) = if side == OrderType::Bid {
                         ("bid", self.place_bid(market_id, &price, &quantity, order_ref).await)
                     } else {
@@ -1243,7 +1271,7 @@ pub(crate) fn grid_funding(
     out.offer_need = offer_levels
         .iter()
         .map(|l| l.quantity.parse::<f64>().unwrap_or(0.0))
-        .sum();
+        .fold(0.0, |total, q| total + q);
     out.offer = side_funding(out.offer_need, out.offer_avail);
 
     // Total quote needed for bids (buying base with quote)
@@ -1253,7 +1281,7 @@ pub(crate) fn grid_funding(
                 let qty: f64 = l.quantity.parse().unwrap_or(0.0);
                 qty * mid * (1.0 + l.delta_percent / 100.0)
             })
-            .sum();
+            .fold(0.0, |total, q| total + q);
         out.bid = side_funding(out.bid_need, out.bid_avail);
     }
     out
@@ -1579,7 +1607,7 @@ pub fn shape_offer_levels(
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(qty * DEFAULT_MIN_RUNG_FRACTION);
         if !(scaled.is_finite() && scaled >= min_rung) {
-            dropped += 1;
+            dropped = dropped.saturating_add(1);
             continue;
         }
         levels.push(PriceLevel {
@@ -2404,11 +2432,11 @@ mod grid_plan_tests {
     }
 
     fn manager_at(url: String, markets: Vec<MarketConfig>) -> OrderManager {
-        let mut config = BaseConfig::test_minimal();
+        let mut config = BaseConfig::test_minimal().unwrap();
         config.orderbook_grpc_url = url;
         config.markets = markets;
         let client = OrderbookClient::lazy_for_tests(&config).unwrap();
-        let tracker = OrderTracker::new(0, Secret::seal(&mut [7u8; 32]));
+        let tracker = OrderTracker::new(0, Secret::seal(&mut [7u8; 32]).unwrap());
         OrderManager::new(config, client, Arc::new(Mutex::new(tracker)))
     }
 
@@ -2893,6 +2921,27 @@ mod grid_plan_tests {
         om.pending_cancels.insert("AAA-USD".into(), HashSet::from([4]));
         om.handle_priceless("AAA-USD", "test").await;
         assert!(!om.pending_cancels.contains_key("AAA-USD"));
+    }
+
+    // Without an order id the placement is skipped, not sent
+    #[tokio::test]
+    async fn a_grid_order_without_an_order_id_is_skipped() {
+        let aaa = market("AAA-USD", ladder(-1.0, "1"), ladder(1.0, "1"));
+        let mut om = offline_manager(vec![aaa.clone()]);
+        om.tick_sizes.insert("AAA-USD".to_string(), 0.01);
+        om.stub_submit = Some(Ok(9));
+        om.fail_order_ref = true;
+        let stop = Shutdown::new();
+        let mut report = CycleReport::default();
+        let run = om.execute_plan(&aaa, 100.0, &[], &aaa.offer_levels, (Replace, Replace), &stop, &mut report);
+        tokio::time::timeout(Duration::from_secs(10), run).await.unwrap();
+        assert_eq!(report.placed, 0);
+        assert!(om.order_ref_warned_at.is_some(), "the skip is reported");
+
+        om.fail_order_ref = false;
+        let run = om.execute_plan(&aaa, 100.0, &[], &aaa.offer_levels, (Replace, Replace), &stop, &mut report);
+        tokio::time::timeout(Duration::from_secs(10), run).await.unwrap();
+        assert_eq!(report.placed, 6, "three rungs a side");
     }
 
     // A shutdown seen after a cancel issues none of the market's remaining ops

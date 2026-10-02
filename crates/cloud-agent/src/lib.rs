@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use agent_logic::config::BaseConfig;
 use agent_logic::runner::{AgentOptions, BalanceProvider, run_agent};
 use agent_logic::shutdown::Shutdown;
+use agent_logic::supervise;
 use orderbook_proto::ledger::{
     AcceptCip56Params, ExecuteMultiCallParams, FaucetInstrument, FaucetRequest, PreapprovalInfo,
     GetAgentConfigRequest, GetAgentConfigResponse, GetOnboardingStatusRequest, LockHoldingsParams,
@@ -35,14 +36,18 @@ pub mod atomic_swap;
 pub mod backend;
 pub mod config;
 pub mod dvp_gc_worker;
+pub mod env;
 pub mod fill_loop;
 pub mod holdings_cache;
 pub mod ledger_client;
+mod lp_stream;
 pub mod merge_worker;
 pub mod payment_queue;
 pub mod rfq_handler;
 pub mod rfq_v2;
 pub mod split_worker;
+#[cfg(test)]
+mod test_util;
 pub mod ticket_pool;
 pub mod topup;
 pub mod updates_worker;
@@ -53,6 +58,7 @@ pub use atomic_swap::AtomicSwapper;
 pub use backend::CloudSettlementBackend;
 pub use holdings_cache::HoldingsCache;
 pub use ledger_client::{AtomicProviderClient, DAppProviderClient};
+pub use lp_stream::{run_lp_atomic_stream, run_lp_settlement_stream};
 
 /// Off-chain prepaid traffic balance + credit ceiling, parsed from the
 /// `GetPrepaidTrafficBalance` RPC response into typed Decimals.
@@ -506,6 +512,7 @@ pub enum AtomicTicketCommands {
 /// Fetch instrument registry (CC/Amulet + DSO, CIP-56 registries) from
 /// orderbook-rpc and populate `BaseConfig`. Replaces the old configuration.toml
 /// `[[canton_coin]]` / `[[instrument]]` sections for the client.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn populate_instruments(config: &mut BaseConfig) -> Result<()> {
     let mut client = agent_logic::client::OrderbookClient::new(config)
         .await
@@ -527,13 +534,22 @@ pub struct CloudBalanceProvider {
     pub client: TokioMutex<DAppProviderClient>,
 }
 
+/// Longest wait for the balance client while another fetch holds it.
+const BALANCE_CLIENT_WAIT: std::time::Duration = agent_logic::transport::RPC_TIMEOUT;
+
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 #[async_trait]
 impl BalanceProvider for CloudBalanceProvider {
     async fn fetch_balances(&self) -> Result<Vec<TokenBalance>> {
-        self.client.lock().await.get_balances().await
+        // The call carries its own deadline; this bounds the wait for the client.
+        let mut client = tokio::time::timeout(BALANCE_CLIENT_WAIT, self.client.lock())
+            .await
+            .map_err(|_| anyhow!("balance client busy for {BALANCE_CLIENT_WAIT:?}"))?;
+        client.get_balances().await
     }
 }
 
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn run_cloud_agent(
     config: BaseConfig,
     settlement_only: bool,
@@ -546,6 +562,7 @@ pub async fn run_cloud_agent(
     confirm: bool,
     version_info: Option<&str>,
 ) -> Result<()> {
+    env::validate()?;
     if let Some(v) = version_info {
         info!("Starting Orderbook Cloud Agent (build: {})", v);
     } else {
@@ -595,17 +612,17 @@ pub async fn run_cloud_agent(
             Ok(markets) => {
                 for market in &markets {
                     let parts: Vec<&str> = market.market_id.split('-').collect();
-                    if parts.len() == 2 {
+                    if let [base, quote] = parts.as_slice() {
                         // The CC key is owned by its own balance feed; never
                         // alias it to a market instrument.
-                        if parts[0] != agent_logic::liquidity::CC_TOKEN {
+                        if *base != agent_logic::liquidity::CC_TOKEN {
                             liquidity_manager
-                                .register_alias(parts[0], &market.base_instrument)
+                                .register_alias(base, &market.base_instrument)
                                 .await;
                         }
-                        if parts[1] != agent_logic::liquidity::CC_TOKEN {
+                        if *quote != agent_logic::liquidity::CC_TOKEN {
                             liquidity_manager
-                                .register_alias(parts[1], &market.quote_instrument)
+                                .register_alias(quote, &market.quote_instrument)
                                 .await;
                         }
                     }
@@ -636,12 +653,12 @@ pub async fn run_cloud_agent(
     // Spawned BEFORE the GC so the GC's first cycle (~2s later) reads a real
     // coefficient rather than the 0.0 default. Idempotent, so the runner may
     // call it again for embedders that bypass this function.
-    agent_logic::forecast::spawn_forecast_poller(config.clone(), lp_shutdown.clone());
+    agent_logic::forecast::spawn_forecast_poller(config.clone(), lp_shutdown.clone())?;
 
     // DvpProposal GC — archives expired legacy-DVP proposals during
     // high-issuance-coefficient windows (see dvp_gc_worker.rs). Env-gated;
     // no-op when DVP_GC_ENABLED=false.
-    dvp_gc_worker::spawn_dvp_gc_worker(config.clone(), lp_shutdown.clone());
+    dvp_gc_worker::spawn_dvp_gc_worker(config.clone(), lp_shutdown.clone())?;
 
     // RFQ V2 activation: LP-level switch + quote key present (config::assemble
     // validated the pairing already; this is belt-and-braces).
@@ -689,7 +706,7 @@ pub async fn run_cloud_agent(
     // Trailing net tracker, LP mode only. Created before any pricing so it
     // accumulates even while the config is still in shadow.
     let mut net_positions: Option<Arc<agent_logic::net_position::NetPositionTracker>> = None;
-    let quoted_rfq_trades = if config.liquidity_provider.is_some() {
+    let quoted_rfq_trades = if let Some(lp_cfg) = config.liquidity_provider.as_ref() {
         // Decay window = the max across configured pool_impact sections (the
         // tracker is per-token, so per-market windows cannot differ anyway).
         let window_hours = config
@@ -738,7 +755,7 @@ pub async fn run_cloud_agent(
             rfq_handler.mid_prices(),
             rfq_market_ids,
             lp_shutdown.clone(),
-        );
+        )?;
 
         if config.rfq_v2_only {
             info!(
@@ -748,31 +765,21 @@ pub async fn run_cloud_agent(
         } else {
             info!(
                 "LP mode enabled: name={}, starting settlement stream",
-                config.liquidity_provider.as_ref().unwrap().name
+                lp_cfg.name
             );
-            let config_clone = config.clone();
-            let lp_shutdown_clone = lp_shutdown.clone();
-            let handler = rfq_handler.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    run_lp_settlement_stream(config_clone, handler, lp_shutdown_clone).await
-                {
-                    tracing::error!("LP settlement stream failed: {}", e);
-                }
-            });
+            lp_stream::spawn_settlement_stream(config.clone(), rfq_handler.clone(), lp_shutdown.clone())?;
         }
 
         // ---- RFQ V2 stack (updates watcher, split/ticket maintenance, atomic stream) ----
-        if rfq_v2_active {
-            let v2cfg = rfq_v2_cfg.clone().expect("checked by rfq_v2_active");
-            let quote_key = config
-                .atomic_quote_key
-                .clone()
-                .expect("checked by rfq_v2_active");
+        if let Some((v2cfg, quote_key)) = rfq_v2_cfg
+            .as_ref()
+            .zip(config.atomic_quote_key.as_ref())
+            .filter(|_| rfq_v2_active)
+        {
             match setup_rfq_v2(
                 &config,
-                &v2cfg,
-                &quote_key,
+                v2cfg,
+                quote_key,
                 &market_instrument_ids,
                 rfq_handler.clone(),
                 holdings_cache.clone(),
@@ -818,7 +825,7 @@ pub async fn run_cloud_agent(
         liquidity_manager,
         lp_shutdown.clone(),
         holdings_cache,
-    );
+    )?;
     if let Some(mp) = lp_mid_prices {
         backend = backend.with_mid_prices(mp);
     }
@@ -834,7 +841,7 @@ pub async fn run_cloud_agent(
             backend.holdings_cache().clone(),
             vec![split_worker::SplitInstrument::cc()],
             lp_shutdown.clone(),
-        );
+        )?;
     }
 
     let ledger_client = DAppProviderClient::new(
@@ -860,7 +867,7 @@ pub async fn run_cloud_agent(
         config.min_prepaid_traffic_balance_cc,
         config.prepaid_traffic_topup_cc,
     ) {
-        (Some(_), Some(_)) => {
+        (Some(min_cc), Some(topup_cc)) => {
             let topup_client = DAppProviderClient::new(
                 &config.orderbook_grpc_url,
                 &config.party_id,
@@ -877,16 +884,18 @@ pub async fn run_cloud_agent(
             let runner = topup::TopupRunner::new(
                 topup_client,
                 config.party_id.clone(),
-                config.min_prepaid_traffic_balance_cc,
-                config.prepaid_traffic_topup_cc,
+                Some(min_cc),
+                Some(topup_cc),
             )
-            .expect("env vars present (matched above)");
+            .ok_or_else(|| {
+                anyhow!("auto-topup: MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC rejected")
+            })?;
             info!(
-                min_cc = %config.min_prepaid_traffic_balance_cc.unwrap(),
-                topup_cc = %config.prepaid_traffic_topup_cc.unwrap(),
+                min_cc = %min_cc,
+                topup_cc = %topup_cc,
                 "Auto-topup enabled"
             );
-            Some(Arc::new(runner).spawn(lp_shutdown.clone()))
+            Some(Arc::new(runner).spawn(lp_shutdown.clone())?)
         }
         _ => {
             info!(
@@ -935,7 +944,8 @@ pub async fn run_cloud_agent(
             orders_only,
             poller_balance_provider: Some(poller_balance_provider),
             actionable_count: None,
-            shutdown: None,
+            // A required background task that fails signals this, which stops the agent
+            shutdown: Some(lp_shutdown.clone()),
             accepted_rfq_trades: None,
             rejected_rfq_trades: None,
             quoted_rfq_trades,
@@ -955,7 +965,11 @@ pub async fn run_cloud_agent(
     if let Some(tracker) = &net_positions {
         tracker.save();
     }
-    result
+    result?;
+    match supervise::escalated_task() {
+        Some(task) => Err(anyhow!("required background task {task} failed; the agent stopped")),
+        None => Ok(()),
+    }
 }
 
 /// Wire the RFQ V2 stack: ticket pool + venue registry + quote state, restore
@@ -968,6 +982,7 @@ pub async fn run_cloud_agent(
 /// `BaseConfig::for_party`) plus the shared per-agent objects, this brings up
 /// the entire per-agent RFQ V2 LP stack in one call.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn setup_rfq_v2(
     config: &BaseConfig,
     v2cfg: &agent_logic::config::RfqV2Config,
@@ -1026,10 +1041,9 @@ pub async fn setup_rfq_v2(
             .cloned()
             .unwrap_or_else(|| {
                 let parts: Vec<&str> = market.market_id.split('-').collect();
-                if parts.len() == 2 {
-                    (parts[0].to_string(), parts[1].to_string())
-                } else {
-                    (market.market_id.clone(), String::new())
+                match parts.as_slice() {
+                    [base, quote] => (base.to_string(), quote.to_string()),
+                    _ => (market.market_id.clone(), String::new()),
                 }
             });
         let (base_ocid, base_admin) = config.resolve_instrument(&base_instr);
@@ -1178,7 +1192,7 @@ pub async fn setup_rfq_v2(
             holdings_cache.clone(),
             merge_instruments,
             lp_shutdown.clone(),
-        );
+        )?;
     }
 
     if market_v2.is_empty() {
@@ -1227,7 +1241,7 @@ pub async fn setup_rfq_v2(
             .filter(|s| s.party_id == config.party_id)
         {
             if let Some(pool) = &ticket_pool {
-                pool.restore(saved.atomic_tickets);
+                pool.restore(saved.atomic_tickets, rfq_v2::RfqV2State::restore_ttl_cap());
             }
             state.restore_pending(saved.pending_v2_quotes).await;
         }
@@ -1263,7 +1277,7 @@ pub async fn setup_rfq_v2(
         settle_tx,
         v2cfg.updates_poll_interval_secs,
         lp_shutdown.clone(),
-    );
+    )?;
     split_worker::spawn_maintenance_worker(
         config.clone(),
         holdings_cache,
@@ -1271,7 +1285,7 @@ pub async fn setup_rfq_v2(
         split_targets,
         v2cfg.clone(),
         lp_shutdown.clone(),
-    );
+    )?;
 
     if validated.is_empty() {
         if config.rfq_v2_only {
@@ -1288,24 +1302,15 @@ pub async fn setup_rfq_v2(
         );
     } else {
         info!("RFQ V2 enabled for markets: {:?}", validated);
-        let config_clone = config.clone();
-        let state_clone = state.clone();
         let agent_version = version_info.unwrap_or("unknown").to_string();
-        let shutdown_clone = lp_shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_lp_atomic_stream(
-                config_clone,
-                rfq_handler,
-                state_clone,
-                settle_rx,
-                agent_version,
-                shutdown_clone,
-            )
-            .await
-            {
-                tracing::error!("LP atomic stream failed: {}", e);
-            }
-        });
+        lp_stream::spawn_atomic_stream(
+            config.clone(),
+            rfq_handler,
+            state.clone(),
+            settle_rx,
+            agent_version,
+            lp_shutdown.clone(),
+        )?;
     }
 
     let pool_for_snap = ticket_pool;
@@ -1322,7 +1327,7 @@ pub async fn setup_rfq_v2(
 
 /// Run a buyer/seller fill loop with background settlement processing
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn run_fill(
     config: BaseConfig,
     direction: fill_loop::FillDirection,
@@ -1339,6 +1344,7 @@ pub async fn run_fill(
     force: bool,
     confirm: bool,
 ) -> Result<()> {
+    env::validate()?;
     let dir_str = match direction {
         fill_loop::FillDirection::Buy => "buy",
         fill_loop::FillDirection::Sell => "sell",
@@ -1360,6 +1366,10 @@ pub async fn run_fill(
         warn!("--fee-token only applies to --atomic (RFQ V2) fills — ignored on the v1 path");
     }
 
+    // Check for saved fill state
+    let state_file = PathBuf::from("agent-state.json");
+    let saved_fill_state = fill_loop::load_fill_state(&state_file, &config.party_id)?;
+
     let confirm_lock = agent_logic::confirm::new_confirm_lock();
     let fill_lm = agent_logic::liquidity::LiquidityManager::new(
         config.fee_reserve_cc,
@@ -1375,13 +1385,13 @@ pub async fn run_fill(
     // handling — both observe the same signal; `tokio::signal::ctrl_c()` is
     // idempotent across multiple awaiters.)
     let fill_backend_shutdown = Shutdown::new();
-    {
-        let s = fill_backend_shutdown.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            s.signal();
-        });
-    }
+    let s = fill_backend_shutdown.clone();
+    let ctrl_c = agent_logic::supervise::try_spawn("fill backend Ctrl-C", async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => s.signal(),
+            Err(e) => warn!("Ctrl-C listener unavailable ({e}); the fill backend stops with the fill loop"),
+        }
+    });
     let backend = CloudSettlementBackend::new(
         config.clone(),
         verbose,
@@ -1392,7 +1402,7 @@ pub async fn run_fill(
         fill_lm,
         fill_backend_shutdown.clone(),
         holdings_cache::HoldingsCache::new(false),
-    );
+    )?;
 
     // CC-only dust merge for the fill path (no ladders here → this cache has no
     // dust thresholds, so the merge worker falls back to legacy total-count
@@ -1404,7 +1414,7 @@ pub async fn run_fill(
             backend.holdings_cache().clone(),
             vec![split_worker::SplitInstrument::cc()],
             fill_backend_shutdown.clone(),
-        );
+        )?;
     }
 
     // The fill loop doesn't use the settlement-machine / payment-queue paths.
@@ -1417,6 +1427,7 @@ pub async fn run_fill(
         force,
         confirm,
         confirm_lock: confirm_lock.clone(),
+        fee_debits: accept_settle::FeeDebits::default(),
     });
 
     // RFQ V2 taker driver — shares the backend's holdings cache (its ACS
@@ -1448,12 +1459,6 @@ pub async fn run_fill(
         fee_tokens,
     };
 
-    // Check for saved fill state
-    let state_file = PathBuf::from("agent-state.json");
-    let saved_fill_state = agent_logic::state::load_state(&state_file)
-        .filter(|s| s.party_id == config.party_id)
-        .and_then(|s| s.fill_state);
-
     // Keep `backend` alive so its ACS worker keeps refreshing amulets until return.
     let _backend_guard = backend;
     let result = fill_loop::run_fill_loop(
@@ -1468,7 +1473,72 @@ pub async fn run_fill(
     // Signal backend shutdown on natural completion too — covers paths where
     // the fill loop returns without a Ctrl-C (target filled, error, etc.).
     fill_backend_shutdown.signal();
+    if let Some(ctrl_c) = ctrl_c {
+        ctrl_c.abort();
+    }
     result
+}
+
+/// Longest wait to update the shared mid-price map; a busy map skips the update.
+const MID_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Insert (`Some`) or evict (`None`) one market's mid. Returns whether an entry
+/// was there before, or `None` when the map stayed busy and nothing changed.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+async fn write_mid(
+    mid_prices: &tokio::sync::RwLock<std::collections::HashMap<String, agent_logic::pool_impact::MarketMid>>,
+    market_id: &str,
+    entry: Option<agent_logic::pool_impact::MarketMid>,
+    within: std::time::Duration,
+) -> Option<bool> {
+    let Ok(mut map) = tokio::time::timeout(within, mid_prices.write()).await else {
+        warn!("Mid-price poller: {} not updated, price map busy for {:?}", market_id, within);
+        return None;
+    };
+    Some(match entry {
+        Some(e) => map.insert(market_id.to_string(), e).is_some(),
+        None => map.remove(market_id).is_some(),
+    })
+}
+
+type MidPrices = tokio::sync::RwLock<std::collections::HashMap<String, agent_logic::pool_impact::MarketMid>>;
+
+/// Empty the mid-price map within `within`; false when it stayed busy.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+async fn clear_mids(mid_prices: &MidPrices, within: std::time::Duration) -> bool {
+    match tokio::time::timeout(within, mid_prices.write()).await {
+        Ok(mut map) => {
+            map.clear();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Empties the mid-price map when a poller run ends other than by shutdown.
+struct ClearMidsOnDrop(Option<Arc<MidPrices>>);
+
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+impl ClearMidsOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+impl Drop for ClearMidsOnDrop {
+    fn drop(&mut self) {
+        let Some(mids) = self.0.take() else { return };
+        if let Ok(mut map) = mids.try_write() {
+            map.clear();
+            return;
+        }
+        let _ = supervise::try_spawn("mid-price clear", async move {
+            if !clear_mids(&mids, MID_WRITE_TIMEOUT).await {
+                warn!("Mid-price poller: price map busy; stale mids not cleared");
+            }
+        });
+    }
 }
 
 /// Mid-price poller — the ONLY writer to `RfqHandler::mid_prices()`. Feeds V1
@@ -1477,748 +1547,144 @@ pub async fn run_fill(
 /// LP mode — including `rfq_v2_only` mode, where the V1 settlement stream is
 /// never opened. `run_cloud_agent` spawns it once per process;
 /// `run_lp_settlement_stream` does NOT spawn it.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 fn spawn_mid_price_poller(
     price_config: BaseConfig,
-    mid_prices: Arc<
-        tokio::sync::RwLock<std::collections::HashMap<String, agent_logic::pool_impact::MarketMid>>,
-    >,
+    mid_prices: Arc<MidPrices>,
+    price_markets: Vec<String>,
+    price_shutdown: Shutdown,
+) -> Result<()> {
+    let s = price_shutdown.clone();
+    supervise::spawn_supervised("mid-price poller", price_shutdown, supervise::Policy::Restart, move || {
+        mid_price_poller(price_config.clone(), Arc::clone(&mid_prices), price_markets.clone(), s.clone())
+    })?;
+    Ok(())
+}
+
+/// One run of the mid-price poller; it starts from an empty price map.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+async fn mid_price_poller(
+    price_config: BaseConfig,
+    mid_prices: Arc<MidPrices>,
     price_markets: Vec<String>,
     price_shutdown: Shutdown,
 ) {
     use agent_logic::client::OrderbookClient;
     use agent_logic::pool_impact::{MarketMid, PoolDepth};
 
-    tokio::spawn(async move {
-        let poll_interval = std::time::Duration::from_secs(10);
-        // Inner future returns when the poller has nothing left to do (shutdown
-        // observed at any sleep / top-of-loop check). Single log site below.
-        let result: Result<(), ()> = async {
-            if price_shutdown.sleep(std::time::Duration::from_secs(2)).await {
+    let stale_guard = ClearMidsOnDrop(Some(Arc::clone(&mid_prices)));
+    while !clear_mids(&mid_prices, MID_WRITE_TIMEOUT).await {
+        warn!("Mid-price poller: price map busy for {:?}; retrying the reset", MID_WRITE_TIMEOUT);
+        if price_shutdown.is_shutting_down() {
+            stale_guard.disarm();
+            return;
+        }
+    }
+
+    let poll_interval = std::time::Duration::from_secs(10);
+    // Inner future returns when the poller has nothing left to do (shutdown
+    // observed at any sleep / top-of-loop check). Single log site below.
+    let result: Result<(), ()> = async {
+        if price_shutdown.sleep(std::time::Duration::from_secs(2)).await {
+            return Err(());
+        }
+
+        // Retry client creation forever (backoff capped at 60s): a one-off
+        // connect failure at startup must not permanently kill the poller —
+        // without it mid_prices stays empty and the LP never quotes RFQs.
+        let mut client = {
+            let mut backoff = std::time::Duration::from_secs(5);
+            loop {
+                match OrderbookClient::new(&price_config).await {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Mid-price poller: failed to create client ({}); retrying in {:?}",
+                            e, backoff
+                        );
+                        if price_shutdown.sleep(backoff).await {
+                            return Err(());
+                        }
+                        backoff = backoff.saturating_mul(2).min(std::time::Duration::from_secs(60));
+                    }
+                }
+            }
+        };
+
+        loop {
+            if price_shutdown.is_shutting_down() {
                 return Err(());
             }
-
-            // Retry client creation forever (backoff capped at 60s): a one-off
-            // connect failure at startup must not permanently kill the poller —
-            // without it mid_prices stays empty and the LP never quotes RFQs.
-            let mut client = {
-                let mut backoff = std::time::Duration::from_secs(5);
-                loop {
-                    match OrderbookClient::new(&price_config).await {
-                        Ok(c) => break c,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Mid-price poller: failed to create client ({}); retrying in {:?}",
-                                e, backoff
-                            );
-                            if price_shutdown.sleep(backoff).await {
-                                return Err(());
-                            }
-                            backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
-                        }
-                    }
-                }
-            };
-
-            loop {
-                if price_shutdown.is_shutting_down() {
-                    return Err(());
-                }
-                for market_id in &price_markets {
-                    match client.get_price(market_id).await {
-                        Ok(resp) => {
-                            let mid = match (resp.bid, resp.ask) {
-                                (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
-                                _ => resp.last,
+            for market_id in &price_markets {
+                match client.get_price(market_id).await {
+                    Ok(resp) => {
+                        let mid = match (resp.bid, resp.ask) {
+                            (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b + a) / 2.0,
+                            _ => resp.last,
+                        };
+                        if mid > 0.0 && mid.is_finite() {
+                            // Any size reference rides the same response
+                            // and shares one entry with the mid.
+                            let entry = MarketMid {
+                                mid,
+                                pool_depth: resp
+                                    .pool_depth
+                                    .as_ref()
+                                    .and_then(PoolDepth::from_proto),
                             };
-                            if mid > 0.0 && mid.is_finite() {
-                                // Any size reference rides the same response
-                                // and shares one entry with the mid.
-                                let entry = MarketMid {
-                                    mid,
-                                    pool_depth: resp
-                                        .pool_depth
-                                        .as_ref()
-                                        .and_then(PoolDepth::from_proto),
-                                };
-                                if mid_prices.write().await.insert(market_id.clone(), entry).is_none()
-                                {
-                                    tracing::info!(
-                                        "Mid-price poller: {} price available ({}); RFQ quoting enabled",
-                                        market_id, mid
-                                    );
-                                }
-                            } else {
-                                // NO PRICE = NO QUOTES: evict so price_rfq
-                                // rejects (TemporarilyUnavailable) instead of
-                                // quoting off a stale mid.
-                                if mid_prices.write().await.remove(market_id).is_some() {
-                                    tracing::warn!(
-                                        "Mid-price poller: {} returned non-positive mid ({}); \
-                                         evicting — RFQ quoting paused",
-                                        market_id, mid
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // NO PRICE = NO QUOTES. Evict rather than quote
-                            // off the last-known mid; warn on the transition.
-                            if mid_prices.write().await.remove(market_id).is_some() {
-                                tracing::warn!(
-                                    "Mid-price poller: {} has NO price ({}); evicting stale mid — \
-                                     RFQ quoting paused until the price returns",
-                                    market_id, e
+                            if write_mid(&mid_prices, market_id, Some(entry), MID_WRITE_TIMEOUT).await
+                                == Some(false)
+                            {
+                                tracing::info!(
+                                    "Mid-price poller: {} price available ({}); RFQ quoting enabled",
+                                    market_id, mid
                                 );
-                            } else {
-                                tracing::debug!("Mid-price poller: {} error: {}", market_id, e);
+                            }
+                        } else {
+                            // NO PRICE = NO QUOTES: evict so price_rfq
+                            // rejects (TemporarilyUnavailable) instead of
+                            // quoting off a stale mid.
+                            if write_mid(&mid_prices, market_id, None, MID_WRITE_TIMEOUT).await == Some(true) {
+                                tracing::warn!(
+                                    "Mid-price poller: {} returned non-positive mid ({}); \
+                                     evicting — RFQ quoting paused",
+                                    market_id, mid
+                                );
                             }
                         }
                     }
-                }
-                if price_shutdown.sleep(poll_interval).await {
-                    return Err(());
-                }
-            }
-        }
-        .await;
-        if result.is_err() {
-            info!("Mid-price poller shutting down");
-        }
-    });
-}
-
-/// Run the LP settlement stream (bidirectional gRPC for RFQ handling).
-/// Never spawned when `rfq_v2_only = true` — without the handshake's
-/// `liquidity_provider_name` registration the server routes no V1 RFQs to
-/// this party and it drops out of `GetConnectedLiquidityProviders`.
-pub async fn run_lp_settlement_stream(
-    config: BaseConfig,
-    rfq_handler: Arc<rfq_handler::RfqHandler>,
-    shutdown: Shutdown,
-) -> Result<()> {
-    use orderbook_proto::settlement::{
-        CantonNodeAuth, CantonToServerMessage, Heartbeat, SettlementHandshake,
-        canton_to_server_message::Message as CantonMessage,
-        server_to_canton_message::Message as ServerMessage,
-        settlement_service_client::SettlementServiceClient,
-    };
-    use rfq_handler::RfqResponse;
-    use tokio_stream::StreamExt;
-
-    let lp_config = config
-        .liquidity_provider
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No LP config"))?;
-
-    loop {
-        if shutdown.is_shutting_down() {
-            info!("LP stream shutting down, not reconnecting");
-            return Ok(());
-        }
-
-        info!(
-            "Connecting LP settlement stream to {}",
-            config.orderbook_grpc_url
-        );
-
-        let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to connect: {}, retrying in 5s", e);
-                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        let mut client =
-            SettlementServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
-
-        // Create the outbound channel
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<CantonToServerMessage>(64);
-        let outbound_stream = tokio_stream::wrappers::ReceiverStream::new(outbound_rx);
-
-        let auth_header = agent_logic::auth::generate_jwt(
-            &config.party_id,
-            &config.role,
-            &config.private_key.expose(),
-            config.token_ttl_secs,
-            Some(&config.node_name),
-        )
-        .map_err(|e| anyhow!("{}", e))
-        .and_then(|jwt| {
-            format!("Bearer {}", jwt)
-                .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
-                .map_err(|e| anyhow!("{}", e))
-        });
-        let auth_header = match auth_header {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(
-                    "LP settlement stream: failed to build auth token: {}, retrying in 5s",
-                    e
-                );
-                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        let mut open_request = tonic::Request::new(outbound_stream);
-        open_request
-            .metadata_mut()
-            .insert("authorization", auth_header);
-
-        // Open bidirectional stream
-        let response = match client.settlement_stream(open_request).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to open settlement stream: {}, retrying in 5s", e);
-                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        let mut inbound = response.into_inner();
-
-        // Send handshake with LP name
-        let handshake = CantonToServerMessage {
-            session_id: String::new(),
-            sequence_number: 0,
-            message: Some(CantonMessage::Handshake(SettlementHandshake {
-                auth: Some(CantonNodeAuth {
-                    party_id: config.party_id.clone(),
-                    jwt_token: String::new(),
-                    node_instance: config.node_name.clone(),
-                    connected_at: Some(prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    }),
-                }),
-                party_ids: vec![config.party_id.clone()],
-                user_services: vec![],
-                operator_party: config.settlement_operator.clone(),
-                capabilities: None,
-                liquidity_provider_name: Some(lp_config.name.clone()),
-            })),
-            sent_at: Some(prost_types::Timestamp {
-                seconds: chrono::Utc::now().timestamp(),
-                nanos: 0,
-            }),
-        };
-
-        if outbound_tx.send(handshake).await.is_err() {
-            tracing::error!("Failed to send handshake, retrying");
-            if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                return Ok(());
-            }
-            continue;
-        }
-
-        info!("LP settlement stream connected, listening for RFQ requests");
-
-        // Send a heartbeat every 30s. If the outbound send fails, the stream's
-        // write half is closed — reconnect. Tonic doesn't surface silent
-        // half-closes on the read side, so we can't rely on inbound activity
-        // alone; the heartbeat send-failure is what detects a dead stream.
-        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
-        let mut heartbeat_interval =
-            tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate first tick so we don't send a heartbeat 0s after connect.
-        heartbeat_interval.tick().await;
-        let mut client_seq: u64 = 0;
-
-        loop {
-            tokio::select! {
-                biased;
-                // Observe shutdown the moment select is idle. This does NOT
-                // cancel an in-flight RFQ-handling body — once `inbound.next()`
-                // has fired and we're processing a message, the body runs to
-                // completion. The shutdown arm only fires when waiting.
-                _ = shutdown.wait() => {
-                    info!("LP settlement stream observed shutdown, breaking inner loop");
-                    break;
-                }
-                _ = heartbeat_interval.tick() => {
-                    client_seq += 1;
-                    let now = prost_types::Timestamp {
-                        seconds: chrono::Utc::now().timestamp(),
-                        nanos: 0,
-                    };
-                    let hb = CantonToServerMessage {
-                        session_id: String::new(),
-                        sequence_number: client_seq,
-                        message: Some(CantonMessage::Heartbeat(Heartbeat {
-                            session_id: String::new(),
-                            sequence_number: client_seq,
-                            timestamp: Some(now.clone()),
-                        })),
-                        sent_at: Some(now),
-                    };
-                    if outbound_tx.send(hb).await.is_err() {
-                        tracing::warn!("LP settlement stream send-failed on heartbeat, reconnecting");
-                        break;
-                    }
-                }
-                msg_result = inbound.next() => {
-                    let msg = match msg_result {
-                        None => {
-                            tracing::warn!("LP settlement stream ended (None), reconnecting");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            tracing::error!("LP settlement stream error: {}", e);
-                            break;
-                        }
-                        Some(Ok(m)) => m,
-                    };
-
-                    match msg.message {
-                        Some(ServerMessage::HandshakeAck(ack)) => {
-                            info!("LP handshake acknowledged: accepted={}", ack.accepted);
-                        }
-                        Some(ServerMessage::RfqRequest(request)) => {
-                            if shutdown.is_shutting_down() {
-                                info!("Ignoring RFQ {} - shutting down", request.rfq_id);
-                                break;
-                            }
-                            info!(
-                                "Received RFQ request: rfq_id={}, market={}, direction={}, qty={}",
-                                request.rfq_id, request.market_id, request.direction, request.quantity
+                    Err(e) => {
+                        // NO PRICE = NO QUOTES. Evict rather than quote
+                        // off the last-known mid; warn on the transition.
+                        if write_mid(&mid_prices, market_id, None, MID_WRITE_TIMEOUT).await == Some(true) {
+                            tracing::warn!(
+                                "Mid-price poller: {} has NO price ({}); evicting stale mid — \
+                                 RFQ quoting paused until the price returns",
+                                market_id, e
                             );
-
-                            let response = rfq_handler.handle_rfq_request(request).await;
-
-                            let response_msg = match response {
-                                RfqResponse::Quote(quote) => CantonToServerMessage {
-                                    session_id: String::new(),
-                                    sequence_number: 0,
-                                    message: Some(CantonMessage::RfqQuote(quote)),
-                                    sent_at: Some(prost_types::Timestamp {
-                                        seconds: chrono::Utc::now().timestamp(),
-                                        nanos: 0,
-                                    }),
-                                },
-                                RfqResponse::Reject(reject) => CantonToServerMessage {
-                                    session_id: String::new(),
-                                    sequence_number: 0,
-                                    message: Some(CantonMessage::RfqReject(reject)),
-                                    sent_at: Some(prost_types::Timestamp {
-                                        seconds: chrono::Utc::now().timestamp(),
-                                        nanos: 0,
-                                    }),
-                                },
-                            };
-
-                            if outbound_tx.send(response_msg).await.is_err() {
-                                tracing::error!("Failed to send RFQ response, stream may be closed");
-                                break;
-                            }
-                        }
-                        Some(ServerMessage::Heartbeat(_)) => {
-                            // Server-side keepalive — no action needed.
-                        }
-                        other => {
-                            tracing::debug!("LP stream received unhandled message: {:?}", other.map(|_| "..."));
+                        } else {
+                            tracing::debug!("Mid-price poller: {} error: {}", market_id, e);
                         }
                     }
                 }
             }
-        }
-
-        if shutdown.is_shutting_down() {
-            info!("LP stream shutting down after disconnect");
-            return Ok(());
-        }
-        tracing::warn!("LP settlement stream disconnected, reconnecting in 5s");
-        if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-            return Ok(());
+            if price_shutdown.sleep(poll_interval).await {
+                return Err(());
+            }
         }
     }
-}
-
-/// Run the RFQ V2 atomic stream (design §5.5): a second bidi stream parallel
-/// to the v1 settlement stream. Phase 1 (AtomicRfqRequest) prices through the
-/// SHARED v1 pipeline with an advisory availability check (no reserve); phase
-/// 2 (RfqConfirmRequest) commits the LiquidityManager funds, hard-reserves
-/// holdings, signs, and returns the disclosure envelope.
-pub async fn run_lp_atomic_stream(
-    config: BaseConfig,
-    rfq_handler: Arc<rfq_handler::RfqHandler>,
-    state: Arc<rfq_v2::RfqV2State>,
-    mut settle_rx: tokio::sync::mpsc::UnboundedReceiver<rfq_v2::SettleObserved>,
-    agent_version: String,
-    shutdown: Shutdown,
-) -> Result<()> {
-    use orderbook_proto::rfqv2::{
-        AtomicHandshake, AtomicHeartbeat, AtomicLpToServer, AtomicRfqReject,
-        atomic_lp_to_server::Message as LpMessage,
-        atomic_rfq_service_client::AtomicRfqServiceClient,
-        atomic_server_to_lp::Message as ServerMessage,
-    };
-    use tokio_stream::StreamExt;
-
-    let lp_name = state.lp_name().to_string();
-
-    // Settle-observation consumer: lives across stream reconnects so watcher
-    // events are handled even while the stream is down.
-    {
-        let state_clone = state.clone();
-        let shutdown_clone = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown_clone.wait() => return,
-                    obs = settle_rx.recv() => {
-                        match obs {
-                            Some(obs) => {
-                                state_clone.handle_settle_observed(&obs.quote_id, &obs.update_id).await;
-                            }
-                            None => return, // watcher gone
-                        }
-                    }
-                }
-            }
-        });
+    .await;
+    if result.is_err() {
+        info!("Mid-price poller shutting down");
     }
-
-    fn now_ts() -> prost_types::Timestamp {
-        prost_types::Timestamp {
-            seconds: chrono::Utc::now().timestamp(),
-            nanos: 0,
-        }
-    }
-    fn wrap(seq: u64, message: LpMessage) -> AtomicLpToServer {
-        AtomicLpToServer {
-            session_id: String::new(),
-            sequence_number: seq,
-            message: Some(message),
-            sent_at: Some(now_ts()),
-        }
-    }
-
-    loop {
-        if shutdown.is_shutting_down() {
-            info!("LP atomic stream shutting down, not reconnecting");
-            return Ok(());
-        }
-
-        info!(
-            "Connecting LP atomic stream to {}",
-            config.orderbook_grpc_url
-        );
-
-        let channel = match create_raw_channel(&config.orderbook_grpc_url).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Atomic stream: failed to connect: {}, retrying in 5s", e);
-                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        let mut client =
-            AtomicRfqServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
-
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<AtomicLpToServer>(64);
-        let outbound_stream = tokio_stream::wrappers::ReceiverStream::new(outbound_rx);
-
-        // The V2 stream requires a Bearer JWT at open (no CantonNodeAuth
-        // fallback, unlike the v1 settlement stream). Fresh per reconnect.
-        let auth_header = agent_logic::auth::generate_jwt(
-            &config.party_id,
-            &config.role,
-            &config.private_key.expose(),
-            config.token_ttl_secs,
-            Some(&config.node_name),
-        )
-        .map_err(|e| anyhow!("{}", e))
-        .and_then(|jwt| {
-            format!("Bearer {}", jwt)
-                .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
-                .map_err(|e| anyhow!("{}", e))
-        });
-        let auth_header = match auth_header {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(
-                    "Atomic stream: failed to build auth token: {}, retrying in 5s",
-                    e
-                );
-                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        let mut open_request = tonic::Request::new(outbound_stream);
-        open_request
-            .metadata_mut()
-            .insert("authorization", auth_header);
-
-        let response = match client.atomic_rfq_stream(open_request).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to open atomic RFQ stream: {}, retrying in 5s", e);
-                if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        let mut inbound = response.into_inner();
-
-        let handshake = wrap(
-            0,
-            LpMessage::Handshake(AtomicHandshake {
-                party_ids: vec![config.party_id.clone()],
-                lp_name: lp_name.clone(),
-                agent_version: agent_version.clone(),
-                market_ids: state.validated_market_ids(),
-            }),
-        );
-        if outbound_tx.send(handshake).await.is_err() {
-            tracing::error!("Atomic stream: failed to send handshake, retrying");
-            if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-                return Ok(());
-            }
-            continue;
-        }
-
-        info!("LP atomic stream connected, listening for atomic RFQ requests");
-
-        const HEARTBEAT_INTERVAL_SECS: u64 = 30;
-        let mut heartbeat_interval =
-            tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        heartbeat_interval.tick().await; // skip the immediate first tick
-        let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut client_seq: u64 = 0;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => {
-                    info!("LP atomic stream observed shutdown, breaking inner loop");
-                    break;
-                }
-                _ = heartbeat_interval.tick() => {
-                    client_seq += 1;
-                    let hb = wrap(client_seq, LpMessage::Heartbeat(AtomicHeartbeat { at: Some(now_ts()) }));
-                    if outbound_tx.send(hb).await.is_err() {
-                        tracing::warn!("LP atomic stream send-failed on heartbeat, reconnecting");
-                        break;
-                    }
-                }
-                _ = sweep_interval.tick() => {
-                    // Releases expired confirm-time LM commitments / hard
-                    // reserves / ticket assignments (traceability row 9)
-                    state.sweep(std::time::Instant::now()).await;
-                }
-                msg_result = inbound.next() => {
-                    let msg = match msg_result {
-                        None => {
-                            tracing::warn!("LP atomic stream ended (None), reconnecting");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            tracing::error!("LP atomic stream error: {}", e);
-                            break;
-                        }
-                        Some(Ok(m)) => m,
-                    };
-
-                    match msg.message {
-                        Some(ServerMessage::HandshakeAck(ack)) => {
-                            info!("LP atomic handshake acknowledged: success={} session={}", ack.success, ack.session_id);
-                        }
-                        Some(ServerMessage::Heartbeat(_)) => {
-                            // Server-side keepalive — no action needed.
-                        }
-                        Some(ServerMessage::RfqRequest(request)) => {
-                            if shutdown.is_shutting_down() {
-                                info!("Ignoring atomic RFQ {} - shutting down", request.rfq_id);
-                                break;
-                            }
-                            // Venue identity for [[venue_overrides]] pricing:
-                            // explicit venue_name, falling back to the VA2
-                            // attribution prefix for servers predating it.
-                            let rfq_venue = request
-                                .venue_name
-                                .as_deref()
-                                .filter(|s| !s.is_empty())
-                                .or(request.quote_id_prefix.as_deref().filter(|s| !s.is_empty()));
-                            let rfq_venue_branch =
-                                request.venue_branch.as_deref().filter(|s| !s.is_empty());
-                            // Requesting party id; keys the per-counterparty
-                            // accumulator. Absent ⇒ no per-party term.
-                            let rfq_user_party =
-                                request.user_party.as_deref().filter(|s| !s.is_empty());
-                            info!(
-                                "Received atomic RFQ: rfq_id={}, market={}, direction={}, qty={}, venue={}{}",
-                                request.rfq_id, request.market_id, request.direction, request.quantity,
-                                rfq_venue.unwrap_or("-"),
-                                rfq_venue_branch.map(|b| format!("/{b}")).unwrap_or_default()
-                            );
-
-                            let reject = |reason: String, min: String, max: String| {
-                                LpMessage::Reject(AtomicRfqReject {
-                                    rfq_id: request.rfq_id.clone(),
-                                    market_id: request.market_id.clone(),
-                                    reason,
-                                    lp_party_id: config.party_id.clone(),
-                                    min_quantity: min,
-                                    max_quantity: max,
-                                })
-                            };
-
-                            // V2 direction is a string; the shared pricing fn
-                            // takes the v1 i32 enum (1=BUY user buys, 2=SELL)
-                            let direction = match request.direction.to_ascii_lowercase().as_str() {
-                                "buy" => 1,
-                                "sell" => 2,
-                                _ => 0,
-                            };
-
-                            let message = if direction == 0 {
-                                reject(format!("invalid direction '{}'", request.direction), String::new(), String::new())
-                            } else if !state.quotable(&request.market_id) {
-                                reject("market not available for atomic RFQ".to_string(), String::new(), String::new())
-                            } else {
-                                match rfq_handler
-                                    .price_rfq(
-                                        &request.rfq_id,
-                                        &request.market_id,
-                                        direction,
-                                        &request.quantity,
-                                        request.quote_quantity.as_deref().unwrap_or(""),
-                                        // V2: no min-notional floor — the user
-                                        // pays every fee (3x dust surcharge
-                                        // server-side); the LP pays none.
-                                        false,
-                                        rfq_venue,
-                                        rfq_venue_branch,
-                                        rfq_user_party,
-                                    )
-                                    .await
-                                {
-                                    Err(r) => reject(
-                                        r.reason_detail.unwrap_or_else(|| format!("{:?}", r.reason)),
-                                        r.min_quantity.unwrap_or_default(),
-                                        r.max_quantity.unwrap_or_default(),
-                                    ),
-                                    Ok(priced) => {
-                                        // Venue-attribution (VA2): when the server supplies a
-                                        // prefix, the quote id becomes "<venue>-<uuidv7>" so the
-                                        // venue slug rides the signed canonical message
-                                        // (quote_nonce) onto the chain. The server DROPS quotes
-                                        // that fail to echo the expected prefix.
-                                        let quote_id = match request.quote_id_prefix.as_deref() {
-                                            Some(prefix) if !prefix.is_empty() => {
-                                                format!("{prefix}-{}", uuid::Uuid::now_v7())
-                                            }
-                                            _ => uuid::Uuid::now_v7().to_string(),
-                                        };
-                                        let side = if direction == 1 {
-                                            atomic_quote::QuoteSide::Buy
-                                        } else {
-                                            atomic_quote::QuoteSide::Sell
-                                        };
-                                        match state
-                                            .register_indicative(
-                                                &quote_id,
-                                                &request.market_id,
-                                                side,
-                                                &priced,
-                                                request.settlement_fee.clone(),
-                                                rfq_user_party,
-                                            )
-                                            .await
-                                        {
-                                            Err(e) => reject(e, String::new(), String::new()),
-                                            Ok(()) => {
-                                                let now = chrono::Utc::now();
-                                                let valid_until = now
-                                                    + chrono::Duration::seconds(priced.valid_for_secs as i64);
-                                                LpMessage::Quote(orderbook_proto::rfqv2::AtomicRfqQuote {
-                                                    rfq_id: request.rfq_id.clone(),
-                                                    quote_id,
-                                                    market_id: request.market_id.clone(),
-                                                    direction: request.direction.clone(),
-                                                    price: priced.price_str.clone(),
-                                                    quantity: priced.quantity_str.clone(),
-                                                    quote_quantity: priced.quote_quantity_str.clone(),
-                                                    valid_for_secs: priced.valid_for_secs,
-                                                    valid_until: Some(prost_types::Timestamp {
-                                                        seconds: valid_until.timestamp(),
-                                                        nanos: 0,
-                                                    }),
-                                                    lp_party_id: config.party_id.clone(),
-                                                    lp_name: lp_name.clone(),
-                                                    quoted_at: Some(now_ts()),
-                                                    // echo of the authoritative fee — the relay
-                                                    // drops the quote on any mismatch (design §14 D19)
-                                                    settlement_fee: request.settlement_fee.clone(),
-                                                })
-                                            }
-                                        }
-                                    }
-                                }
-                            };
-
-                            client_seq += 1;
-                            if outbound_tx.send(wrap(client_seq, message)).await.is_err() {
-                                tracing::error!("Failed to send atomic RFQ response, stream may be closed");
-                                break;
-                            }
-                        }
-                        Some(ServerMessage::ConfirmRequest(req)) => {
-                            info!(
-                                "Received atomic confirm: rfq_id={}, quote_id={}, user={}",
-                                req.rfq_id, req.quote_id, req.user_party
-                            );
-                            let message = match state.handle_confirm(req).await {
-                                Ok(envelope) => LpMessage::Envelope(envelope),
-                                Err(reject) => LpMessage::ConfirmReject(reject),
-                            };
-                            client_seq += 1;
-                            if outbound_tx.send(wrap(client_seq, message)).await.is_err() {
-                                tracing::error!("Failed to send atomic confirm response, stream may be closed");
-                                break;
-                            }
-                        }
-                        None => {
-                            tracing::debug!("LP atomic stream received empty message");
-                        }
-                    }
-                }
-            }
-        }
-
-        if shutdown.is_shutting_down() {
-            info!("LP atomic stream shutting down after disconnect");
-            return Ok(());
-        }
-        tracing::warn!("LP atomic stream disconnected, reconnecting in 5s");
-        if shutdown.sleep(std::time::Duration::from_secs(5)).await {
-            return Ok(());
-        }
-    }
+    stale_guard.disarm();
 }
 
 // ============================================================================
 // Info commands
 // ============================================================================
 
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
     let map = s
         .fields
@@ -2228,6 +1694,7 @@ pub fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub fn prost_value_to_json(v: &prost_types::Value) -> serde_json::Value {
     match &v.kind {
         Some(prost_types::value::Kind::NullValue(_)) => serde_json::Value::Null,
@@ -3087,7 +2554,7 @@ pub async fn run_transfer(
 
                 // The margin is a preference, not a requirement: a wallet that
                 // covers the payments themselves is still allowed to try.
-                let target = payment_queue::with_fee_margin(total);
+                let target = payment_queue::with_fee_margin(total).unwrap_or(total);
                 let mut indices = payment_queue::select_amulet_indices(&amounts, target);
                 let mut tight = false;
                 if indices.is_empty() {
@@ -3397,7 +2864,7 @@ pub fn parse_batch_pay_csv(path: &std::path::Path) -> Result<Vec<(String, String
 // ============================================================================
 
 pub fn run_generate_private_key() -> Result<()> {
-    let (private_key, public_key) = agent_logic::sign::generate_keypair();
+    let (private_key, public_key) = agent_logic::sign::generate_keypair()?;
     println!("PARTY_AGENT_PRIVATE_KEY={}", private_key);
     println!("PARTY_AGENT_PUBLIC_KEY={}", public_key);
     Ok(())
@@ -3408,6 +2875,7 @@ pub fn run_generate_private_key() -> Result<()> {
 // ============================================================================
 
 /// Resolve the CIP-56 operator party for a registry from the advertised list.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub fn operator_for_registry(
     advertised: &[FaucetInstrument],
     registry: &str,
@@ -3702,35 +3170,12 @@ pub fn maybe_write_agent_toml(
     }
 }
 
-/// Create a raw (unauthenticated) gRPC channel
+/// Create a raw (unauthenticated) gRPC channel. Connect, TLS handshake and
+/// response headers are bounded; keepalive detects a dead peer.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn create_raw_channel(grpc_url: &str) -> Result<tonic::transport::Channel> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    if grpc_url.starts_with("https://") {
-        let tls_config = tonic::transport::ClientTlsConfig::new()
-            .with_webpki_roots()
-            .domain_name(
-                grpc_url
-                    .trim_start_matches("https://")
-                    .split(':')
-                    .next()
-                    .unwrap_or("localhost"),
-            );
-
-        tonic::transport::Channel::from_shared(grpc_url.to_string())
-            .context("Invalid gRPC URL")?
-            .tls_config(tls_config)
-            .context("Failed to configure TLS")?
-            .connect()
-            .await
-            .context("Failed to connect to gRPC service")
-    } else {
-        tonic::transport::Channel::from_shared(grpc_url.to_string())
-            .context("Invalid gRPC URL")?
-            .connect()
-            .await
-            .context("Failed to connect to gRPC service")
-    }
+    agent_logic::transport::connect_channel(grpc_url, agent_logic::transport::ChannelOpts::default())
+        .await
 }
 
 /// Sign an onboarding RPC request using the agent's private key
@@ -4038,7 +3483,7 @@ fn prepare_onboard_key(
     } else {
         // No key provided and none in .env — generate new keypair
         println!("Generating new Ed25519 keypair...");
-        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair();
+        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair()?;
         let priv_b58 = Zeroizing::new(priv_b58);
         upsert_env_value(env_file, "PARTY_AGENT_PRIVATE_KEY", &priv_b58)?;
         upsert_env_value(env_file, "PARTY_AGENT_PUBLIC_KEY", &pub_b58)?;
@@ -4074,31 +3519,41 @@ impl OnboardConfig {
         party_override: Option<&str>,
         key_override: Option<&agent_logic::secret::Zeroizing<String>>,
     ) -> Result<Self> {
+        Self::from_lookup(&|name| std::env::var(name).ok(), party_override, key_override)
+    }
+
+    /// [`Self::from_env_with`] reading the variables through `get`.
+    #[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+    pub fn from_lookup(
+        get: &dyn Fn(&str) -> Option<String>,
+        party_override: Option<&str>,
+        key_override: Option<&agent_logic::secret::Zeroizing<String>>,
+    ) -> Result<Self> {
         let party_id = match party_override {
             Some(p) => p.to_string(),
-            None => std::env::var("PARTY_AGENT")
-                .map_err(|_| anyhow::anyhow!("PARTY_AGENT env var is required"))?,
+            None => get("PARTY_AGENT")
+                .ok_or_else(|| anyhow::anyhow!("PARTY_AGENT env var is required"))?,
         };
         let private_key_base58 = match key_override {
             Some(k) => agent_logic::secret::Zeroizing::new(k.to_string()),
             None => agent_logic::secret::Zeroizing::new(
-                std::env::var("PARTY_AGENT_PRIVATE_KEY").map_err(|_| {
+                get("PARTY_AGENT_PRIVATE_KEY").ok_or_else(|| {
                     anyhow::anyhow!("PARTY_AGENT_PRIVATE_KEY env var (or --private-key) is required")
                 })?,
             ),
         };
         let mut private_key_bytes = agent_logic::config::decode_private_key(&private_key_base58)?;
-        let private_key = agent_logic::secret::Secret::seal(&mut private_key_bytes);
-        let node_name = std::env::var("NODE_NAME")
-            .map_err(|_| anyhow::anyhow!("NODE_NAME env var is required"))?;
-        let ledger_service_public_key_base58 = std::env::var("LEDGER_SERVICE_PUBLIC_KEY")
-            .map_err(|_| anyhow::anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
+        let private_key = agent_logic::secret::Secret::seal(&mut private_key_bytes)?;
+        let node_name = get("NODE_NAME")
+            .ok_or_else(|| anyhow::anyhow!("NODE_NAME env var is required"))?;
+        let ledger_service_public_key_base58 = get("LEDGER_SERVICE_PUBLIC_KEY")
+            .ok_or_else(|| anyhow::anyhow!("LEDGER_SERVICE_PUBLIC_KEY env var is required"))?;
         let ledger_service_public_key =
             agent_logic::config::decode_public_key(&ledger_service_public_key_base58)?;
 
         Ok(Self {
             party_id,
-            role: std::env::var("AGENT_ROLE").unwrap_or_else(|_| "agent".to_string()),
+            role: get("AGENT_ROLE").unwrap_or_else(|| "agent".to_string()),
             private_key,
             node_name,
             ledger_service_public_key,
@@ -4109,6 +3564,21 @@ impl OnboardConfig {
     }
 }
 
+/// The onboarding config from `process` and `env_file`; a set variable wins
+/// over the file, and the process environment is left unchanged.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+fn onboard_env(
+    env_file: &std::path::Path,
+    process: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    party_override: Option<&str>,
+    key_override: Option<&agent_logic::secret::Zeroizing<String>>,
+) -> Result<(OnboardConfig, env::FileVars)> {
+    let file_vars = env::FileVars::load_if_exists(env_file)?;
+    let cfg = OnboardConfig::from_lookup(&|name| file_vars.get_with(name, process), party_override, key_override)
+        .context("Failed to load onboarding config from .env")?;
+    Ok((cfg, file_vars))
+}
+
 /// Complete ledger onboarding (preapproval + user-service).
 /// Called after PARTY_AGENT is set in .env. Does not require `agent.toml`.
 pub async fn complete_ledger_onboarding(
@@ -4117,11 +3587,10 @@ pub async fn complete_ledger_onboarding(
     party_override: Option<&str>,
     key_override: Option<&agent_logic::secret::Zeroizing<String>>,
 ) -> Result<()> {
-    // Ensure .env is loaded into process env
-    let _ = dotenvy::from_path(env_file);
-
-    let cfg = OnboardConfig::from_env_with(party_override, key_override)
-        .context("Failed to load onboarding config from .env")?;
+    // Settings read lazily elsewhere, if written to the env file during this
+    // run, apply from the next start.
+    let process = |name: &str| std::env::var_os(name);
+    let (cfg, file_vars) = onboard_env(env_file, &process, party_override, key_override)?;
 
     println!(
         "\nCompleting ledger onboarding for party {}...",
@@ -4181,7 +3650,7 @@ pub async fn complete_ledger_onboarding(
                 .map(|c| (c.template_id.clone(), struct_field_string(c, "expiresAt")))
                 .collect();
             // Renew ahead of expiry: Splice asserts expiresAt when the transfer runs.
-            Some(classify_cc_coverage(&entries, cc_renewal_deadline(chrono::Utc::now())))
+            Some(classify_cc_coverage(&entries, cc_renewal_deadline(agent_logic::clock::now_utc())))
         }
         Err(e) => {
             println!("Warning: could not query existing Splice CC preapprovals: {:#}", e);
@@ -4200,8 +3669,7 @@ pub async fn complete_ledger_onboarding(
                 "Warning: no usable Amulet entry in the preapproval target list; skipping CC preapproval."
             );
             preapproval_failures.push("CC (Splice): no Amulet preapproval target".to_string());
-        } else {
-            let amulet = amulet_entry.expect("checked above");
+        } else if let Some(amulet) = amulet_entry {
             let dso_for_cc = amulet.registry.clone();
             let amulet_operator = amulet.operator.clone();
             println!("Creating Splice preapproval for CC...");
@@ -4390,9 +3858,8 @@ pub async fn complete_ledger_onboarding(
             if let Some(cc_inst) = needs_faucet.iter().find(|i| i.token_name == "Amulet") {
                 let mut cc_ok = false;
                 let delays = [0u64, 10, 15, 20, 25, 30, 30, 30, 30];
-                for attempt in 0..delays.len() as u64 {
+                for (attempt, &delay) in delays.iter().enumerate() {
                     if attempt > 0 {
-                        let delay = delays[attempt as usize];
                         println!(
                             "  CC: retrying in {}s (waiting for preapproval acceptance)...",
                             delay
@@ -4455,8 +3922,8 @@ pub async fn complete_ledger_onboarding(
     // transaction hits a `Deny` at the canton-agent's preflight. The
     // per-tx auto-topup hook only fires AFTER a successful submit, so it
     // can't seed the initial balance — onboarding has to.
-    let min_env = std::env::var("MIN_PREPAID_TRAFFIC_BALANCE_CC").ok();
-    let topup_env = std::env::var("PREPAID_TRAFFIC_TOPUP_CC").ok();
+    let min_env = file_vars.get_with("MIN_PREPAID_TRAFFIC_BALANCE_CC", &process);
+    let topup_env = file_vars.get_with("PREPAID_TRAFFIC_TOPUP_CC", &process);
     match (min_env, topup_env) {
         (Some(min_str), Some(topup_str)) => {
             let min_cc: rust_decimal::Decimal = min_str.parse().with_context(|| {
@@ -4502,7 +3969,9 @@ pub async fn complete_ledger_onboarding(
                 Some(min_cc),
                 Some(topup_cc),
             )
-            .expect("env vars validated above");
+            .ok_or_else(|| {
+                anyhow!("auto-topup: MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC rejected")
+            })?;
 
             if canton_chain == "devnet" {
                 // Devnet: faucet above funded the agent's CC amulet wallet, so an
@@ -4813,21 +4282,21 @@ pub fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
     match command {
         SignCommands::Multihash { input, private_key } => {
             let key = agent_logic::sign::resolve_signing_key(
-                &config.private_key.expose(),
+                &*config.private_key.expose()?,
                 private_key.as_deref(),
             )?;
             println!("{}", agent_logic::sign::sign_multihash(&key, &input)?);
         }
         SignCommands::Message { input, private_key } => {
             let key = agent_logic::sign::resolve_signing_key(
-                &config.private_key.expose(),
+                &*config.private_key.expose()?,
                 private_key.as_deref(),
             )?;
             println!("{}", agent_logic::sign::sign_message(&key, &input));
         }
         SignCommands::Binary { input, private_key } => {
             let key = agent_logic::sign::resolve_signing_key(
-                &config.private_key.expose(),
+                &*config.private_key.expose()?,
                 private_key.as_deref(),
             )?;
             println!("{}", agent_logic::sign::sign_binary(&key, &input)?);
@@ -6599,6 +6068,109 @@ pub async fn atomic_setup_agent(
 }
 
 #[cfg(test)]
+mod daemon_tests {
+    use super::*;
+    use agent_logic::pool_impact::MarketMid;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    // A map held by a reader skips the update instead of stalling the poller
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_mid_price_map_skips_the_update() {
+        let mids = tokio::sync::RwLock::new(HashMap::new());
+        let mid = || Some(MarketMid { mid: 1.0, pool_depth: None });
+        let reader = mids.read().await;
+        let within = Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        assert_eq!(write_mid(&mids, "A-B", mid(), within).await, None);
+        assert_eq!(write_mid(&mids, "A-B", None, within).await, None);
+        assert!(started.elapsed() >= within * 2);
+        drop(reader);
+        assert_eq!(write_mid(&mids, "A-B", mid(), within).await, Some(false));
+        assert_eq!(write_mid(&mids, "A-B", mid(), within).await, Some(true));
+        assert_eq!(write_mid(&mids, "A-B", None, within).await, Some(true));
+        assert!(mids.read().await.is_empty());
+    }
+
+    // A balance fetch never waits forever for a client another fetch holds
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_balance_client_is_not_waited_on_forever() {
+        let opts = agent_logic::transport::ChannelOpts::default();
+        let channel = agent_logic::transport::endpoint("http://127.0.0.1:1", opts)
+            .unwrap()
+            .connect_lazy();
+        let key = agent_logic::secret::Secret::seal(&mut [7u8; 32]).unwrap();
+        let client = DAppProviderClient::from_channel(channel, "p", "agent", &key, 3600, None, &[0u8; 32]).unwrap();
+        let provider = CloudBalanceProvider { client: TokioMutex::new(client) };
+        let _held = provider.client.lock().await;
+        let started = tokio::time::Instant::now();
+        let err = provider.fetch_balances().await.unwrap_err().to_string();
+        assert!(err.contains("balance client busy"), "{err}");
+        assert!(started.elapsed() >= BALANCE_CLIENT_WAIT);
+    }
+
+    fn a_mid() -> MarketMid {
+        MarketMid { mid: 1.0, pool_depth: None }
+    }
+
+    fn unreachable_config() -> BaseConfig {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = "http://127.0.0.1:1".to_string();
+        config
+    }
+
+    // A restarted poller starts without the mids an earlier run left behind
+    #[tokio::test]
+    async fn a_poller_run_starts_from_an_empty_price_map() {
+        let mids = Arc::new(tokio::sync::RwLock::new(HashMap::from([("A-B".to_string(), a_mid())])));
+        let shutdown = Shutdown::new();
+        let run = tokio::spawn(mid_price_poller(unreachable_config(), Arc::clone(&mids), vec!["A-B".into()], shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(mids.read().await.is_empty());
+        shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+    }
+
+    // A run that dies takes its mids with it; a clean shutdown leaves them
+    #[tokio::test]
+    async fn a_poller_run_that_dies_clears_its_mids() {
+        let mids = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let shutdown = Shutdown::new();
+        let run = tokio::spawn(mid_price_poller(unreachable_config(), Arc::clone(&mids), vec!["A-B".into()], shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        mids.write().await.insert("A-B".to_string(), a_mid());
+        run.abort();
+        let _ = run.await;
+        assert!(mids.read().await.is_empty(), "no stale mid outlives the run");
+
+        let run = tokio::spawn(mid_price_poller(unreachable_config(), Arc::clone(&mids), Vec::new(), shutdown.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        mids.write().await.insert("A-B".to_string(), a_mid());
+        shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap();
+        assert_eq!(mids.read().await.len(), 1, "a clean shutdown leaves the map as it was");
+    }
+
+    #[test]
+    fn the_poller_needs_a_runtime() {
+        let mids = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        assert!(spawn_mid_price_poller(unreachable_config(), mids, Vec::new(), Shutdown::new()).is_err());
+    }
+
+    // A peer that never answers the TLS handshake fails the LP stream connect
+    #[tokio::test]
+    async fn the_raw_channel_bounds_a_stalled_tls_handshake() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(30), create_raw_channel(&url)).await;
+        assert!(matches!(result, Ok(Err(_))), "the handshake bound should end the connect");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        drop(listener);
+    }
+}
+
+#[cfg(test)]
 mod onboard_key_tests {
     use super::*;
     use agent_logic::secret::Zeroizing;
@@ -6620,8 +6192,48 @@ mod onboard_key_tests {
     }
 
     fn keypair() -> (Zeroizing<String>, String) {
-        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair();
+        let (priv_b58, pub_b58) = agent_logic::sign::generate_keypair().unwrap();
         (Zeroizing::new(priv_b58), pub_b58)
+    }
+
+    // Onboarding used to copy the env file into the environment while the runtime ran
+    #[test]
+    fn onboarding_reads_the_env_file_without_changing_the_environment() {
+        let probe = format!("CLOUD_AGENT_ONBOARD_PROBE_{}", std::process::id());
+        let (key, ledger_pub) = keypair();
+        let path = scratch_env(Some(&format!(
+            "{probe}=from-file\nPARTY_AGENT=party::file\nNODE_NAME=node-file\nLEDGER_SERVICE_PUBLIC_KEY={ledger_pub}\n"
+        )));
+        let no_env = |_: &str| None;
+        let (cfg, vars) = onboard_env(&path, &no_env, None, Some(&key)).unwrap();
+        assert!(std::env::var_os(&probe).is_none(), "the process environment is unchanged");
+        assert_eq!((cfg.party_id.as_str(), cfg.node_name.as_str(), cfg.role.as_str()), ("party::file", "node-file", "agent"));
+        assert_eq!(cfg.ledger_service_public_key, agent_logic::config::decode_public_key(&ledger_pub).unwrap());
+        assert_eq!(vars.get_with(&probe, &no_env).as_deref(), Some("from-file"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn onboarding_prefers_a_set_variable_then_the_first_file_line() {
+        let (key, ledger_pub) = keypair();
+        let path = scratch_env(Some(&format!(
+            "PARTY_AGENT=party::file\nNODE_NAME=node-first\nNODE_NAME=node-second\n\
+             LEDGER_SERVICE_PUBLIC_KEY={ledger_pub}\nMIN_PREPAID_TRAFFIC_BALANCE_CC=5\n"
+        )));
+        let process = |name: &str| (name == "PARTY_AGENT").then(|| std::ffi::OsString::from("party::env"));
+        let (cfg, vars) = onboard_env(&path, &process, None, Some(&key)).unwrap();
+        assert_eq!(cfg.party_id, "party::env");
+        assert_eq!(cfg.node_name, "node-first");
+        assert_eq!(vars.get_with("MIN_PREPAID_TRAFFIC_BALANCE_CC", &process).as_deref(), Some("5"));
+        let (cfg, _) = onboard_env(&path, &process, Some("party::flag"), Some(&key)).unwrap();
+        assert_eq!(cfg.party_id, "party::flag", "the override wins over both");
+        let _ = std::fs::remove_file(&path);
+
+        let missing = scratch_env(None);
+        let Err(err) = onboard_env(&missing, &|_| None, None, Some(&key)) else {
+            panic!("no party anywhere must be an error");
+        };
+        assert!(format!("{err:#}").contains("PARTY_AGENT env var is required"), "{err:#}");
     }
 
     fn advertised(token_name: &str, registry: &str, operator: &str) -> FaucetInstrument {
@@ -7062,7 +6674,8 @@ mod transfer_tests {
 
     #[test]
     fn the_fee_margin_raises_the_selection_target() {
-        assert_eq!(payment_queue::with_fee_margin(dec("100")), dec("102.00"));
+        assert_eq!(payment_queue::with_fee_margin(dec("100")), Some(dec("102.00")));
+        assert_eq!(payment_queue::with_fee_margin(rust_decimal::Decimal::MAX), None);
     }
 
     #[test]

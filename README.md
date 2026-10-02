@@ -129,11 +129,19 @@ struct Args {
     #[arg(long, default_value = "5.0")] min_settlement: f64,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Load .env before any thread starts: changing the environment later is unsound
     let _ = dotenvy::dotenv();
     let args = Args::parse();
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start the async runtime")?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // 1. Load config from .env + agent.toml
     let mut config = BaseConfig::load_or_defaults("agent.toml")?;
@@ -150,14 +158,16 @@ async fn main() -> Result<()> {
     );
     let backend = CloudSettlementBackend::new(
         config.clone(), false, false, false, false, confirm_lock.clone(), lm,
-    );
+        agent_logic::shutdown::Shutdown::new(),
+        cloud_agent::holdings_cache::HoldingsCache::new(false),
+    )?;
 
     // 4. Create settler for atomic multicall settlement
     let settler = Arc::new(MulticallSettler {
         config: config.clone(),
         amulet_cache: backend.amulet_cache().clone(),
         verbose: false, dry_run: false, force: false, confirm: false,
-        confirm_lock,
+        confirm_lock, fee_debits: Default::default(),
     });
 
     // 5. Run the fill loop
@@ -169,9 +179,11 @@ async fn main() -> Result<()> {
         min_settlement: args.min_settlement,
         max_settlement: args.amount,
         interval_secs: args.poll_period,
+        atomic: false,
+        fee_tokens: vec![],
     };
     let _backend_guard = backend;
-    fill_loop::run_fill_loop(config, settler, params, None, None).await
+    fill_loop::run_fill_loop(config, settler, params, None, None, None).await
 }
 ```
 
@@ -233,7 +245,7 @@ Flags:
 | `--party <ID>`           | Skip the waiting list; prompts for the private key when none is configured |
 | `--private-key <B58>`    | Base58 Ed25519 private key for `--party` (optional in a terminal — prompted, input hidden) |
 | `--env-file <PATH>`      | Path to .env file (default: `.env`; global flag, works on every command) |
-| `--poll-interval <SECS>` | Polling interval during onboarding (default: 10) |
+| `--poll-interval <SECS>` | Polling interval during onboarding, 1–3600 (default: 10) |
 
 ### Configuration
 
@@ -259,7 +271,7 @@ cloud-agent --party <ID> agent            # prompts for the key in a terminal
 cloud-agent --quote-private-key <HEX> agent
 ```
 
-`--party` overrides `PARTY_AGENT`, `--private-key` overrides `PARTY_AGENT_PRIVATE_KEY`, and `--quote-private-key` overrides `ATOMIC_QUOTE_PRIVATE_KEY`. Precedence is flag, then environment (`.env`/shell), then — for the private key only — a hidden terminal prompt when a party is known but no key is configured. The flags may appear before or after the subcommand. Without a terminal the command exits with an error, so non-interactive runs need the variable or the flag. `info network`, `info party`, `atomic keygen` and `sign` with an explicit `--private-key` need no agent key at all. The quote key is never prompted for. Keys supplied this way are not written to `.env`.
+`--party` overrides `PARTY_AGENT`, `--private-key` overrides `PARTY_AGENT_PRIVATE_KEY`, and `--quote-private-key` overrides `ATOMIC_QUOTE_PRIVATE_KEY`. Precedence is flag, then environment (`.env`/shell), then — for the private key only — a hidden terminal prompt when a party is known but no key is configured. The flags may appear before or after the subcommand. Without a terminal, or when no key is entered within 5 minutes, the command exits with an error, so non-interactive runs need the variable or the flag. `info network`, `info party`, `atomic keygen` and `sign` with an explicit `--private-key` need no agent key at all. The quote key is never prompted for. Keys supplied this way are not written to `.env`.
 
 #### `.env` — Environment Variables
 
@@ -278,13 +290,16 @@ cloud-agent --quote-private-key <HEX> agent
 | `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
 | `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
 | `PARTY_ORDERBOOK_FEE`            | Orderbook fee collection party                                         |         yes          |
-| `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`)                         |         yes          |
+| `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`; a finite number)        |         yes          |
 | `MERGE_THRESHOLD`                | Merge worker triggers when selectable amulets exceed this count        |         yes          |
 | `MERGE_MAX_AMULETS`              | Max amulets merged per round (default: `100`)                          |         yes          |
-| `MERGE_POLL_INTERVAL_SEC`        | Merge worker poll interval in seconds (default: `600`)                 |         yes          |
+| `MERGE_POLL_INTERVAL_SEC`        | Merge worker poll interval in seconds (default: `600`; at least 1)     |         yes          |
 | `LOG_DESTINATION`                | `console` \| `file` (paired with `LOG_DIR`, `LOG_FILE_PREFIX`)         |         yes          |
 | `RECURRING_PAYMENT_PACKAGE_NAME` | Recurring-payment package name; required for `subscription *` commands |         yes          |
-| `SETTLEMENT_THREAD_COUNT`        | Concurrent settlement threads (default used when unset)                |          no          |
+| `SETTLEMENT_THREAD_COUNT`        | Concurrent settlement threads, 1–1024 (default `25` when unset)        |          no          |
+| `MAX_ALLOCATION_WORKERS`         | Concurrent allocation payments, 1–256 (default `20` when unset)        |          no          |
+| `MAX_FEE_WORKERS`                | Concurrent fee payments, 1–256 (default `5` when unset)                |          no          |
+| `MAX_PAYMENT_WORKERS`            | Sets both payment pools at once, 1–256; overrides the two above        |          no          |
 | `AGENT_MAX_SETTLEMENTS`          | Max active settlements (default used when unset)                       |          no          |
 
 #### Sequencer congestion (advanced)
@@ -296,24 +311,24 @@ None of these are written by `onboard`; the defaults are what production runs. T
 | `FEE_PAUSE_SECS`                    |  `10`   | How long fee dispatch pauses after a `SEQUENCER_BACKPRESSURE` reply                                                 |
 | `BACKGROUND_PAUSE_SECS`             |  `60`   | How long deadline-free background work (DvpProposal GC) pauses after the same reply. Longer on purpose: it is the last thing that should resume competing for slots |
 | `SEQUENCER_OVERLOAD_THRESHOLD`      |  `0.5`  | Predicted issuance coefficient below which fees pause. RFQs are rejected 0.1 below this                             |
-| `FORECAST_POLL_SECS`                |  `30`   | Issuance-forecast poll interval. A dead poller freezes every gate above, so this doubles as its liveness signal     |
+| `FORECAST_POLL_SECS`                |  `30`   | Issuance-forecast poll interval, 1–3600; any other value stops startup. A dead poller freezes every gate above, so this doubles as its liveness signal |
 | `LEDGER_UNHEALTHY_FAILURE_THRESHOLD`|   `3`   | Consecutive sequencer-unreachable failures that dark quoting. Backpressure is deliberately excluded — the ledger is up, just congested |
-| `LEDGER_UNHEALTHY_COOLDOWN_SECS`    |  `60`   | How long quoting stays dark after the breaker trips                                                                 |
-| `MAX_RETRIES`                       |   `5`   | Retries per transaction submission. Background operations ignore this and give up on the first backpressure reply   |
+| `LEDGER_UNHEALTHY_COOLDOWN_SECS`    |  `60`   | How long quoting stays dark after the breaker trips, 0–86400; any other value stops startup                         |
+| `MAX_RETRIES`                       |   `5`   | Retries per transaction submission, at least 1; `0` or a non-number stops startup. No new attempt starts after 120s and the wait between attempts is capped at 30s. Background operations ignore this and give up on the first backpressure reply |
 
 #### DvpProposal GC (advanced)
 
-Archives expired legacy-DVP proposals from the party's ACS. Also unwritten by `onboard`.
+Archives expired legacy-DVP proposals from the party's ACS. Also unwritten by `onboard`. A timer or coefficient value that does not parse or is out of range stops startup. The two switches take `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off`; a blank value uses the default, and any other value uses the default with a warning.
 
 | Variable                     | Default | Description                                                                                    |
 | ---------------------------- | :-----: | ---------------------------------------------------------------------------------------------- |
 | `DVP_GC_ENABLED`             | `true`  | Master switch                                                                                   |
-| `DVP_GC_REFRESH_SECS`        | `3600`  | Interval between full ACS scans                                                                 |
-| `DVP_GC_DELAY_SECS`          |   `2`   | Delay between archival transactions, and the gate's poll period                                 |
+| `DVP_GC_REFRESH_SECS`        | `3600`  | Interval between full ACS scans; at least 1                                                     |
+| `DVP_GC_DELAY_SECS`          |   `2`   | Delay between archival transactions, and the gate's poll period; at least 1                     |
 | `DVP_GC_SAFETY_MARGIN_SECS`  | `3600`  | Only proposals whose `settleBefore` is at least this far in the past are touched                |
 | `DVP_GC_REJECT_ENABLED`      | `true`  | Also reject expired proposals where this party is the counterparty                              |
-| `DVP_GC_MIN_COEFFICIENT`     | `0.68`  | Archival pauses while the predicted coefficient is below this                                   |
-| `DVP_GC_MAX_PAUSE_SECS`      |  `900`  | Abandon the cycle and rescan after the gate has been shut this long (floored at 60; raise it, never set 0, to effectively disable) |
+| `DVP_GC_MIN_COEFFICIENT`     | `0.68`  | Archival pauses while the predicted coefficient is below this; must be a finite number          |
+| `DVP_GC_MAX_PAUSE_SECS`      |  `900`  | Abandon the cycle and rescan after the gate has been shut this long; at least 60 (raise it to effectively disable) |
 | `DVP_GC_STALE_FORECAST_SECS` |  `300`  | Warn when the gate is deciding on a coefficient older than this                                 |
 
 #### `agent.toml` — Agent Settings
@@ -435,7 +450,11 @@ Flags (both `buy` and `sell`):
 | `--price-limit <N>`    | Max (buy) or min (sell) price per unit — default: mid ± 3% |
 | `--min-settlement <N>` | Minimum per-round size (default: 5.0)                      |
 | `--max-settlement <N>` | Maximum per-round size (default: total amount)             |
-| `--interval <SECS>`    | Retry interval when no quote arrives (default: 60)         |
+| `--interval <SECS>`    | Retry interval when no quote arrives, at least 1 (default: 60) |
+
+Amounts and the price limit must be finite numbers above 0. When a round's settle may have committed but this cannot be confirmed, the loop stops with an error instead of requesting a new quote; check the ledger before you restart it.
+
+Progress is saved to `agent-state.json` in the working directory, and each round is marked there before it can commit. If that file cannot be read or written, or belongs to another party, the loop does not start, or stops before the round is submitted. A restart reads the settlement status of a marked V1 round up to six times, 10s apart, before quoting; a V1 round whose outcome is still unknown stops the restart until a rerun can read its status, and a marked atomic round stops it with the order's progress and the edits to `agent-state.json` that continue it. With `--confirm`, a prompt left unanswered stops the loop instead of accepting another quote.
 
 ### `agent` mode — flags
 
@@ -447,7 +466,7 @@ Flags (both `buy` and `sell`):
 | `--no-reject`       | Accept all proposals without RFQ-state verification          |
 | `--dry-run`         | Prepare and verify transactions without signing or executing |
 | `--force`           | Sign and execute even if verification fails                  |
-| `--confirm`         | Prompt for confirmation before signing each transaction      |
+| `--confirm`         | Prompt for confirmation before signing each transaction; no answer within 120s, or 120s waiting behind another prompt, declines it |
 | `--verbose`         | Enable verbose logging                                       |
 | `--config <PATH>`   | Path to agent.toml (default: `agent.toml`)                   |
 
@@ -519,6 +538,8 @@ The `SettlementStream` RPC is a long-lived bidirectional gRPC stream used for RF
 **Agent sends:** handshake, heartbeats, preconfirmations, DVP lifecycle events, RFQ quotes/rejections.
 
 **Server sends:** handshake ack, heartbeats, settlement proposals, preconfirmation requests, RFQ requests.
+
+Both LP streams (this one and the atomic RFQ stream) reconnect after 5s when the stream ends, the open gets no response within 30s, an outbound send stalls for 10s, or the server goes silent for 90s after its first heartbeat.
 
 The agent opens this stream when `[liquidity_provider]` is configured in `agent.toml` — unless `rfq_v2_only = true`, in which case the stream is never opened and the agent never appears in `GetConnectedLiquidityProviders`.
 

@@ -7,12 +7,14 @@
 //!
 //! On error, returns `[0u8; 32]` sentinel so the caller falls back to the server hash.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};
+
+use crate::text::short;
 
 use crate::decode::canton_proto::com::daml::ledger::api::v2 as proto_v2;
 use proto_v2::interactive::{
@@ -36,6 +38,12 @@ const METADATA_ENCODING_V1: u8 = 0x01;
 
 /// Hashing scheme version in final hash — ALWAYS V2 even for V3 metadata
 const HASHING_SCHEME_V2: u8 = 0x02;
+
+/// Deepest node nesting followed (roots are level 1).
+const MAX_NODE_DEPTH: usize = 256;
+
+/// Deepest value nesting encoded (a top-level value is level 1).
+const MAX_VALUE_DEPTH: usize = 128;
 
 /// Node type tags
 const CREATE_TAG: u8 = 0x00;
@@ -125,7 +133,7 @@ impl Acc {
     /// Decode hex string to bytes, then encode as length-prefixed bytes
     fn hex_bytes(&mut self, hex_str: &str) -> Result<&mut Self> {
         let decoded = hex::decode(hex_str)
-            .with_context(|| format!("invalid hex: {}...", &hex_str[..hex_str.len().min(20)]))?;
+            .with_context(|| format!("invalid hex: {}...", short(hex_str, 20)))?;
         Ok(self.bytes_val(&decoded))
     }
 
@@ -187,6 +195,14 @@ fn encode_optional_identifier(acc: &mut Acc, id: &Option<Identifier>) {
 // ============================================================================
 
 fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
+    encode_value_at(acc, value, 1)
+}
+
+fn encode_value_at(acc: &mut Acc, value: &Value, depth: usize) -> Result<()> {
+    if depth > MAX_VALUE_DEPTH {
+        bail!("value nesting exceeds {MAX_VALUE_DEPTH} levels");
+    }
+    let next = depth.saturating_add(1);
     let sum = value.sum.as_ref().context("Value has no sum field set")?;
 
     match sum {
@@ -231,7 +247,7 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
             match &opt.value {
                 Some(inner) => {
                     acc.byte(0x01);
-                    encode_value(acc, inner)?;
+                    encode_value_at(acc, inner, next)?;
                 }
                 None => {
                     acc.byte(0x00);
@@ -242,7 +258,7 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
             acc.byte(LIST_TAG);
             acc.i32_val(list.elements.len() as i32);
             for elem in &list.elements {
-                encode_value(acc, elem)?;
+                encode_value_at(acc, elem, next)?;
             }
         }
         Sum::TextMap(map) => {
@@ -250,9 +266,10 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
             acc.i32_val(map.entries.len() as i32);
             for entry in &map.entries {
                 acc.str_val(&entry.key);
-                encode_value(
+                encode_value_at(
                     acc,
                     entry.value.as_ref().context("TextMap entry missing value")?,
+                    next,
                 )?;
             }
         }
@@ -268,9 +285,10 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
                     acc.byte(0x01);
                     acc.str_val(&field.label);
                 }
-                encode_value(
+                encode_value_at(
                     acc,
                     field.value.as_ref().context("Record field missing value")?,
+                    next,
                 )?;
             }
         }
@@ -278,9 +296,10 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
             acc.byte(VARIANT_TAG);
             encode_optional_identifier(acc, &variant.variant_id);
             acc.str_val(&variant.constructor);
-            encode_value(
+            encode_value_at(
                 acc,
                 variant.value.as_ref().context("Variant missing value")?,
+                next,
             )?;
         }
         Sum::Enum(e) => {
@@ -292,13 +311,15 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
             acc.byte(GEN_MAP_TAG);
             acc.i32_val(map.entries.len() as i32);
             for entry in &map.entries {
-                encode_value(
+                encode_value_at(
                     acc,
                     entry.key.as_ref().context("GenMap entry missing key")?,
+                    next,
                 )?;
-                encode_value(
+                encode_value_at(
                     acc,
                     entry.value.as_ref().context("GenMap entry missing value")?,
+                    next,
                 )?;
             }
         }
@@ -311,14 +332,16 @@ fn encode_value(acc: &mut Acc, value: &Value) -> Result<()> {
 // Node seed lookup
 // ============================================================================
 
-/// Find seed for a node by matching NodeSeed.node_id (i32) to DamlNode.node_id (String)
-fn find_seed(node_id: &str, node_seeds: &[daml_transaction::NodeSeed]) -> Option<Vec<u8>> {
+type SeedMap<'a> = HashMap<String, &'a [u8]>;
+
+/// Seeds keyed by `NodeSeed.node_id` rendered as decimal, matching
+/// `DamlNode.node_id` text exactly; the first entry for an id wins.
+fn build_seed_map(node_seeds: &[daml_transaction::NodeSeed]) -> SeedMap<'_> {
+    let mut map = HashMap::new();
     for ns in node_seeds {
-        if ns.node_id.to_string() == node_id {
-            return Some(ns.seed.clone());
-        }
+        map.entry(ns.node_id.to_string()).or_insert(ns.seed.as_slice());
     }
-    None
+    map
 }
 
 // ============================================================================
@@ -327,21 +350,21 @@ fn find_seed(node_id: &str, node_seeds: &[daml_transaction::NodeSeed]) -> Option
 
 type NodesDict<'a> = HashMap<String, &'a daml_transaction::Node>;
 
+/// Lookup tables for one transaction plus the node ids already hashed in it.
+struct NodeWalk<'a> {
+    nodes: NodesDict<'a>,
+    seeds: SeedMap<'a>,
+    seen: HashSet<&'a str>,
+}
+
 /// Encode a Create node (without NodeEncodingVersion prefix).
 /// Used both for transaction nodes and input contract (disclosed) nodes.
-fn encode_create_node(
-    acc: &mut Acc,
-    create: &Create,
-    node_id: &str,
-    node_seeds: &[daml_transaction::NodeSeed],
-) -> Result<()> {
-    let seed = find_seed(node_id, node_seeds);
-
+fn encode_create_node(acc: &mut Acc, create: &Create, seed: Option<&[u8]>) -> Result<()> {
     acc.str_val(&create.lf_version);
     acc.byte(CREATE_TAG);
 
     // Optional seed
-    match &seed {
+    match seed {
         Some(s) => {
             acc.byte(0x01);
             acc.raw(s); // raw 32 bytes, no length prefix
@@ -371,20 +394,24 @@ fn encode_create_node(
 }
 
 /// Encode an Exercise node
-fn encode_exercise_node(
+fn encode_exercise_node<'a>(
     acc: &mut Acc,
-    exercise: &Exercise,
+    exercise: &'a Exercise,
     node_id: &str,
-    nodes_dict: &NodesDict<'_>,
-    node_seeds: &[daml_transaction::NodeSeed],
+    walk: &mut NodeWalk<'a>,
+    depth: usize,
 ) -> Result<()> {
-    let seed = find_seed(node_id, node_seeds).context("Exercise node must have a seed")?;
+    let seed = walk
+        .seeds
+        .get(node_id)
+        .copied()
+        .context("Exercise node must have a seed")?;
 
     acc.str_val(&exercise.lf_version);
     acc.byte(EXERCISE_TAG);
 
     // Required seed — raw bytes, NOT optional-wrapped
-    acc.raw(&seed);
+    acc.raw(seed);
 
     acc.hex_bytes(&exercise.contract_id)?;
     acc.str_val(&exercise.package_name);
@@ -426,7 +453,7 @@ fn encode_exercise_node(
     acc.string_set(&exercise.choice_observers);
 
     // Children — recursive
-    encode_node_ids(acc, &exercise.children, nodes_dict, node_seeds)?;
+    encode_node_ids(acc, &exercise.children, walk, depth.saturating_add(1))?;
 
     Ok(())
 }
@@ -457,22 +484,22 @@ fn encode_fetch_node(acc: &mut Acc, fetch: &Fetch) -> Result<()> {
 }
 
 /// Encode a Rollback node (no lf_version)
-fn encode_rollback_node(
+fn encode_rollback_node<'a>(
     acc: &mut Acc,
-    rollback: &Rollback,
-    nodes_dict: &NodesDict<'_>,
-    node_seeds: &[daml_transaction::NodeSeed],
+    rollback: &'a Rollback,
+    walk: &mut NodeWalk<'a>,
+    depth: usize,
 ) -> Result<()> {
     acc.byte(ROLLBACK_TAG);
-    encode_node_ids(acc, &rollback.children, nodes_dict, node_seeds)?;
+    encode_node_ids(acc, &rollback.children, walk, depth.saturating_add(1))?;
     Ok(())
 }
 
 /// Encode a full node: NodeEncodingVersion + node-type-specific encoding, then SHA-256
-fn hash_node(
-    daml_node: &daml_transaction::Node,
-    nodes_dict: &NodesDict<'_>,
-    node_seeds: &[daml_transaction::NodeSeed],
+fn hash_node<'a>(
+    daml_node: &'a daml_transaction::Node,
+    walk: &mut NodeWalk<'a>,
+    depth: usize,
 ) -> Result<[u8; 32]> {
     let versioned = daml_node
         .versioned_node
@@ -493,22 +520,17 @@ fn hash_node(
 
     match node_type {
         NodeType::Create(create) => {
-            encode_create_node(&mut acc, create, &daml_node.node_id, node_seeds)?;
+            let seed = walk.seeds.get(daml_node.node_id.as_str()).copied();
+            encode_create_node(&mut acc, create, seed)?;
         }
         NodeType::Exercise(exercise) => {
-            encode_exercise_node(
-                &mut acc,
-                exercise,
-                &daml_node.node_id,
-                nodes_dict,
-                node_seeds,
-            )?;
+            encode_exercise_node(&mut acc, exercise, &daml_node.node_id, walk, depth)?;
         }
         NodeType::Fetch(fetch) => {
             encode_fetch_node(&mut acc, fetch)?;
         }
         NodeType::Rollback(rollback) => {
-            encode_rollback_node(&mut acc, rollback, nodes_dict, node_seeds)?;
+            encode_rollback_node(&mut acc, rollback, walk, depth)?;
         }
     }
 
@@ -523,19 +545,28 @@ fn hash_node(
     Ok(h)
 }
 
-/// Encode a list of node IDs as repeated hashed nodes
-fn encode_node_ids(
+/// Encode a list of node IDs as repeated hashed nodes. Each node may be
+/// referenced once per transaction, at most `MAX_NODE_DEPTH` levels deep.
+fn encode_node_ids<'a>(
     acc: &mut Acc,
-    node_ids: &[String],
-    nodes_dict: &NodesDict<'_>,
-    node_seeds: &[daml_transaction::NodeSeed],
+    node_ids: &'a [String],
+    walk: &mut NodeWalk<'a>,
+    depth: usize,
 ) -> Result<()> {
+    if depth > MAX_NODE_DEPTH && !node_ids.is_empty() {
+        bail!("transaction nesting exceeds {MAX_NODE_DEPTH} levels");
+    }
     acc.i32_val(node_ids.len() as i32);
     for node_id in node_ids {
-        let daml_node = nodes_dict
-            .get(node_id)
-            .with_context(|| format!("Node '{}' not found in transaction", node_id))?;
-        let h = hash_node(daml_node, nodes_dict, node_seeds)?;
+        if !walk.seen.insert(node_id.as_str()) {
+            bail!("Node '{node_id}' referenced more than once");
+        }
+        let daml_node = walk
+            .nodes
+            .get(node_id.as_str())
+            .copied()
+            .with_context(|| format!("Node '{node_id}' not found in transaction"))?;
+        let h = hash_node(daml_node, walk, depth)?;
         acc.hash_val(&h);
     }
     Ok(())
@@ -546,12 +577,16 @@ fn encode_node_ids(
 // ============================================================================
 
 fn hash_transaction(tx: &proto_v2::interactive::DamlTransaction) -> Result<[u8; 32]> {
-    let nodes_dict = build_nodes_dict(tx);
+    let mut walk = NodeWalk {
+        nodes: build_nodes_dict(tx),
+        seeds: build_seed_map(&tx.node_seeds),
+        seen: HashSet::new(),
+    };
 
     let mut acc = Acc::new();
     acc.raw(&HASH_PURPOSE);
     acc.str_val(&tx.version);
-    encode_node_ids(&mut acc, &tx.roots, &nodes_dict, &tx.node_seeds)?;
+    encode_node_ids(&mut acc, &tx.roots, &mut walk, 1)?;
 
     let h = acc.finish();
     debug!("Layer 1 (tx_hash): {}", hex::encode(h));
@@ -628,10 +663,10 @@ fn hash_metadata(
         // Hash the create node with no seed (disclosed contracts have no seed)
         let mut create_acc = Acc::new();
         create_acc.byte(NODE_ENCODING_V1);
-        encode_create_node(&mut create_acc, create, "unused", &[])?;
+        encode_create_node(&mut create_acc, create, None)?;
         let create_hash = create_acc.finish();
         debug!("  input_contract[{}] hash: {} (created_at={})",
-            &create.contract_id[..create.contract_id.len().min(16)],
+            short(&create.contract_id, 16),
             hex::encode(create_hash), ic.created_at);
         acc.hash_val(&create_hash);
     }
@@ -731,5 +766,209 @@ pub fn compute_hash(
             error!("TX HASH computation failed: {:#}", e);
             Ok([0u8; 32]) // sentinel → caller falls back to server hash
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use std::time::{Duration, Instant};
+
+    const SENTINEL: [u8; 32] = [0u8; 32];
+
+    fn hash(p: &PreparedTransaction) -> [u8; 32] {
+        compute_hash(&encode(p), "V2").expect("compute_hash only fails on undecodable bytes")
+    }
+
+    fn leaf(id: &str) -> Node {
+        create_node(id, create(ident("M", "T"), boolean(true), &["p"]))
+    }
+
+    /// Exercise chain 0 -> 1 -> ... -> len-1, every node seeded.
+    fn chain(len: usize) -> PreparedTransaction {
+        let nodes = (0..len)
+            .map(|i| {
+                let children = if i + 1 < len { vec![(i + 1).to_string()] } else { vec![] };
+                exercise_node(&i.to_string(), exercise("C", &["p"], children))
+            })
+            .collect();
+        let seeds = (0..len).map(|i| seed(i as i32, 1)).collect();
+        prepared(&["0"], nodes, seeds, &["p"])
+    }
+
+    #[test]
+    fn plain_tree_hashes() {
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", exercise("C", &["p"], ids(&["1", "2"]))), leaf("1"), leaf("2")],
+            vec![seed(0, 1)],
+            &["p"],
+        );
+        let h = hash(&p);
+        assert_ne!(h, SENTINEL);
+        assert_eq!(hash(&p), h, "deterministic");
+    }
+
+    #[test]
+    fn self_referencing_node_returns_sentinel() {
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", exercise("C", &["p"], ids(&["0"])))],
+            vec![seed(0, 0)],
+            &["p"],
+        );
+        assert_eq!(hash(&p), SENTINEL);
+    }
+
+    #[test]
+    fn two_node_cycle_through_rollback_returns_sentinel() {
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", exercise("C", &["p"], ids(&["1"]))), rollback_node("1", ids(&["0"]))],
+            vec![seed(0, 0)],
+            &["p"],
+        );
+        assert_eq!(hash(&p), SENTINEL);
+    }
+
+    #[test]
+    fn shared_child_returns_sentinel() {
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", exercise("C", &["p"], ids(&["1", "1"]))), leaf("1")],
+            vec![seed(0, 1)],
+            &["p"],
+        );
+        assert_eq!(hash(&p), SENTINEL);
+    }
+
+    #[test]
+    fn duplicate_root_returns_sentinel() {
+        let p = prepared(&["0", "0"], vec![leaf("0")], vec![], &["p"]);
+        assert_eq!(hash(&p), SENTINEL);
+    }
+
+    #[test]
+    fn diamond_dag_is_not_expanded() {
+        // node i -> [i+1, i+1]: expanding it would hash 2^24 leaves
+        const LEVELS: usize = 24;
+        let mut nodes: Vec<Node> = (0..LEVELS)
+            .map(|i| {
+                let next = (i + 1).to_string();
+                exercise_node(&i.to_string(), exercise("C", &["p"], vec![next.clone(), next]))
+            })
+            .collect();
+        nodes.push(leaf(&LEVELS.to_string()));
+        let seeds = (0..LEVELS).map(|i| seed(i as i32, 1)).collect();
+        let p = prepared(&["0"], nodes, seeds, &["p"]);
+        let start = Instant::now();
+        assert_eq!(hash(&p), SENTINEL);
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn nesting_at_the_limit_hashes_within_a_small_stack() {
+        let p = chain(MAX_NODE_DEPTH);
+        let h = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || hash(&p))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_ne!(h, SENTINEL);
+    }
+
+    #[test]
+    fn nesting_past_the_limit_returns_sentinel() {
+        assert_eq!(hash(&chain(MAX_NODE_DEPTH + 1)), SENTINEL);
+    }
+
+    #[test]
+    fn very_deep_chain_returns_sentinel() {
+        assert_eq!(hash(&chain(20_000)), SENTINEL);
+    }
+
+    #[test]
+    fn rollback_counts_towards_nesting() {
+        // 255 exercises plus a rollback at level 256 holding a leaf at level 257
+        let mut p = chain(MAX_NODE_DEPTH - 1);
+        let tx = p.transaction.as_mut().unwrap();
+        let last = (MAX_NODE_DEPTH - 2).to_string();
+        for n in tx.nodes.iter_mut().filter(|n| n.node_id == last) {
+            *n = exercise_node(&last, exercise("C", &["p"], ids(&["rb"])));
+        }
+        tx.nodes.push(rollback_node("rb", ids(&["leaf"])));
+        tx.nodes.push(leaf("leaf"));
+        assert_eq!(hash(&p), SENTINEL);
+        // the same rollback without a child stays within the limit
+        let tx = p.transaction.as_mut().unwrap();
+        for n in tx.nodes.iter_mut().filter(|n| n.node_id == "rb") {
+            *n = rollback_node("rb", vec![]);
+        }
+        assert_ne!(hash(&p), SENTINEL);
+    }
+
+    #[test]
+    fn many_nodes_and_seeds_hash_in_linear_time() {
+        // 10k unseeded creates under one exercise plus 10k unrelated seeds
+        const N: usize = 10_000;
+        let mut nodes: Vec<Node> = (1..=N).map(|i| leaf(&i.to_string())).collect();
+        let children = (1..=N).map(|i| i.to_string()).collect();
+        nodes.push(exercise_node("0", exercise("C", &["p"], children)));
+        let mut seeds: Vec<NodeSeed> = (1..=N).map(|i| seed(-(i as i32), 2)).collect();
+        seeds.push(seed(0, 1));
+        let p = prepared(&["0"], nodes, seeds, &["p"]);
+        let start = Instant::now();
+        assert_ne!(hash(&p), SENTINEL);
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn first_seed_entry_wins() {
+        let tx_with = |seeds: Vec<NodeSeed>| {
+            prepared(&["0"], vec![exercise_node("0", exercise("C", &["p"], vec![]))], seeds, &["p"])
+        };
+        let first = hash(&tx_with(vec![seed(0, 1), seed(0, 2)]));
+        assert_ne!(first, SENTINEL);
+        assert_eq!(first, hash(&tx_with(vec![seed(0, 1)])));
+        assert_ne!(first, hash(&tx_with(vec![seed(0, 2)])));
+    }
+
+    #[test]
+    fn seed_ids_match_the_decimal_text_only() {
+        let tx_with = |node_id: &str, seeds: Vec<NodeSeed>| {
+            prepared(&[node_id], vec![leaf(node_id)], seeds, &["p"])
+        };
+        let unseeded = hash(&tx_with("05", vec![]));
+        assert_eq!(hash(&tx_with("05", vec![seed(5, 9)])), unseeded, "\"05\" is not seed 5");
+        assert_ne!(hash(&tx_with("5", vec![seed(5, 9)])), hash(&tx_with("5", vec![])));
+    }
+
+    #[test]
+    fn value_nesting_limit() {
+        let nested = |levels: usize| {
+            let mut v = boolean(true);
+            for _ in 1..levels {
+                v = optional(Some(v));
+            }
+            v
+        };
+        assert!(encode_value(&mut Acc::new(), &nested(MAX_VALUE_DEPTH)).is_ok());
+        let err = encode_value(&mut Acc::new(), &nested(MAX_VALUE_DEPTH + 1)).unwrap_err();
+        assert!(err.to_string().contains("value nesting"), "{err}");
+        let wide = list(vec![nested(MAX_VALUE_DEPTH - 1), record(vec![("f", nested(MAX_VALUE_DEPTH))])]);
+        assert!(encode_value(&mut Acc::new(), &wide).is_err());
+    }
+
+    #[test]
+    fn non_hex_multibyte_contract_id_is_an_error() {
+        let bad = "€".repeat(10);
+        let err = Acc::new().hex_bytes(&bad).err().expect("not hex");
+        assert_eq!(err.to_string(), format!("invalid hex: {}...", "€".repeat(10)));
+        let mut c = create(ident("M", "T"), boolean(true), &["p"]);
+        c.contract_id = "€".repeat(30);
+        let p = prepared(&["0"], vec![create_node("0", c)], vec![], &["p"]);
+        assert_eq!(hash(&p), SENTINEL);
     }
 }

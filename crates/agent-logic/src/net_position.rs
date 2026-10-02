@@ -1,8 +1,6 @@
 //! Trailing signed net flow per (counterparty, token) and per token, decayed
 //! over a window and checkpointed to JSON. Reads are pure; file IO is lock-free.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -103,7 +101,7 @@ struct SavedNetPositions {
 }
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    i64::try_from(crate::clock::now_millis()).unwrap_or(i64::MAX)
 }
 
 /// Whole milliseconds of `d`, saturating at `i64::MAX`.
@@ -382,23 +380,43 @@ impl NetPositionTracker {
         token: &str,
         signed_base_delta: f64,
     ) {
-        if !signed_base_delta.is_finite() || signed_base_delta == 0.0 || token.is_empty() {
-            return;
-        }
+        self.check_and_record(quote_id, party, token, signed_base_delta, |_| true);
+    }
+
+    /// Count as [`Self::record_confirm`] does only if `accept` passes the current
+    /// (party, token) net, 0 without a party; `accept` runs under the lock.
+    pub fn check_and_record(
+        &self,
+        quote_id: &str,
+        party: Option<&str>,
+        token: &str,
+        signed_base_delta: f64,
+        accept: impl FnOnce(f64) -> bool,
+    ) -> bool {
+        let now = now_ms();
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if inner.pending.contains_key(quote_id) {
-            return; // idempotent re-confirm
+        let net = match party {
+            Some(p) => self.read_entry(inner.nets.get(&(p.to_string(), token.to_string())), now),
+            None => 0.0,
+        };
+        if !accept(net) {
+            return false;
         }
-        inner.pending.insert(
-            quote_id.to_string(),
-            PendingNet {
-                party: party.map(|p| p.to_string()),
-                token: token.to_string(),
-                delta: signed_base_delta,
-                at_ms: now_ms(),
-            },
-        );
-        Self::apply_delta_locked(&mut inner, self.window_hours, party, token, signed_base_delta);
+        let countable = signed_base_delta.is_finite() && signed_base_delta != 0.0 && !token.is_empty();
+        // A quote already pending is not counted twice
+        if countable && !inner.pending.contains_key(quote_id) {
+            inner.pending.insert(
+                quote_id.to_string(),
+                PendingNet {
+                    party: party.map(|p| p.to_string()),
+                    token: token.to_string(),
+                    delta: signed_base_delta,
+                    at_ms: now,
+                },
+            );
+            Self::apply_delta_locked(&mut inner, self.window_hours, party, token, signed_base_delta);
+        }
+        true
     }
 
     /// Settle observed: drop the pending marker, keep the applied value. An
@@ -446,7 +464,7 @@ impl NetPositionTracker {
     fn snapshot_locked(inner: &Inner, window_hours: f64) -> SavedNetPositions {
         SavedNetPositions {
             version: NET_STATE_VERSION,
-            saved_at: chrono::Utc::now().to_rfc3339(),
+            saved_at: crate::clock::now_utc().to_rfc3339(),
             window_hours,
             entries: inner
                 .nets
@@ -688,6 +706,43 @@ mod tests {
         t2.record_confirm("q1", Some("ghost"), "TOKEN", 1e-12); // below epsilon
         let dropped = t2.sweep_decayed();
         assert!(dropped > 0 || t2.net("ghost", "TOKEN").abs() <= 1e-9);
+    }
+
+    // The check and the count used to be separate steps, so concurrent confirms read one net
+    #[test]
+    fn check_and_record_counts_only_what_it_accepts() {
+        let t = fresh("check-and-record");
+        let mut seen = Vec::new();
+        assert!(t.check_and_record("q1", Some("alice"), "TOKEN", 50_000.0, |net| {
+            seen.push(net);
+            true
+        }));
+        let refused = t.check_and_record("q2", Some("alice"), "TOKEN", 50_000.0, |net| {
+            seen.push(net);
+            net < 10_000.0
+        });
+        assert!(!refused);
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].abs() < 1.0, "the first check sees no count");
+        assert!((seen[1] - 50_000.0).abs() < 1.0, "the second check sees the first count");
+        assert!((t.net("alice", "TOKEN") - 50_000.0).abs() < 1.0, "a refused check counts nothing");
+        t.release("q2");
+        assert!((t.net("alice", "TOKEN") - 50_000.0).abs() < 1.0, "nothing pending for a refused quote");
+
+        // Counted once per quote, as record_confirm is
+        assert!(t.check_and_record("q1", Some("alice"), "TOKEN", 50_000.0, |_| true));
+        assert!((t.net("alice", "TOKEN") - 50_000.0).abs() < 1.0);
+        t.release("q1");
+        assert!(t.net("alice", "TOKEN").abs() < 1.0);
+
+        // Without a party the check sees 0 and only the desk net moves
+        let mut party_less = None;
+        assert!(t.check_and_record("q3", None, "TOKEN", 5_000.0, |net| {
+            party_less = Some(net);
+            true
+        }));
+        assert_eq!(party_less, Some(0.0));
+        assert!((t.desk_net("TOKEN") - 5_000.0).abs() < 1.0);
     }
 
     /// confirm → settle keeps the delta; confirm → release reverses it; both

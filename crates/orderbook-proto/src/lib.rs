@@ -5,6 +5,8 @@
 //! - SettlementService: DVP settlement coordination and streaming
 //! - PricingService: Real-time price feeds and market data aggregation
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use once_cell::sync::Lazy;
 use prost_reflect::DescriptorPool;
 
@@ -77,24 +79,29 @@ pub mod rfqv2 {
 }
 
 /// Descriptor pool for orderbook service reflection
+#[cfg_attr(not(test), expect(clippy::unwrap_used, reason = "compile-time embedded descriptor; no runtime callers"))]
 pub static ORDERBOOK_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
-    Lazy::new(|| DescriptorPool::decode(orderbook::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
+    Lazy::new(|| DescriptorPool::decode(orderbook::FILE_DESCRIPTOR_SET).unwrap());
 
 /// Descriptor pool for settlement service reflection
+#[cfg_attr(not(test), expect(clippy::unwrap_used, reason = "compile-time embedded descriptor; no runtime callers"))]
 pub static SETTLEMENT_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
-    Lazy::new(|| DescriptorPool::decode(settlement::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
+    Lazy::new(|| DescriptorPool::decode(settlement::FILE_DESCRIPTOR_SET).unwrap());
 
 /// Descriptor pool for pricing service reflection
+#[cfg_attr(not(test), expect(clippy::unwrap_used, reason = "compile-time embedded descriptor; no runtime callers"))]
 pub static PRICING_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
-    Lazy::new(|| DescriptorPool::decode(pricing::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
+    Lazy::new(|| DescriptorPool::decode(pricing::FILE_DESCRIPTOR_SET).unwrap());
 
 /// Descriptor pool for ledger gateway service reflection
+#[cfg_attr(not(test), expect(clippy::unwrap_used, reason = "compile-time embedded descriptor; no runtime callers"))]
 pub static LEDGER_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
-    Lazy::new(|| DescriptorPool::decode(ledger::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
+    Lazy::new(|| DescriptorPool::decode(ledger::FILE_DESCRIPTOR_SET).unwrap());
 
 /// Descriptor pool for RFQ V2 service reflection
+#[cfg_attr(not(test), expect(clippy::unwrap_used, reason = "compile-time embedded descriptor; no runtime callers"))]
 pub static RFQV2_DESCRIPTOR_POOL: Lazy<DescriptorPool> =
-    Lazy::new(|| DescriptorPool::decode(rfqv2::FILE_DESCRIPTOR_SET.as_ref()).unwrap());
+    Lazy::new(|| DescriptorPool::decode(rfqv2::FILE_DESCRIPTOR_SET).unwrap());
 
 // Re-export commonly used types for convenience
 pub use orderbook::{
@@ -225,6 +232,19 @@ mod tests {
             .expect("Should find SettlementProposalMessage");
 
         assert_eq!(proposal_descriptor.full_name(), "silvana.settlement.v1.SettlementProposalMessage");
+    }
+
+    #[test]
+    fn all_descriptor_pools_decode() {
+        for (pool, message) in [
+            (&*ORDERBOOK_DESCRIPTOR_POOL, "silvana.orderbook.v1.Market"),
+            (&*SETTLEMENT_DESCRIPTOR_POOL, "silvana.settlement.v1.SettlementProposalMessage"),
+            (&*PRICING_DESCRIPTOR_POOL, "silvana.pricing.v1.Price"),
+            (&*LEDGER_DESCRIPTOR_POOL, "silvana.ledger.v1.Fee"),
+            (&*RFQV2_DESCRIPTOR_POOL, "silvana.rfqv2.v1.AtomicQuote"),
+        ] {
+            assert!(pool.get_message_by_name(message).is_some(), "{message}");
+        }
     }
 
     #[test]

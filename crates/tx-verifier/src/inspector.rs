@@ -6,7 +6,7 @@
 //!                 ProposeDvp, AcceptDvp, Allocate, RequestPreapproval, RequestRecurringPayasyougo.
 //! Stub: TransferCip56 (send-side).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use prost::Message;
@@ -18,7 +18,11 @@ use proto_v2::interactive::transaction::v1::node::NodeType;
 use proto_v2::interactive::transaction::v1::Exercise;
 use proto_v2::{value::Sum, Identifier, Record, Value};
 
+use crate::text::short;
 use crate::types::{InspectionResult, OperationExpectation};
+
+/// Verbose mode skips the JSON dump of transactions larger than this.
+const VERBOSE_DUMP_MAX_BYTES: usize = 256 * 1024;
 
 // ============================================================================
 // Value extraction helpers
@@ -153,19 +157,21 @@ fn bytes_to_hex(bytes_arr: &[serde_json::Value]) -> String {
 fn compact_event_blobs(json: &mut serde_json::Value) {
     if let Some(meta) = json.pointer_mut("/metadata/input_contracts") {
         if let Some(arr) = meta.as_array_mut() {
-            for contract in arr {
-                if let Some(blob) = contract.get("event_blob") {
-                    if let Some(bytes_arr) = blob.as_array() {
-                        let bytes: Vec<u8> = bytes_arr
-                            .iter()
-                            .filter_map(|v| v.as_u64().map(|n| n as u8))
-                            .collect();
-                        contract["event_blob"] = serde_json::Value::String(format!(
-                            "base58:{}",
-                            bs58::encode(&bytes).into_string()
-                        ));
-                    }
-                }
+            for contract in arr.iter_mut().filter_map(|c| c.as_object_mut()) {
+                let Some(bytes_arr) = contract.get("event_blob").and_then(|b| b.as_array()) else {
+                    continue;
+                };
+                let bytes: Vec<u8> = bytes_arr
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as u8))
+                    .collect();
+                contract.insert(
+                    "event_blob".to_string(),
+                    serde_json::Value::String(format!(
+                        "base58:{}",
+                        bs58::encode(&bytes).into_string()
+                    )),
+                );
             }
         }
     }
@@ -175,20 +181,27 @@ fn compact_event_blobs(json: &mut serde_json::Value) {
 fn compact_seeds(json: &mut serde_json::Value) {
     if let Some(seeds) = json.pointer_mut("/transaction/node_seeds") {
         if let Some(arr) = seeds.as_array_mut() {
-            for entry in arr {
-                if let Some(seed) = entry.get("seed") {
-                    if let Some(bytes_arr) = seed.as_array() {
-                        entry["seed"] = serde_json::Value::String(bytes_to_hex(bytes_arr));
-                    }
-                }
+            for entry in arr.iter_mut().filter_map(|e| e.as_object_mut()) {
+                let Some(bytes_arr) = entry.get("seed").and_then(|s| s.as_array()) else {
+                    continue;
+                };
+                let hex_seed = bytes_to_hex(bytes_arr);
+                entry.insert("seed".to_string(), serde_json::Value::String(hex_seed));
             }
         }
     }
 }
 
-/// Dump full PreparedTransaction and OperationExpectation as JSON (verbose mode only).
-fn log_verbose(prepared_transaction_bytes: &[u8], expectation: &OperationExpectation) {
-    let tx_json = match PreparedTransaction::decode(prepared_transaction_bytes)
+/// PreparedTransaction as compacted JSON, or a size note when it is too large to dump.
+fn prepared_json_for_log(prepared_transaction_bytes: &[u8]) -> String {
+    if prepared_transaction_bytes.len() > VERBOSE_DUMP_MAX_BYTES {
+        return format!(
+            "({} bytes, above the {} byte verbose limit; not dumped)",
+            prepared_transaction_bytes.len(),
+            VERBOSE_DUMP_MAX_BYTES
+        );
+    }
+    match PreparedTransaction::decode(prepared_transaction_bytes)
         .context("Failed to decode PreparedTransaction protobuf")
     {
         Ok(prepared) => match serde_json::to_value(&prepared) {
@@ -201,7 +214,12 @@ fn log_verbose(prepared_transaction_bytes: &[u8], expectation: &OperationExpecta
             Err(e) => format!("(serialize error: {})", e),
         },
         Err(e) => format!("(decode error: {})", e),
-    };
+    }
+}
+
+/// Dump full PreparedTransaction and OperationExpectation as JSON (verbose mode only).
+fn log_verbose(prepared_transaction_bytes: &[u8], expectation: &OperationExpectation) {
+    let tx_json = prepared_json_for_log(prepared_transaction_bytes);
     let expect_json = serde_json::to_string_pretty(expectation)
         .unwrap_or_else(|e| format!("(serialize error: {})", e));
     debug!("PreparedTransaction:\n{}", tx_json);
@@ -261,17 +279,17 @@ fn inspect_transfer_cc(
     let nodes_dict = build_nodes_dict(tx);
 
     // --- Find root exercise node ---
-    if tx.roots.is_empty() {
+    let Some(root_id) = tx.roots.first() else {
         return Ok(InspectionResult {
             accepted: false,
             summary: "TransferCc: no root nodes".to_string(),
             warnings,
             rejection_reason: Some("Transaction has no root nodes".to_string()),
         });
-    }
+    };
 
     let root_node = nodes_dict
-        .get(&tx.roots[0])
+        .get(root_id)
         .context("Root node not found in nodes dict")?;
     let root_exercise = match get_node_type(root_node) {
         Some(NodeType::Exercise(ex)) => ex,
@@ -473,8 +491,8 @@ fn inspect_transfer_cc(
         .filter(|n| matches!(get_node_type(n), Some(NodeType::Create(_))))
         .count();
 
-    let sender_short = &sender_party[..sender_party.len().min(8)];
-    let receiver_short = &receiver_party[..receiver_party.len().min(8)];
+    let sender_short = short(sender_party, 8);
+    let receiver_short = short(receiver_party, 8);
 
     let summary = format!(
         "TransferCc VERIFIED: {} CC {} → {} | {} nodes ({} exercise, {} fetch, {} create)",
@@ -540,17 +558,17 @@ fn inspect_accept_cip56(
     let nodes_dict = build_nodes_dict(tx);
 
     // --- Find root exercise node ---
-    if tx.roots.is_empty() {
+    let Some(root_id) = tx.roots.first() else {
         return Ok(InspectionResult {
             accepted: false,
             summary: "AcceptCip56: no root nodes".to_string(),
             warnings,
             rejection_reason: Some("Transaction has no root nodes".to_string()),
         });
-    }
+    };
 
     let root_node = nodes_dict
-        .get(&tx.roots[0])
+        .get(root_id)
         .context("Root node not found in nodes dict")?;
     let root_exercise = match get_node_type(root_node) {
         Some(NodeType::Exercise(ex)) => ex,
@@ -642,9 +660,13 @@ fn inspect_accept_cip56(
         &nodes_dict,
     );
     if transfer_rule.is_none() {
-        // Check one level deeper (via children of children)
+        // Check one level deeper (via children of children), each child once
         let mut found = false;
+        let mut visited: HashSet<&str> = HashSet::new();
         for child_id in &root_exercise.children {
+            if !visited.insert(child_id.as_str()) {
+                continue;
+            }
             if let Some(child_node) = nodes_dict.get(child_id) {
                 if let Some(NodeType::Exercise(ex)) = get_node_type(child_node) {
                     if find_exercise_by_choice("TransferRule_Transfer", &ex.children, &nodes_dict)
@@ -766,14 +788,14 @@ fn inspect_request_user_service(
     }
 
     // --- Must have exactly 1 root and 1 node (a Create) ---
-    if tx.roots.len() != 1 {
+    let [root_id] = tx.roots.as_slice() else {
         return Ok(InspectionResult {
             accepted: false,
             summary: format!("RequestUserService: expected 1 root, got {}", tx.roots.len()),
             warnings,
             rejection_reason: Some(format!("Expected 1 root node, got {}", tx.roots.len())),
         });
-    }
+    };
 
     if tx.nodes.len() != 1 {
         warnings.push(format!("Expected 1 node, got {}", tx.nodes.len()));
@@ -782,7 +804,7 @@ fn inspect_request_user_service(
     let root_node = tx
         .nodes
         .iter()
-        .find(|n| n.node_id == tx.roots[0])
+        .find(|n| n.node_id == *root_id)
         .context("Root node not found")?;
 
     let create = match get_node_type(root_node) {
@@ -912,14 +934,14 @@ fn inspect_request_preapproval(
     }
 
     // --- Must have exactly 1 root and 1 node (a Create) ---
-    if tx.roots.len() != 1 {
+    let [root_id] = tx.roots.as_slice() else {
         return Ok(InspectionResult {
             accepted: false,
             summary: format!("RequestPreapproval: expected 1 root, got {}", tx.roots.len()),
             warnings,
             rejection_reason: Some(format!("Expected 1 root node, got {}", tx.roots.len())),
         });
-    }
+    };
 
     if tx.nodes.len() != 1 {
         warnings.push(format!("Expected 1 node, got {}", tx.nodes.len()));
@@ -928,7 +950,7 @@ fn inspect_request_preapproval(
     let root_node = tx
         .nodes
         .iter()
-        .find(|n| n.node_id == tx.roots[0])
+        .find(|n| n.node_id == *root_id)
         .context("Root node not found")?;
 
     let create = match get_node_type(root_node) {
@@ -1064,14 +1086,14 @@ fn inspect_recurring_payasyougo(
     }
 
     // --- Must have exactly 1 root and 1 node (a Create) ---
-    if tx.roots.len() != 1 {
+    let [root_id] = tx.roots.as_slice() else {
         return Ok(InspectionResult {
             accepted: false,
             summary: format!("{}: expected 1 root, got {}", op_name, tx.roots.len()),
             warnings,
             rejection_reason: Some(format!("Expected 1 root node, got {}", tx.roots.len())),
         });
-    }
+    };
 
     if tx.nodes.len() != 1 {
         warnings.push(format!("Expected 1 node, got {}", tx.nodes.len()));
@@ -1080,7 +1102,7 @@ fn inspect_recurring_payasyougo(
     let root_node = tx
         .nodes
         .iter()
-        .find(|n| n.node_id == tx.roots[0])
+        .find(|n| n.node_id == *root_id)
         .context("Root node not found")?;
 
     let create = match get_node_type(root_node) {
@@ -1184,8 +1206,8 @@ fn inspect_recurring_payasyougo(
     let summary = format!(
         "{} VERIFIED: user {} requests from app {}, amount={}/day | 1 Create node",
         op_name,
-        &party[..party.len().min(16)],
-        &app_party[..app_party.len().min(16)],
+        short(party, 16),
+        short(app_party, 16),
         actual_amount.unwrap_or(amount),
     );
 
@@ -1315,8 +1337,8 @@ fn inspect_recurring_prepaid(
     let summary = format!(
         "{} VERIFIED: user {} requests from app {}, amount={}/day | {}",
         op_name,
-        &party[..party.len().min(16)],
-        &app_party[..app_party.len().min(16)],
+        short(party, 16),
+        short(app_party, 16),
         amount,
         node_summary(parts.tx),
     );
@@ -1407,16 +1429,16 @@ fn extract_root_exercise<'a>(
 
     let nodes_dict = build_nodes_dict(tx);
 
-    if tx.roots.is_empty() {
+    let Some(root_id) = tx.roots.first() else {
         return Err(InspectionResult {
             accepted: false,
             summary: format!("{}: no root nodes", op_name),
             warnings: vec![],
             rejection_reason: Some("Transaction has no root nodes".to_string()),
         });
-    }
+    };
 
-    let root_node = nodes_dict.get(&tx.roots[0]).ok_or_else(|| InspectionResult {
+    let root_node = nodes_dict.get(root_id).ok_or_else(|| InspectionResult {
         accepted: false,
         summary: format!("{}: root node not found", op_name),
         warnings: vec![],
@@ -1582,8 +1604,8 @@ fn inspect_pay_fee(
     let summary = format!(
         "PayFee({}) VERIFIED: {} pays fee to {} for {} | {}",
         fee_type,
-        &sender_party[..sender_party.len().min(8)],
-        &fee_party[..fee_party.len().min(8)],
+        short(sender_party, 8),
+        short(fee_party, 8),
         proposal_id,
         node_summary(parts.tx),
     );
@@ -1752,7 +1774,7 @@ fn inspect_propose_dvp(
 
     let summary = format!(
         "ProposeDvp VERIFIED: buyer {} proposes {} | {}",
-        &buyer_party[..buyer_party.len().min(8)],
+        short(buyer_party, 8),
         proposal_id,
         node_summary(parts.tx),
     );
@@ -1907,8 +1929,8 @@ fn inspect_dvp_proposal_gc(
     let summary = format!(
         "{} VERIFIED: party {} archives {} | {}",
         op_name,
-        &party[..party.len().min(8)],
-        &dvp_proposal_cid[..dvp_proposal_cid.len().min(16)],
+        short(party, 8),
+        short(dvp_proposal_cid, 16),
         node_summary(parts.tx),
     );
 
@@ -2016,8 +2038,8 @@ fn inspect_accept_dvp(
                     if !dvp_proposal_cid.is_empty() && cid != dvp_proposal_cid {
                         warnings.push(format!(
                             "chosen_value.cid={} does not match expected dvp_proposal_cid={}",
-                            &cid[..cid.len().min(16)],
-                            &dvp_proposal_cid[..dvp_proposal_cid.len().min(16)]
+                            short(cid, 16),
+                            short(dvp_proposal_cid, 16)
                         ));
                     }
                 }
@@ -2130,11 +2152,8 @@ fn inspect_accept_dvp(
                                             warnings,
                                             rejection_reason: Some(format!(
                                                 "DVP delivery instrument.admin={}, expected={}",
-                                                &admin[..admin.len().min(20)],
-                                                &expected_delivery_instrument_admin
-                                                    [..expected_delivery_instrument_admin
-                                                        .len()
-                                                        .min(20)]
+                                                short(admin, 20),
+                                                short(expected_delivery_instrument_admin, 20)
                                             )),
                                         });
                                     }
@@ -2210,11 +2229,8 @@ fn inspect_accept_dvp(
                                             warnings,
                                             rejection_reason: Some(format!(
                                                 "DVP payment instrument.admin={}, expected={}",
-                                                &admin[..admin.len().min(20)],
-                                                &expected_payment_instrument_admin
-                                                    [..expected_payment_instrument_admin
-                                                        .len()
-                                                        .min(20)]
+                                                short(admin, 20),
+                                                short(expected_payment_instrument_admin, 20)
                                             )),
                                         });
                                     }
@@ -2244,7 +2260,7 @@ fn inspect_accept_dvp(
 
     let summary = format!(
         "AcceptDvp VERIFIED: seller {} accepts proposal {} | {}",
-        &seller_party[..seller_party.len().min(8)],
+        short(seller_party, 8),
         proposal_id,
         node_summary(parts.tx),
     );
@@ -2337,7 +2353,7 @@ fn inspect_allocate(
 
     let summary = format!(
         "Allocate VERIFIED: {} allocates for {} | {}",
-        &party[..party.len().min(8)],
+        short(party, 8),
         proposal_id,
         node_summary(parts.tx),
     );
@@ -2389,12 +2405,7 @@ pub fn inspect(
             ..
         } => format!("TransferCip56({} {})", amount, instrument_id),
         OperationExpectation::AcceptCip56 { contract_id, .. } => {
-            let short = if contract_id.len() > 16 {
-                &contract_id[..16]
-            } else {
-                contract_id
-            };
-            format!("AcceptCip56({})", short)
+            format!("AcceptCip56({})", short(contract_id, 16))
         }
         OperationExpectation::SplitCc { output_amounts, .. } => {
             format!("SplitCc({} outputs)", output_amounts.len())
@@ -2570,5 +2581,353 @@ pub fn inspect(
                 rejection_reason: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use std::time::{Duration, Instant};
+
+    // 3-byte chars: byte cuts at 8, 16 and 20 all land inside a character
+    const P: &str = "€€€€€€€€::1220aa";
+    const Q: &str = "₿₿₿₿₿₿₿₿::1220bb";
+    const CID: &str = "€€€€€€€€€€€€€€€€€€";
+    // longer than the 16/20-character summary cuts
+    const P_LONG: &str = "€€€€€€€€::1220aa-extra-suffix";
+    const Q_LONG: &str = "₿₿₿₿₿₿₿₿::1220bb-extra-suffix";
+
+    fn run(p: &PreparedTransaction, exp: OperationExpectation) -> InspectionResult {
+        inspect(&encode(p), &exp, false).expect("inspection must not error")
+    }
+
+    fn root_exercise(choice: &str, acting: &[&str]) -> Exercise {
+        exercise(choice, acting, vec![])
+    }
+
+    fn single_exercise(ex: Exercise, act_as: &[&str]) -> PreparedTransaction {
+        prepared(&["0"], vec![exercise_node("0", ex)], vec![], act_as)
+    }
+
+    #[test]
+    fn transfer_cc_summary_with_multibyte_parties() {
+        let mut ex = root_exercise("TransferFactory_Transfer", &[P]);
+        ex.template_id = Some(ident("Splice.ExternalPartyAmuletRules", "ExternalPartyAmuletRules"));
+        ex.chosen_value = Some(record(vec![(
+            "transfer",
+            record(vec![("sender", party(P)), ("receiver", party(Q)), ("amount", numeric("1.0"))]),
+        )]));
+        let r = run(
+            &single_exercise(ex, &[P]),
+            OperationExpectation::TransferCc {
+                sender_party: P.into(),
+                receiver_party: Q.into(),
+                amount: "1".into(),
+                command_id: "cmd".into(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("€€€€€€€€ → ₿₿₿₿₿₿₿₿"), "{}", r.summary);
+    }
+
+    #[test]
+    fn recurring_payasyougo_summary_with_multibyte_parties() {
+        let c = create(
+            ident("RecurringPaymentRequest", "RecurringPaymentRequest"),
+            record(vec![("user", party(P_LONG)), ("app", party(Q_LONG)), ("amountPerDayUsd", numeric("5.0"))]),
+            &[P_LONG],
+        );
+        let p = prepared(&["0"], vec![create_node("0", c)], vec![], &[P_LONG]);
+        let r = run(
+            &p,
+            OperationExpectation::RequestRecurringPayasyougo {
+                party: P_LONG.into(),
+                app_party: Q_LONG.into(),
+                amount: "5".into(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("user €€€€€€€€::1220aa requests from app ₿₿₿₿₿₿₿₿::1220bb,"), "{}", r.summary);
+    }
+
+    #[test]
+    fn recurring_prepaid_summary_with_multibyte_parties() {
+        let ex = root_exercise("RecurringPaymentAppService_LockFundsForRequest", &[P_LONG]);
+        let r = run(
+            &single_exercise(ex, &[P_LONG]),
+            OperationExpectation::RequestRecurringPrepaid {
+                party: P_LONG.into(),
+                app_party: Q_LONG.into(),
+                amount: "5".into(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("user €€€€€€€€::1220aa requests from app ₿₿₿₿₿₿₿₿::1220bb,"), "{}", r.summary);
+    }
+
+    #[test]
+    fn pay_fee_summary_with_multibyte_parties() {
+        let ex = root_exercise("TransferFactory_Transfer", &[P]);
+        let r = run(
+            &single_exercise(ex, &[P]),
+            OperationExpectation::PayFee {
+                sender_party: P.into(),
+                fee_party: Q.into(),
+                proposal_id: "prop".into(),
+                fee_type: "dvp".into(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("€€€€€€€€ pays fee to ₿₿₿₿₿₿₿₿ for prop"), "{}", r.summary);
+    }
+
+    #[test]
+    fn propose_dvp_summary_with_multibyte_party() {
+        let mut ex = root_exercise("UserService_ProposeDvp", &[P]);
+        ex.template_id = Some(ident("Utility.Settlement.App.V1.Service.User", "UserService"));
+        let r = run(
+            &single_exercise(ex, &[P]),
+            OperationExpectation::ProposeDvp {
+                buyer_party: P.into(),
+                seller_party: Q.into(),
+                proposal_id: "prop".into(),
+                synchronizer_id: String::new(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("buyer €€€€€€€€ proposes prop"), "{}", r.summary);
+    }
+
+    #[test]
+    fn dvp_proposal_gc_summary_with_multibyte_ids() {
+        let mut ex = root_exercise("DvpProposal_Cancel", &[P]);
+        ex.template_id = Some(ident("Utility.Settlement.App.V1.Model.Dvp", "DvpProposal"));
+        ex.contract_id = CID.into();
+        let r = run(
+            &single_exercise(ex, &[P]),
+            OperationExpectation::CancelDvpProposal {
+                party: P.into(),
+                dvp_proposal_cid: CID.into(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("party €€€€€€€€ archives €€€€€€€€€€€€€€€€ |"), "{}", r.summary);
+    }
+
+    #[test]
+    fn allocate_summary_with_multibyte_party() {
+        let ex = root_exercise("AllocationFactory_Allocate", &[P]);
+        let r = run(
+            &single_exercise(ex, &[P]),
+            OperationExpectation::Allocate {
+                party: P.into(),
+                proposal_id: "prop".into(),
+                dvp_cid: String::new(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("€€€€€€€€ allocates for prop"), "{}", r.summary);
+    }
+
+    fn accept_dvp_expectation(delivery_admin: &str, payment_admin: &str) -> OperationExpectation {
+        OperationExpectation::AcceptDvp {
+            seller_party: P.into(),
+            proposal_id: "prop".into(),
+            dvp_proposal_cid: CID.into(),
+            expected_delivery_amount: String::new(),
+            expected_payment_amount: String::new(),
+            expected_delivery_instrument_id: "D".into(),
+            expected_delivery_instrument_admin: delivery_admin.into(),
+            expected_payment_instrument_id: "Q".into(),
+            expected_payment_instrument_admin: payment_admin.into(),
+        }
+    }
+
+    fn accept_dvp_tx(delivery_admin: &str, payment_admin: &str) -> PreparedTransaction {
+        let mut ex = root_exercise("UserService_AcceptDvpProposal", &[P]);
+        ex.template_id = Some(ident("Utility.Settlement.App.V1.Service.User", "UserService"));
+        ex.chosen_value = Some(record(vec![("cid", contract_id(&format!("{CID}x")))]));
+        let iq = |id: &str, admin: &str| {
+            record(vec![
+                ("instrument", record(vec![("id", text(id)), ("admin", party(admin))])),
+                ("amount", numeric("1.0")),
+            ])
+        };
+        let proposal = create(
+            ident("Utility.Settlement.App.V1.Model.Dvp", "DvpProposal"),
+            record(vec![(
+                "terms",
+                record(vec![
+                    ("deliveries", list(vec![iq("D", delivery_admin)])),
+                    ("payments", list(vec![iq("Q", payment_admin)])),
+                ]),
+            )]),
+            &[P],
+        );
+        with_input_contract(single_exercise(ex, &[P]), proposal)
+    }
+
+    #[test]
+    fn accept_dvp_summary_and_cid_warning_with_multibyte_ids() {
+        let r = run(&accept_dvp_tx(Q, Q), accept_dvp_expectation(Q, Q));
+        assert!(r.accepted, "{r:?}");
+        assert!(r.summary.contains("seller €€€€€€€€ accepts proposal prop"), "{}", r.summary);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("€€€€€€€€€€€€€€€€ does not match")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn accept_dvp_admin_mismatch_with_multibyte_admins() {
+        let r = run(&accept_dvp_tx(P_LONG, Q_LONG), accept_dvp_expectation(Q_LONG, Q_LONG));
+        assert!(!r.accepted);
+        assert_eq!(
+            r.rejection_reason.as_deref(),
+            Some("DVP delivery instrument.admin=€€€€€€€€::1220aa-ext, expected=₿₿₿₿₿₿₿₿::1220bb-ext")
+        );
+        let r = run(&accept_dvp_tx(Q_LONG, P_LONG), accept_dvp_expectation(Q_LONG, Q_LONG));
+        assert!(!r.accepted);
+        assert_eq!(
+            r.rejection_reason.as_deref(),
+            Some("DVP payment instrument.admin=€€€€€€€€::1220aa-ext, expected=₿₿₿₿₿₿₿₿::1220bb-ext")
+        );
+    }
+
+    #[test]
+    fn accept_cip56_with_multibyte_contract_id_does_not_panic() {
+        let p = prepared(&[], vec![], vec![], &[P]);
+        let r = run(
+            &p,
+            OperationExpectation::AcceptCip56 {
+                receiver_party: P.into(),
+                contract_id: CID.into(),
+            },
+        );
+        assert!(!r.accepted);
+        assert_eq!(r.rejection_reason.as_deref(), Some("Transaction has no root nodes"));
+    }
+
+    #[test]
+    fn root_count_rejections() {
+        let c = || create(ident("M", "T"), record(vec![]), &[P]);
+        for roots in [vec![], vec!["0", "1"]] {
+            let p = prepared(&roots, vec![create_node("0", c()), create_node("1", c())], vec![], &[P]);
+            for exp in [
+                OperationExpectation::RequestUserService { party: P.into() },
+                OperationExpectation::RequestPreapproval { party: P.into() },
+                OperationExpectation::RequestRecurringPayasyougo {
+                    party: P.into(),
+                    app_party: Q.into(),
+                    amount: "1".into(),
+                },
+            ] {
+                let r = run(&p, exp);
+                assert!(!r.accepted);
+                assert_eq!(
+                    r.rejection_reason,
+                    Some(format!("Expected 1 root node, got {}", roots.len()))
+                );
+            }
+        }
+        let empty = prepared(&[], vec![], vec![], &[P]);
+        for exp in [
+            OperationExpectation::TransferCc {
+                sender_party: P.into(),
+                receiver_party: Q.into(),
+                amount: "1".into(),
+                command_id: "cmd".into(),
+            },
+            OperationExpectation::Allocate {
+                party: P.into(),
+                proposal_id: "prop".into(),
+                dvp_cid: String::new(),
+            },
+        ] {
+            let r = run(&empty, exp);
+            assert!(!r.accepted);
+            assert_eq!(r.rejection_reason.as_deref(), Some("Transaction has no root nodes"));
+        }
+    }
+
+    #[test]
+    fn accept_cip56_duplicate_children_are_scanned_once() {
+        // root lists child "1" 10k times and "1" lists a missing "2" 10k times
+        const C: usize = 10_000;
+        let mut root = root_exercise("TransferInstruction_Accept", &["r"]);
+        root.contract_id = "cid".into();
+        root.children = vec!["1".to_string(); C];
+        let mut mid = root_exercise("Other", &["r"]);
+        mid.children = vec!["2".to_string(); C];
+        let p = prepared(&["0"], vec![exercise_node("0", root), exercise_node("1", mid)], vec![], &["r"]);
+        let start = Instant::now();
+        let r = run(
+            &p,
+            OperationExpectation::AcceptCip56 {
+                receiver_party: "r".into(),
+                contract_id: "cid".into(),
+            },
+        );
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(r.accepted, "{r:?}");
+        assert!(r.warnings.iter().any(|w| w == "TransferRule_Transfer not found in exercise tree"));
+    }
+
+    #[test]
+    fn accept_cip56_finds_transfer_rule_one_level_down() {
+        let mut root = root_exercise("TransferInstruction_Accept", &["r"]);
+        root.contract_id = "cid".into();
+        root.children = ids(&["1", "1", "2"]);
+        let p = prepared(
+            &["0"],
+            vec![
+                exercise_node("0", root),
+                exercise_node("1", root_exercise("Other", &["r"])),
+                exercise_node("2", exercise("Other", &["r"], ids(&["3"]))),
+                exercise_node("3", root_exercise("TransferRule_Transfer", &["r"])),
+            ],
+            vec![],
+            &["r"],
+        );
+        let r = run(
+            &p,
+            OperationExpectation::AcceptCip56 {
+                receiver_party: "r".into(),
+                contract_id: "cid".into(),
+            },
+        );
+        assert!(r.accepted, "{r:?}");
+        assert!(!r.warnings.iter().any(|w| w.contains("TransferRule_Transfer")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn verbose_dump_skips_large_transactions() {
+        let big = vec![0u8; VERBOSE_DUMP_MAX_BYTES + 1];
+        assert_eq!(
+            prepared_json_for_log(&big),
+            format!("({} bytes, above the {} byte verbose limit; not dumped)", big.len(), VERBOSE_DUMP_MAX_BYTES)
+        );
+        let small = encode(&prepared(&["0"], vec![exercise_node("0", root_exercise("C", &[P]))], vec![seed(0, 7)], &[P]));
+        let json = prepared_json_for_log(&small);
+        assert!(json.contains("\"seed\": \"0707"), "{json}");
+    }
+
+    #[test]
+    fn compaction_rewrites_byte_arrays_and_skips_other_shapes() {
+        let mut v = serde_json::json!({
+            "metadata": {"input_contracts": [{"event_blob": [1, 2, 3]}, [1, 2], 5, {"event_blob": "x"}]},
+            "transaction": {"node_seeds": [{"seed": [255, 1]}, "y", {"seed": 3}]}
+        });
+        compact_event_blobs(&mut v);
+        compact_seeds(&mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "metadata": {"input_contracts": [{"event_blob": "base58:Ldp"}, [1, 2], 5, {"event_blob": "x"}]},
+                "transaction": {"node_seeds": [{"seed": "ff01"}, "y", {"seed": 3}]}
+            })
+        );
     }
 }

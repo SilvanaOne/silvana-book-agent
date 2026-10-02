@@ -4,8 +4,6 @@
 //! settlement proposals against them. User orders (placed via frontend) are
 //! imported from the server on demand.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-
 use anyhow::{Context, Result};
 use base64::Engine;
 use rust_decimal::Decimal;
@@ -254,7 +252,7 @@ impl OrderTracker {
             anyhow::bail!("order signing disabled for test");
         }
 
-        let nonce = chrono::Utc::now().timestamp_millis() as u64;
+        let nonce = crate::clock::now_millis();
 
         // Canonical JSON with sorted keys (BTreeMap guarantees alphabetical order)
         let mut fields = BTreeMap::new();
@@ -266,7 +264,7 @@ impl OrderTracker {
         fields.insert("quantity", serde_json::Value::String(quantity.to_string()));
         let signed_data_bytes =
             serde_json::to_vec(&fields).context("failed to serialize order for signing")?;
-        let signature = sign_order_data(&self.private_key.expose(), &signed_data_bytes);
+        let signature = sign_order_data(&*self.private_key.expose()?, &signed_data_bytes);
 
         Ok((signature, signed_data_bytes, nonce))
     }
@@ -384,11 +382,11 @@ impl OrderTracker {
         }
 
         // Verify signature
-        if !verify_order_signature(
-            &self.private_key.expose(),
-            &tracked.signed_data,
-            &tracked.signature,
-        ) {
+        let key = match self.private_key.expose() {
+            Ok(key) => key,
+            Err(e) => return VerifyResult::Rejected { reason: format!("Order {order_id}: signing key unavailable: {e}") },
+        };
+        if !verify_order_signature(&key, &tracked.signed_data, &tracked.signature) {
             return VerifyResult::Rejected {
                 reason: format!("Order {} has invalid signature", order_id),
             };
@@ -429,11 +427,11 @@ impl OrderTracker {
         };
 
         // Verify signature with our key
-        if !verify_order_signature(
-            &self.private_key.expose(),
-            &order.signed_data,
-            &signature,
-        ) {
+        let key = match self.private_key.expose() {
+            Ok(key) => key,
+            Err(e) => return VerifyResult::Rejected { reason: format!("Order {order_id}: signing key unavailable: {e}") },
+        };
+        if !verify_order_signature(&key, &order.signed_data, &signature) {
             return VerifyResult::Rejected {
                 reason: format!("Order {} signature verification failed (not signed by our key)", order_id),
             };
@@ -759,7 +757,7 @@ mod tests {
     #[test]
     fn test_sign_and_verify_order() {
         let key = test_private_key();
-        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "1.0").unwrap();
 
@@ -779,7 +777,7 @@ mod tests {
     #[test]
     fn test_settlement_matching_agent_order() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0").unwrap();
 
@@ -800,7 +798,7 @@ mod tests {
     #[test]
     fn test_quantity_tracking() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0").unwrap();
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5.0", nonce, &signature, &signed_data);
@@ -833,7 +831,7 @@ mod tests {
     fn test_stale_nonce_rejected() {
         let key = test_private_key();
         let start_time = chrono::Utc::now().timestamp_millis() as u64;
-        let mut tracker = OrderTracker::new(start_time, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(start_time, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         // Create signed data with old nonce
         let old_nonce = start_time - 1000; // Before start_time
@@ -860,7 +858,7 @@ mod tests {
     #[test]
     fn test_unknown_order_needs_server_lookup() {
         let key = test_private_key();
-        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         // Order 42 is not in the tracker
         let proposal = make_proposal("our-party", "counterparty", "1.0", 42, 99);
@@ -874,7 +872,7 @@ mod tests {
     #[test]
     fn test_invalid_signature_rejected() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let nonce = chrono::Utc::now().timestamp_millis() as u64;
         let signed_data = serde_json::to_vec(&serde_json::json!({
@@ -903,7 +901,7 @@ mod tests {
     #[test]
     fn test_failed_settlement_releases_pending() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0").unwrap();
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
@@ -928,7 +926,7 @@ mod tests {
     #[test]
     fn test_record_does_not_consume_capacity() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0").unwrap();
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
@@ -949,7 +947,7 @@ mod tests {
     #[test]
     fn test_try_reserve_pending_idempotent_and_missing() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5.0").unwrap();
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5.0", nonce, &signature, &signed_data);
@@ -972,7 +970,7 @@ mod tests {
     #[test]
     fn test_reserve_capacity_backstop() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "3.0").unwrap();
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "3.0", nonce, &signature, &signed_data);
@@ -999,7 +997,7 @@ mod tests {
     #[test]
     fn test_placement_guard_holds_untracked_orders_in_its_market_only() {
         let key = test_private_key();
-        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let guard = tracker.begin_placement("BTC-USD");
         assert!(tracker.placement_in_flight("BTC-USD"));
@@ -1024,7 +1022,7 @@ mod tests {
     #[test]
     fn test_placement_guard_counts_nested_placements() {
         let key = test_private_key();
-        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let first = tracker.begin_placement("BTC-USD");
         let second = tracker.begin_placement("BTC-USD");
@@ -1037,7 +1035,7 @@ mod tests {
     #[test]
     fn test_tracked_order_wins_over_placement_guard() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
 
         let guard = tracker.begin_placement("BTC-USD");
         let (signature, signed_data, nonce) =
@@ -1088,7 +1086,7 @@ mod tests {
     #[test]
     fn test_failed_submit_holds_untracked_orders_for_a_while() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
         let now = std::time::Instant::now();
 
         let submit = failed_offer(&tracker, "BTC-USD", "1.0");
@@ -1126,7 +1124,7 @@ mod tests {
     #[test]
     fn test_order_booked_by_a_failed_submit_is_adopted_with_fresh_capacity() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
         let now = Instant::now();
         let submit = failed_offer(&tracker, "BTC-USD", "1.0");
         tracker.note_submit_failed(submit.clone(), now);
@@ -1155,7 +1153,7 @@ mod tests {
     #[test]
     fn test_failed_submits_are_kept_for_a_window_and_a_bounded_count() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
         let now = Instant::now();
         let first = failed_offer(&tracker, "BTC-USD", "1.0");
         tracker.note_submit_failed(first.clone(), now);
@@ -1176,7 +1174,7 @@ mod tests {
     #[test]
     fn test_server_order_with_out_of_range_amounts_is_rejected_without_panic() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "1").unwrap();
         let order = Order {
             order_id: 42,
@@ -1229,7 +1227,7 @@ mod tests {
     #[test]
     fn test_out_of_range_requested_or_tracked_amounts_are_rejected_without_panic() {
         let key = test_private_key();
-        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }));
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
         let (signature, signed_data, nonce) = tracker.sign_order("BTC-USD", "bid", "100.50", "5").unwrap();
         tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5", nonce, &signature, &signed_data);
 
@@ -1263,5 +1261,44 @@ mod tests {
         tracker.mark_settled("p-settle");
         assert_eq!(tracker.orders[&42].settled_quantity, Decimal::MAX);
         assert_eq!(tracker.orders[&42].pending_quantity, Decimal::ZERO);
+    }
+
+    fn rejected_reason(r: VerifyResult) -> String {
+        match r {
+            VerifyResult::Rejected { reason } => reason,
+            _ => panic!("expected a reject"),
+        }
+    }
+
+    // A signing key that cannot be opened rejects instead of panicking
+    #[test]
+    fn a_key_that_cannot_be_opened_rejects_and_fails_signing() {
+        let key = test_private_key();
+        let good = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { key }).unwrap());
+        let (signature, signed_data, nonce) = good.sign_order("BTC-USD", "bid", "100.50", "5.0").unwrap();
+
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::corrupt_for_tests());
+        assert!(tracker.sign_order("BTC-USD", "bid", "100.50", "5.0").is_err());
+        tracker.track_order(42, "BTC-USD", OrderType::Bid as i32, "100.50", "5.0", nonce, &signature, &signed_data);
+        let proposal = make_proposal("our-party", "counterparty", "2.0", 42, 99);
+        let reason = rejected_reason(tracker.verify_settlement(&proposal, "our-party"));
+        assert!(reason.contains("signing key unavailable"), "{reason}");
+
+        let order = Order {
+            order_id: 43,
+            market_id: "BTC-USD".to_string(),
+            order_type: OrderType::Bid as i32,
+            price: "100.50".to_string(),
+            quantity: "5.0".to_string(),
+            filled_quantity: "0".to_string(),
+            nonce,
+            signature: Some(signature),
+            signed_data,
+            ..Default::default()
+        };
+        let proposal = make_proposal("our-party", "counterparty", "2.0", 43, 99);
+        let reason = rejected_reason(tracker.verify_and_import_order(&order, &proposal));
+        assert!(reason.contains("signing key unavailable"), "{reason}");
+        assert!(!tracker.orders.contains_key(&43));
     }
 }

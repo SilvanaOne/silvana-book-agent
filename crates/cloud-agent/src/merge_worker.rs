@@ -15,77 +15,109 @@
 //! Ladder rungs (`>= floor`) are never touched, so the merge worker never fights
 //! the split worker.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::anyhow;
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
+use agent_logic::clock;
 use agent_logic::config::BaseConfig;
+use agent_logic::num::dec_sum;
 use agent_logic::shutdown::Shutdown;
+use agent_logic::supervise::{self, Policy, Watch};
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, PrepareTransactionRequest,
     SplitCcParams, TransferCip56Params, TransactionOperation,
 };
 use tx_verifier::OperationExpectation;
 
-use crate::holdings_cache::{CachedHolding, HoldingsCache};
+use crate::holdings_cache::{CachedHolding, HoldingsCache, ReservationGuard};
 use crate::ledger_client::DAppProviderClient;
 use crate::split_worker::SplitInstrument;
 
-/// Spawn the merge worker background task for the given instruments.
-/// Only call this if `config.merge_threshold` is Some.
+/// Wait on one merge cycle; a slower cycle keeps running, holding its
+/// reservations until its submit ends, and later cycles wait for it.
+const MERGE_SUBMIT_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Everything one merge cycle reads.
+struct MergeCtx {
+    config: BaseConfig,
+    cache: Arc<HoldingsCache>,
+    instruments: Vec<SplitInstrument>,
+    threshold: usize,
+    max_amulets: usize,
+}
+
+/// Spawn the merge worker background task for the given instruments; it
+/// restarts if it fails. Only call this if `config.merge_threshold` is Some.
 pub fn spawn_merge_worker(
     config: BaseConfig,
     cache: Arc<HoldingsCache>,
     instruments: Vec<SplitInstrument>,
     shutdown: Shutdown,
-) {
+) -> anyhow::Result<()> {
     let threshold = config.merge_threshold.unwrap_or(200);
     let max_amulets = config.merge_max_amulets;
     let interval = Duration::from_secs(config.merge_poll_interval_sec);
+    let ctx = Arc::new(MergeCtx { config, cache, instruments, threshold, max_amulets });
+    let s = shutdown.clone();
+    supervise::spawn_supervised("merge worker", shutdown, Policy::Restart, move || {
+        run(Arc::clone(&ctx), interval, s.clone())
+    })?;
+    Ok(())
+}
 
-    tokio::spawn(async move {
-        let keys: Vec<&str> = instruments.iter().map(|i| i.key.as_str()).collect();
-        info!(
-            "Merge worker started (threshold={}, max_amulets={}, poll={}s, instruments={:?})",
-            threshold, max_amulets, interval.as_secs(), keys
-        );
+async fn run(ctx: Arc<MergeCtx>, interval: Duration, shutdown: Shutdown) {
+    let keys: Vec<&str> = ctx.instruments.iter().map(|i| i.key.as_str()).collect();
+    info!(
+        "Merge worker started (threshold={}, max_amulets={}, poll={}s, instruments={:?})",
+        ctx.threshold, ctx.max_amulets, interval.as_secs(), keys
+    );
 
-        // Initial delay to let ACS cache populate (cancellable)
-        if shutdown.sleep(Duration::from_secs(30)).await {
-            info!("Merge worker shutting down");
-            return;
+    // Initial delay to let ACS cache populate (cancellable)
+    if shutdown.sleep(Duration::from_secs(30)).await {
+        info!("Merge worker shutting down");
+        return;
+    }
+
+    let report = |watch: Watch<()>| match watch {
+        Watch::Done(()) => {}
+        Watch::Slow => warn!(
+            "Merge cycle still running after {}s; its inputs stay reserved until it ends",
+            MERGE_SUBMIT_DEADLINE.as_secs()
+        ),
+        Watch::Busy => debug!("Merge cycle skipped: the previous cycle is still running"),
+        Watch::Failed(why) => warn!("Merge cycle failed: {why}"),
+    };
+    let cycle = || {
+        let ctx = Arc::clone(&ctx);
+        let shutdown = shutdown.clone();
+        async move { merge_cycle(&ctx, &shutdown).await }
+    };
+    supervise::run_watched("merge cycle", MERGE_SUBMIT_DEADLINE, interval, &shutdown, report, cycle).await;
+    info!("Merge worker shutting down");
+}
+
+async fn merge_cycle(ctx: &MergeCtx, shutdown: &Shutdown) {
+    // One client per cycle, created lazily on the first instrument that
+    // actually merges (most cycles merge nothing).
+    let mut client: Option<DAppProviderClient> = None;
+    for inst in &ctx.instruments {
+        if shutdown.is_shutting_down() {
+            break;
         }
-
-        loop {
-            if shutdown.is_shutting_down() {
-                info!("Merge worker shutting down");
-                return;
-            }
-
-            // One client per cycle, created lazily on the first instrument that
-            // actually merges (most cycles merge nothing).
-            let mut client: Option<DAppProviderClient> = None;
-            for inst in &instruments {
-                if shutdown.is_shutting_down() {
-                    break;
-                }
-                match check_and_merge_instrument(
-                    &config, &cache, inst, threshold, max_amulets, &mut client,
-                ).await {
-                    Ok(Some(msg)) => info!("{}", msg),
-                    Ok(None) => debug!("Merge {}: dust count below threshold", inst.key),
-                    Err(e) => warn!("Merge {} failed: {:#}", inst.key, e),
-                }
-            }
-
-            if shutdown.sleep(interval).await {
-                info!("Merge worker shutting down");
-                return;
-            }
+        match check_and_merge_instrument(
+            &ctx.config, &ctx.cache, inst, ctx.threshold, ctx.max_amulets, &mut client,
+        ).await {
+            Ok(Some(msg)) => info!("{}", msg),
+            Ok(None) => debug!("Merge {}: dust count below threshold", inst.key),
+            Err(e) => warn!("Merge {} failed: {:#}", inst.key, e),
         }
-    });
+    }
 }
 
 /// Decide which holdings to consolidate this cycle for one instrument.
@@ -139,7 +171,9 @@ async fn check_and_merge_instrument(
         // "merge" would be a pointless tx — leave the rungs for the split worker.
         return Ok(None);
     }
-    let total_amount: Decimal = to_merge.iter().map(|a| a.amount).sum();
+    let total_amount = dec_sum(to_merge.iter().map(|a| a.amount)).ok_or_else(|| {
+        anyhow!("total of {} {} holdings is out of range", merge_count, inst.key)
+    })?;
     let cids: Vec<String> = to_merge.iter().map(|a| a.contract_id.clone()).collect();
 
     match floor {
@@ -153,38 +187,37 @@ async fn check_and_merge_instrument(
         ),
     }
 
+    // Lazily create (and reuse) the ledger client for this cycle, before
+    // reserving, so a failed connect leaves nothing reserved.
+    if client.is_none() {
+        *client = Some(
+            DAppProviderClient::new(
+                &config.orderbook_grpc_url,
+                &config.party_id,
+                &config.role,
+                &config.private_key,
+                config.token_ttl_secs,
+                Some(config.node_name.as_str()),
+                &config.ledger_service_public_key,
+                Some(config.connection_timeout_secs),
+                Some(config.request_timeout_secs),
+            )
+            .await?,
+        );
+    }
+    let Some(client) = client.as_mut() else {
+        return Err(anyhow!("no ledger client for the merge of {}", inst.key));
+    };
+
     // Reserve the inputs so no other selection (split worker, settlement) grabs
     // them mid-flight. All-or-nothing.
-    let job_id = format!("merge-{}-{}", inst.key, now_millis());
+    let job_id = format!("merge-{}-{}", inst.key, clock::now_millis());
     if !cache.reserve_split(&cids, &job_id).await {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "Failed to reserve {} holdings for merge of {}", merge_count, inst.key
         ));
     }
-
-    // Lazily create (and reuse) the ledger client for this cycle.
-    if client.is_none() {
-        match DAppProviderClient::new(
-            &config.orderbook_grpc_url,
-            &config.party_id,
-            &config.role,
-            &config.private_key,
-            config.token_ttl_secs,
-            Some(config.node_name.as_str()),
-            &config.ledger_service_public_key,
-            Some(config.connection_timeout_secs),
-            Some(config.request_timeout_secs),
-        )
-        .await
-        {
-            Ok(c) => *client = Some(c),
-            Err(e) => {
-                cache.release_reservations(&cids).await;
-                return Err(e);
-            }
-        }
-    }
-    let client = client.as_mut().expect("client initialized above");
+    let reservation = ReservationGuard::new(Arc::clone(cache), cids.clone());
 
     // Build the self-consolidation op: CC via SplitCc, utility via a
     // self-transfer (receiver == sender) with amount == Σ inputs → one output.
@@ -233,6 +266,7 @@ async fn check_and_merge_instrument(
     let result = client
         .submit_transaction(request, &expectation, false, false, false)
         .await;
+    reservation.disarm();
 
     match result {
         Ok(ref resp) => {
@@ -255,13 +289,6 @@ async fn check_and_merge_instrument(
             Err(e)
         }
     }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -337,5 +364,56 @@ mod tests {
         let few: Vec<String> = (0..80).map(|i| (i + 1).to_string()).collect();
         let refs: Vec<&str> = few.iter().map(|s| s.as_str()).collect();
         assert!(plan_merge(holdings(&refs), None, 100, 10).is_empty());
+    }
+
+    const USDC: &str = "reg::USDC";
+
+    fn usdc() -> SplitInstrument {
+        SplitInstrument { key: USDC.to_string(), is_cc: false, on_chain_id: "USDC".into(), admin: "reg".into() }
+    }
+
+    async fn cache_with(amounts: &[&str]) -> Arc<HoldingsCache> {
+        let cache = HoldingsCache::new(false);
+        let mut hs = holdings(amounts);
+        for h in &mut hs {
+            h.instrument = USDC.to_string();
+        }
+        cache.add_created(hs).await;
+        cache
+    }
+
+    // An out-of-range total fails before anything is reserved
+    #[tokio::test]
+    async fn an_out_of_range_total_fails_before_reserving() {
+        let huge = "50000000000000000000000000000";
+        let cache = cache_with(&[huge, huge, huge]).await;
+        let config = BaseConfig::test_minimal().unwrap();
+        let err = check_and_merge_instrument(&config, &cache, &usdc(), 1, 10, &mut None).await.unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+        assert_eq!(cache.stats(USDC).await.2, 0);
+    }
+
+    // While the client connects, the inputs stay free for other selections
+    #[tokio::test]
+    async fn nothing_is_reserved_while_the_client_connects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = format!("https://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let cache = cache_with(&["1", "2", "3"]).await;
+        let task = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { check_and_merge_instrument(&config, &cache, &usdc(), 1, 10, &mut None).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "the TLS handshake stalls");
+        assert_eq!(cache.stats(USDC).await.2, 0);
+        task.abort();
+        drop(listener);
+    }
+
+    #[test]
+    fn spawning_outside_a_runtime_is_an_error() {
+        let config = BaseConfig::test_minimal().unwrap();
+        assert!(spawn_merge_worker(config, HoldingsCache::new(false), vec![usdc()], Shutdown::new()).is_err());
     }
 }

@@ -4,9 +4,7 @@
 //! including authentication, price fetching, order submission, cancellation,
 //! and settlement streaming.
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
-
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use orderbook_proto::{
     orderbook::{
@@ -23,23 +21,30 @@ use orderbook_proto::{
         RequestQuotesV2Response, RfqConfirmRejectReason, rfq_v2_service_client::RfqV2ServiceClient,
     },
 };
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio_stream::Stream;
 use tonic::Request;
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::transport::Channel;
 use tracing::debug;
 
 use crate::auth::{generate_jwt, generate_jwt_with_branch};
 use crate::config::BaseConfig;
 use crate::secret::Secret;
-
-/// Bound on a TLS handshake, including on reconnect; the per-RPC deadline does not cover it.
-const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+use crate::transport::{self, ChannelOpts};
+use crate::{clock, sync};
 
 /// Per-RPC deadline on the orderbook and pricing channels.
-pub(crate) const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const RPC_TIMEOUT: Duration = transport::RPC_TIMEOUT;
+
+const MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Most pages one `get_instruments` listing fetches.
+const MAX_INSTRUMENT_PAGES: usize = 100;
+/// Most pages one `get_pending_proposals` listing fetches.
+const MAX_PROPOSAL_PAGES: usize = 200;
 
 /// External account authentication data
 #[derive(Clone)]
@@ -70,12 +75,14 @@ pub struct OrderbookClient {
     // Raw client for streaming (interceptors don't work well with streaming)
     raw_orderbook_client: OrderbookServiceClient<Channel>,
     auth_data: ExternalAuthData,
+    /// Bound on each call, including the channel's reconnect wait.
+    deadline: Duration,
 }
 
 impl OrderbookClient {
     /// Create a new orderbook client with external account authentication
     pub async fn new(config: &BaseConfig) -> Result<Self> {
-        let channel = Self::create_channel(&config.orderbook_grpc_url, TLS_HANDSHAKE_TIMEOUT).await?;
+        let channel = Self::create_channel(&config.orderbook_grpc_url, ChannelOpts::default()).await?;
         Self::with_channel(channel, config)
     }
 
@@ -84,8 +91,8 @@ impl OrderbookClient {
     pub(crate) fn lazy_for_tests(config: &BaseConfig) -> Result<Self> {
         let endpoint = Channel::from_shared(config.orderbook_grpc_url.clone())
             .context("Invalid gRPC URL")?
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_timeout(std::time::Duration::from_secs(2));
+            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(2));
         Self::with_channel(endpoint.connect_lazy(), config)
     }
 
@@ -95,18 +102,15 @@ impl OrderbookClient {
         let jwt = generate_jwt_with_branch(
             &config.party_id,
             &config.role,
-            &config.private_key.expose(),
+            &*config.private_key.expose()?,
             config.token_ttl_secs,
             Some(config.node_name.as_str()),
             config.venue_branch.as_deref(),
         )?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = clock::now_secs();
         let token_arc = Arc::new(RwLock::new(jwt));
-        let expires_at = Arc::new(RwLock::new(now + config.token_ttl_secs));
+        let expires_at = Arc::new(RwLock::new(now.saturating_add(config.token_ttl_secs)));
 
         let auth_data = ExternalAuthData {
             party_id: config.party_id.clone(),
@@ -126,17 +130,17 @@ impl OrderbookClient {
 
         let pricing_client =
             PricingServiceClient::with_interceptor(channel.clone(), auth_interceptor.clone())
-                .max_decoding_message_size(16 * 1024 * 1024);
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
         let orderbook_client =
             OrderbookServiceClient::with_interceptor(channel.clone(), auth_interceptor.clone())
-                .max_decoding_message_size(16 * 1024 * 1024);
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
         let rfqv2_client = RfqV2ServiceClient::with_interceptor(channel.clone(), auth_interceptor)
-            .max_decoding_message_size(16 * 1024 * 1024);
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
         let raw_orderbook_client =
-            OrderbookServiceClient::new(channel).max_decoding_message_size(16 * 1024 * 1024);
+            OrderbookServiceClient::new(channel).max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
         Ok(Self {
             pricing_client,
@@ -144,55 +148,13 @@ impl OrderbookClient {
             rfqv2_client,
             raw_orderbook_client,
             auth_data,
+            deadline: RPC_TIMEOUT,
         })
     }
 
-    /// Create gRPC channel with TLS
-    async fn create_channel(grpc_url: &str, tls_handshake: std::time::Duration) -> Result<Channel> {
-        // Initialize Rustls crypto provider
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        // Per-RPC deadline + keepalive: safety keys off calls RETURNING, so a
-        // server that never responds must error rather than hang.
-        let builder = |endpoint: tonic::transport::Endpoint| {
-            endpoint
-                .timeout(RPC_TIMEOUT)
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-                .keep_alive_timeout(std::time::Duration::from_secs(10))
-                .keep_alive_while_idle(true)
-        };
-
-        if grpc_url.starts_with("https://") {
-            // Use embedded webpki-roots (Mozilla root certificates compiled into binary)
-            let tls_config = ClientTlsConfig::new().with_webpki_roots().domain_name(
-                grpc_url
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .split(':')
-                    .next()
-                    .unwrap_or("localhost"),
-            )
-            .timeout(tls_handshake);
-
-            builder(
-                Channel::from_shared(grpc_url.to_string())
-                    .context("Invalid gRPC URL")?
-                    .tls_config(tls_config)
-                    .context("Failed to configure TLS")?,
-            )
-            .connect()
-            .await
-            .context("Failed to connect to gRPC service")
-        } else {
-            // Plain HTTP connection for local testing
-            builder(
-                Channel::from_shared(grpc_url.to_string()).context("Invalid gRPC URL")?,
-            )
-            .connect()
-            .await
-            .context("Failed to connect to gRPC service")
-        }
+    /// Create the gRPC channel (TLS for `https`), bounded as a whole by `opts`.
+    async fn create_channel(grpc_url: &str, opts: ChannelOpts) -> Result<Channel> {
+        transport::connect_channel(grpc_url, opts).await
     }
 
     /// Get current price for a market
@@ -202,9 +164,7 @@ impl OrderbookClient {
             source: None,
         });
 
-        let response = self
-            .pricing_client
-            .get_price(request)
+        let response = within(self.deadline, self.pricing_client.get_price(request))
             .await
             .map_err(|e| anyhow::anyhow!("get_price failed: {}", e.message()))?;
 
@@ -222,9 +182,7 @@ impl OrderbookClient {
             offset: None,
         });
 
-        let response = self
-            .orderbook_client
-            .get_markets(request)
+        let response = within(self.deadline, self.orderbook_client.get_markets(request))
             .await
             .map_err(|e| anyhow::anyhow!("get_markets failed: {}", e.message()))?;
 
@@ -239,29 +197,24 @@ impl OrderbookClient {
     pub async fn get_instruments(&mut self) -> Result<Vec<Instrument>> {
         // The server defaults to 50 per page and caps a request at 1000, so
         // page until `total` is covered rather than silently truncating.
-        let mut collected: Vec<Instrument> = Vec::new();
-        loop {
-            let request = Request::new(GetInstrumentsRequest {
-                instrument_type: None,
-                limit: Some(1000),
-                offset: Some(collected.len() as u32),
-            });
-
-            let response = self
-                .orderbook_client
-                .get_instruments(request)
-                .await
-                .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?
-                .into_inner();
-
-            let total = response.total as usize;
-            let page = response.instruments.len();
-            collected.extend(response.instruments);
-            if page == 0 || collected.len() >= total {
-                break;
+        let client = self.orderbook_client.clone();
+        let deadline = self.deadline;
+        collect_pages("get_instruments", MAX_INSTRUMENT_PAGES, move |offset| {
+            let mut client = client.clone();
+            async move {
+                let request = Request::new(GetInstrumentsRequest {
+                    instrument_type: None,
+                    limit: Some(1000),
+                    offset: Some(offset),
+                });
+                let response = within(deadline, client.get_instruments(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_instruments failed: {}", e.message()))?
+                    .into_inner();
+                Ok(Page { total: response.total, ends: false, items: response.instruments })
             }
-        }
-        Ok(collected)
+        })
+        .await
     }
 
     /// Submit a new order with pre-computed signature fields
@@ -296,9 +249,7 @@ impl OrderbookClient {
             liquidity_provider_name: None,
         });
 
-        let response = self
-            .orderbook_client
-            .submit_order(request)
+        let response = within(self.deadline, self.orderbook_client.submit_order(request))
             .await
             .map_err(submit_order_error)?;
 
@@ -309,9 +260,7 @@ impl OrderbookClient {
     pub async fn cancel_order(&mut self, order_id: u64) -> Result<CancelOrderResponse> {
         let request = Request::new(CancelOrderRequest { order_id });
 
-        let response = self
-            .orderbook_client
-            .cancel_order(request)
+        let response = within(self.deadline, self.orderbook_client.cancel_order(request))
             .await
             .map_err(|e| anyhow::anyhow!("Cancel order failed: {}", e.message()))?;
 
@@ -333,9 +282,7 @@ impl OrderbookClient {
                 liquidity_provider_names: vec![],
             });
 
-            let response = self
-                .orderbook_client
-                .get_orders(request)
+            let response = within(self.deadline, self.orderbook_client.get_orders(request))
                 .await
                 .map_err(|e| anyhow::anyhow!("get_orders failed: {}", e.message()))?;
 
@@ -360,9 +307,7 @@ impl OrderbookClient {
                 liquidity_provider_names: vec![],
             });
 
-            let response = self
-                .orderbook_client
-                .get_orders(request)
+            let response = within(self.deadline, self.orderbook_client.get_orders(request))
                 .await
                 .map_err(|e| anyhow::anyhow!("get_all_active_orders failed: {}", e.message()))?;
 
@@ -374,35 +319,27 @@ impl OrderbookClient {
 
     /// Get pending settlement proposals for this party (paginated, fetches all)
     pub async fn get_pending_proposals(&mut self) -> Result<Vec<SettlementProposal>> {
-        let page_size = 50u32;
-        let mut all_proposals = Vec::new();
-        let mut offset = 0u32;
-
-        loop {
-            let request = Request::new(GetSettlementProposalsRequest {
-                market_id: None,
-                status: Some(SettlementStatus::Pending as i32),
-                limit: Some(page_size),
-                offset: Some(offset),
-            });
-
-            let response = self
-                .orderbook_client
-                .get_settlement_proposals(request)
-                .await
-                .map_err(|e| anyhow::anyhow!("get_settlement_proposals failed: {}", e.message()))?;
-
-            let inner = response.into_inner();
-            let page_count = inner.proposals.len() as u32;
-            all_proposals.extend(inner.proposals);
-
-            if page_count < page_size || all_proposals.len() as u32 >= inner.total {
-                break;
+        const PAGE_SIZE: u32 = 50;
+        let client = self.orderbook_client.clone();
+        let deadline = self.deadline;
+        collect_pages("get_settlement_proposals", MAX_PROPOSAL_PAGES, move |offset| {
+            let mut client = client.clone();
+            async move {
+                let request = Request::new(GetSettlementProposalsRequest {
+                    market_id: None,
+                    status: Some(SettlementStatus::Pending as i32),
+                    limit: Some(PAGE_SIZE),
+                    offset: Some(offset),
+                });
+                let inner = within(deadline, client.get_settlement_proposals(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_settlement_proposals failed: {}", e.message()))?
+                    .into_inner();
+                let short = u32::try_from(inner.proposals.len()).is_ok_and(|n| n < PAGE_SIZE);
+                Ok(Page { total: inner.total, ends: short, items: inner.proposals })
             }
-            offset += page_size;
-        }
-
-        Ok(all_proposals)
+        })
+        .await
     }
 
     /// Subscribe to settlement updates
@@ -418,7 +355,7 @@ impl OrderbookClient {
         let jwt = generate_jwt(
             &self.auth_data.party_id,
             &self.auth_data.role,
-            &self.auth_data.private_key.expose(),
+            &*self.auth_data.private_key.expose()?,
             self.auth_data.ttl_secs,
             Some(self.auth_data.node_name.as_str()),
         )?;
@@ -429,9 +366,7 @@ impl OrderbookClient {
                 .context("Failed to parse JWT")?,
         );
 
-        let response = self
-            .raw_orderbook_client
-            .subscribe_settlements(request)
+        let response = within(self.deadline, self.raw_orderbook_client.subscribe_settlements(request))
             .await
             .context("Failed to subscribe to settlements")?;
 
@@ -455,9 +390,7 @@ impl OrderbookClient {
             timeout_secs,
         });
 
-        let response = self
-            .orderbook_client
-            .request_quotes(request)
+        let response = within(self.deadline, self.orderbook_client.request_quotes(request))
             .await
             .map_err(|e| anyhow::anyhow!("request_quotes failed: {}", e.message()))?;
 
@@ -475,9 +408,7 @@ impl OrderbookClient {
             quote_id: quote_id.to_string(),
         });
 
-        let response = self
-            .orderbook_client
-            .accept_quote(request)
+        let response = within(self.deadline, self.orderbook_client.accept_quote(request))
             .await
             .map_err(|e| anyhow::anyhow!("accept_quote failed: {}", e.message()))?;
 
@@ -515,9 +446,7 @@ impl OrderbookClient {
             quote_quantity: quote_quantity.map(str::to_string),
         });
 
-        let response = self
-            .rfqv2_client
-            .request_quotes(request)
+        let response = within(self.deadline, self.rfqv2_client.request_quotes(request))
             .await
             .map_err(|e| anyhow::anyhow!("request_quotes_atomic failed: {}", e.message()))?;
 
@@ -545,9 +474,7 @@ impl OrderbookClient {
             user: None,
         });
 
-        let response = self
-            .rfqv2_client
-            .accept_quote_atomic(request)
+        let response = within(self.deadline, self.rfqv2_client.accept_quote_atomic(request))
             .await
             .map_err(|e| {
                 anyhow::anyhow!("accept_quote_atomic failed ({}): {}", e.code(), e.message())
@@ -569,13 +496,51 @@ impl OrderbookClient {
     /// Get rounds data including issuance forecast
     pub async fn get_rounds_data(&mut self, limit: Option<u32>) -> Result<GetRoundsDataResponse> {
         let request = Request::new(GetRoundsDataRequest { limit });
-        let response = self
-            .orderbook_client
-            .get_rounds_data(request)
+        let response = within(self.deadline, self.orderbook_client.get_rounds_data(request))
             .await
             .map_err(|e| anyhow::anyhow!("get_rounds_data failed: {}", e.message()))?;
         Ok(response.into_inner())
     }
+}
+
+/// One call bounded by `d`, including the channel's reconnect wait.
+async fn within<T>(
+    d: Duration,
+    call: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+) -> Result<tonic::Response<T>, tonic::Status> {
+    tokio::time::timeout(d, call)
+        .await
+        .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded(format!("client deadline {d:?} exceeded"))))
+}
+
+/// One page of a paginated listing.
+struct Page<T> {
+    /// Server-reported size of the whole listing.
+    total: u32,
+    /// The server signalled the last page.
+    ends: bool,
+    items: Vec<T>,
+}
+
+/// Pages a listing from offset 0 until a page is empty or marked last, or the
+/// reported total is covered; still incomplete after `max_pages` is an error.
+async fn collect_pages<T, F, Fut>(what: &str, max_pages: usize, mut fetch: F) -> Result<Vec<T>>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<Page<T>>>,
+{
+    let mut collected: Vec<T> = Vec::new();
+    for _ in 0..max_pages {
+        let offset = u32::try_from(collected.len()).map_err(|_| anyhow!("{what}: offset out of range"))?;
+        let page = fetch(offset).await?;
+        let empty = page.items.is_empty();
+        collected.extend(page.items);
+        let covered = u64::try_from(collected.len()).map_or(true, |n| n >= u64::from(page.total));
+        if empty || page.ends || covered {
+            return Ok(collected);
+        }
+    }
+    Err(anyhow!("{what}: listing still incomplete after {max_pages} pages"))
 }
 
 /// Displays as "submit_order failed: `<message>`" and keeps the status for its code.
@@ -619,29 +584,29 @@ const REFRESH_BEFORE_EXPIRY_SECS: u64 = 300;
 
 impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let expires_at = *self.expires_at.read().unwrap_or_else(PoisonError::into_inner);
+        let now = clock::now_secs();
+        let expires_at = *sync::read(&self.expires_at);
 
-        if now + REFRESH_BEFORE_EXPIRY_SECS >= expires_at {
-            match generate_jwt_with_branch(
-                &self.auth_data.party_id,
-                &self.auth_data.role,
-                &self.auth_data.private_key.expose(),
-                self.auth_data.ttl_secs,
-                Some(self.auth_data.node_name.as_str()),
-                self.auth_data.venue_branch.as_deref(),
-            ) {
+        if now.saturating_add(REFRESH_BEFORE_EXPIRY_SECS) >= expires_at {
+            // On failure the previous token is kept
+            let refreshed = self.auth_data.private_key.expose().map_err(anyhow::Error::from).and_then(|key| {
+                generate_jwt_with_branch(
+                    &self.auth_data.party_id,
+                    &self.auth_data.role,
+                    &key,
+                    self.auth_data.ttl_secs,
+                    Some(self.auth_data.node_name.as_str()),
+                    self.auth_data.venue_branch.as_deref(),
+                )
+            });
+            match refreshed {
                 Ok(new_jwt) => {
                     debug!(
                         "JWT token refreshed (was expiring in {}s)",
                         expires_at.saturating_sub(now)
                     );
-                    *self.token.write().unwrap_or_else(PoisonError::into_inner) = new_jwt;
-                    *self.expires_at.write().unwrap_or_else(PoisonError::into_inner) =
-                        now + self.auth_data.ttl_secs;
+                    *sync::write(&self.token) = new_jwt;
+                    *sync::write(&self.expires_at) = now.saturating_add(self.auth_data.ttl_secs);
                 }
                 Err(e) => {
                     tracing::error!("Failed to refresh JWT: {}", e);
@@ -649,7 +614,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
             }
         }
 
-        let token = self.token.read().unwrap_or_else(PoisonError::into_inner).clone();
+        let token = sync::read(&self.token).clone();
         request.metadata_mut().insert(
             "authorization",
             format!("Bearer {}", token)
@@ -673,10 +638,74 @@ mod tests {
     async fn a_stalled_tls_handshake_times_out() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("https://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let connect = OrderbookClient::create_channel(&url, std::time::Duration::from_millis(200));
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), connect).await;
+        let opts = ChannelOpts { tls: Duration::from_millis(200), ..ChannelOpts::default() };
+        let connect = OrderbookClient::create_channel(&url, opts);
+        let result = tokio::time::timeout(Duration::from_secs(10), connect).await;
         assert!(matches!(result, Ok(Err(_))), "the handshake bound should end the connect");
         drop(listener);
+    }
+
+    // A server that accepts TCP but never answers HTTP/2: each call ends at the client deadline
+    #[tokio::test]
+    async fn calls_on_a_silent_server_end_at_the_client_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let channel = Channel::from_shared(config.orderbook_grpc_url.clone()).unwrap().connect_lazy();
+        let mut client = OrderbookClient::with_channel(channel, &config).unwrap();
+        client.deadline = Duration::from_millis(200);
+        let bound = Duration::from_secs(5);
+
+        let err = tokio::time::timeout(bound, client.get_price("CC-USDCx")).await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("client deadline"), "{err}");
+        let err = tokio::time::timeout(bound, client.get_instruments()).await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("client deadline"), "{err}");
+        let submit = client.submit_order("CC-USDCx", OrderType::Bid, "1".into(), "1".into(), None, None, Vec::new(), 1);
+        let err = tokio::time::timeout(bound, submit).await.unwrap().unwrap_err();
+        assert!(crate::order_manager::submit_outcome_unknown(&err), "a timed-out submit may have been booked");
+        assert!(tokio::time::timeout(bound, client.subscribe_settlements(None)).await.unwrap().is_err());
+        drop(listener);
+    }
+
+    fn page(total: u32, ends: bool, items: std::ops::Range<u32>) -> Result<Page<u32>> {
+        Ok(Page { total, ends, items: items.collect() })
+    }
+
+    #[tokio::test]
+    async fn pages_are_collected_until_the_listing_ends() {
+        // Covered total, from cumulative offsets
+        let mut offsets = Vec::new();
+        let all = collect_pages("t", 10, |offset| {
+            offsets.push(offset);
+            let end = (offset + 3).min(7);
+            std::future::ready(page(7, false, offset..end))
+        })
+        .await
+        .unwrap();
+        assert_eq!(all, (0..7).collect::<Vec<_>>());
+        assert_eq!(offsets, [0, 3, 6]);
+
+        // A page marked last, and an empty page, end the listing early
+        let ends = collect_pages("t", 10, |o| std::future::ready(page(100, true, o..o + 2))).await.unwrap();
+        assert_eq!(ends, [0, 1]);
+        let empty = collect_pages("t", 10, |_| std::future::ready(page(100, false, 0..0))).await.unwrap();
+        assert!(empty.is_empty());
+
+        let failed = collect_pages("t", 10, |_| std::future::ready(Err::<Page<u32>, _>(anyhow!("down")))).await;
+        assert_eq!(failed.unwrap_err().to_string(), "down");
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_never_ends_is_an_error_after_the_page_cap() {
+        let mut fetches = 0usize;
+        let err = collect_pages("get_instruments", 5, |o| {
+            fetches += 1;
+            std::future::ready(page(u32::MAX, false, o..o + 1))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(fetches, 5);
+        assert!(err.to_string().contains("get_instruments: listing still incomplete after 5 pages"), "{err}");
     }
 
     #[test]
@@ -702,5 +731,52 @@ mod tests {
         let ids: Vec<u64> = out.iter().map(|o| o.order_id).collect();
         assert_eq!(ids, vec![7, 8]);
         assert_eq!(out[0].filled_quantity, "0.5", "the Partial copy wins");
+    }
+
+    fn interceptor(private_key: Secret<32>, expires_at: u64) -> AuthInterceptor {
+        AuthInterceptor {
+            token: Arc::new(RwLock::new("previous".to_string())),
+            expires_at: Arc::new(RwLock::new(expires_at)),
+            auth_data: ExternalAuthData {
+                party_id: "party".to_string(),
+                public_key_hex: String::new(),
+                private_key,
+                role: "agent".to_string(),
+                ttl_secs: 3600,
+                node_name: "node".to_string(),
+                venue_branch: None,
+            },
+        }
+    }
+
+    fn sent_token(i: &mut AuthInterceptor) -> String {
+        use tonic::service::Interceptor;
+        let request = i.call(Request::new(())).unwrap();
+        request.metadata().get("authorization").unwrap().to_str().unwrap().to_string()
+    }
+
+    // A key that cannot be opened keeps the previous token instead of panicking
+    #[test]
+    fn interceptor_keeps_the_previous_token_when_the_key_cannot_be_opened() {
+        let mut i = interceptor(Secret::corrupt_for_tests(), 0);
+        assert_eq!(sent_token(&mut i), "Bearer previous");
+        assert_eq!(*sync::read(&i.expires_at), 0, "the expiry is not advanced");
+    }
+
+    #[test]
+    fn interceptor_refreshes_a_token_near_expiry() {
+        let mut i = interceptor(Secret::seal(&mut [3u8; 32]).unwrap(), 0);
+        let token = sent_token(&mut i);
+        assert!(token.starts_with("Bearer ") && token != "Bearer previous");
+        assert!(*sync::read(&i.expires_at) > 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_key_cannot_be_opened_is_an_error() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.private_key = Secret::corrupt_for_tests();
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let err = OrderbookClient::with_channel(channel, &config).err().unwrap();
+        assert_eq!(err.to_string(), "sealed secret is corrupt");
     }
 }
