@@ -13,6 +13,8 @@
 //! user agent (H14 pre-check), canton-agent's dvp test harness, and the
 //! enterprise-canton-sdk ledger-service (fail-fast re-verification).
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use anyhow::{anyhow, bail, Result};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -258,13 +260,27 @@ pub struct QuoteKeyFile {
     pub pub_spki_hex: String,
 }
 
+/// Fresh draws before giving up on getting a valid (non-zero, < n) scalar.
+const KEYGEN_ATTEMPTS: usize = 8;
+
 pub fn gen_keypair() -> Result<QuoteKeyFile> {
-    let key = SigningKey::random(&mut rand::rngs::OsRng);
-    let point = key.verifying_key().to_encoded_point(false);
-    Ok(QuoteKeyFile {
-        priv_scalar_hex: hex::encode(key.to_bytes()),
-        pub_spki_hex: spki_from_point(&hex::encode(point.as_bytes()))?,
-    })
+    gen_keypair_with(&mut rand::rngs::OsRng)
+}
+
+fn gen_keypair_with(rng: &mut impl rand::RngCore) -> Result<QuoteKeyFile> {
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    for _ in 0..KEYGEN_ATTEMPTS {
+        rng.try_fill_bytes(seed.as_mut_slice())
+            .map_err(|e| anyhow!("random source failed: {e}"))?;
+        if let Ok(key) = SigningKey::from_slice(seed.as_slice()) {
+            let point = key.verifying_key().to_encoded_point(false);
+            return Ok(QuoteKeyFile {
+                priv_scalar_hex: hex::encode(key.to_bytes()),
+                pub_spki_hex: spki_from_point(&hex::encode(point.as_bytes()))?,
+            });
+        }
+    }
+    bail!("could not draw a valid secp256k1 scalar in {KEYGEN_ATTEMPTS} attempts")
 }
 
 /// Build a keyfile from a raw 32-byte scalar (lowercase hex) — the
@@ -304,7 +320,9 @@ pub fn load_or_create_keyfile(path: &Path, create: bool) -> Result<QuoteKeyFile>
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
-                eprintln!(
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
                     "⚠ quote keyfile {} has permissive mode {:o} — fixing to 0600",
                     path.display(),
                     mode
@@ -344,8 +362,12 @@ pub fn load_or_create_keyfile(path: &Path, create: bool) -> Result<QuoteKeyFile>
             .map_err(|e| anyhow!("cannot create quote keyfile {}: {e}", path.display()))?;
         f.write_all(serde_json::to_string_pretty(&kf)?.as_bytes())?;
     }
-    println!("  Generated new secp256k1 quote keypair -> {}", path.display());
-    println!("  ⚠ Keep this file safe: it signs all quotes for venues created with it.");
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "  Generated new secp256k1 quote keypair -> {}", path.display());
+        let _ = writeln!(out, "  ⚠ Keep this file safe: it signs all quotes for venues created with it.");
+    }
     Ok(kf)
 }
 
@@ -541,5 +563,126 @@ mod tests {
         let padded: [u8; 32] = hex::decode(&kf.priv_scalar_hex).unwrap().try_into().unwrap();
         assert_eq!(sign_quote_scalar(&padded, msg).unwrap(), sig);
         assert!(keyfile_from_scalar(&"01".repeat(10)).is_err());
+    }
+
+    /// Test RNG: `try_fill_bytes` fails or yields `byte`; `fill_bytes` (the
+    /// panicking path) is only tolerated for a bounded number of calls.
+    struct TestRng {
+        byte: Option<u8>,
+        fill_calls: usize,
+    }
+
+    impl rand::RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut b = [0u8; 4];
+            self.fill_bytes(&mut b);
+            u32::from_le_bytes(b)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut b = [0u8; 8];
+            self.fill_bytes(&mut b);
+            u64::from_le_bytes(b)
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.fill_calls += 1;
+            assert!(self.fill_calls < 100, "fill_bytes looped");
+            self.try_fill_bytes(dest).expect("fill_bytes on a failing source");
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            match self.byte {
+                Some(b) => {
+                    dest.fill(b);
+                    Ok(())
+                }
+                None => Err(rand::Error::new(std::io::Error::other("no entropy"))),
+            }
+        }
+    }
+    impl rand::CryptoRng for TestRng {}
+
+    #[test]
+    fn gen_keypair_reports_rng_failure() {
+        let mut rng = TestRng { byte: None, fill_calls: 0 };
+        let err = gen_keypair_with(&mut rng).err().expect("must fail");
+        assert!(err.to_string().contains("random source failed"), "{err}");
+    }
+
+    #[test]
+    fn gen_keypair_gives_up_on_invalid_scalars() {
+        // all-zero and all-0xff (>= group order) are not valid scalars
+        for byte in [0x00u8, 0xff] {
+            let mut rng = TestRng { byte: Some(byte), fill_calls: 0 };
+            let err = gen_keypair_with(&mut rng).err().expect("must fail");
+            assert!(err.to_string().contains("valid secp256k1 scalar"), "{err}");
+        }
+    }
+
+    #[test]
+    fn gen_keypair_uses_the_drawn_scalar() {
+        let mut rng = TestRng { byte: Some(0x11), fill_calls: 0 };
+        let kf = gen_keypair_with(&mut rng).unwrap();
+        assert_eq!(kf.priv_scalar_hex, "11".repeat(32));
+        assert_eq!(keyfile_from_scalar(&kf.priv_scalar_hex).unwrap().pub_spki_hex, kf.pub_spki_hex);
+        let msg = "msg_type=silvana.atomic-dvp.quote.v3\nlp=lp\n";
+        let sig = sign_quote(&kf.priv_scalar_hex, msg).unwrap();
+        assert!(verify_quote(&sig, msg, &kf.pub_spki_hex));
+    }
+
+    /// Runs `load_or_create_keyfile` in a child process whose stdout and
+    /// stderr are closed pipes; it must finish instead of panicking on EPIPE.
+    #[cfg(unix)]
+    #[test]
+    fn keyfile_messages_survive_closed_stdio() {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        const CHILD_DIR: &str = "ATOMIC_QUOTE_CLOSED_STDIO_DIR";
+        const READY: &str = "ATOMIC-QUOTE-CHILD-READY";
+
+        if let Ok(dir) = std::env::var(CHILD_DIR) {
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "{READY}");
+            let _ = out.flush();
+            // wait until the parent has closed the read end
+            let start = Instant::now();
+            while writeln!(out, "ping").and_then(|_| out.flush()).is_ok() {
+                assert!(start.elapsed() < Duration::from_secs(30), "stdout never closed");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let dir = PathBuf::from(dir);
+            let path = dir.join("quote-key.json");
+            load_or_create_keyfile(&path, true).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            load_or_create_keyfile(&path, false).unwrap();
+            std::fs::write(dir.join("done"), "ok").unwrap();
+            return;
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aq-stdio-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (err_reader, err_writer) = std::io::pipe().unwrap();
+        drop(err_reader);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::keyfile_messages_survive_closed_stdio", "--nocapture", "--test-threads=1"])
+            .env(CHILD_DIR, &dir)
+            .stdout(Stdio::piped())
+            .stderr(err_writer)
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 && !line.contains(READY) {
+            line.clear();
+        }
+        drop(reader);
+        let _ = child.wait();
+        let done = dir.join("done").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(done, "child panicked writing to a closed stdout/stderr");
     }
 }

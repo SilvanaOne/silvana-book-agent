@@ -47,14 +47,21 @@ struct Args {
     min_settlement: f64,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Load .env before any thread starts: changing the environment later is unsound
     let _ = dotenvy::dotenv();
     let args = Args::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start the async runtime")?
+        .block_on(run(args))
+}
 
-    tracing_subscriber::fmt()
+async fn run(args: Args) -> Result<()> {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
-        .init();
+        .try_init();
 
     // Load config from .env + agent.toml (lenient — serde defaults if missing)
     let mut config = BaseConfig::load_or_defaults("agent.toml")
@@ -90,7 +97,7 @@ async fn main() -> Result<()> {
         lm,
         agent_logic::shutdown::Shutdown::new(),
         cloud_agent::holdings_cache::HoldingsCache::new(false),
-    );
+    )?;
 
     // Create settler for atomic multicall settlements
     let settler = Arc::new(MulticallSettler {
@@ -101,6 +108,7 @@ async fn main() -> Result<()> {
         force: false,
         confirm: false,
         confirm_lock,
+        fee_debits: Default::default(),
     });
 
     let params = FillParams {

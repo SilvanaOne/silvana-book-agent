@@ -27,6 +27,15 @@ pub const CC_TOKEN: &str = "CC";
 /// A balance not refreshed within this window is reported as stale.
 pub const DEFAULT_BALANCE_STALE_AFTER: Duration = Duration::from_secs(120);
 
+/// Display bounds: `±u64::MAX`.
+const SHOWN_MAX: Decimal = Decimal::from_parts(u32::MAX, u32::MAX, 0, false, 0);
+const SHOWN_MIN: Decimal = Decimal::from_parts(u32::MAX, u32::MAX, 0, true, 0);
+
+/// `amount` capped to what `{:.4}` can print; Decimal formatting panics near its maximum.
+pub(crate) fn shown(amount: Decimal) -> Decimal {
+    amount.max(SHOWN_MIN).min(SHOWN_MAX)
+}
+
 // ---------------------------------------------------------------------------
 // Per-token state
 // ---------------------------------------------------------------------------
@@ -50,17 +59,18 @@ impl TokenState {
         }
     }
 
+    /// A negative reported balance is held as zero.
     fn set_balance(&mut self, balance: Decimal, now: Instant) {
-        self.balance = balance;
+        self.balance = balance.max(Decimal::ZERO);
         self.last_refreshed = Some(now);
     }
 
     fn committed(&self) -> Decimal {
-        self.allocation_commitments.values().copied().sum()
+        self.allocation_commitments.values().fold(Decimal::ZERO, |acc, v| acc.saturating_add(*v))
     }
 
     fn available(&self) -> Decimal {
-        (self.balance - self.committed()).max(Decimal::ZERO)
+        self.balance.saturating_sub(self.committed()).max(Decimal::ZERO)
     }
 }
 
@@ -136,7 +146,7 @@ impl FeeCommitments {
     }
 
     fn total(&self) -> Decimal {
-        self.entries.values().copied().sum()
+        self.entries.values().fold(Decimal::ZERO, |acc, v| acc.saturating_add(*v))
     }
 }
 
@@ -353,9 +363,12 @@ impl LiquidityManager {
         if s.cc_usd_rate <= Decimal::ZERO || my_fees_usd <= Decimal::ZERO {
             return Decimal::ZERO;
         }
-        let raw = my_fees_usd / s.cc_usd_rate;
         let margin = Decimal::from_f64_retain(self.margin).unwrap_or(Decimal::ONE);
-        raw * margin
+        // Out of Decimal range reads as unaffordable
+        my_fees_usd
+            .checked_div(s.cc_usd_rate)
+            .and_then(|raw| raw.checked_mul(margin))
+            .unwrap_or(Decimal::MAX)
     }
 
     /// Shared availability check for `try_commit` / `can_commit`.
@@ -382,7 +395,7 @@ impl LiquidityManager {
         if token_available < allocation_amount {
             return Err(format!(
                 "insufficient {} ({:.4} available, {:.4} needed for allocation)",
-                allocation_token, token_available, allocation_amount
+                allocation_token, shown(token_available), shown(allocation_amount)
             ));
         }
 
@@ -391,10 +404,12 @@ impl LiquidityManager {
             .tokens
             .get(CC_TOKEN)
             .map_or(Decimal::ZERO, |t| t.available());
-        let cc_available_for_fees = cc_available - self.fee_reserve_cc - s.fee_commitments.total();
+        let cc_available_for_fees = cc_available
+            .saturating_sub(self.fee_reserve_cc)
+            .saturating_sub(s.fee_commitments.total());
         // If allocation_token is CC, the allocation also consumes CC
         let cc_after_alloc = if allocation_token == CC_TOKEN {
-            cc_available_for_fees - allocation_amount
+            cc_available_for_fees.saturating_sub(allocation_amount)
         } else {
             cc_available_for_fees
         };
@@ -402,8 +417,8 @@ impl LiquidityManager {
         if cc_after_alloc < fee_cc {
             return Err(format!(
                 "insufficient CC for fees ({:.4} available after allocation + reserve, {:.4} needed)",
-                cc_after_alloc.max(Decimal::ZERO),
-                fee_cc
+                shown(cc_after_alloc.max(Decimal::ZERO)),
+                shown(fee_cc)
             ));
         }
 
@@ -474,7 +489,7 @@ impl LiquidityManager {
 
         debug!(
             "[{}] Committed: {} {} + {:.4} CC fees",
-            proposal_id, allocation_amount, allocation_token, fee_cc
+            proposal_id, allocation_amount, allocation_token, shown(fee_cc)
         );
         Ok(())
     }
@@ -575,7 +590,7 @@ impl LiquidityManager {
         let resolved = Self::resolve_alias(&s.aliases, token);
         let base = s.tokens.get(resolved).map_or(Decimal::ZERO, |t| t.available());
         if resolved == CC_TOKEN {
-            (base - self.fee_reserve_cc - s.fee_commitments.total()).max(Decimal::ZERO)
+            base.saturating_sub(self.fee_reserve_cc).saturating_sub(s.fee_commitments.total()).max(Decimal::ZERO)
         } else {
             base
         }
@@ -609,7 +624,7 @@ impl LiquidityManager {
         let available = s.tokens.get(resolved.as_str()).map_or(Decimal::ZERO, |t| t.available());
         // For CC, subtract fee reserve and fee commitments
         let effective_available = if resolved == CC_TOKEN {
-            (available - self.fee_reserve_cc - s.fee_commitments.total()).max(Decimal::ZERO)
+            available.saturating_sub(self.fee_reserve_cc).saturating_sub(s.fee_commitments.total()).max(Decimal::ZERO)
         } else {
             available
         };
@@ -657,7 +672,7 @@ impl LiquidityManager {
             let committed = state.committed();
             let fee_committed = if token == CC_TOKEN { fee_total } else { Decimal::ZERO };
             let available = if token == CC_TOKEN {
-                (state.available() - self.fee_reserve_cc - fee_total).max(Decimal::ZERO)
+                state.available().saturating_sub(self.fee_reserve_cc).saturating_sub(fee_total).max(Decimal::ZERO)
             } else {
                 state.available()
             };
@@ -692,12 +707,7 @@ impl LiquidityManager {
             });
         }
 
-        // Sort: CC first, then alphabetical
-        result.sort_by(|a, b| {
-            if a.token == CC_TOKEN { std::cmp::Ordering::Less }
-            else if b.token == CC_TOKEN { std::cmp::Ordering::Greater }
-            else { a.token.cmp(&b.token) }
-        });
+        result.sort_by(|a, b| stats_order(&a.token, &b.token));
 
         result
     }
@@ -728,6 +738,11 @@ impl LiquidityManager {
     }
 }
 
+/// CC first, then alphabetical; a total order, as `sort_by` requires.
+fn stats_order(a: &str, b: &str) -> std::cmp::Ordering {
+    (a != CC_TOKEN).cmp(&(b != CC_TOKEN)).then_with(|| a.cmp(b))
+}
+
 /// Stats for a single token (returned by `LiquidityManager::stats()`).
 pub struct TokenStats {
     pub token: String,
@@ -756,7 +771,7 @@ impl std::fmt::Display for TokenStats {
             "{} {:.2} bal / {:.2} committed / {:.2} avail ({} stlmts), flow {:.1}/hr, depl={:.1} ({})",
             self.token,
             self.balance,
-            self.committed + self.fee_committed,
+            self.committed.saturating_add(self.fee_committed),
             self.available,
             self.num_commitments,
             self.net_outflow_per_hour,
@@ -773,6 +788,44 @@ impl std::fmt::Display for TokenStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_caps_at_the_u64_bounds() {
+        assert_eq!(shown(Decimal::MAX), Decimal::from(u64::MAX));
+        assert_eq!(shown(Decimal::MIN), -Decimal::from(u64::MAX));
+        assert_eq!(shown(Decimal::new(-15, 1)), Decimal::new(-15, 1));
+    }
+
+    #[test]
+    fn stats_order_is_total_with_cc_first() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(stats_order(CC_TOKEN, CC_TOKEN), Equal);
+        assert_eq!(stats_order(CC_TOKEN, "AAA"), Less);
+        assert_eq!(stats_order("AAA", CC_TOKEN), Greater);
+        assert_eq!(stats_order("USDC", "CBTC"), Greater);
+        let mut tokens = vec!["USDC", CC_TOKEN, "CBTC", "CC1"];
+        tokens.sort_by(|a, b| stats_order(a, b));
+        assert_eq!(tokens, [CC_TOKEN, "CBTC", "CC1", "USDC"]);
+    }
+
+    #[test]
+    fn stats_display_survives_extreme_commitments() {
+        let stats = TokenStats {
+            token: CC_TOKEN.to_string(),
+            balance: Decimal::MAX,
+            committed: Decimal::MAX,
+            fee_committed: Decimal::MAX,
+            fee_reserve: Decimal::ZERO,
+            available: Decimal::MIN,
+            num_commitments: 1,
+            net_outflow_per_hour: 0.0,
+            hours_to_depletion: f64::INFINITY,
+            depletion_coefficient: 0.0,
+            refreshed_secs_ago: None,
+        };
+        let shown = stats.to_string();
+        assert!(shown.starts_with("CC 79228162514264337593543950335.00 bal"), "{shown}");
+    }
 
     #[tokio::test]
     async fn stale_age_uses_the_configured_window() {
@@ -1048,6 +1101,23 @@ mod tests {
         assert_eq!(fee, Decimal::ZERO);
     }
 
+    // Amounts at the edge of the Decimal range read as unaffordable instead of overflowing
+    #[tokio::test]
+    async fn test_out_of_range_fee_and_allocation_are_unaffordable() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.15").unwrap()).await;
+
+        let fee_cc = lm.estimate_fee_cc(Decimal::MAX).await;
+        assert_eq!(fee_cc, Decimal::MAX);
+        let reason = lm.can_commit("USDCx", Decimal::ONE, fee_cc).await.unwrap_err();
+        assert!(reason.contains("18446744073709551615.0000 needed"), "{reason}");
+        assert!(lm.can_commit(CC_TOKEN, Decimal::MAX, Decimal::ZERO).await.is_err());
+        // Intake refuses negative amounts; the CC arithmetic must not overflow on one either
+        let _ = lm.can_commit(CC_TOKEN, Decimal::MIN, Decimal::ONE).await;
+    }
+
     #[tokio::test]
     async fn test_retain_commitments_drops_orphaned() {
         // Reproduces the reservation leak: a proposal whose terminal event was
@@ -1110,5 +1180,65 @@ mod tests {
         // The V2 path's own release is what frees it.
         lm.release("rfqv2:q1").await;
         assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
+    }
+
+    #[tokio::test]
+    async fn a_negative_reported_balance_cannot_panic_the_manager() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::ZERO).await.unwrap();
+        lm.try_commit("p2", CC_TOKEN, Decimal::from(10), Decimal::ONE).await.unwrap();
+        lm.update_token_balance("USDCx", Decimal::MIN).await;
+        lm.update_cc_balance(Decimal::MIN).await;
+
+        let stats = lm.stats().await;
+        assert_eq!(stats.len(), 2);
+        assert!(stats.iter().all(|s| s.balance.is_zero() && s.available.is_zero()));
+        assert!(lm.can_commit("USDCx", Decimal::ONE, Decimal::ZERO).await.is_err());
+        assert_eq!(lm.available("USDCx").await, Decimal::ZERO);
+        assert_eq!(lm.available_cc().await, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_totals_saturate_instead_of_panicking() {
+        let mut t = TokenState::new();
+        t.allocation_commitments.insert("a".into(), Decimal::MAX);
+        t.allocation_commitments.insert("b".into(), Decimal::MAX);
+        assert_eq!(t.committed(), Decimal::MAX);
+        let mut t = TokenState::new();
+        t.allocation_commitments.insert("a".into(), Decimal::ONE);
+        t.balance = Decimal::MIN;
+        assert_eq!(t.available(), Decimal::ZERO);
+        let mut fees = FeeCommitments::new();
+        fees.entries.insert("a".into(), Decimal::MIN);
+        fees.entries.insert("b".into(), Decimal::MIN);
+        assert_eq!(fees.total(), Decimal::MIN);
+
+        // A negative fee total takes each CC site past the maximum
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.restore_flows(vec![SavedTokenFlow { token: CC_TOKEN.to_string(), net_outflow_per_hour: 1.0 }])
+            .await;
+        lm.state.write().await.fee_commitments.entries.insert("f".into(), Decimal::MIN);
+        assert_eq!(lm.available_cc().await, Decimal::MAX);
+        assert_eq!(lm.depletion_coefficient(CC_TOKEN).await, 0.0);
+        let stats = lm.stats().await;
+        assert_eq!(stats.len(), 1);
+        assert!(stats.iter().all(|s| s.available == Decimal::MAX));
+    }
+
+    // A fee too large for fixed-precision formatting is logged capped
+    #[tokio::test]
+    async fn committing_a_huge_fee_logs_without_panicking() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::DEBUG);
+        let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::MAX).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.0000000001").unwrap()).await;
+        lm.update_token_balance("USDCx", Decimal::from(10)).await;
+        let fee_cc = Decimal::from_scientific("1e27").unwrap();
+        assert!(lm.try_commit("p", "USDCx", Decimal::ONE, fee_cc).await.is_ok());
+        assert_eq!(logs.count("18446744073709551615.0000 CC fees"), 1);
     }
 }

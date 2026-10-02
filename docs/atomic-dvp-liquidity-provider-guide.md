@@ -643,7 +643,7 @@ running (use `tmux` or run it as a service to keep it up after closing the termi
 
 Only four keys have **no default** and must be present: `liquidity_provider.name`, each
 `markets[].market_id`, and each market's `markets.rfq.min_quantity` / `max_quantity`. Everything
-else falls back to the defaults shown.
+else falls back to the defaults shown. A value outside its stated range stops startup with an error.
 
 ### Top level
 
@@ -652,8 +652,8 @@ else falls back to the defaults shown.
 | `auto_settle` | `true` | Settle accepted trades automatically |
 | `poll_interval_secs` | `5` | Main loop poll interval |
 | `role` | `"trader"` | Agent role |
-| `token_ttl_secs` | `3600` | Auth token lifetime |
-| `connection_timeout_secs` | `30` | gRPC connect timeout |
+| `token_ttl_secs` | `3600` | Auth token lifetime, 60–86400 |
+| `connection_timeout_secs` | `30` | gRPC connect timeout, 1–300 |
 | `rfq_v2_only` | `false` | **Atomic DVP only, enforced**: never open the V1 LP settlement stream (no V1 registration/quotes) and never place grid orders (bid/offer levels ignored). In‑flight V1 settlements still needing this agent's steps are actively cancelled on encounter (already‑allocated ones are left to settle). Requires `[liquidity_provider.rfq_v2].enabled = true` and ≥ 1 enabled market with `[markets.rfq.v2].enabled = true`; conflicts with `--orders-only`. Env override: `RFQ_V2_ONLY` |
 
 ### `[liquidity_provider]`
@@ -671,9 +671,9 @@ else falls back to the defaults shown.
 | --- | --- | --- |
 | `enabled` | `false` | **Set `true` to turn on Atomic DVP** (requires `ATOMIC_QUOTE_PRIVATE_KEY`) |
 | `ticket_threshold_usd` | none | At/above this USD notional a quote consumes a single‑use ticket; unset = always ticketless |
-| `atomic_quote_valid_secs` | `120` | Signed‑quote validity window |
-| `settle_grace_secs` | `30` | Reservation TTL beyond the signed validity |
-| `ticket_batch_size` | `50` | Tickets issued per batch |
+| `atomic_quote_valid_secs` | `120` | Signed‑quote validity window, 1–3600 |
+| `settle_grace_secs` | `30` | Reservation TTL beyond the signed validity, 0–3600 |
+| `ticket_batch_size` | `50` | Tickets issued per batch, 1–1000 |
 | `ticket_low_water` | `50` | Re‑issue tickets when live count drops below this |
 
 ### `[liquidity_provider.rfq_v2.denominations]`
@@ -681,7 +681,8 @@ else falls back to the defaults shown.
 Map of **token symbol → list of `"AMOUNTxCOUNT"` rungs**, e.g. `CC = ["150x120"]`. The split worker
 keeps `COUNT` holdings sized in `[AMOUNT, 2×AMOUNT)`. Each in‑flight quote reserves one holding of
 the token the LP pays, so **your concurrency per token = its ready rungs**. Provide one entry for
-every token that appears in your markets.
+every token that appears in your markets. `AMOUNT` is at most 10^15 with at most 10 decimal places,
+and `COUNT` is 1–10000; a rung outside these bounds is rejected and its ladder is not split.
 
 Canton caps a split at ~100 outputs per transaction (Canton Coin rejects more with
 `maximum-outputs-exceeded`). Ladders that need more — e.g. `150x120` — are filled across multiple
@@ -695,7 +696,7 @@ transactions automatically, both by `atomic setup` and by the runtime split work
 | `markets.enabled` | `true` | Enable this market |
 | `markets.rfq.enabled` | `true` | Enable RFQ on this market (**required for Atomic DVP**) |
 | `markets.rfq.min_quantity` | — (**required**) | Smallest base quantity you'll quote |
-| `markets.rfq.max_quantity` | — (**required**) | Largest base quantity you'll quote |
+| `markets.rfq.max_quantity` | — (**required**) | Largest base quantity you'll quote; a positive number |
 | `markets.rfq.bid_spread_percent` | `0.5` | Spread when the user sells / LP buys |
 | `markets.rfq.offer_spread_percent` | `0.5` | Spread when the user buys / LP sells |
 | `markets.rfq.disable_overload_spread_widening` | `false` | Pin spread — ignore sequencer‑load widening |

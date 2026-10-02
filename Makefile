@@ -1,9 +1,23 @@
-.PHONY: help build-arm build-x86 build-mac build-all release-archives github-release
+.PHONY: help lint build-arm build-x86 build-mac build-all release-archives github-release
 
 .DEFAULT_GOAL := help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
+
+LINT_PACKAGES := -p agent-logic -p cloud-agent -p cli -p tx-verifier -p message-signing -p atomic-quote -p orderbook-proto
+
+PRECISION_DIRS := crates/agent-logic/src crates/cloud-agent/src crates/cli/src crates/atomic-quote/src crates/tx-verifier/src crates/message-signing/src crates/orderbook-proto/src
+PRECISION_ALLOW := lint/precision-allow.txt
+
+lint: ## Run clippy with the no-panic gates (deny attributes plus clippy.toml) and the precision grep gate
+	cargo clippy $(LINT_PACKAGES) --lib --bins
+	@test -r $(PRECISION_ALLOW) || { echo "$(PRECISION_ALLOW) is missing" >&2; exit 1; }
+	@hits=$$(grep -rE '\{[A-Za-z_0-9]*:[^{}]*\.([3-9]|[1-9][0-9]|\*|[A-Za-z_0-9]+\$$)[xX]?\??\}' $(PRECISION_DIRS)) || [ $$? -eq 1 ] || exit 2; \
+	tmp=$$(mktemp) || exit 2; trap 'rm -f "$$tmp"' EXIT; \
+	LC_ALL=C sort $(PRECISION_ALLOW) > "$$tmp" || exit 2; \
+	new=$$(printf '%s\n' "$$hits" | grep -v '^$$' | LC_ALL=C sort | LC_ALL=C comm -23 - "$$tmp"); \
+	if [ -n "$$new" ]; then printf 'Unreviewed {:.N} formatting; use num::Dp on Decimal:\n%s\n' "$$new" >&2; exit 1; fi
 
 build-arm: ## Build cloud-agent for Ubuntu Linux ARM64 (aarch64) using Docker
 	@echo "Building cloud-agent for Ubuntu Linux ARM64..."

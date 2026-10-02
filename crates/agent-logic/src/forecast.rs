@@ -20,8 +20,15 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
+
+use crate::config::BaseConfig;
+use crate::shutdown::Shutdown;
+use crate::supervise::{self, Policy};
+use crate::{clock, sync};
 
 /// Current IssuanceForecast enum value (0=Unspecified, 1=LOW, 2=MEDIUM, 3=HIGH).
 static FORECAST: AtomicI32 = AtomicI32::new(0);
@@ -29,8 +36,9 @@ static FORECAST: AtomicI32 = AtomicI32::new(0);
 /// The predicted coefficient string used for the forecast (for logging).
 static FORECAST_COEFFICIENT: Mutex<Option<String>> = Mutex::new(None);
 
-/// The predicted coefficient as f64 (for overload threshold comparison).
-static FORECAST_COEFF_VALUE: Mutex<f64> = Mutex::new(0.0);
+/// The predicted coefficient as `f64` bits (for overload threshold comparison).
+/// The initial 0 is 0.0.
+static FORECAST_COEFF_BITS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the previous forecast was LOW (for detecting traffic pause transitions).
 static WAS_LOW: AtomicBool = AtomicBool::new(false);
@@ -43,6 +51,12 @@ static WAS_OVERLOADED: AtomicBool = AtomicBool::new(false);
 /// startup default until this is non-zero.
 static LAST_UPDATE_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
 
+const POLL_SECS_ENV: &str = "FORECAST_POLL_SECS";
+/// Poll interval when `FORECAST_POLL_SECS` is unset or empty.
+pub const DEFAULT_POLL_SECS: u64 = 30;
+/// Largest accepted `FORECAST_POLL_SECS`.
+pub const MAX_POLL_SECS: u64 = 3600;
+
 /// Interval for the background poller (`FORECAST_POLL_SECS`, default 30).
 ///
 /// This is deliberately much faster than the data: the server republishes the
@@ -54,17 +68,39 @@ static LAST_UPDATE_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
 /// poller shows up in minutes instead of hiding behind the 10-minute cadence.
 /// It also means a newly published coefficient reaches the gates within 30s
 /// rather than up to a full poll period late.
-static POLL_SECS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FORECAST_POLL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(30)
-});
+pub fn poll_secs_from_env() -> Result<u64> {
+    match std::env::var(POLL_SECS_ENV) {
+        Ok(raw) => parse_poll_secs(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_poll_secs(None),
+        Err(e) => bail!("{POLL_SECS_ENV}: {e}"),
+    }
+}
 
-/// Set once the poller task exists, so every entry point can call
+fn parse_poll_secs(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_POLL_SECS);
+    };
+    let secs: u64 = raw
+        .parse()
+        .with_context(|| format!("{POLL_SECS_ENV}={raw:?} is not a whole number of seconds"))?;
+    if !(1..=MAX_POLL_SECS).contains(&secs) {
+        bail!("{POLL_SECS_ENV}={secs} is outside 1..={MAX_POLL_SECS}");
+    }
+    Ok(secs)
+}
+
+/// Set while the poller's supervisor runs, so every entry point can call
 /// `spawn_forecast_poller` unconditionally.
 static POLLER_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Clears `POLLER_SPAWNED` when the supervisor that owns it ends.
+struct PollerSlot;
+
+impl Drop for PollerSlot {
+    fn drop(&mut self) {
+        POLLER_SPAWNED.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Warn after this many consecutive poll failures (not on every one — a poll
 /// runs every 30s and transient RPC errors are normal).
@@ -74,13 +110,6 @@ const POLL_FAILURES_BEFORE_WARN: u32 = 3;
 /// interceptor, so a persistent failure is far more likely to be a dead
 /// transport than an expired token.
 const POLL_FAILURES_BEFORE_RECONNECT: u32 = 5;
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Predicted coefficient threshold below which normal fees are paused.
 /// When the coefficient drops below this, the sequencer is extremely overloaded
@@ -104,11 +133,11 @@ pub fn update_forecast(forecast_value: i32, coefficient: Option<String>) {
         .as_deref()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    *FORECAST_COEFF_VALUE.lock().unwrap() = coeff_f64;
+    FORECAST_COEFF_BITS.store(coeff_f64.to_bits(), Ordering::Relaxed);
 
     FORECAST.store(forecast_value, Ordering::Relaxed);
-    *FORECAST_COEFFICIENT.lock().unwrap() = coefficient;
-    LAST_UPDATE_EPOCH_SECS.store(now_epoch_secs(), Ordering::Relaxed);
+    *sync::lock(&FORECAST_COEFFICIENT) = coefficient;
+    LAST_UPDATE_EPOCH_SECS.store(clock::now_secs(), Ordering::Relaxed);
 
     // Traffic fee pause transitions (LOW threshold)
     if now_low && !prev_low {
@@ -157,7 +186,7 @@ pub fn is_traffic_paused_by_forecast() -> bool {
 /// the sequencer is extremely overloaded and fee transactions would hit
 /// SEQUENCER_BACKPRESSURE errors.
 pub fn is_fees_paused_by_overload() -> bool {
-    let coeff = *FORECAST_COEFF_VALUE.lock().unwrap();
+    let coeff = coefficient_value();
     coeff > 0.0 && coeff < *OVERLOAD_THRESHOLD
 }
 
@@ -168,7 +197,7 @@ pub fn is_fees_paused_by_overload() -> bool {
 /// sequencer is critically overloaded — proposing new trades would fail
 /// with SEQUENCER_BACKPRESSURE errors.
 pub fn is_rfq_rejected_by_overload() -> bool {
-    let coeff = *FORECAST_COEFF_VALUE.lock().unwrap();
+    let coeff = coefficient_value();
     coeff > 0.0 && coeff < *OVERLOAD_THRESHOLD - 0.1
 }
 
@@ -184,14 +213,14 @@ pub fn forecast_label() -> &'static str {
 
 /// The predicted coefficient value (for heartbeat logging).
 pub fn forecast_coefficient() -> Option<String> {
-    FORECAST_COEFFICIENT.lock().unwrap().clone()
+    sync::lock(&FORECAST_COEFFICIENT).clone()
 }
 
 /// The predicted coefficient as f64. Returns 0.0 when no forecast has been
 /// received yet — callers gating on "coefficient must exceed a threshold"
 /// therefore stay paused until the first real forecast arrives.
 pub fn coefficient_value() -> f64 {
-    *FORECAST_COEFF_VALUE.lock().unwrap()
+    f64::from_bits(FORECAST_COEFF_BITS.load(Ordering::Relaxed))
 }
 
 /// Seconds since the coefficient was last refreshed, or `None` if no forecast
@@ -206,7 +235,7 @@ pub fn coefficient_value() -> f64 {
 pub fn forecast_age_secs() -> Option<u64> {
     match LAST_UPDATE_EPOCH_SECS.load(Ordering::Relaxed) {
         0 => None,
-        last => Some(now_epoch_secs().saturating_sub(last)),
+        last => Some(clock::now_secs().saturating_sub(last)),
     }
 }
 
@@ -220,127 +249,134 @@ pub fn forecast_age_secs() -> Option<u64> {
 /// special handling — `AuthInterceptor` regenerates the JWT on every request
 /// once it is within 300s of expiry — but the transport can die, so the client
 /// is rebuilt after repeated failures.
-pub fn spawn_forecast_poller(config: crate::config::BaseConfig, shutdown: crate::shutdown::Shutdown) {
+/// Fails on an invalid `FORECAST_POLL_SECS` or outside a tokio runtime; a
+/// panicked poller is restarted.
+pub fn spawn_forecast_poller(config: BaseConfig, shutdown: Shutdown) -> Result<()> {
+    let period = Duration::from_secs(poll_secs_from_env()?);
     if POLLER_SPAWNED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return;
+        return Ok(());
     }
 
-    tokio::spawn(async move {
-        let period = Duration::from_secs(*POLL_SECS);
-        info!("Issuance forecast poller started: interval={}s", period.as_secs());
+    let slot = PollerSlot;
+    let task_shutdown = shutdown.clone();
+    supervise::spawn_supervised("forecast_poller", shutdown, Policy::Restart, move || {
+        // The factory owns the slot, so the flag clears when the supervisor ends.
+        let _slot = &slot;
+        poll_loop(config.clone(), task_shutdown.clone(), period)
+    })
+    .map(drop)
+}
 
-        let mut ticker = tokio::time::interval(period);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+async fn poll_loop(config: BaseConfig, shutdown: Shutdown, period: Duration) {
+    info!("Issuance forecast poller started: interval={}s", period.as_secs());
 
-        let mut client: Option<crate::client::OrderbookClient> = None;
-        let mut failures: u32 = 0;
-        let mut warned = false;
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => {
-                    info!("Issuance forecast poller shutting down");
-                    break;
-                }
-                // Fires immediately on the first pass, so the first coefficient
-                // lands before any consumer gates on it.
-                _ = ticker.tick() => {}
+    let mut client: Option<crate::client::OrderbookClient> = None;
+    let mut failures: u32 = 0;
+    let mut warned = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => {
+                info!("Issuance forecast poller shutting down");
+                break;
             }
+            // Fires immediately on the first pass, so the first coefficient
+            // lands before any consumer gates on it.
+            _ = ticker.tick() => {}
+        }
 
-            if client.is_none() {
-                // Bounded: `OrderbookClient::create_channel` builds its tonic
-                // Endpoint without a connect_timeout, so a TCP-accepted but
-                // stalled handshake would otherwise park this task forever —
-                // the exact frozen-coefficient failure this poller exists to
-                // eliminate. The next tick retries.
-                let connect = tokio::time::timeout(
-                    Duration::from_secs(config.connection_timeout_secs.max(5)),
-                    crate::client::OrderbookClient::new(&config),
-                )
-                .await;
-                match connect {
-                    Ok(Ok(c)) => client = Some(c),
-                    Ok(Err(e)) => {
-                        failures += 1;
-                        note_poll_failure(failures, &mut warned, &format!("client create failed: {:#}", e));
-                        continue;
-                    }
-                    Err(_) => {
-                        failures += 1;
-                        note_poll_failure(failures, &mut warned, "client create timed out");
-                        continue;
-                    }
+        if client.is_none() {
+            // Outer bound on top of the client's own connect and TLS bounds;
+            // the next tick retries.
+            let connect = tokio::time::timeout(
+                Duration::from_secs(config.connection_timeout_secs.max(5)),
+                crate::client::OrderbookClient::new(&config),
+            )
+            .await;
+            match connect {
+                Ok(Ok(c)) => client = Some(c),
+                Ok(Err(e)) => {
+                    failures = failures.saturating_add(1);
+                    note_poll_failure(failures, &mut warned, &format!("client create failed: {e:#}"));
+                    continue;
                 }
-            }
-
-            let outcome = {
-                let c = client.as_mut().expect("client is Some — built directly above");
-                tokio::time::timeout(Duration::from_secs(5), c.get_rounds_data(Some(1))).await
-            };
-
-            // Three outcomes, not two: a healthy response WITHOUT a prediction
-            // must be neither a success (it would clear `warned` mid-outage
-            // and hide the freeze) nor a failure (the transport is fine, so
-            // reconnecting is pointless and the breaker would lie).
-            // Ok(true) = prediction stored, Ok(false) = healthy/no prediction,
-            // Err = transport failure.
-            let poll: Result<bool, String> = match outcome {
-                Ok(Ok(resp)) => match resp.prediction {
-                    Some(prediction) => {
-                        update_forecast(prediction.forecast, prediction.forecast_coefficient);
-                        Ok(true)
-                    }
-                    None => Ok(false),
-                },
-                Ok(Err(e)) => Err(format!("{:#}", e)),
-                Err(_) => Err("timed out after 5s".to_string()),
-            };
-
-            match poll {
-                Ok(true) => {
-                    if warned {
-                        info!("Issuance forecast poller recovered — prediction received");
-                        warned = false;
-                    }
-                    failures = 0;
-                }
-                Ok(false) => {
-                    // Transport healthy: reset the reconnect counter, but the
-                    // coefficient is silently going stale — and a frozen HIGH
-                    // value passes every gate without ever reaching the GC's
-                    // stale canary, so once the data is genuinely old this has
-                    // to surface at warn level (once per outage, like
-                    // note_poll_failure; a real prediction re-arms it).
-                    failures = 0;
-                    let stale = forecast_age_secs().is_none_or(|age| age > *POLL_SECS * 10);
-                    if stale && !warned {
-                        let age = forecast_age_secs()
-                            .map(|a| format!("{}s old", a))
-                            .unwrap_or_else(|| "never received".to_string());
-                        warn!(
-                            "Issuance forecast poll returned no prediction — coefficient is {}",
-                            age
-                        );
-                        warned = true;
-                    } else {
-                        debug!("Issuance forecast poll returned no prediction");
-                    }
-                }
-                Err(msg) => {
-                    failures += 1;
-                    note_poll_failure(failures, &mut warned, &msg);
-                    if failures % POLL_FAILURES_BEFORE_RECONNECT == 0 {
-                        debug!("Issuance forecast poller: rebuilding client after {} failures", failures);
-                        client = None;
-                    }
+                Err(_) => {
+                    failures = failures.saturating_add(1);
+                    note_poll_failure(failures, &mut warned, "client create timed out");
+                    continue;
                 }
             }
         }
-    });
+
+        let Some(c) = client.as_mut() else { continue };
+        let outcome = tokio::time::timeout(Duration::from_secs(5), c.get_rounds_data(Some(1))).await;
+
+        // Three outcomes, not two: a healthy response WITHOUT a prediction
+        // must be neither a success (it would clear `warned` mid-outage
+        // and hide the freeze) nor a failure (the transport is fine, so
+        // reconnecting is pointless and the breaker would lie).
+        // Ok(true) = prediction stored, Ok(false) = healthy/no prediction,
+        // Err = transport failure.
+        let poll: Result<bool, String> = match outcome {
+            Ok(Ok(resp)) => match resp.prediction {
+                Some(prediction) => {
+                    update_forecast(prediction.forecast, prediction.forecast_coefficient);
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(_) => Err("timed out after 5s".to_string()),
+        };
+
+        match poll {
+            Ok(true) => {
+                if warned {
+                    info!("Issuance forecast poller recovered — prediction received");
+                    warned = false;
+                }
+                failures = 0;
+            }
+            Ok(false) => {
+                // Transport healthy: reset the reconnect counter, but the
+                // coefficient is silently going stale — and a frozen HIGH
+                // value passes every gate without ever reaching the GC's
+                // stale canary, so once the data is genuinely old this has
+                // to surface at warn level (once per outage, like
+                // note_poll_failure; a real prediction re-arms it).
+                failures = 0;
+                let stale_after = period.as_secs().saturating_mul(10);
+                let stale = forecast_age_secs().is_none_or(|age| age > stale_after);
+                if stale && !warned {
+                    let age = forecast_age_secs()
+                        .map(|a| format!("{a}s old"))
+                        .unwrap_or_else(|| "never received".to_string());
+                    warn!(
+                        "Issuance forecast poll returned no prediction — coefficient is {}",
+                        age
+                    );
+                    warned = true;
+                } else {
+                    debug!("Issuance forecast poll returned no prediction");
+                }
+            }
+            Err(msg) => {
+                failures = failures.saturating_add(1);
+                note_poll_failure(failures, &mut warned, &msg);
+                if failures % POLL_FAILURES_BEFORE_RECONNECT == 0 {
+                    debug!("Issuance forecast poller: rebuilding client after {} failures", failures);
+                    client = None;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +400,68 @@ mod tests {
         let age = forecast_age_secs().expect("age is Some once a forecast has landed");
         assert!(age <= 2, "age should be ~0 right after an update, got {}s", age);
         assert!((coefficient_value() - 0.75).abs() < 1e-9);
+
+        // A panic while the coefficient lock is held must not break later writers or readers
+        let poisoner = std::thread::spawn(|| {
+            let _held = FORECAST_COEFFICIENT.lock().unwrap();
+            panic!("poison the coefficient lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(FORECAST_COEFFICIENT.is_poisoned());
+        update_forecast(3, Some("0.9".to_string()));
+        assert_eq!(forecast_coefficient().as_deref(), Some("0.9"));
+        assert!((coefficient_value() - 0.9).abs() < 1e-9);
+        assert!(!is_fees_paused_by_overload());
+        assert!(!is_rfq_rejected_by_overload());
+        assert_eq!(forecast_label(), "high");
+    }
+
+    #[test]
+    fn poll_interval_must_be_between_one_second_and_one_hour() {
+        assert_eq!(parse_poll_secs(None).unwrap(), DEFAULT_POLL_SECS);
+        assert_eq!(parse_poll_secs(Some("")).unwrap(), DEFAULT_POLL_SECS);
+        assert_eq!(parse_poll_secs(Some("  ")).unwrap(), DEFAULT_POLL_SECS);
+        assert_eq!(parse_poll_secs(Some(" 45 ")).unwrap(), 45);
+        assert_eq!(parse_poll_secs(Some("1")).unwrap(), 1);
+        assert_eq!(parse_poll_secs(Some("3600")).unwrap(), MAX_POLL_SECS);
+        for bad in ["0", "3601", "-5", "abc", "1.5", "18446744073709551615", "99999999999999999999"] {
+            let err = parse_poll_secs(Some(bad)).unwrap_err();
+            assert!(err.to_string().starts_with("FORECAST_POLL_SECS="), "{bad}: {err}");
+        }
+    }
+
+    // One test: POLLER_SPAWNED is process-global
+    #[test]
+    fn poller_spawn_needs_a_runtime_and_its_flag_tracks_the_supervisor() {
+        let err = spawn_forecast_poller(BaseConfig::test_minimal().unwrap(), Shutdown::new()).unwrap_err();
+        assert!(err.to_string().contains("no tokio runtime"), "{err}");
+        assert!(!POLLER_SPAWNED.load(Ordering::SeqCst), "a failed spawn must not leave the flag set");
+
+        let logs = crate::test_logs::LogBuf::default();
+        let _capture = logs.capture(tracing::Level::INFO);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            for run in 1..=2 {
+                let shutdown = Shutdown::new();
+                spawn_forecast_poller(BaseConfig::test_minimal().unwrap(), shutdown.clone()).unwrap();
+                assert!(POLLER_SPAWNED.load(Ordering::SeqCst));
+                spawn_forecast_poller(BaseConfig::test_minimal().unwrap(), Shutdown::new()).unwrap();
+                wait_for("the poller to start", || logs.count("Issuance forecast poller started") >= run).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(logs.count("Issuance forecast poller started"), run, "one poller per process");
+
+                shutdown.signal();
+                wait_for("the flag to clear", || !POLLER_SPAWNED.load(Ordering::SeqCst)).await;
+            }
+        });
+    }
+
+    async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 

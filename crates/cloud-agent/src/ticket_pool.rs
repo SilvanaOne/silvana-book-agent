@@ -11,11 +11,14 @@
 //! "<= 1 live quote per ticket" invariant. Tickets are only *archived* (Spent)
 //! by an actual settle.
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_logic::state::SavedTicket;
+use agent_logic::{clock, sync};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,24 +78,22 @@ impl TicketPool {
     /// Empty pool ⇒ None (the caller rejects NO_TICKET_AVAILABLE — never issue
     /// synchronously; the batch worker refills).
     pub fn assign(&self, quote_id: &str, expires_at: Instant) -> Option<(String, TicketEntry)> {
-        let mut entries = self.entries.lock().unwrap();
-        let ticket_id = entries
-            .values()
-            .find(|e| e.status == TicketStatus::Free && e.is_disclosable())
-            .map(|e| e.ticket_id.clone())?;
-        let entry = entries.get_mut(&ticket_id).expect("just found");
+        let mut entries = sync::lock(&self.entries);
+        let entry = entries
+            .values_mut()
+            .find(|e| e.status == TicketStatus::Free && e.is_disclosable())?;
         entry.status = TicketStatus::Assigned {
             quote_id: quote_id.to_string(),
             expires_at,
         };
-        debug!("Assigned ticket {} to quote {}", ticket_id, quote_id);
-        Some((ticket_id.clone(), entry.clone()))
+        debug!("Assigned ticket {} to quote {}", entry.ticket_id, quote_id);
+        Some((entry.ticket_id.clone(), entry.clone()))
     }
 
     /// Return the ticket assigned to `quote_id` (if any) to the Free pool
     /// (reject paths / expiry sweep).
     pub fn unassign(&self, quote_id: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = sync::lock(&self.entries);
         for e in entries.values_mut() {
             if matches!(&e.status, TicketStatus::Assigned { quote_id: q, .. } if q == quote_id) {
                 debug!("Unassigned ticket {} from quote {}", e.ticket_id, quote_id);
@@ -104,7 +105,7 @@ impl TicketPool {
     /// A SettlementTicket contract was archived on-ledger (consumed by a
     /// settle or cancelled) — mark Spent.
     pub fn on_archived(&self, contract_id: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = sync::lock(&self.entries);
         for e in entries.values_mut() {
             if e.contract_id == contract_id {
                 debug!("Ticket {} archived on ledger — Spent", e.ticket_id);
@@ -115,7 +116,7 @@ impl TicketPool {
 
     /// Mark the ticket assigned to `quote_id` as Spent (observed settle).
     pub fn mark_spent(&self, quote_id: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = sync::lock(&self.entries);
         for e in entries.values_mut() {
             if matches!(&e.status, TicketStatus::Assigned { quote_id: q, .. } if q == quote_id) {
                 e.status = TicketStatus::Spent;
@@ -124,9 +125,7 @@ impl TicketPool {
     }
 
     pub fn free_count(&self) -> usize {
-        self.entries
-            .lock()
-            .unwrap()
+        sync::lock(&self.entries)
             .values()
             .filter(|e| e.status == TicketStatus::Free && e.is_disclosable())
             .count()
@@ -137,13 +136,13 @@ impl TicketPool {
     /// - on ledger but unknown → adopt as Free
     /// - known → keep status, backfill blob/payload/template/cid
     pub fn reconcile_from_acs(&self, on_ledger: Vec<TicketAcsInfo>) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = sync::lock(&self.entries);
         let ledger_ids: std::collections::HashSet<&str> =
             on_ledger.iter().map(|t| t.ticket_id.as_str()).collect();
 
         let before = entries.len();
         entries.retain(|tid, _| ledger_ids.contains(tid.as_str()));
-        let dropped = before - entries.len();
+        let dropped = before.saturating_sub(entries.len());
 
         let mut adopted = 0usize;
         for t in on_ledger {
@@ -172,7 +171,7 @@ impl TicketPool {
                             status: TicketStatus::Free,
                         },
                     );
-                    adopted += 1;
+                    adopted = adopted.saturating_add(1);
                 }
             }
         }
@@ -189,7 +188,7 @@ impl TicketPool {
     /// Return expired assignments to Free (backstop; the reject paths and the
     /// settle watcher are the primary mechanisms).
     pub fn expire_assignments(&self, now: Instant) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = sync::lock(&self.entries);
         for e in entries.values_mut() {
             if matches!(&e.status, TicketStatus::Assigned { expires_at, .. } if now >= *expires_at)
             {
@@ -202,21 +201,21 @@ impl TicketPool {
     /// Snapshot for SavedState (blobs NOT persisted — re-fetched at startup).
     pub fn snapshot(&self) -> Vec<SavedTicket> {
         let now_instant = Instant::now();
-        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-        self.entries
-            .lock()
-            .unwrap()
+        let now_ms = clock::now_millis();
+        sync::lock(&self.entries)
             .values()
             .map(|e| {
                 let (status, quote_id, expires_at_ms) = match &e.status {
                     TicketStatus::Free => ("free".to_string(), None, None),
                     TicketStatus::Assigned { quote_id, expires_at } => {
-                        let remaining_ms =
-                            expires_at.saturating_duration_since(now_instant).as_millis() as u64;
+                        let remaining_ms = u64::try_from(
+                            expires_at.saturating_duration_since(now_instant).as_millis(),
+                        )
+                        .unwrap_or(u64::MAX);
                         (
                             "assigned".to_string(),
                             Some(quote_id.clone()),
-                            Some(now_ms + remaining_ms),
+                            Some(now_ms.saturating_add(remaining_ms)),
                         )
                     }
                     TicketStatus::Spent => ("spent".to_string(), None, None),
@@ -234,20 +233,21 @@ impl TicketPool {
 
     /// Restore from SavedState (blob-pending; reconcile backfills). Assigned
     /// entries whose wall-clock expiry passed while the agent was down come
-    /// back Free.
-    pub fn restore(&self, saved: Vec<SavedTicket>) {
-        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    /// back Free; a remaining assignment is capped at `max_ttl`.
+    pub fn restore(&self, saved: Vec<SavedTicket>, max_ttl: Duration) {
+        let now_ms = clock::now_millis();
         let now_instant = Instant::now();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = sync::lock(&self.entries);
         let count = saved.len();
         for t in saved {
             let status = match t.status.as_str() {
                 "assigned" => match (t.quote_id.clone(), t.expires_at_ms) {
                     (Some(quote_id), Some(expires_at_ms)) if expires_at_ms > now_ms => {
+                        let ttl = Duration::from_millis(expires_at_ms.saturating_sub(now_ms))
+                            .min(max_ttl);
                         TicketStatus::Assigned {
                             quote_id,
-                            expires_at: now_instant
-                                + std::time::Duration::from_millis(expires_at_ms - now_ms),
+                            expires_at: now_instant.checked_add(ttl).unwrap_or(now_instant),
                         }
                     }
                     _ => TicketStatus::Free,
@@ -372,7 +372,7 @@ mod tests {
         let snap = pool.snapshot();
 
         let restored = TicketPool::new();
-        restored.restore(snap);
+        restored.restore(snap, Duration::from_secs(300));
         // blobs not persisted → nothing assignable until reconcile
         assert_eq!(restored.free_count(), 0);
         restored.reconcile_from_acs(vec![on_ledger_entry("t1"), on_ledger_entry("t2")]);
@@ -380,5 +380,91 @@ mod tests {
         assert_eq!(restored.free_count(), 1);
         let snap2 = restored.snapshot();
         assert!(snap2.iter().any(|t| t.status == "assigned" && t.quote_id.as_deref() == Some("q1")));
+    }
+
+    fn saved_assigned(tid: &str, expires_at_ms: u64) -> SavedTicket {
+        SavedTicket {
+            ticket_id: tid.to_string(),
+            contract_id: format!("00{tid}"),
+            status: "assigned".to_string(),
+            quote_id: Some("q1".to_string()),
+            expires_at_ms: Some(expires_at_ms),
+        }
+    }
+
+    // A far-future saved expiry is capped, so the ticket cannot stay assigned forever
+    #[test]
+    fn restore_caps_assignment_at_max_ttl() {
+        let pool = TicketPool::new();
+        pool.restore(vec![saved_assigned("t1", u64::MAX)], Duration::from_millis(50));
+        pool.reconcile_from_acs(vec![on_ledger_entry("t1")]);
+        assert_eq!(pool.free_count(), 0, "restored as assigned");
+        pool.expire_assignments(Instant::now() + Duration::from_secs(1));
+        assert_eq!(pool.free_count(), 1, "assignment must expire after max_ttl");
+    }
+
+    // A saved expiry within the cap keeps its own deadline
+    #[test]
+    fn restore_keeps_expiry_within_cap() {
+        let pool = TicketPool::new();
+        let in_60s = agent_logic::clock::now_millis() + 60_000;
+        pool.restore(vec![saved_assigned("t1", in_60s)], Duration::from_secs(300));
+        pool.reconcile_from_acs(vec![on_ledger_entry("t1")]);
+        pool.expire_assignments(Instant::now() + Duration::from_secs(30));
+        assert_eq!(pool.free_count(), 0, "still assigned before its own expiry");
+        pool.expire_assignments(Instant::now() + Duration::from_secs(61));
+        assert_eq!(pool.free_count(), 1);
+    }
+
+    // A restored assignment backing a live envelope keeps its own expiry under the protocol cap
+    #[test]
+    fn restore_keeps_a_live_assignment_under_the_protocol_cap() {
+        let pool = TicketPool::new();
+        let in_500s = agent_logic::clock::now_millis() + 500_000;
+        pool.restore(vec![saved_assigned("t1", in_500s)], crate::rfq_v2::RfqV2State::restore_ttl_cap());
+        pool.reconcile_from_acs(vec![on_ledger_entry("t1")]);
+        for secs in [120, 490] {
+            pool.expire_assignments(Instant::now() + Duration::from_secs(secs));
+            assert_eq!(pool.free_count(), 0, "still assigned after {secs}s");
+        }
+        pool.expire_assignments(Instant::now() + Duration::from_secs(501));
+        assert_eq!(pool.free_count(), 1);
+    }
+
+    // An assignment too far out to express in epoch ms saturates instead of wrapping
+    #[test]
+    fn snapshot_saturates_far_future_expiry() {
+        let pool = TicketPool::new();
+        pool.reconcile_from_acs(vec![on_ledger_entry("t1")]);
+        // 2e19 ms exceeds u64::MAX, so a truncating cast would wrap to a small value
+        let far = Instant::now().checked_add(Duration::from_secs(20_000_000_000_000_000)).unwrap();
+        pool.assign("q1", far).unwrap();
+        let snap = pool.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].expires_at_ms, Some(u64::MAX));
+    }
+
+    // Every operation keeps working after a panic poisoned the pool lock
+    #[test]
+    fn poisoned_lock_is_tolerated() {
+        let pool = TicketPool::new();
+        pool.reconcile_from_acs(vec![on_ledger_entry("t1"), on_ledger_entry("t2")]);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = pool.entries.lock().unwrap();
+            panic!("poison the pool lock");
+        }));
+        assert!(pool.entries.is_poisoned());
+
+        let expires = Instant::now() + Duration::from_secs(60);
+        let (tid, _) = pool.assign("q1", expires).unwrap();
+        pool.unassign("q1");
+        pool.assign("q2", expires).unwrap();
+        pool.mark_spent("q2");
+        pool.on_archived(&format!("00{tid}"));
+        pool.expire_assignments(Instant::now());
+        pool.reconcile_from_acs(vec![on_ledger_entry("t3")]);
+        assert_eq!(pool.free_count(), 1);
+        let snap = pool.snapshot();
+        pool.restore(snap, Duration::from_secs(60));
     }
 }

@@ -22,9 +22,9 @@
 //!
 //! `record_submit_success` clears everything immediately (the ledger is back).
 
+use anyhow::{bail, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Consecutive submission failures with no intervening success.
@@ -46,20 +46,47 @@ static FAILURE_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
         .unwrap_or(3)
 });
 
+const COOLDOWN_ENV: &str = "LEDGER_UNHEALTHY_COOLDOWN_SECS";
+/// Cooldown when `LEDGER_UNHEALTHY_COOLDOWN_SECS` is unset or empty.
+pub const DEFAULT_COOLDOWN_SECS: u64 = 60;
+/// Largest accepted `LEDGER_UNHEALTHY_COOLDOWN_SECS`.
+pub const MAX_COOLDOWN_SECS: u64 = 86_400;
+
 /// How long the breaker stays tripped after a failure before it auto-re-opens to
 /// probe the ledger. Each new failure extends the deadline.
-static COOLDOWN_SECS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("LEDGER_UNHEALTHY_COOLDOWN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60)
-});
+static COOLDOWN_SECS: LazyLock<u64> =
+    LazyLock::new(|| cooldown_secs_from_env().unwrap_or(DEFAULT_COOLDOWN_SECS));
+
+/// `LEDGER_UNHEALTHY_COOLDOWN_SECS`: unset or empty gives 60; anything that is
+/// not an integer in 0..=86400 is an error.
+pub fn cooldown_secs_from_env() -> Result<u64> {
+    match std::env::var(COOLDOWN_ENV) {
+        Ok(raw) => parse_cooldown_secs(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_cooldown_secs(None),
+        Err(e) => bail!("{COOLDOWN_ENV}: {e}"),
+    }
+}
+
+fn parse_cooldown_secs(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_COOLDOWN_SECS);
+    };
+    let Ok(secs) = raw.parse::<u64>() else {
+        bail!("{COOLDOWN_ENV}='{raw}' is not a whole number of seconds");
+    };
+    if secs > MAX_COOLDOWN_SECS {
+        bail!("{COOLDOWN_ENV}={secs} is outside 0..={MAX_COOLDOWN_SECS}");
+    }
+    Ok(secs)
+}
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::clock::now_millis()
+}
+
+/// Epoch millis at which a breaker tripped at `now_ms` re-opens.
+fn resume_at_ms(now_ms: u64, cooldown_secs: u64) -> u64 {
+    now_ms.saturating_add(cooldown_secs.saturating_mul(1000))
 }
 
 /// Record one sequencer-unreachable submission failure. Call **once per logical
@@ -67,12 +94,12 @@ fn now_ms() -> u64 {
 /// consecutive failures. Trips the breaker once `threshold` consecutive failures
 /// accumulate, and (re)extends the cooldown deadline while failures continue.
 pub fn record_submit_failure() {
-    let failures = CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    let failures = CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     if failures < *FAILURE_THRESHOLD {
         return;
     }
     let was_healthy = UNHEALTHY_UNTIL_MS.load(Ordering::Relaxed) <= now_ms();
-    let resume_at = now_ms() + *COOLDOWN_SECS * 1000;
+    let resume_at = resume_at_ms(now_ms(), *COOLDOWN_SECS);
     UNHEALTHY_UNTIL_MS.fetch_max(resume_at, Ordering::Relaxed);
     if was_healthy {
         UNHEALTHY_SINCE_MS.store(now_ms(), Ordering::Relaxed);
@@ -232,6 +259,35 @@ mod tests {
         UNHEALTHY_UNTIL_MS.store(now_ms().saturating_sub(1), Ordering::Relaxed);
         assert!(!is_unhealthy(), "breaker must auto-re-open after cooldown to probe");
         reset();
+    }
+
+    #[test]
+    fn a_saturated_failure_counter_still_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset();
+        CONSECUTIVE_FAILURES.store(u64::MAX, Ordering::Relaxed);
+        record_submit_failure();
+        assert!(is_unhealthy());
+        reset();
+    }
+
+    #[test]
+    fn the_resume_deadline_saturates() {
+        assert_eq!(resume_at_ms(5_000, 60), 65_000);
+        assert_eq!(resume_at_ms(u64::MAX - 1, 60), u64::MAX);
+        assert_eq!(resume_at_ms(1, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_cooldown_setting_is_validated() {
+        assert_eq!(parse_cooldown_secs(None).unwrap(), DEFAULT_COOLDOWN_SECS);
+        assert_eq!(parse_cooldown_secs(Some(" ")).unwrap(), DEFAULT_COOLDOWN_SECS);
+        assert_eq!(parse_cooldown_secs(Some("0")).unwrap(), 0);
+        assert_eq!(parse_cooldown_secs(Some(" 86400 ")).unwrap(), MAX_COOLDOWN_SECS);
+        for bad in ["86401", "-1", "1.5", "abc", "18446744073709551616"] {
+            let err = parse_cooldown_secs(Some(bad)).unwrap_err().to_string();
+            assert!(err.starts_with("LEDGER_UNHEALTHY_COOLDOWN_SECS"), "{bad}: {err}");
+        }
     }
 
     #[test]

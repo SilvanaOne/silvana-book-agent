@@ -13,13 +13,16 @@
 //! selection unconditionally and from v1 selection with fail-open (v1 settle
 //! success outranks reserve preservation), consumed only by the split worker.
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agent_logic::num::dec_sum;
 use rust_decimal::Decimal;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// TTL for available holdings (refreshed by ACS worker every 30s)
 const AVAILABLE_TTL_SECS: u64 = 180; // 3 minutes
@@ -128,7 +131,7 @@ struct PendingSplit {
 
 impl PendingSplit {
     fn is_expired(&self, now: Instant) -> bool {
-        now.duration_since(self.recorded_at).as_secs() > PENDING_SPLIT_TTL_SECS
+        now.saturating_duration_since(self.recorded_at).as_secs() > PENDING_SPLIT_TTL_SECS
     }
 }
 
@@ -136,11 +139,11 @@ impl ReservedEntry {
     fn is_expired(&self, now: Instant) -> bool {
         match &self.kind {
             ReservationKind::V1Payment { .. } => {
-                now.duration_since(self.reserved_at).as_secs() > V1_RESERVATION_TTL_SECS
+                now.saturating_duration_since(self.reserved_at).as_secs() > V1_RESERVATION_TTL_SECS
             }
             ReservationKind::V2Quote { expires_at, .. } => now >= *expires_at,
             ReservationKind::Split { .. } => {
-                now.duration_since(self.reserved_at).as_secs() > SPLIT_RESERVATION_TTL_SECS
+                now.saturating_duration_since(self.reserved_at).as_secs() > SPLIT_RESERVATION_TTL_SECS
             }
         }
     }
@@ -187,6 +190,20 @@ impl HoldingsCache {
         *self.dust_below.write().await = thresholds;
     }
 
+    /// Selections wait while the returned guard is held.
+    #[cfg(test)]
+    pub(crate) async fn block_selection_for_tests(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<InstrumentKey, Decimal>> {
+        self.dust_below.write().await
+    }
+
+    /// Reservation releases wait while the returned guard is held.
+    #[cfg(test)]
+    pub(crate) async fn block_releases_for_tests(&self) -> impl Sized + '_ {
+        self.reserved.read().await
+    }
+
     /// The dust-merge threshold for an instrument (its smallest ladder rung), or
     /// `None` if no ladder is configured for it. Holdings below it are sub-rung
     /// dust; holdings at/above it are ladder rungs the split worker maintains.
@@ -217,17 +234,18 @@ impl HoldingsCache {
         let new_count = new_available.len();
 
         {
+            // Both pools change under both locks, in the readers' order, so a
+            // cancelled refresh changes neither.
+            let mut available = self.available.write().await;
             let mut consumed = self.consumed.write().await;
+
             let before = consumed.len();
             consumed.retain(|cid, _| new_available.contains_key(cid));
-            let removed = before - consumed.len();
+            let removed = before.saturating_sub(consumed.len());
             if removed > 0 {
                 debug!("Cleaned {} consumed entries no longer in ACS", removed);
             }
-        }
 
-        {
-            let mut available = self.available.write().await;
             available.retain(|_, h| h.discovered_at > snapshot_start);
             let kept_recent = available.len();
             for (cid, h) in new_available {
@@ -269,7 +287,7 @@ impl HoldingsCache {
             .values()
             .filter(|h| h.instrument == instrument)
             .filter(|h| {
-                if now.duration_since(h.discovered_at).as_secs() > AVAILABLE_TTL_SECS {
+                if now.saturating_duration_since(h.discovered_at).as_secs() > AVAILABLE_TTL_SECS {
                     return false;
                 }
                 if consumed.contains_key(&h.contract_id) {
@@ -320,7 +338,7 @@ impl HoldingsCache {
             .values()
             .filter(|h| h.instrument == instrument)
             .filter(|h| !consumed.contains_key(&h.contract_id))
-            .filter(|h| now.duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
+            .filter(|h| now.saturating_duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
             .max_by(|a, b| {
                 a.amount
                     .cmp(&b.amount)
@@ -355,17 +373,17 @@ impl HoldingsCache {
             .filter(|h| !consumed.contains_key(&h.contract_id))
             .filter(|h| Some(&h.contract_id) != splitter_cid.as_ref())
             .filter(|h| h.amount >= lo && h.amount < hi)
-            .count() as u32;
+            .count();
+        let existing = u32::try_from(existing).unwrap_or(u32::MAX);
 
-        let pending: u32 = self
+        let pending = self
             .pending_splits
             .read()
             .await
             .iter()
             .filter(|p| p.instrument == instrument && !p.is_expired(now))
             .filter(|p| p.denom >= lo && p.denom < hi)
-            .map(|p| p.count)
-            .sum();
+            .fold(0u32, |acc, p| acc.saturating_add(p.count));
 
         existing.saturating_add(pending)
     }
@@ -395,7 +413,7 @@ impl HoldingsCache {
         let mut pending = self.pending_splits.write().await;
         let before = pending.len();
         pending.retain(|p| p.recorded_at >= snapshot_start);
-        let removed = before - pending.len();
+        let removed = before.saturating_sub(pending.len());
         if removed > 0 {
             debug!("Cleared {} pending-split entr(ies) confirmed by ACS snapshot", removed);
         }
@@ -408,7 +426,7 @@ impl HoldingsCache {
         let now = Instant::now();
         let mut ops = self.split_op_times.write().await;
         let entry = ops.entry(instrument.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t).as_secs() < SPLIT_OP_WINDOW_SECS);
+        entry.retain(|t| now.saturating_duration_since(*t).as_secs() < SPLIT_OP_WINDOW_SECS);
         entry.push(now);
     }
 
@@ -422,7 +440,7 @@ impl HoldingsCache {
             .get(instrument)
             .map(|ops| {
                 ops.iter()
-                    .filter(|t| now.duration_since(**t).as_secs() < SPLIT_OP_WINDOW_SECS)
+                    .filter(|t| now.saturating_duration_since(**t).as_secs() < SPLIT_OP_WINDOW_SECS)
                     .copied()
                     .collect()
             })
@@ -470,7 +488,7 @@ impl HoldingsCache {
             return None;
         }
         let target = if is_cc {
-            amount * Decimal::new(102, 2) + Decimal::ONE
+            amount.checked_mul(Decimal::new(102, 2))?.checked_add(Decimal::ONE)?
         } else {
             amount
         };
@@ -702,7 +720,7 @@ impl HoldingsCache {
         let mut reserved = self.reserved.write().await;
         let before = reserved.len();
         reserved.retain(|_, entry| !entry.is_expired(now));
-        let removed = before - reserved.len();
+        let removed = before.saturating_sub(reserved.len());
         if removed > 0 {
             info!("Cleaned up {} expired holding reservations", removed);
         }
@@ -718,7 +736,7 @@ impl HoldingsCache {
         let available = self.available.read().await;
         let consumed = self.consumed.read().await;
         let reserved = self.reserved.read().await;
-        available
+        let amounts = available
             .values()
             .filter(|h| h.instrument == instrument)
             .filter(|h| !consumed.contains_key(&h.contract_id))
@@ -728,8 +746,8 @@ impl HoldingsCache {
                 }
                 _ => true,
             })
-            .map(|h| h.amount)
-            .sum()
+            .map(|h| h.amount);
+        total_or_max(instrument, amounts)
     }
 
     /// Total amount [`Self::select_for_disclosure_with`] could actually cover
@@ -758,7 +776,7 @@ impl HoldingsCache {
         let mut amounts: Vec<Decimal> = available
             .values()
             .filter(|h| h.instrument == instrument)
-            .filter(|h| now.duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
+            .filter(|h| now.saturating_duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
             .filter(|h| !consumed.contains_key(&h.contract_id))
             .filter(|h| match reserved.get(&h.contract_id) {
                 Some(entry) => entry.is_expired(now),
@@ -769,7 +787,7 @@ impl HoldingsCache {
             .map(|h| h.amount)
             .collect();
         amounts.sort_unstable_by(|a, b| b.cmp(a));
-        amounts.into_iter().take(max_inputs).sum()
+        total_or_max(instrument, amounts.into_iter().take(max_inputs))
     }
 
     /// Contract-ids that WOULD be selectable for disclosure (fresh, unconsumed,
@@ -792,7 +810,7 @@ impl HoldingsCache {
         let mut pending: Vec<&CachedHolding> = available
             .values()
             .filter(|h| h.instrument == instrument)
-            .filter(|h| now.duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
+            .filter(|h| now.saturating_duration_since(h.discovered_at).as_secs() <= AVAILABLE_TTL_SECS)
             .filter(|h| !consumed.contains_key(&h.contract_id))
             .filter(|h| match reserved.get(&h.contract_id) {
                 Some(entry) => entry.is_expired(now),
@@ -820,7 +838,7 @@ impl HoldingsCache {
             .values()
             .filter(|h| h.instrument == instrument)
             .filter(|h| {
-                if now.duration_since(h.discovered_at).as_secs() > AVAILABLE_TTL_SECS {
+                if now.saturating_duration_since(h.discovered_at).as_secs() > AVAILABLE_TTL_SECS {
                     return false;
                 }
                 if consumed.contains_key(&h.contract_id) {
@@ -866,7 +884,7 @@ impl HoldingsCache {
                 Some(entry) if !entry.is_expired(now)
             );
             if is_reserved {
-                reserved_count += 1;
+                reserved_count = reserved_count.saturating_add(1);
             }
             out.push((h.amount, is_reserved));
         }
@@ -877,6 +895,14 @@ impl HoldingsCache {
     pub async fn get(&self, cid: &str) -> Option<CachedHolding> {
         self.available.read().await.get(cid).cloned()
     }
+}
+
+/// Sum of holding amounts, or `Decimal::MAX` with a warning when it overflows.
+fn total_or_max(instrument: &str, amounts: impl IntoIterator<Item = Decimal>) -> Decimal {
+    dec_sum(amounts).unwrap_or_else(|| {
+        warn!("{instrument}: holdings total exceeds the Decimal range; reporting the maximum");
+        Decimal::MAX
+    })
 }
 
 /// Smallest-single-fit, else greedy largest-first (capped) + tighten-last.
@@ -900,7 +926,7 @@ fn select_from(
             break;
         }
         picks.push(h.clone());
-        total += h.amount;
+        total = total.checked_add(h.amount)?;
         if total >= target {
             break;
         }
@@ -911,21 +937,60 @@ fn select_from(
 
     // Tighten-last: replace the last (smallest) pick with the smallest single
     // holding covering the residual — near-optimal at minimal count.
-    if picks.len() >= 2 {
-        let last = picks.last().cloned()
-            .expect("picks.len() >= 2 checked above");
-        let residual = target - (total - last.amount);
-        let picked_cids: std::collections::HashSet<&str> =
-            picks[..picks.len() - 1].iter().map(|h| h.contract_id.as_str()).collect();
-        if let Some(replacement) = selectable_asc.iter().find(|h| {
-            h.amount >= residual && !picked_cids.contains(h.contract_id.as_str())
-        }) {
-            let n = picks.len();
-            picks[n - 1] = replacement.clone();
-        }
+    let replacement = match picks.split_last() {
+        Some((last, rest)) if !rest.is_empty() => total
+            .checked_sub(last.amount)
+            .and_then(|others| target.checked_sub(others))
+            .and_then(|residual| {
+                let picked_cids: std::collections::HashSet<&str> =
+                    rest.iter().map(|h| h.contract_id.as_str()).collect();
+                selectable_asc
+                    .iter()
+                    .find(|h| h.amount >= residual && !picked_cids.contains(h.contract_id.as_str()))
+                    .cloned()
+            }),
+        _ => None,
+    };
+    if let (Some(replacement), Some(last)) = (replacement, picks.last_mut()) {
+        *last = replacement;
     }
 
     Some(picks)
+}
+
+/// Releases reserved holdings when dropped, also on unwind or cancellation,
+/// unless `disarm` hands them back first.
+pub(crate) struct ReservationGuard {
+    cache: Arc<HoldingsCache>,
+    cids: Vec<String>,
+}
+
+impl ReservationGuard {
+    pub(crate) fn new(cache: Arc<HoldingsCache>, cids: Vec<String>) -> Self {
+        Self { cache, cids }
+    }
+
+    pub(crate) fn cids(&self) -> &[String] {
+        &self.cids
+    }
+
+    /// The reserved ids; the caller now settles the reservation itself.
+    pub(crate) fn disarm(mut self) -> Vec<String> {
+        std::mem::take(&mut self.cids)
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.cids.is_empty() {
+            return;
+        }
+        let cache = Arc::clone(&self.cache);
+        let cids = std::mem::take(&mut self.cids);
+        let _ = agent_logic::supervise::try_spawn("reservation release", async move {
+            cache.release_reservations(&cids).await;
+        });
+    }
 }
 
 // ============================================================================
@@ -1496,6 +1561,24 @@ mod tests {
         assert!(cids.contains("old"));
     }
 
+    // The refresh used to prune `consumed` before taking `available`, so one
+    // cancelled in between made a spent holding selectable again
+    #[tokio::test]
+    async fn a_cancelled_snapshot_refresh_changes_nothing() {
+        let cache = HoldingsCache::new(false);
+        cache.add_created(vec![holding("spent", USDC, "10", true)]).await;
+        cache.mark_consumed(&["spent".to_string()], "settled").await;
+        {
+            let _reader = cache.available.read().await;
+            let refresh = cache.refresh_from_acs_snapshot(Vec::new(), Instant::now());
+            let waited = tokio::time::timeout(std::time::Duration::from_millis(50), refresh).await;
+            assert!(waited.is_err(), "the refresh waits for the reader and is then dropped");
+        }
+        assert!(cache.get_selectable(USDC, false).await.is_empty(), "the spent holding stays unselectable");
+        cache.refresh_from_acs_snapshot(Vec::new(), Instant::now()).await;
+        assert_eq!(cache.stats(USDC).await, (0, 0, 0, 0), "a finished refresh prunes both pools");
+    }
+
     #[tokio::test]
     async fn count_in_band_counts_existence_not_usability() {
         let Some(stale_at) = stale_instant() else { return };
@@ -1700,5 +1783,60 @@ mod tests {
         assert_eq!(flag_for("20"), Some(true));
         assert_eq!(flag_for("12"), Some(false));
         assert_eq!(flag_for("60"), Some(false));
+    }
+
+    // Totals beyond the Decimal range report the maximum instead of panicking
+    #[tokio::test]
+    async fn totals_beyond_the_decimal_range_report_the_maximum() {
+        let cache = HoldingsCache::new(false);
+        let huge = "50000000000000000000000000000";
+        cache.add_created(vec![holding("a", USDC, huge, true), holding("b", USDC, huge, true)]).await;
+        assert_eq!(cache.total_available_amount(USDC).await, Decimal::MAX);
+        assert_eq!(cache.selectable_blob_ready_total(USDC, 10, true).await, Decimal::MAX);
+    }
+
+    #[tokio::test]
+    async fn selections_beyond_the_decimal_range_find_nothing() {
+        let cache = HoldingsCache::new(false);
+        let cc = CC_INSTRUMENT.to_string();
+        assert!(cache.select_for_disclosure(&cc, Decimal::MAX, 10, true).await.is_none());
+        let huge = "50000000000000000000000000000";
+        let picks = [holding("a", USDC, huge, true), holding("b", USDC, huge, true)];
+        assert!(select_from(&picks, Decimal::MAX, 5).is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_split_counts_saturate() {
+        let cache = HoldingsCache::new(false);
+        cache.record_pending_split(USDC, &[(Decimal::ONE, u32::MAX), (Decimal::ONE, 5)]).await;
+        assert_eq!(cache.count_in_band(USDC, Decimal::ONE, Decimal::TWO).await, u32::MAX);
+    }
+
+    // The guard releases on unwind, and keeps the reservation once disarmed
+    #[tokio::test]
+    async fn a_reservation_guard_releases_on_unwind_unless_disarmed() {
+        let cache = HoldingsCache::new(false);
+        let cids = vec!["x".to_string()];
+        assert!(cache.reserve_split(&cids, "job").await);
+        let guard = ReservationGuard::new(Arc::clone(&cache), cids.clone());
+        let unwound = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("worker failed");
+        })
+        .await;
+        assert!(unwound.is_err());
+        for _ in 0..100 {
+            if cache.stats(USDC).await.2 == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.stats(USDC).await.2, 0, "released by the guard");
+
+        assert!(cache.reserve_split(&cids, "job").await);
+        let kept = ReservationGuard::new(Arc::clone(&cache), cids.clone()).disarm();
+        assert_eq!(kept, cids);
+        tokio::task::yield_now().await;
+        assert_eq!(cache.stats(USDC).await.2, 1, "a disarmed guard leaves it to the caller");
     }
 }

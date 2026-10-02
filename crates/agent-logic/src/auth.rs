@@ -53,15 +53,17 @@ pub fn generate_jwt_with_branch(
     // Minimal claims for external auth
     let mut claims = serde_json::json!({
         "sub": party_id,
-        "exp": now + ttl_secs,
+        "exp": now.saturating_add(ttl_secs),
         "iat": now,
         "role": role,
     });
-    if let Some(nn) = node_name {
-        claims["node_name"] = serde_json::Value::String(nn.to_string());
-    }
-    if let Some(branch) = venue_branch.filter(|b| !b.is_empty()) {
-        claims["venue_branch"] = serde_json::Value::String(branch.to_string());
+    if let Some(obj) = claims.as_object_mut() {
+        if let Some(nn) = node_name {
+            obj.insert("node_name".to_string(), serde_json::Value::String(nn.to_string()));
+        }
+        if let Some(branch) = venue_branch.filter(|b| !b.is_empty()) {
+            obj.insert("venue_branch".to_string(), serde_json::Value::String(branch.to_string()));
+        }
     }
 
     let signing_key = SigningKey::from_bytes(private_key_bytes);
@@ -108,7 +110,7 @@ pub fn generate_jwt_with_branch(
 pub fn is_valid_venue_branch(s: &str) -> bool {
     let b = s.as_bytes();
     (2..=20).contains(&b.len())
-        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.first().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
@@ -142,15 +144,15 @@ pub fn get_public_key_hex(private_key_bytes: &[u8; 32]) -> String {
 /// Extract user ID (sub claim) from a JWT token
 pub fn extract_user_id_from_jwt(jwt: &str) -> Result<String> {
     let parts: Vec<&str> = jwt.split('.').collect();
-    if parts.len() != 3 {
+    let [_, payload, _] = parts.as_slice() else {
         return Err(anyhow!(
             "Invalid JWT format: expected 3 parts separated by '.', got {}",
             parts.len()
         ));
-    }
+    };
 
     let payload_bytes = URL_SAFE_NO_PAD
-        .decode(parts[1])
+        .decode(payload)
         .map_err(|e| anyhow!("Failed to decode JWT payload: {}", e))?;
 
     let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
@@ -218,6 +220,32 @@ mod tests {
         assert!(jwt.contains('.'));
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
+    }
+
+    fn claims_of(jwt: &str) -> serde_json::Value {
+        let payload = jwt.split('.').nth(1).unwrap();
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_maximal_ttl_saturates_the_expiry() {
+        let jwt = generate_jwt("p", "trader", &[3u8; 32], u64::MAX, None).unwrap();
+        assert_eq!(claims_of(&jwt)["exp"], serde_json::json!(u64::MAX));
+    }
+
+    #[test]
+    fn optional_claims_are_added_and_the_subject_reads_back() {
+        let jwt =
+            generate_jwt_with_branch("p::1", "trader", &[3u8; 32], 60, Some("node"), Some("agent")).unwrap();
+        let claims = claims_of(&jwt);
+        assert_eq!(claims["node_name"], "node");
+        assert_eq!(claims["venue_branch"], "agent");
+        assert_eq!(extract_user_id_from_jwt(&jwt).unwrap(), "p::1");
+        let blank = generate_jwt_with_branch("p", "trader", &[3u8; 32], 60, None, Some("")).unwrap();
+        assert!(claims_of(&blank).get("venue_branch").is_none());
+        for bad in ["", "a.b", "a.b.c.d"] {
+            assert!(extract_user_id_from_jwt(bad).unwrap_err().to_string().contains("expected 3 parts"));
+        }
     }
 
     /// VA13: the client-side slug rule must match the server's, so a bad

@@ -7,12 +7,15 @@
 //! The server tracks full settlement status — we only persist the
 //! agent-side state needed for verification and deduplication.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
 use tracing::{error, info, warn};
 
+use crate::clock;
 use crate::liquidity::SavedTokenFlow;
 
 /// Current state file format version
@@ -145,6 +148,29 @@ pub struct SavedFillState {
     pub filled_total: f64,
     pub remaining: f64,
     pub round: u32,
+    /// A round whose settle may have committed when the loop stopped.
+    #[serde(default)]
+    pub unresolved: Option<UnresolvedRound>,
+}
+
+/// A fill round of unknown outcome; a restart must resolve it before quoting.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnresolvedRound {
+    pub kind: UnresolvedKind,
+    /// The V1 proposal id or the atomic quote id.
+    pub id: String,
+    /// The round's base quantity.
+    pub qty: f64,
+}
+
+/// How an unresolved round was settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnresolvedKind {
+    /// A V1 multicall.
+    V1,
+    /// An atomic settle.
+    Atomic,
 }
 
 impl SavedState {
@@ -152,7 +178,7 @@ impl SavedState {
     pub fn new(party_id: String, start_time_ms: u64) -> Self {
         Self {
             version: STATE_VERSION,
-            saved_at: chrono::Utc::now().to_rfc3339(),
+            saved_at: clock::now_utc().to_rfc3339(),
             party_id,
             start_time_ms,
             completed_proposals: Vec::new(),
@@ -169,13 +195,49 @@ impl SavedState {
     }
 }
 
-/// Save state to a JSON file atomically (write to .tmp, then rename)
+/// Save state to a JSON file atomically (write to .tmp, then rename); the file
+/// and its directory are synced, so a reported save survives a host crash.
 pub fn save_state(path: &Path, state: &SavedState) -> Result<()> {
+    save_state_with(path, state, std::fs::File::sync_all)
+}
+
+fn save_state_with(
+    path: &Path,
+    state: &SavedState,
+    sync_file: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
     let json = serde_json::to_string_pretty(state)?;
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)?;
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(json.as_bytes())?;
+    // A save that is not durable is reported as failed
+    sync_file(&file)?;
+    drop(file);
     std::fs::rename(&tmp_path, path)?;
+    sync_dir(parent_dir(path))?;
     info!("State saved to {}", path.display());
+    Ok(())
+}
+
+/// The directory holding `path`; "." for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        // Some filesystems cannot sync a directory
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported) => Ok(()),
+        other => other,
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -196,7 +258,7 @@ pub fn save_backup(path: &Path, state: &SavedState) {
     }
 
     // Use ISO8601 timestamp with colons replaced by dashes for filesystem safety
-    let timestamp = chrono::Utc::now()
+    let timestamp = clock::now_utc()
         .format("%Y-%m-%dT%H-%M-%SZ")
         .to_string();
     let backup_path = backup_dir.join(format!("agent-state-{}.json", timestamp));
@@ -257,6 +319,29 @@ pub fn load_state(path: &Path) -> Option<SavedState> {
     }
 }
 
+/// Load the state file; only a missing file is `None`. A file that cannot be read
+/// or parsed, or of another version, is an error that names it and shows no content.
+pub fn load_state_strict(path: &Path) -> Result<Option<SavedState>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("cannot read state file {}: {}", path.display(), e)),
+    };
+    let state: SavedState = serde_json::from_str(&data).map_err(|e| {
+        let what = match e.classify() {
+            Category::Syntax => "a syntax error",
+            Category::Data => "a missing field or a value of the wrong type",
+            Category::Eof => "an unexpected end",
+            Category::Io => "a read error",
+        };
+        anyhow!("state file {} does not parse: {} at line {} column {}", path.display(), what, e.line(), e.column())
+    })?;
+    if state.version != STATE_VERSION {
+        anyhow::bail!("state file {} has version {}, expected {}", path.display(), state.version, STATE_VERSION);
+    }
+    Ok(Some(state))
+}
+
 /// Prune stale data from state before saving to disk.
 ///
 /// Removes orders, proposals, and RFQ trades that are no longer needed.
@@ -274,7 +359,7 @@ pub fn prune_state(state: &mut SavedState) {
         .iter()
         .map(|so| so.proposal_id.as_str())
         .collect();
-    let cutoff_ms = chrono::Utc::now().timestamp_millis() as u64 - (24 * 3600 * 1000);
+    let cutoff_ms = clock::now_millis().saturating_sub(24 * 3600 * 1000);
 
     // Fix stale pending_quantity on orders not backed by a settlement_order
     let mut pending_fixed = 0usize;
@@ -283,7 +368,7 @@ pub fn prune_state(state: &mut SavedState) {
             && !referenced_order_ids.contains(&order.order_id)
         {
             order.pending_quantity = "0".to_string();
-            pending_fixed += 1;
+            pending_fixed = pending_fixed.saturating_add(1);
         }
     }
 
@@ -294,18 +379,16 @@ pub fn prune_state(state: &mut SavedState) {
             || referenced_order_ids.contains(&o.order_id)
             || o.nonce > cutoff_ms
     });
-    let orders_pruned = orders_before - state.orders.len();
+    let orders_pruned = orders_before.saturating_sub(state.orders.len());
 
     // Cap dedup sets at 1000 (appended chronologically, drain oldest from front)
     const MAX_DEDUP_SET: usize = 1000;
     let completed_before = state.completed_proposals.len();
-    if state.completed_proposals.len() > MAX_DEDUP_SET {
-        let drain_count = state.completed_proposals.len() - MAX_DEDUP_SET;
+    if let Some(drain_count) = completed_before.checked_sub(MAX_DEDUP_SET) {
         state.completed_proposals.drain(..drain_count);
     }
     let rejected_before = state.rejected_proposals.len();
-    if state.rejected_proposals.len() > MAX_DEDUP_SET {
-        let drain_count = state.rejected_proposals.len() - MAX_DEDUP_SET;
+    if let Some(drain_count) = rejected_before.checked_sub(MAX_DEDUP_SET) {
         state.rejected_proposals.drain(..drain_count);
     }
 
@@ -321,10 +404,10 @@ pub fn prune_state(state: &mut SavedState) {
 
     // Drop V2 quotes whose signed window (+ a generous grace) has passed —
     // the on-ledger window check makes a late settle impossible.
-    let now_micros = chrono::Utc::now().timestamp_micros();
+    let now_micros = clock::now_micros_i64();
     state
         .pending_v2_quotes
-        .retain(|q| q.valid_until_micros + 120_000_000 > now_micros);
+        .retain(|q| q.valid_until_micros.saturating_add(120_000_000) > now_micros);
 
     info!(
         "State pruned: orders {}->{} (removed {}, fixed {} stale pending), \
@@ -403,6 +486,7 @@ mod tests {
             filled_total: 50.0,
             remaining: 50.0,
             round: 5,
+            unresolved: Some(UnresolvedRound { kind: UnresolvedKind::V1, id: "p-5".to_string(), qty: 10.0 }),
         });
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -424,11 +508,26 @@ mod tests {
         assert_eq!(fill.filled_total, 50.0);
         assert_eq!(fill.remaining, 50.0);
         assert_eq!(fill.round, 5);
+        let marker = fill.unresolved.unwrap();
+        assert_eq!((marker.kind, marker.id.as_str(), marker.qty), (UnresolvedKind::V1, "p-5", 10.0));
+        assert!(json.contains("\"kind\": \"v1\""), "{json}");
+    }
+
+    // A fill state saved before the unresolved-round marker existed still loads
+    #[test]
+    fn a_fill_state_without_the_marker_loads() {
+        let old = r#"{"direction":"sell","market_id":"CC-USDC","total_amount":10.0,"filled_total":4.0,"remaining":6.0,"round":2}"#;
+        let fill: SavedFillState = serde_json::from_str(old).unwrap();
+        assert_eq!((fill.round, fill.unresolved), (2, None));
+        let atomic = r#"{"direction":"buy","market_id":"M","total_amount":1.0,"filled_total":0.0,"remaining":1.0,"round":1,
+            "unresolved":{"kind":"atomic","id":"q-1","qty":0.5}}"#;
+        let fill: SavedFillState = serde_json::from_str(atomic).unwrap();
+        assert_eq!(fill.unresolved, Some(UnresolvedRound { kind: UnresolvedKind::Atomic, id: "q-1".to_string(), qty: 0.5 }));
     }
 
     #[test]
     fn test_save_and_load_state() {
-        let dir = std::env::temp_dir().join("silvana-test-state");
+        let dir = std::env::temp_dir().join(format!("silvana-test-state-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test-state.json");
 
@@ -446,6 +545,82 @@ mod tests {
         assert!(load_state(&path).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh directory for one test, removed when dropped.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("silvana-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_bare_file_name_is_synced_in_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("agent-state.json")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("run/agent-state.json")), Path::new("run"));
+    }
+
+    // A save used to report success while its data could still be lost to a host crash
+    #[test]
+    fn a_save_that_cannot_be_synced_fails_and_keeps_the_previous_file() {
+        let dir = TestDir::new("state-sync");
+        let path = dir.0.join("agent-state.json");
+        save_state(&path, &SavedState::new("old-party".to_string(), 1)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let refused = |_: &std::fs::File| Err(std::io::Error::other("sync refused"));
+        let err = save_state_with(&path, &SavedState::new("new-party".to_string(), 2), refused).unwrap_err();
+        assert!(err.to_string().contains("sync refused"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let synced = std::cell::Cell::new(0u32);
+        let counted = |f: &std::fs::File| {
+            synced.set(synced.get() + 1);
+            f.sync_all()
+        };
+        save_state_with(&path, &SavedState::new("new-party".to_string(), 2), counted).unwrap();
+        assert_eq!(synced.get(), 1);
+        assert_eq!(load_state(&path).unwrap().party_id, "new-party");
+    }
+
+    // A state file that could not be read used to load as no state at all
+    #[test]
+    fn a_strict_load_fails_on_anything_but_a_missing_file() {
+        let dir = TestDir::new("state-strict");
+        let path = dir.0.join("agent-state.json");
+        assert!(load_state_strict(&path).unwrap().is_none());
+        save_state(&path, &SavedState::new("party".to_string(), 3)).unwrap();
+        assert_eq!(load_state_strict(&path).unwrap().unwrap().start_time_ms, 3);
+
+        std::fs::write(&path, r#"{"version": 1, "party_id": "probe-value",}"#).unwrap();
+        let err = load_state_strict(&path).err().unwrap().to_string();
+        assert!(err.contains("agent-state.json") && err.contains("syntax error at line 1"), "{err}");
+        assert!(!err.contains("probe-value"), "{err}");
+
+        let mut wrong = serde_json::to_value(SavedState::new("party".to_string(), 3)).unwrap();
+        wrong["start_time_ms"] = serde_json::json!("probe-value");
+        std::fs::write(&path, wrong.to_string()).unwrap();
+        let err = load_state_strict(&path).err().unwrap().to_string();
+        assert!(err.contains("wrong type") && !err.contains("probe-value"), "{err}");
+
+        let mut newer = serde_json::to_value(SavedState::new("party".to_string(), 3)).unwrap();
+        newer["version"] = serde_json::json!(99);
+        std::fs::write(&path, newer.to_string()).unwrap();
+        assert!(load_state_strict(&path).err().unwrap().to_string().contains("version 99"));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_state_strict(&path).err().unwrap().to_string().contains("cannot read state file"));
     }
 
     #[test]
@@ -604,6 +779,22 @@ mod tests {
         // Accepted RFQ trades: only active one kept
         assert_eq!(state.accepted_rfq_trades.len(), 1);
         assert_eq!(state.accepted_rfq_trades[0].proposal_id, "prop-active");
+    }
+
+    #[test]
+    fn prune_keeps_live_v2_quotes_and_drops_expired_ones_at_the_extremes() {
+        let quote = |id: &str, valid_until_micros: i64| SavedPendingV2 {
+            quote_id: id.to_string(),
+            market_id: "CC-USDCx".to_string(),
+            holding_cids: Vec::new(),
+            ticket_id: String::new(),
+            valid_until_micros,
+        };
+        let mut state = SavedState::new("test-party".to_string(), 0);
+        state.pending_v2_quotes = vec![quote("far", i64::MAX), quote("gone", i64::MIN), quote("old", 1)];
+        prune_state(&mut state);
+        let kept: Vec<&str> = state.pending_v2_quotes.iter().map(|q| q.quote_id.as_str()).collect();
+        assert_eq!(kept, ["far"]);
     }
 
     // Legacy state files predate the `reserved` flag: those entries all had

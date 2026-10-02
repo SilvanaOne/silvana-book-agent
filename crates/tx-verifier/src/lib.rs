@@ -9,9 +9,14 @@
 //! - On hash MISMATCH: WARN + return sentinel (caller falls back to server hash)
 //! - Always `accepted: true` — never blocks transactions during debugging
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 pub mod decode;
 pub mod hasher;
 pub mod inspector;
+#[cfg(test)]
+mod test_support;
+mod text;
 pub mod types;
 
 pub use types::{InspectionResult, OperationExpectation, VerificationResult};

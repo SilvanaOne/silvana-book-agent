@@ -7,6 +7,8 @@
 //! serialized through a PaymentQueue to avoid LOCKED_CONTRACTS race conditions.
 //! Operations that don't use amulets (propose_dvp, accept_dvp) run concurrently.
 
+#![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -72,17 +74,18 @@ pub fn bucket_by_usd(
     h.priced = true;
     for (amount, _reserved) in holdings {
         let usd = amount.to_f64().unwrap_or(0.0) * price;
-        if usd < 10.0 {
-            h.under_10 += 1;
+        let bucket = if usd < 10.0 {
+            &mut h.under_10
         } else if usd < 20.0 {
-            h.b10_20 += 1;
+            &mut h.b10_20
         } else if usd < 50.0 {
-            h.b20_50 += 1;
+            &mut h.b20_50
         } else if usd < 100.0 {
-            h.b50_100 += 1;
+            &mut h.b50_100
         } else {
-            h.over_100 += 1;
-        }
+            &mut h.over_100
+        };
+        *bucket = bucket.saturating_add(1);
     }
     h
 }
@@ -114,6 +117,7 @@ pub struct CloudSettlementBackend {
 }
 
 impl CloudSettlementBackend {
+    /// Fails on invalid payment worker limits or outside a tokio runtime.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: BaseConfig,
@@ -125,15 +129,8 @@ impl CloudSettlementBackend {
         liquidity_manager: Arc<LiquidityManager>,
         shutdown: Shutdown,
         cache: Arc<HoldingsCache>,
-    ) -> Self {
-        // Spawn ACS worker to refresh the holdings cache and update liquidity manager
-        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown.clone());
-
-        // NOTE: the merge worker is spawned by the caller (lib.rs), not here — it
-        // needs the per-instrument SplitInstrument set (CC + the utility ladders),
-        // which is only built after this constructor runs. The LP/RFQ-v2 path
-        // spawns an all-instrument merge; the fill path spawns a CC-only merge.
-
+    ) -> Result<Self> {
+        // Built first so invalid worker limits fail before any task starts
         let payment_queue = PaymentQueue::new(
             config.clone(),
             verbose,
@@ -143,9 +140,18 @@ impl CloudSettlementBackend {
             confirm_lock.clone(),
             cache.cc(),
             shutdown.clone(),
-        );
+        )?;
+
+        // Spawn ACS worker to refresh the holdings cache and update liquidity manager
+        spawn_acs_worker(config.clone(), cache.clone(), liquidity_manager.clone(), shutdown.clone())?;
+
+        // NOTE: the merge worker is spawned by the caller (lib.rs), not here — it
+        // needs the per-instrument SplitInstrument set (CC + the utility ladders),
+        // which is only built after this constructor runs. The LP/RFQ-v2 path
+        // spawns an all-instrument merge; the fill path spawns a CC-only merge.
+
         let amulet_cache = cache.cc();
-        Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, mid_prices: None, shutdown }
+        Ok(Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, mid_prices: None, shutdown })
     }
 
     /// Wire the RfqHandler's shared mid-price map so the LIQUIDITY heartbeat can
@@ -312,14 +318,11 @@ impl SettlementBackend for CloudSettlementBackend {
         self.payment_queue.shutdown();
     }
 
-    fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
-        // Use block_in_place since stats() is async (holds read locks)
-        Some(tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.amulet_cache.stats())
-        }))
+    async fn cache_stats(&self) -> Option<(usize, usize, usize, usize)> {
+        Some(self.amulet_cache.stats().await)
     }
 
-    fn holdings_histogram(&self, token: &str) -> Option<HoldingsHistogram> {
+    async fn holdings_histogram(&self, token: &str) -> Option<HoldingsHistogram> {
         let mid_prices = self.mid_prices.clone()?;
         // Map the LiquidityManager token symbol to the HoldingsCache key: "CC"
         // for Amulet, else instrument_key(registry, on_chain_id).
@@ -332,14 +335,8 @@ impl SettlementBackend for CloudSettlementBackend {
             }
             instrument_key(&registry, &on_chain_id)
         };
-        // block_in_place: the cache reads + price read are async (hold locks).
-        let (total, reserved, holdings, usd_price) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let (t, r, hs) = self.holdings_cache.holdings_for_instrument(&cache_key).await;
-                let price = token_usd_price(&mid_prices, token).await;
-                (t, r, hs, price)
-            })
-        });
+        let (total, reserved, holdings) = self.holdings_cache.holdings_for_instrument(&cache_key).await;
+        let usd_price = token_usd_price(&mid_prices, token).await;
         Some(bucket_by_usd(total, reserved, &holdings, usd_price))
     }
 
@@ -439,3 +436,37 @@ mod histogram_tests {
         assert_eq!(hist.under_10 + hist.b10_20 + hist.b20_50 + hist.b50_100 + hist.over_100, 0);
     }
 }
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    // Heartbeat stats work on a current-thread runtime, where block_in_place panics
+    #[tokio::test]
+    async fn heartbeat_stats_work_on_a_current_thread_runtime() {
+        let shutdown = Shutdown::new();
+        let mids = Arc::new(RwLock::new(HashMap::from([(
+            "CC-USDCx".to_string(),
+            agent_logic::pool_impact::MarketMid { mid: 0.1, pool_depth: None },
+        )])));
+        let backend = CloudSettlementBackend::new(
+            BaseConfig::test_minimal().unwrap(),
+            false,
+            false,
+            false,
+            false,
+            agent_logic::confirm::new_confirm_lock(),
+            LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0),
+            shutdown.clone(),
+            HoldingsCache::new(false),
+        )
+        .unwrap()
+        .with_mid_prices(mids);
+        assert_eq!(backend.cache_stats().await, Some((0, 0, 0, 0)));
+        let histogram = backend.holdings_histogram(CC_INSTRUMENT).await.unwrap();
+        assert!(histogram.priced);
+        assert_eq!(histogram.total, 0);
+        shutdown.signal();
+    }
+}
+

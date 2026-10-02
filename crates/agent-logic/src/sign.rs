@@ -2,9 +2,11 @@
 //!
 //! Used by both `orderbook-agent` and `orderbook-cloud-agent`.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
+use rand::RngCore;
+use zeroize::Zeroize;
 
 use crate::config::decode_private_key;
 
@@ -54,19 +56,64 @@ pub fn sign_binary(signing_key: &SigningKey, hex_input: &str) -> Result<String> 
 }
 
 /// Generate a new Ed25519 keypair. Returns (private_key_base58, public_key_base58).
-pub fn generate_keypair() -> (String, String) {
-    use rand::rngs::OsRng;
+pub fn generate_keypair() -> Result<(String, String)> {
+    generate_keypair_with(&mut rand::rngs::OsRng)
+}
 
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
+fn generate_keypair_with<R: RngCore>(rng: &mut R) -> Result<(String, String)> {
+    let mut seed = [0u8; 32];
+    if let Err(e) = rng.try_fill_bytes(&mut seed) {
+        seed.zeroize();
+        return Err(anyhow!("random source failed: {e}"));
+    }
+    let signing_key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
 
-    // Encode full 64-byte keypair (32-byte seed + 32-byte public key) as base58
-    let mut keypair_bytes = [0u8; 64];
-    keypair_bytes[..32].copy_from_slice(signing_key.as_bytes());
-    keypair_bytes[32..].copy_from_slice(verifying_key.as_bytes());
+    // Full 64-byte keypair (32-byte seed + 32-byte public key) as base58
+    let mut keypair_bytes = signing_key.to_keypair_bytes();
     let private_key_b58 = bs58::encode(&keypair_bytes).into_string();
+    keypair_bytes.zeroize();
 
-    let public_key_b58 = bs58::encode(verifying_key.as_bytes()).into_string();
+    let public_key_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
 
-    (private_key_b58, public_key_b58)
+    Ok((private_key_b58, public_key_b58))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingRng;
+
+    impl RngCore for FailingRng {
+        fn next_u32(&mut self) -> u32 {
+            0
+        }
+        fn next_u64(&mut self) -> u64 {
+            0
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), rand::Error> {
+            Err(rand::Error::new(std::io::Error::other("no entropy")))
+        }
+    }
+
+    #[test]
+    fn a_failing_random_source_is_an_error() {
+        let err = generate_keypair_with(&mut FailingRng).unwrap_err();
+        assert!(err.to_string().contains("random source failed"), "{err}");
+    }
+
+    #[test]
+    fn a_generated_keypair_round_trips() {
+        let (private_b58, public_b58) = generate_keypair().unwrap();
+        let seed = decode_private_key(&private_b58).unwrap();
+        let derived = SigningKey::from_bytes(&seed).verifying_key();
+        assert_eq!(bs58::encode(derived.as_bytes()).into_string(), public_b58);
+        let full = bs58::decode(&private_b58).into_vec().unwrap();
+        assert_eq!(full.get(32..), Some(derived.as_bytes().as_slice()));
+        assert_ne!(generate_keypair().unwrap().0, private_b58);
+    }
 }

@@ -28,6 +28,8 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::rpc_client::OrderbookRpcClient;
+use crate::transport::{self, ChannelOpts};
+use crate::{clock, sync};
 
 /// Buffered events before `try_send` drops (diagnostic trail, not ledger).
 const BUFFER_EVENTS: usize = 1024;
@@ -37,6 +39,26 @@ const FLUSH_MAX_EVENTS: usize = 50;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Rate limit for drop/flush-failure warnings.
 const WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Bounds on one flush: batching window, reconnect, and the ReportErrors call.
+#[derive(Clone, Copy, Debug)]
+struct FlushBounds {
+    interval: Duration,
+    connect: Duration,
+    rpc: Duration,
+}
+
+const FLUSH_BOUNDS: FlushBounds = FlushBounds {
+    interval: FLUSH_INTERVAL,
+    connect: ChannelOpts {
+        connect: transport::CONNECT_TIMEOUT,
+        tls: transport::TLS_HANDSHAKE_TIMEOUT,
+        request: None,
+        keepalive: true,
+    }
+    .connect_budget(),
+    rpc: transport::RPC_TIMEOUT,
+};
 
 /// Fresh-JWT provider for the flusher (agent JWTs are short-TTL).
 pub type JwtSource = Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>;
@@ -57,12 +79,12 @@ pub fn init(orderbook_url: String, jwt_source: JwtSource) {
     // Spawn the flusher FIRST, so REPORTER is only ever set once a receiver
     // exists. If there is no runtime, `spawn` would panic — guard on it and
     // stay uninstalled rather than leave a senders-only Reporter behind.
-    if tokio::runtime::Handle::try_current().is_err() {
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("error reporter init called outside a tokio runtime — not installed");
         return;
-    }
+    };
     let (tx, rx) = mpsc::channel(BUFFER_EVENTS);
-    let handle = tokio::spawn(run_flusher(orderbook_url, jwt_source, rx));
+    let handle = rt.spawn(run_flusher(orderbook_url, jwt_source, rx, FLUSH_BOUNDS));
     if REPORTER
         .set(Reporter {
             tx,
@@ -100,7 +122,7 @@ pub fn init_from_config(config: &crate::config::BaseConfig) {
             crate::auth::generate_jwt(
                 &party_id,
                 &role,
-                &private_key.expose(),
+                &*private_key.expose()?,
                 token_ttl_secs,
                 Some(node_name.as_str()),
             )
@@ -112,16 +134,15 @@ pub fn init_from_config(config: &crate::config::BaseConfig) {
 /// caller; silent no-op before `init()`.
 pub fn report(event: ErrorEvent) {
     let Some(r) = REPORTER.get() else { return };
+    report_to(r, event);
+}
+
+fn report_to(r: &Reporter, event: ErrorEvent) {
     if r.tx.try_send(event).is_err() {
-        let n = r.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        // Poison-safe: this is the one panicking path in a function
-        // documented "never fails the caller", and it runs on the sync
-        // submission path (ledger_health, ledger_client) — reuse a poisoned
-        // guard rather than propagate the panic.
-        let mut warn_at = r
-            .last_warn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = r.dropped.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        // Poison-tolerant: this runs on the sync submission path
+        // (ledger_health, ledger_client) and must never fail the caller.
+        let mut warn_at = sync::lock(&r.last_warn);
         if warn_at.is_none_or(|t| t.elapsed() >= WARN_EVERY) {
             *warn_at = Some(Instant::now());
             warn!(
@@ -132,13 +153,18 @@ pub fn report(event: ErrorEvent) {
     }
 }
 
-async fn run_flusher(url: String, jwt_source: JwtSource, mut rx: mpsc::Receiver<ErrorEvent>) {
+async fn run_flusher(
+    url: String,
+    jwt_source: JwtSource,
+    mut rx: mpsc::Receiver<ErrorEvent>,
+    bounds: FlushBounds,
+) {
     let mut client: Option<OrderbookRpcClient> = None;
     let mut last_warn: Option<Instant> = None;
     loop {
         let Some(first) = rx.recv().await else { return };
         let mut batch = vec![first];
-        let deadline = tokio::time::Instant::now() + FLUSH_INTERVAL;
+        let deadline = clock::deadline_after(bounds.interval);
         while batch.len() < FLUSH_MAX_EVENTS {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(event)) => batch.push(event),
@@ -149,16 +175,21 @@ async fn run_flusher(url: String, jwt_source: JwtSource, mut rx: mpsc::Receiver<
 
         // Connect lazily (the tonic channel is process-cached, so this is
         // cheap after the first success) and refresh the short-TTL JWT.
-        if client.is_none() {
-            match OrderbookRpcClient::connect(&url, None).await {
-                Ok(c) => client = Some(c),
-                Err(e) => {
+        let c = match client {
+            Some(ref mut c) => c,
+            None => match tokio::time::timeout(bounds.connect, OrderbookRpcClient::connect(&url, None)).await {
+                Ok(Ok(c)) => client.insert(c),
+                Ok(Err(e)) => {
                     warn_rate_limited(&mut last_warn, &format!("connect failed: {e:#}"), batch.len());
                     continue; // batch dropped, never re-queued
                 }
-            }
-        }
-        let c = client.as_mut().expect("client just ensured");
+                Err(_) => {
+                    let msg = format!("connect failed: (Unavailable) connect to {url} timed out after {:?}", bounds.connect);
+                    warn_rate_limited(&mut last_warn, &msg, batch.len());
+                    continue;
+                }
+            },
+        };
         match jwt_source() {
             Ok(jwt) => c.set_jwt(jwt),
             Err(e) => {
@@ -168,7 +199,14 @@ async fn run_flusher(url: String, jwt_source: JwtSource, mut rx: mpsc::Receiver<
         }
 
         let n = batch.len();
-        match c.report_errors(batch).await {
+        let reported = match tokio::time::timeout(bounds.rpc, c.report_errors(batch)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "ReportErrors RPC failed (Unavailable): client deadline {:?} exceeded",
+                bounds.rpc
+            )),
+        };
+        match reported {
             Ok((_accepted, rejected)) if rejected > 0 => {
                 // The server rate-limited some events (party/venue window) —
                 // visible ONLY here, since a partial-accept is not an RPC
@@ -176,7 +214,7 @@ async fn run_flusher(url: String, jwt_source: JwtSource, mut rx: mpsc::Receiver<
                 warn_rate_limited(
                     &mut last_warn,
                     &format!("server rejected {rejected} of {n} error reports (rate-limited)"),
-                    rejected as usize,
+                    usize::try_from(rejected).unwrap_or(usize::MAX),
                 );
             }
             Ok(_) => {}
@@ -215,7 +253,7 @@ pub struct ErrorEventBuilder {
 
 impl ErrorEventBuilder {
     pub fn new(error_type: &str, error_message: impl Into<String>) -> Self {
-        let now = chrono::Utc::now();
+        let now = clock::now_utc();
         Self {
             event: ErrorEvent {
                 source: "agent".to_string(),
@@ -224,7 +262,7 @@ impl ErrorEventBuilder {
                 error_message: error_message.into(),
                 occurred_at: Some(prost_types::Timestamp {
                     seconds: now.timestamp(),
-                    nanos: now.timestamp_subsec_nanos() as i32,
+                    nanos: i32::try_from(now.timestamp_subsec_nanos()).unwrap_or(0),
                 }),
                 ..Default::default()
             },
@@ -299,12 +337,16 @@ fn json_to_prost_struct(value: &serde_json::Value) -> Option<prost_types::Struct
     let serde_json::Value::Object(map) = value else {
         return None;
     };
-    Some(prost_types::Struct {
+    Some(map_to_prost_struct(map))
+}
+
+fn map_to_prost_struct(map: &serde_json::Map<String, serde_json::Value>) -> prost_types::Struct {
+    prost_types::Struct {
         fields: map
             .iter()
             .map(|(k, v)| (k.clone(), json_to_prost_value(v)))
             .collect(),
-    })
+    }
 }
 
 fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
@@ -317,9 +359,7 @@ fn json_to_prost_value(value: &serde_json::Value) -> prost_types::Value {
         serde_json::Value::Array(items) => Kind::ListValue(prost_types::ListValue {
             values: items.iter().map(json_to_prost_value).collect(),
         }),
-        serde_json::Value::Object(_) => Kind::StructValue(
-            json_to_prost_struct(value).expect("object checked above"),
-        ),
+        serde_json::Value::Object(map) => Kind::StructValue(map_to_prost_struct(map)),
     };
     prost_types::Value { kind: Some(kind) }
 }
@@ -351,5 +391,98 @@ mod tests {
         let meta = e.metadata.expect("metadata");
         assert!(meta.fields.contains_key("attempts"));
         assert!(meta.fields.contains_key("op"));
+    }
+
+    #[test]
+    fn nested_objects_and_lists_convert() {
+        use prost_types::value::Kind;
+        let e = ErrorEventBuilder::new("t", "m")
+            .metadata(serde_json::json!({"outer": {"inner": [1, {"deep": true}]}}))
+            .build();
+        let fields = e.metadata.unwrap().fields;
+        let Some(Kind::StructValue(outer)) = fields["outer"].kind.clone() else { panic!("outer") };
+        let Some(Kind::ListValue(list)) = outer.fields["inner"].kind.clone() else { panic!("inner") };
+        assert_eq!(list.values[0].kind, Some(Kind::NumberValue(1.0)));
+        let Some(Kind::StructValue(deep)) = list.values[1].kind.clone() else { panic!("deep") };
+        assert_eq!(deep.fields["deep"].kind, Some(Kind::BoolValue(true)));
+        assert!(ErrorEventBuilder::new("t", "m").metadata(serde_json::json!([1])).build().metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_buffer_with_a_saturated_drop_count_does_not_panic() {
+        let (tx, _rx) = mpsc::channel(1);
+        let r = Reporter { tx, dropped: AtomicU64::new(u64::MAX), last_warn: Mutex::new(None) };
+        report_to(&r, ErrorEvent::default());
+        report_to(&r, ErrorEvent::default());
+        assert_eq!(r.dropped.load(Ordering::Relaxed), 0, "the counter wraps instead of panicking");
+    }
+
+    mod flusher {
+        use super::super::*;
+        use std::convert::Infallible;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll};
+        use tonic::codegen::http;
+
+        /// Counts calls and never answers them.
+        #[derive(Clone, Default)]
+        struct SilentSettlement(Arc<AtomicUsize>);
+
+        impl tonic::server::NamedService for SilentSettlement {
+            const NAME: &'static str = "silvana.settlement.v1.SettlementService";
+        }
+
+        impl<B> tonic::codegen::Service<http::Request<B>> for SilentSettlement
+        where
+            B: tonic::codegen::Body + Send + 'static,
+            B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+        {
+            type Response = http::Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = tonic::codegen::BoxFuture<Self::Response, Infallible>;
+
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _: http::Request<B>) -> Self::Future {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }
+        }
+
+        async fn wait_for(calls: &AtomicUsize, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while calls.load(Ordering::SeqCst) < n {
+                assert!(Instant::now() < deadline, "flush {n} never reached the server");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // A hung ReportErrors call ends at the flush bound, so later batches still go out
+        #[tokio::test]
+        async fn a_hung_report_does_not_stall_later_flushes() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = SilentSettlement::default();
+            let calls = server.0.clone();
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(server)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let bounds = FlushBounds {
+                interval: Duration::from_millis(10),
+                connect: Duration::from_secs(5),
+                rpc: Duration::from_millis(200),
+            };
+            let (tx, rx) = mpsc::channel(8);
+            let flusher = tokio::spawn(run_flusher(url, Arc::new(|| Ok("jwt".to_string())), rx, bounds));
+            tx.send(ErrorEvent::default()).await.unwrap();
+            wait_for(&calls, 1).await;
+            tx.send(ErrorEvent::default()).await.unwrap();
+            wait_for(&calls, 2).await;
+            flusher.abort();
+        }
     }
 }
