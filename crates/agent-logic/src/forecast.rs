@@ -7,16 +7,8 @@
 //! than the shortest timer period. Mainnet ran for days with a coefficient
 //! frozen at its startup value because of exactly that.
 //!
-//! Two independent pause thresholds protect against sequencer overload:
-//!
-//! 1. **Traffic fees** are paused when forecast is LOW (coefficient < 0.6).
-//!    LOW means the featured app is generating heavy sequencer load, so
-//!    traffic fee transactions would likely hit SEQUENCER_BACKPRESSURE errors.
-//!
-//! 2. **Normal fees** (DVP/allocation) are paused when the predicted coefficient
-//!    drops below `SEQUENCER_OVERLOAD_THRESHOLD` (default 0.5).  This is a more
-//!    severe threshold — at this level the sequencer is extremely overloaded and
-//!    even normal fee transactions would hit SEQUENCER_BACKPRESSURE.
+//! A LOW forecast widens RFQ spreads 2x; a coefficient below `SEQUENCER_OVERLOAD_THRESHOLD`
+//! (default 0.5) widens them 3x, and 0.1 below it RFQs are rejected.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -40,10 +32,10 @@ static FORECAST_COEFFICIENT: Mutex<Option<String>> = Mutex::new(None);
 /// The initial 0 is 0.0.
 static FORECAST_COEFF_BITS: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the previous forecast was LOW (for detecting traffic pause transitions).
+/// Whether the previous forecast was LOW (for detecting transitions).
 static WAS_LOW: AtomicBool = AtomicBool::new(false);
 
-/// Whether fees were previously paused by overload (for detecting transitions).
+/// Whether the previous coefficient was below the overload threshold (for detecting transitions).
 static WAS_OVERLOADED: AtomicBool = AtomicBool::new(false);
 
 /// Epoch-seconds of the last `update_forecast` that carried a prediction.
@@ -111,9 +103,7 @@ const POLL_FAILURES_BEFORE_WARN: u32 = 3;
 /// transport than an expired token.
 const POLL_FAILURES_BEFORE_RECONNECT: u32 = 5;
 
-/// Predicted coefficient threshold below which normal fees are paused.
-/// When the coefficient drops below this, the sequencer is extremely overloaded
-/// and fee transactions would hit SEQUENCER_BACKPRESSURE errors.
+/// Predicted coefficient below which the sequencer counts as overloaded.
 static OVERLOAD_THRESHOLD: LazyLock<f64> = LazyLock::new(|| {
     std::env::var("SEQUENCER_OVERLOAD_THRESHOLD")
         .ok()
@@ -121,9 +111,7 @@ static OVERLOAD_THRESHOLD: LazyLock<f64> = LazyLock::new(|| {
         .unwrap_or(0.5)
 });
 
-/// Update the global forecast state.  Logs warn on transition to LOW
-/// (traffic paused) and info on transition away from LOW (traffic resumed).
-/// Also tracks overload threshold for normal fee pausing.
+/// Update the global forecast state and log the LOW and overload transitions.
 pub fn update_forecast(forecast_value: i32, coefficient: Option<String>) {
     let prev_low = WAS_LOW.load(Ordering::Relaxed);
     let now_low = forecast_value == 1; // ISSUANCE_FORECAST_LOW
@@ -139,53 +127,43 @@ pub fn update_forecast(forecast_value: i32, coefficient: Option<String>) {
     *sync::lock(&FORECAST_COEFFICIENT) = coefficient;
     LAST_UPDATE_EPOCH_SECS.store(clock::now_secs(), Ordering::Relaxed);
 
-    // Traffic fee pause transitions (LOW threshold)
+    // LOW transitions
     if now_low && !prev_low {
-        warn!("Issuance forecast LOW — pausing traffic fee processing (heavy sequencer load expected)");
+        warn!("Issuance forecast LOW — widening RFQ spreads 2x (heavy sequencer load expected)");
         WAS_LOW.store(true, Ordering::Relaxed);
     } else if !now_low && prev_low {
         info!(
-            "Issuance forecast {} — resuming traffic fee processing",
+            "Issuance forecast {} — LOW spread widening off",
             forecast_label()
         );
         WAS_LOW.store(false, Ordering::Relaxed);
     }
 
-    // Normal fee overload transitions (SEQUENCER_OVERLOAD_THRESHOLD)
+    // Overload transitions (SEQUENCER_OVERLOAD_THRESHOLD)
     let prev_overloaded = WAS_OVERLOADED.load(Ordering::Relaxed);
     let now_overloaded = coeff_f64 > 0.0 && coeff_f64 < *OVERLOAD_THRESHOLD;
     if now_overloaded && !prev_overloaded {
         warn!(
-            "Predicted coefficient {:.4} below overload threshold {:.2} — pausing normal fee processing",
+            "Predicted coefficient {:.4} below overload threshold {:.2} — widening RFQ spreads 3x",
             coeff_f64, *OVERLOAD_THRESHOLD
         );
         WAS_OVERLOADED.store(true, Ordering::Relaxed);
     } else if !now_overloaded && prev_overloaded {
         info!(
-            "Predicted coefficient {:.4} above overload threshold {:.2} — resuming normal fee processing",
+            "Predicted coefficient {:.4} above overload threshold {:.2} — overload spread widening off",
             coeff_f64, *OVERLOAD_THRESHOLD
         );
         WAS_OVERLOADED.store(false, Ordering::Relaxed);
     }
 }
 
-/// Returns `true` when traffic fees should be paused.
-///
-/// Traffic fees are paused when the issuance forecast is LOW because a low
-/// coefficient means the featured app is generating heavy transaction volume
-/// on the sequencer, so traffic fee transactions would likely hit
-/// SEQUENCER_BACKPRESSURE errors.
-pub fn is_traffic_paused_by_forecast() -> bool {
+/// Whether the issuance forecast is LOW (heavy sequencer load expected).
+pub fn is_forecast_low() -> bool {
     FORECAST.load(Ordering::Relaxed) == 1
 }
 
-/// Returns `true` when normal fees should be paused due to sequencer overload.
-///
-/// Normal fees (DVP/allocation PayFee) are paused when the predicted coefficient
-/// drops below `SEQUENCER_OVERLOAD_THRESHOLD` (default 0.5).  At this level
-/// the sequencer is extremely overloaded and fee transactions would hit
-/// SEQUENCER_BACKPRESSURE errors.
-pub fn is_fees_paused_by_overload() -> bool {
+/// Whether the predicted coefficient is below `SEQUENCER_OVERLOAD_THRESHOLD` (default 0.5).
+pub fn is_sequencer_overloaded() -> bool {
     let coeff = coefficient_value();
     coeff > 0.0 && coeff < *OVERLOAD_THRESHOLD
 }
@@ -411,7 +389,7 @@ mod tests {
         update_forecast(3, Some("0.9".to_string()));
         assert_eq!(forecast_coefficient().as_deref(), Some("0.9"));
         assert!((coefficient_value() - 0.9).abs() < 1e-9);
-        assert!(!is_fees_paused_by_overload());
+        assert!(!is_sequencer_overloaded());
         assert!(!is_rfq_rejected_by_overload());
         assert_eq!(forecast_label(), "high");
     }

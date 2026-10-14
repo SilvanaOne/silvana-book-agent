@@ -169,7 +169,7 @@ pub fn unhealthy_duration_ms() -> u64 {
 ///
 /// `SEQUENCER_BACKPRESSURE` is deliberately EXCLUDED: it is transient congestion
 /// (the ledger is up), already handled by the graduated forecast RFQ gate and
-/// the fee-pause `signal_sequencer_backpressure` mechanism. Tripping the hard
+/// the background pause of `signal_sequencer_backpressure`. Tripping the hard
 /// ledger-wide breaker on it would needlessly dark all quoting for the cooldown.
 ///
 /// Matching is case-insensitive so both the gRPC status token (`UNAVAILABLE`)
@@ -306,7 +306,7 @@ mod tests {
         assert!(!is_sequencer_unreachable("DA.Exception.PreconditionFailed / PRECONDITION_FAILED"));
         assert!(!is_sequencer_unreachable("DUPLICATE_COMMAND"));
         // Backpressure is transient congestion (ledger up) — handled by the
-        // fee-pause + forecast gate, must NOT trip the hard breaker.
+        // background pause + forecast gates, must NOT trip the hard breaker.
         assert!(!is_sequencer_unreachable(
             "Status { message: SEQUENCER_BACKPRESSURE: too many requests }"
         ));

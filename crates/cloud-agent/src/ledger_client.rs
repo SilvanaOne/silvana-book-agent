@@ -126,22 +126,8 @@ impl SubmitBudget {
     }
 }
 
-/// Duration in seconds to pause regular fee dispatch after SEQUENCER_BACKPRESSURE.
-static FEE_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
-    std::env::var("FEE_PAUSE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10)
-});
-
-/// Duration in seconds to pause background housekeeping after
-/// SEQUENCER_BACKPRESSURE.
-///
-/// Deliberately much longer than `FEE_PAUSE_SECS`: background work (today, the
-/// DvpProposal GC) has no deadline whatsoever, so it should be the last thing to
-/// resume competing for sequencer slots. This is the same deadline the on-chain
-/// CC traffic fees used before traffic billing moved off-chain — a low-priority
-/// class of transaction that yields to settlements under congestion.
+/// Seconds to pause background housekeeping (the DvpProposal GC) after SEQUENCER_BACKPRESSURE;
+/// it has no deadline, so it is the last work to resume competing for sequencer slots.
 static BACKGROUND_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
     std::env::var("BACKGROUND_PAUSE_SECS")
         .ok()
@@ -149,20 +135,12 @@ static BACKGROUND_PAUSE_SECS: Lazy<u64> = Lazy::new(|| {
         .unwrap_or(60)
 });
 
-/// Epoch millis after which regular fee dispatch may resume.
-static FEE_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
-
 /// Epoch millis after which background housekeeping may resume.
 static BACKGROUND_PAUSE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Record a backpressure event — pauses regular fees for FEE_PAUSE_SECS
-/// and background housekeeping for BACKGROUND_PAUSE_SECS.
+/// Record a backpressure event: pauses background housekeeping for BACKGROUND_PAUSE_SECS.
 pub fn signal_sequencer_backpressure() {
     let now_ms = clock::now_millis();
-
-    let fee_resume_at = resume_at_ms(now_ms, *FEE_PAUSE_SECS);
-    FEE_PAUSE_UNTIL_MS.fetch_max(fee_resume_at, AtomicOrdering::Relaxed);
-
     let background_resume_at = resume_at_ms(now_ms, *BACKGROUND_PAUSE_SECS);
     BACKGROUND_PAUSE_UNTIL_MS.fetch_max(background_resume_at, AtomicOrdering::Relaxed);
 }
@@ -182,12 +160,6 @@ fn pause_remaining(until_ms: &AtomicU64) -> Option<u64> {
         return None;
     }
     remaining_secs(resume_at, clock::now_millis())
-}
-
-/// Check whether regular fees are currently paused due to sequencer backpressure.
-/// Returns Some(remaining_secs) if paused, None if not.
-pub fn fee_pause_remaining() -> Option<u64> {
-    pause_remaining(&FEE_PAUSE_UNTIL_MS)
 }
 
 /// Check whether background housekeeping is currently paused due to sequencer
@@ -1185,11 +1157,11 @@ impl DAppProviderClient {
             if !result.success {
                 let error_msg = result.error_message.as_deref().unwrap_or("unknown error");
 
-                // SEQUENCER_BACKPRESSURE: signal fee pause regardless of retry outcome
+                // SEQUENCER_BACKPRESSURE: pause background housekeeping regardless of retry outcome
                 if error_msg.contains("SEQUENCER_BACKPRESSURE") {
                     warn!(
-                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing fees {}s / background {}s [{}]",
-                        attempt_no, max_retries, *FEE_PAUSE_SECS, *BACKGROUND_PAUSE_SECS, prepared.command_id
+                        "SEQUENCER_BACKPRESSURE detected (attempt {}/{}), pausing background {}s [{}]",
+                        attempt_no, max_retries, *BACKGROUND_PAUSE_SECS, prepared.command_id
                     );
                     signal_sequencer_backpressure();
 
@@ -2686,10 +2658,10 @@ mod backpressure_pause_tests {
         assert!(!is_background_op(TransactionOperation::Unspecified as i32));
     }
 
-    /// One test, not several: the two deadlines are process-global, so separate
-    /// tests would race each other through `signal_sequencer_backpressure`.
-    #[test]
-    fn backpressure_arms_both_pauses_and_background_outlasts_fees() {
+    /// One test, not several: the deadline is process-global, so separate tests
+    /// would race each other through `signal_sequencer_backpressure`.
+    #[tokio::test]
+    async fn backpressure_arms_the_background_pause() {
         assert_eq!(
             background_pause_remaining(),
             None,
@@ -2698,15 +2670,31 @@ mod backpressure_pause_tests {
 
         signal_sequencer_backpressure();
 
-        let fee = fee_pause_remaining().expect("fee pause armed");
         let background = background_pause_remaining().expect("background pause armed");
-        assert!(
-            background >= fee,
-            "deadline-free work must be the last to resume competing for \
-             sequencer slots: background {}s < fees {}s",
-            background,
-            fee,
-        );
+        assert!(background > 0 && background <= *BACKGROUND_PAUSE_SECS, "{background}s");
+
+        // The off-chain fee spends no ledger traffic, so the pause does not hold it back
+        let fake = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let mut config = agent_logic::config::BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = fake.url.clone();
+        let shutdown = agent_logic::shutdown::Shutdown::new();
+        let queue = crate::payment_queue::PaymentQueue::new(
+            config,
+            false,
+            false,
+            false,
+            false,
+            agent_logic::confirm::new_confirm_lock(),
+            crate::holdings_cache::HoldingsCache::new(false).cc(),
+            shutdown.clone(),
+        )
+        .unwrap();
+        let paid = tokio::time::timeout(Duration::from_secs(5), queue.submit_pay_fee("p1", "dvp")).await;
+        shutdown.signal();
+        let prepared = fake.calls("PreparePayFee");
+        fake.stop().await;
+        assert!(paid.is_ok(), "the fee is not held back by backpressure");
+        assert_eq!(prepared, 1);
     }
 }
 

@@ -304,13 +304,12 @@ cloud-agent --quote-private-key <HEX> agent
 
 #### Sequencer congestion (advanced)
 
-None of these are written by `onboard`; the defaults are what production runs. They tune how the agent yields sequencer capacity when the Global Synchronizer is busy. Work is shed in priority order — RFQ quoting first, then fees, then background housekeeping — so that settlements already in flight keep their slots.
+None of these are written by `onboard`; the defaults are what production runs. They tune how the agent yields sequencer capacity when the Global Synchronizer is busy. Work is shed lowest priority first: background housekeeping (the DvpProposal GC) yields first and resumes last, and RFQ quoting is throttled last — spreads widen below `SEQUENCER_OVERLOAD_THRESHOLD` and new RFQs are rejected 0.1 below it — so that settlements already in flight keep their slots. In-flight settlement steps, including the off-chain processing fees, are never paused.
 
 | Variable                            | Default | Description                                                                                                       |
 | ----------------------------------- | :-----: | ----------------------------------------------------------------------------------------------------------------- |
-| `FEE_PAUSE_SECS`                    |  `10`   | How long fee dispatch pauses after a `SEQUENCER_BACKPRESSURE` reply                                                 |
-| `BACKGROUND_PAUSE_SECS`             |  `60`   | How long deadline-free background work (DvpProposal GC) pauses after the same reply. Longer on purpose: it is the last thing that should resume competing for slots |
-| `SEQUENCER_OVERLOAD_THRESHOLD`      |  `0.5`  | Predicted issuance coefficient below which fees pause. RFQs are rejected 0.1 below this                             |
+| `BACKGROUND_PAUSE_SECS`             |  `60`   | How long deadline-free background work (DvpProposal GC) pauses after a `SEQUENCER_BACKPRESSURE` reply. It is the last thing that should resume competing for slots |
+| `SEQUENCER_OVERLOAD_THRESHOLD`      |  `0.5`  | Predicted issuance coefficient below which RFQ spreads widen 3x. RFQs are rejected 0.1 below this                  |
 | `FORECAST_POLL_SECS`                |  `30`   | Issuance-forecast poll interval, 1–3600; any other value stops startup. A dead poller freezes every gate above, so this doubles as its liveness signal |
 | `LEDGER_UNHEALTHY_FAILURE_THRESHOLD`|   `3`   | Consecutive sequencer-unreachable failures that dark quoting. Backpressure is deliberately excluded — the ledger is up, just congested |
 | `LEDGER_UNHEALTHY_COOLDOWN_SECS`    |  `60`   | How long quoting stays dark after the breaker trips, 0–86400; any other value stops startup                         |

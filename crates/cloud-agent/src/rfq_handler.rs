@@ -405,9 +405,9 @@ impl RfqHandler {
         // at 1x so the market always quotes its raw configured spread.
         let spread_multiplier = if rfq_config.disable_overload_spread_widening {
             1.0
-        } else if agent_logic::forecast::is_fees_paused_by_overload() {
+        } else if agent_logic::forecast::is_sequencer_overloaded() {
             3.0
-        } else if agent_logic::forecast::is_traffic_paused_by_forecast() {
+        } else if agent_logic::forecast::is_forecast_low() {
             2.0
         } else {
             1.0
@@ -1262,18 +1262,13 @@ mod price_rfq_tests {
 
     /// `disable_overload_spread_widening` pins the spread at its raw configured
     /// value under real sequencer overload, while an unflagged market still
-    /// widens 3x. Coefficient 0.45 ∈ [0.4, 0.5) triggers fee-overload (3x
+    /// widens 3x. Coefficient 0.45 ∈ [0.4, 0.5) triggers overload (3x
     /// multiplier) WITHOUT tripping the RFQ-reject threshold (0.4). Safe with
     /// concurrent tests: they use zero spreads (0 × 3 = 0) or a negative spread
     /// (stress-gated to raw), so a transient global overload cannot move them.
-    /// Serializes the tests that read or flip the PROCESS-GLOBAL overload
-    /// forecast (`agent_logic::forecast`), so one test's overload window can
-    /// never widen another test's positive-spread quote mid-assertion.
-    static OVERLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[tokio::test]
     async fn disable_overload_widening_pins_raw_spread() {
-        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _overload_guard = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let lp_config: LiquidityProviderConfig =
             serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
         // Same bid spread on both markets; only the flag differs. The absent
@@ -1302,7 +1297,7 @@ mod price_rfq_tests {
         };
 
         agent_logic::forecast::update_forecast(0, Some("0.45".to_string()));
-        assert!(agent_logic::forecast::is_fees_paused_by_overload(), "0.45 < 0.5 must count as overload");
+        assert!(agent_logic::forecast::is_sequencer_overloaded(), "0.45 < 0.5 must count as overload");
         assert!(!agent_logic::forecast::is_rfq_rejected_by_overload(), "0.45 >= 0.4 must still quote");
 
         // direction 2 = user sells → LP bids mid - bid_spread. 1000 EDELx ≈ $13 clears the floor.
@@ -1310,7 +1305,7 @@ mod price_rfq_tests {
         let widened_bid = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "", true, None, None, None).await;
         // Reset global overload state BEFORE asserting so a failure cannot leak it.
         agent_logic::forecast::update_forecast(0, None);
-        assert!(!agent_logic::forecast::is_fees_paused_by_overload());
+        assert!(!agent_logic::forecast::is_sequencer_overloaded());
 
         let pinned_bid = match pinned_bid {
             Ok(p) => p,
@@ -1342,7 +1337,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn venue_override_changes_spread_for_matching_venue_only() {
         // Positive spread ⇒ overload-sensitive ⇒ hold the global-state lock.
-        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _overload_guard = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = handler_with_overrides(
             r#"[{"venue":"walley","rfq":{"offer_spread_percent":2.0}}]"#,
         );
@@ -1370,7 +1365,7 @@ mod price_rfq_tests {
     /// `disable_overload_widening_pins_raw_spread`.
     #[tokio::test]
     async fn venue_override_pins_widening_for_matching_venue() {
-        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _overload_guard = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let lp_config: LiquidityProviderConfig =
             serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
         // Pair has NO disable flags — widens 3x under overload by default.
@@ -1396,7 +1391,7 @@ mod price_rfq_tests {
         };
 
         agent_logic::forecast::update_forecast(0, Some("0.45".to_string()));
-        assert!(agent_logic::forecast::is_fees_paused_by_overload());
+        assert!(agent_logic::forecast::is_sequencer_overloaded());
 
         // direction 2 = user sells → LP bids mid - bid_spread.
         let pinned = handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true, Some("walley"), None, None).await;
@@ -1540,7 +1535,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn no_depth_and_shadow_are_byte_identical_to_legacy() {
         // dir=2 prices the POSITIVE 2.55 bid spread ⇒ overload-sensitive.
-        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _overload_guard = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Legacy = section enabled but no depth arriving (the pre-A3 server).
         let legacy = impact_handler(true, false);
         let shadow = impact_handler(false, true);
@@ -1569,7 +1564,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn round_trip_ends_with_fresh_counterparty_pricing() {
         // dir=2 legs price the POSITIVE bid spread ⇒ overload-sensitive.
-        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _overload_guard = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut h = impact_handler(true, true);
         let t = tracker();
         h.net_positions = Some(t.clone());
@@ -1660,7 +1655,7 @@ mod price_rfq_tests {
     #[tokio::test]
     async fn sell_side_sign_conventions() {
         // dir=2 prices the POSITIVE bid spread ⇒ overload-sensitive.
-        let _overload_guard = OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _overload_guard = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut h = impact_handler(true, true);
         let t = tracker();
         h.net_positions = Some(t.clone());
