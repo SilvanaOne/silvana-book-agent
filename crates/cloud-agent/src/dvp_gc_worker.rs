@@ -28,8 +28,7 @@
 //! The two are complements, not duplicates: (2) is a forecast that avoids the
 //! congestion, (1) is the observed fact that we are already in it. Cancelling an
 //! expired proposal has no deadline of any kind, so it is the first work that
-//! should yield its sequencer slot to settlements and the last to resume — which
-//! is why the background pause is several times longer than the fee pause.
+//! should yield its sequencer slot to settlements and the last to resume.
 //!
 //! The coefficient half makes this worker dependent on
 //! `agent_logic::forecast::spawn_forecast_poller` keeping the coefficient
@@ -605,7 +604,7 @@ async fn await_gate<C: Fn() -> f64, P: Fn() -> Option<u64>>(
 /// Separate "the sequencer is genuinely busy" from "nothing has updated this
 /// number in hours". Only the first is a reason to wait quietly; the second
 /// means every consumer of the coefficient in this process — the RFQ overload
-/// gates and the fee-dispatch pause, not just this worker — is deciding on a
+/// gates, not just this worker — is deciding on a
 /// frozen value, and needs a human.
 fn warn_if_forecast_stale(coeff: f64) {
     match agent_logic::forecast::forecast_age_secs() {

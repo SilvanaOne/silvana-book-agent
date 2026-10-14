@@ -649,7 +649,7 @@ pub async fn run_cloud_agent(
     let lp_shutdown = Shutdown::new();
 
     // Issuance forecast poller — keeps the process-global coefficient fresh for
-    // the RFQ overload gates, the fee-dispatch pause and the DvpProposal GC.
+    // the RFQ overload gates and the DvpProposal GC.
     // Spawned BEFORE the GC so the GC's first cycle (~2s later) reads a real
     // coefficient rather than the 0.0 default. Idempotent, so the runner may
     // call it again for embedders that bypass this function.

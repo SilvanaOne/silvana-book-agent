@@ -1329,11 +1329,8 @@ where
                     };
                     let pause_str = {
                         let mut parts = Vec::new();
-                        if let Some(secs) = settlement_executor.fee_pause_secs() {
-                            parts.push(format!("FEES PAUSED {}s", secs));
-                        }
-                        if crate::forecast::is_fees_paused_by_overload() {
-                            parts.push("FEES PAUSED (sequencer overload)".to_string());
+                        if crate::forecast::is_sequencer_overloaded() {
+                            parts.push("SEQUENCER OVERLOAD".to_string());
                         }
                         if let Some(secs) = settlement_executor.background_pause_secs() {
                             parts.push(format!("CANCELS PAUSED {}s", secs));

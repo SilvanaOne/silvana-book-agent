@@ -10,6 +10,9 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::http;
 use tonic::{Response, Status};
 
+/// Held by tests that set the process-wide forecast in `agent_logic::forecast` or whose result it changes.
+pub(crate) static OVERLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A second live dispatcher keeps callsite interest from being cached as "never".
 fn keep_callsite_interest() {
     static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();

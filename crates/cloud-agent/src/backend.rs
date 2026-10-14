@@ -3,9 +3,8 @@
 //! Implements `SettlementBackend` by calling the DAppProviderService gRPC proxy
 //! instead of accessing Canton ledger directly.
 //!
-//! All amulet-touching operations (pay_fee, allocate, transfer_traffic_fee) are
-//! serialized through a PaymentQueue to avoid LOCKED_CONTRACTS race conditions.
-//! Operations that don't use amulets (propose_dvp, accept_dvp) run concurrently.
+//! Allocations (amulet selection) and the off-chain processing fees go through a
+//! PaymentQueue; propose_dvp and accept_dvp run concurrently.
 
 #![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 
@@ -342,10 +341,6 @@ impl SettlementBackend for CloudSettlementBackend {
 
     fn worker_utilization(&self) -> Option<(u64, usize, u64, usize)> {
         Some(self.payment_queue.worker_utilization())
-    }
-
-    fn fee_pause_secs(&self) -> Option<u64> {
-        self.payment_queue.fee_pause_secs()
     }
 
     fn background_pause_secs(&self) -> Option<u64> {

@@ -106,7 +106,8 @@ const PAYMENT_WAIT: Duration = Duration::from_secs(600);
 /// Worker timeouts in a row after which the shared channel is rebuilt.
 const CHANNEL_REBUILD_AFTER: u32 = 3;
 
-/// Delay when no payment can be processed (insufficient amulets)
+/// Delay when no payment could be dispatched (no amulets, a reservation race or
+/// a full worker pool).
 const SCHEDULER_BACKOFF_SECS: u64 = 5;
 
 /// A payment worker running longer than this (the submit budget plus room for its
@@ -368,12 +369,6 @@ impl PaymentQueue {
         )
     }
 
-    /// Check if regular fees are paused due to sequencer backpressure.
-    /// Returns Some(remaining_secs) if paused, None if not.
-    pub fn fee_pause_secs(&self) -> Option<u64> {
-        crate::ledger_client::fee_pause_remaining()
-    }
-
     /// Scheduler: picks payments, selects amulets, reserves, spawns workers
     #[allow(clippy::too_many_arguments)]
     async fn scheduler(
@@ -469,41 +464,20 @@ impl PaymentQueue {
             // Try to dispatch as many payments as possible
             let mut deferred: Vec<QueuedPayment> = Vec::new();
             let mut dispatched_any = false;
-            let mut allocation_deferred = false;
 
             while let Some(item) = heap.pop() {
                 let Some((item, estimated_cc)) = screen(item) else {
                     continue;
                 };
-                let item_priority = item.priority;
-
-                // Skip non-allocations if an allocation was already deferred —
-                // don't let fees consume amulets that allocations need
-                if allocation_deferred && item_priority != PaymentPriority::High {
-                    deferred.push(item);
-                    continue;
-                }
-
-                // Check if fees are paused (sequencer backpressure or forecast)
-                let fees_paused = crate::ledger_client::fee_pause_remaining().is_some()
-                    || agent_logic::forecast::is_fees_paused_by_overload();
-
-                // Skip sync PayFee while fees paused
-                if item_priority == PaymentPriority::Normal && fees_paused {
-                    if matches!(&item.request, PaymentRequest::PayFee { .. }) {
-                        deferred.push(item);
-                        continue;
-                    }
-                }
-
-                let selectable = cache.get_selectable_amulets().await;
 
                 let is_allocation = matches!(
                     &item.request,
                     PaymentRequest::Allocate { allocation_cc: Some(_), .. }
                 );
-                // Off-chain PayFee needs no amulets — only CC allocations select.
+                // Off-chain PayFee needs no amulets and spends no ledger traffic, so
+                // neither sequencer load nor an allocation short of amulets holds it back.
                 let selected = if is_allocation {
+                    let selectable = cache.get_selectable_amulets().await;
                     let mut sel = select_amulets_for_allocation(&selectable, estimated_cc);
                     if sel.is_empty() {
                         // Splitter-reserve fail-open: v1 settle success outranks
@@ -527,11 +501,6 @@ impl PaymentQueue {
                 if (selected.is_empty() || insufficient_allocation) && estimated_cc > Decimal::ZERO {
                     // Not enough amulets — defer this payment (kept until success)
                     deferred.push(item);
-                    // If allocation can't get amulets, block lower-priority items
-                    // so freed amulets go to allocations first
-                    if item_priority == PaymentPriority::High {
-                        allocation_deferred = true;
-                    }
                     continue;
                 }
 
@@ -595,7 +564,7 @@ impl PaymentQueue {
             // If nothing was dispatched and heap is non-empty, backoff before retrying
             if !dispatched_any && !heap.is_empty() {
                 debug!(
-                    "Scheduler: {} payments deferred (insufficient selectable amulets), backing off {}s",
+                    "Scheduler: {} payments deferred (no amulets or worker slot), backing off {}s",
                     heap.len(),
                     SCHEDULER_BACKOFF_SECS
                 );
@@ -1237,7 +1206,7 @@ mod scheduler_tests {
         assert_eq!(target, dec("11"));
     }
 
-    // A fee whose caller stopped waiting is still paid once fees resume
+    // A fee whose caller stopped waiting is still paid
     #[test]
     fn an_abandoned_fee_stays_queued_but_an_abandoned_allocation_is_dropped() {
         let (item, rx) = queued(PaymentRequest::PayFee { proposal_id: "p1".into(), fee_type: "dvp".into() });
@@ -1482,6 +1451,67 @@ mod scheduler_tests {
         .await;
         assert!(joined.is_err());
         assert_eq!(counter.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    fn queue_on(fake: &crate::test_util::FakeLedger, shutdown: Shutdown) -> PaymentQueue {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = fake.url.clone();
+        PaymentQueue::new(
+            config,
+            false,
+            false,
+            false,
+            false,
+            agent_logic::confirm::new_confirm_lock(),
+            crate::holdings_cache::HoldingsCache::new(false).cc(),
+            shutdown,
+        )
+        .unwrap()
+    }
+
+    // An overload forecast does not hold back the fee, which is paid off-chain
+    #[tokio::test]
+    async fn an_overload_forecast_does_not_hold_back_a_fee() {
+        let _overload = crate::test_util::OVERLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fake = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let shutdown = Shutdown::new();
+        let queue = queue_on(&fake, shutdown.clone());
+        agent_logic::forecast::update_forecast(0, Some("0.45".into()));
+        let overloaded = agent_logic::forecast::is_sequencer_overloaded();
+        let paid = tokio::time::timeout(Duration::from_secs(10), queue.submit_pay_fee("p1", "dvp")).await;
+        agent_logic::forecast::update_forecast(0, None);
+        shutdown.signal();
+        let prepared = fake.calls("PreparePayFee");
+        fake.stop().await;
+        assert!(overloaded, "0.45 must count as overload for this test to mean anything");
+        let err = format!("{:#}", paid.expect("the fee is not held back").unwrap_err());
+        assert!(err.contains("Missing response_signature"), "{err}");
+        assert_eq!(prepared, 1);
+    }
+
+    // A CC allocation short of amulets does not hold back a fee, which needs none
+    #[tokio::test]
+    async fn an_allocation_short_of_amulets_does_not_hold_back_a_fee() {
+        let fake = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let shutdown = Shutdown::new();
+        let queue = Arc::new(queue_on(&fake, shutdown.clone()));
+        let waiting = Arc::clone(&queue);
+        let allocation = tokio::spawn(async move { waiting.submit_allocate("p0", "d0", Some(dec("10"))).await });
+        let held = tokio::time::timeout(Duration::from_secs(5), async {
+            while queue.queue_depth().0 < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let paid = tokio::time::timeout(Duration::from_secs(10), queue.submit_pay_fee("p1", "dvp")).await;
+        let calls = (fake.calls("PreparePayFee"), fake.calls("PrepareTransaction"));
+        allocation.abort();
+        shutdown.signal();
+        fake.stop().await;
+        assert!(held.is_ok(), "the scheduler holds the allocation");
+        let err = format!("{:#}", paid.expect("the fee is not held back").unwrap_err());
+        assert!(err.contains("Missing response_signature"), "{err}");
+        assert_eq!(calls, (1, 0), "the fee is paid while the allocation waits");
     }
 
     // The scheduler ends with its queue; only a failure stops the agent
