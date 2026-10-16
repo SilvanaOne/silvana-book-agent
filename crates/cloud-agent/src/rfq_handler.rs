@@ -312,6 +312,24 @@ impl RfqHandler {
             ));
         }
 
+        // One-sided pair. Tests `direction == 1` like the pricing below, so a
+        // malformed direction cannot fall through into the closed side.
+        let side_closed = if direction == 1 {
+            rfq_config.disable_offer_side
+        } else {
+            rfq_config.disable_bid_side
+        };
+        if side_closed {
+            debug!(
+                "RFQ {}: side closed for market {} (direction {})",
+                rfq_id, market_id, direction
+            );
+            return Err(RejectInfo::new(
+                RfqRejectionReason::MarketNotSupported,
+                "RFQ not available for this side",
+            ));
+        }
+
         // Size mode: the taker gives EITHER a base `quantity` OR a
         // `quote_quantity` (quote-instrument amount, e.g. "pay 50 USDC"). In
         // quote mode the base is unknown until price is computed below, so the
@@ -1895,5 +1913,88 @@ mod price_rfq_tests {
             }
             RfqResponse::Reject(r) => panic!("expected a quote: {:?}", r.reason_detail),
         }
+    }
+
+    /// Zero-spread LP with one side closed per market: `EDELx-USDC` refuses the
+    /// offer side (the wind-down shape), `EDELx-USDCx` refuses the bid side.
+    fn one_sided_handler() -> RfqHandler {
+        let lp_config: LiquidityProviderConfig =
+            serde_json::from_str(r#"{"name":"LP test","min_notional_usd":10.0}"#).unwrap();
+        let bid_only: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDC","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":0.0,"offer_spread_percent":0.0,"disable_offer_side":true}}"#,
+        )
+        .unwrap();
+        let offer_only: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"EDELx-USDCx","rfq":{"min_quantity":"50","max_quantity":"10000","bid_spread_percent":0.0,"offer_spread_percent":0.0,"disable_bid_side":true}}"#,
+        )
+        .unwrap();
+        let mut mids = HashMap::new();
+        mids.insert("EDELx-USDC".to_string(), mm(MID));
+        mids.insert("EDELx-USDCx".to_string(), mm(MID));
+        RfqHandler {
+            lp_config,
+            markets: vec![bid_only, offer_only],
+            venue_overrides: Vec::new(),
+            mid_prices: Arc::new(RwLock::new(mids)),
+            party_id: "lp::test".to_string(),
+            quoted_trades: Arc::new(Mutex::new(Vec::new())),
+            liquidity_manager: None,
+            net_positions: None,
+            rfq_v2_only: false,
+        }
+    }
+
+    /// A closed side is refused as MarketNotSupported while the open side still
+    /// prices at exactly the ungated mid — the gate must not skew the survivor.
+    #[tokio::test]
+    async fn a_closed_side_is_refused_and_the_open_side_is_unchanged() {
+        let handler = one_sided_handler();
+        // direction 1 = user buys base (LP offers); 2 = user sells (LP bids).
+        let refused = handler.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await;
+        let err = refused.err().expect("a closed offer side must not quote");
+        assert_eq!(err.reason, RfqRejectionReason::MarketNotSupported);
+        // Pin WHICH gate refused: several paths share MarketNotSupported.
+        assert_eq!(err.reason_detail.as_deref(), Some("RFQ not available for this side"));
+
+        let open = match handler.price_rfq("t", "EDELx-USDC", 2, "1000", "", true, None, None, None).await {
+            Ok(p) => p,
+            Err(e) => panic!("the open bid side must still quote: {:?}", e.reason_detail),
+        };
+        assert!((f(&open.price_str) - MID).abs() < 1e-12, "price {} vs mid {}", open.price_str, MID);
+
+        // Mirror: bid closed, offer open.
+        let refused = handler.price_rfq("t", "EDELx-USDCx", 2, "1000", "", true, None, None, None).await;
+        let err = refused.err().expect("a closed bid side must not quote");
+        assert_eq!(err.reason, RfqRejectionReason::MarketNotSupported);
+
+        let open = match handler.price_rfq("t", "EDELx-USDCx", 1, "1000", "", true, None, None, None).await {
+            Ok(p) => p,
+            Err(e) => panic!("the open offer side must still quote: {:?}", e.reason_detail),
+        };
+        assert!((f(&open.price_str) - MID).abs() < 1e-12, "price {} vs mid {}", open.price_str, MID);
+    }
+
+    /// Both flags absent — the shape of every market today — quotes both ways.
+    #[tokio::test]
+    async fn an_ungated_pair_quotes_both_directions() {
+        let handler = handler();
+        for direction in [1, 2] {
+            if let Err(e) = handler
+                .price_rfq("t", "EDELx-USDC", direction, "1000", "", true, None, None, None)
+                .await
+            {
+                panic!("ungated direction {direction} must quote: {:?}", e.reason_detail);
+            }
+        }
+    }
+
+    /// Pricing treats any non-1 direction as a bid, so the bid gate must catch a
+    /// malformed one rather than letting it through as the closed side.
+    #[tokio::test]
+    async fn a_malformed_direction_cannot_slip_a_closed_bid_side() {
+        let handler = one_sided_handler();
+        let refused = handler.price_rfq("t", "EDELx-USDCx", 3, "1000", "", true, None, None, None).await;
+        let err = refused.err().expect("direction 3 must be refused on a closed bid side");
+        assert_eq!(err.reason, RfqRejectionReason::MarketNotSupported);
     }
 }
