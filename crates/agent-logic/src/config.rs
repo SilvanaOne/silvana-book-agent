@@ -1585,6 +1585,14 @@ pub struct RfqMarketConfig {
     /// depletion coefficient of the LP-pays token is ignored when pricing.
     #[serde(default)]
     pub disable_depletion_spread_widening: bool,
+    /// Refuse the LP's offer side on this market: requests where the user buys
+    /// the base are rejected as unsupported. Not per-venue.
+    #[serde(default)]
+    pub disable_offer_side: bool,
+    /// Refuse the LP's bid side on this market: requests where the user sells
+    /// the base are rejected as unsupported. Not per-venue.
+    #[serde(default)]
+    pub disable_bid_side: bool,
     #[serde(default)]
     pub quote_valid_secs: Option<u32>,
     /// DVP allocation deadline in seconds from DVP creation (default 15 minutes)
@@ -1772,7 +1780,9 @@ impl VenueOverride {
 /// `v2` (denomination ladders, structural), `min_notional_usd` (the floor is
 /// V1-only, and V1 carries no venue), `allocate_before_secs` /
 /// `settle_before_secs` (consumed only by the V1 quote message; V2 deadlines
-/// come from the atomic-quote globals).
+/// come from the atomic-quote globals), `disable_offer_side` /
+/// `disable_bid_side` (a closed side is a property of the pair, not of who is
+/// asking — a venue must not be able to re-open it).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RfqOverlayConfig {
     /// `Some(false)` = do not quote this venue on the matched markets;
@@ -2391,6 +2401,42 @@ disable_overload_spread_widening = true
         assert!(r.disable_overload_spread_widening);
         let r = resolve_rfq_config(&pair, &overrides, "CBTC-USDCx", Some("lattice"), None);
         assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// The side flags default to open and are pair-level only: a venue overlay
+    /// carries them through unchanged and can never re-open a closed side.
+    #[test]
+    fn test_side_flags_default_open_and_survive_venue_overlay() {
+        let open: RfqMarketConfig = serde_json::from_str(
+            r#"{"min_quantity":"50","max_quantity":"10000"}"#,
+        )
+        .unwrap();
+        assert!(!open.disable_offer_side, "absent key must parse as open");
+        assert!(!open.disable_bid_side, "absent key must parse as open");
+
+        let bid_only: RfqMarketConfig = serde_json::from_str(
+            r#"{"min_quantity":"50","max_quantity":"10000","disable_offer_side":true}"#,
+        )
+        .unwrap();
+        // An overlay that rewrites every field it CAN must still leave the
+        // closed side closed.
+        let overrides: Vec<VenueOverride> = toml::from_str::<AgentToml>(
+            r#"
+[[venue_overrides]]
+venue = "walley"
+[venue_overrides.rfq]
+enabled = true
+bid_spread_percent = 4.0
+offer_spread_percent = 4.0
+"#,
+        )
+        .unwrap()
+        .venue_overrides;
+        let r = resolve_rfq_config(&bid_only, &overrides, "USD8-CC", Some("walley"), None);
+        assert!(matches!(r, std::borrow::Cow::Owned(_)), "overlay must apply");
+        assert_eq!(r.offer_spread_percent, 4.0, "overlay still rewrites spreads");
+        assert!(r.disable_offer_side, "a venue must not re-open a closed side");
+        assert!(!r.disable_bid_side, "the open side stays open");
     }
 
     /// EQUAL-specificity tie rule: stable sort keeps file order, the later
