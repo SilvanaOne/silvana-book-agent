@@ -485,12 +485,12 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `buy --market <ID> --amount <N>`                                                              | Buy via RFQ until filled                                |
 | `sell --market <ID> --amount <N>`                                                             | Sell via RFQ until filled                               |
 | `faucet get --token <CC\|USDC\|…> [--admin <P>] [--amount <N>]`                               | Request tokens (devnet)                                 |
-| `transfer send-cc --receiver <P> --amount <N>`                                                | Send Canton Coin                                        |
-| `transfer send-cip56 --receiver <P> --instrument-id <ID> [--instrument-admin <P>] --amount <N> [--count <N>]` | Send CIP-56 token                     |
+| `transfer send-cc --receiver <P> --amount <N\|all>`                                           | Send Canton Coin                                        |
+| `transfer send-cip56 --receiver <P> --instrument-id <ID> [--instrument-admin <P>] --amount <N\|all> [--count <N>]` | Send CIP-56 token                |
 | `transfer accept-cip56 --contract-id <CID>`                                                   | Accept incoming CIP-56 transfer                         |
 | `transfer split-cc --output-amounts a,b,c --amulet-cids x,y`                                  | Split CC amulets                                        |
 | `transfer batch-pay --file payments.csv`                                                      | Batch CC payments (atomic multicall)                    |
-| `transfer prepay-traffic --amount <N>`                                                        | Top up the off-chain prepaid traffic balance            |
+| `transfer prepay-traffic --amount <N\|all>`                                                   | Top up the off-chain prepaid traffic balance            |
 | `preapproval request --instrument-admin <P>`                                                  | Create a `TransferPreapproval`                          |
 | `preapproval fetch`                                                                           | List existing preapprovals                              |
 | `preapproval check`                                                                           | Compare held preapprovals against the advertised targets |

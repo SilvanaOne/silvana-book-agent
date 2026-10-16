@@ -50,6 +50,7 @@ pub mod split_worker;
 mod test_util;
 pub mod ticket_pool;
 pub mod topup;
+pub mod transfer_all;
 pub mod updates_worker;
 pub mod venue_registry;
 
@@ -123,7 +124,7 @@ pub enum TransferCommands {
         /// Receiver party ID
         #[arg(long)]
         receiver: String,
-        /// Amount to send (decimal string)
+        /// Amount to send (decimal string), or `all` for the full unlocked balance
         #[arg(long)]
         amount: String,
         /// Optional description
@@ -146,7 +147,8 @@ pub enum TransferCommands {
         /// Defaults to the registry recorded for the instrument.
         #[arg(long)]
         instrument_admin: Option<String>,
-        /// Amount to send (decimal string)
+        /// Amount to send (decimal string), or `all` for the full unlocked balance
+        /// (with --count, the total of the N biggest holdings)
         #[arg(long)]
         amount: String,
         /// Optional transfer reference
@@ -193,7 +195,7 @@ pub enum TransferCommands {
     },
     /// Top up the off-chain prepaid traffic balance by transferring CC to PARTY_PREPAID_TRAFFIC
     PrepayTraffic {
-        /// CC amount to credit (decimal string)
+        /// CC amount to credit (decimal string), or `all` for the full unlocked balance
         #[arg(long)]
         amount: String,
         /// Optional human-readable note
@@ -2275,6 +2277,17 @@ pub async fn run_transfer(
             } else {
                 description
             };
+            let (amount, amulet_cids) = if transfer_all::is_all_amount(&amount) {
+                let hint = format!(
+                    "send in chunks with `transfer send-cip56 --instrument-id CC --amount all --count {}`",
+                    transfer_all::MAX_ALL_INPUTS
+                );
+                let (cids, total) = transfer_all::all_amulets(&mut client, None, &hint).await?;
+                println!("Amount: all = {} CC from {} amulet(s)", total, cids.len());
+                (total.to_string(), cids)
+            } else {
+                (amount, Vec::new())
+            };
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
@@ -2301,7 +2314,7 @@ pub async fn run_transfer(
                             description,
                             command_id,
                             settlement_proposal_id: None,
-                            amulet_cids: vec![],
+                            amulet_cids,
                         })),
                         request_signature: None,
                     },
@@ -2324,7 +2337,10 @@ pub async fn run_transfer(
             reference,
             count,
         } => {
-            parse_payment_amount(&amount, &receiver, 1)?;
+            let all = transfer_all::is_all_amount(&amount);
+            if !all {
+                parse_payment_amount(&amount, &receiver, 1)?;
+            }
             // The ledger only knows on-chain wire ids; operators think in names.
             let resolved = config.resolve_instrument_or_wire(&instrument_id);
             match &resolved.wire_id {
@@ -2351,6 +2367,37 @@ pub async fn run_transfer(
                 },
             };
             let wire_instrument_id = resolved.wire_id.clone().unwrap_or_else(|| instrument_id.clone());
+
+            let (amount, input_holding_cids, max_input_holdings) = if all {
+                let count = count.map(|c| usize::try_from(c).unwrap_or(usize::MAX));
+                let hint = format!(
+                    "re-run with --amount all --count {0} to send the {0} biggest, repeating until drained",
+                    transfer_all::MAX_ALL_INPUTS
+                );
+                let (cids, total) = if wire_instrument_id == "Amulet" {
+                    transfer_all::all_amulets(&mut client, count, &hint).await?
+                } else {
+                    transfer_all::all_holdings(
+                        &mut client,
+                        &config.party_id,
+                        &instrument_admin,
+                        &wire_instrument_id,
+                        &instrument_id,
+                        count,
+                        &hint,
+                    )
+                    .await?
+                };
+                println!(
+                    "Amount: all = {} {} from {} holding(s)",
+                    total,
+                    instrument_id,
+                    cids.len()
+                );
+                (total.to_string(), cids, None)
+            } else {
+                (amount, Vec::new(), count)
+            };
 
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
@@ -2383,10 +2430,9 @@ pub async fn run_transfer(
                             receiver_party: receiver,
                             amount,
                             reference,
-                            // CLI send: auto-select inputs (empty) — the merge
-                            // worker is the only caller that passes explicit cids.
-                            input_holding_cids: Vec::new(),
-                            max_input_holdings: count,
+                            // Empty = server auto-select; `--amount all` pins the summed inputs.
+                            input_holding_cids,
+                            max_input_holdings,
                         })),
                         request_signature: None,
                     },
@@ -2674,6 +2720,14 @@ pub async fn run_transfer(
             amount,
             description,
         } => {
+            let (amount, amulet_cids) = if transfer_all::is_all_amount(&amount) {
+                let (cids, total) =
+                    transfer_all::all_amulets(&mut client, None, "pass a fixed --amount").await?;
+                println!("Amount: all = {} CC from {} amulet(s)", total, cids.len());
+                (total.to_string(), cids)
+            } else {
+                (amount, Vec::new())
+            };
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
@@ -2697,7 +2751,7 @@ pub async fn run_transfer(
                             amount,
                             description,
                             command_id,
-                            amulet_cids: vec![],
+                            amulet_cids,
                         })),
                         request_signature: None,
                     },
