@@ -380,6 +380,13 @@ impl MulticallSettler {
         config.orderbook_grpc_url = url.to_string();
         config.connection_timeout_secs = 1;
         config.request_timeout_secs = 1;
+        // USDC is listed so the non-CC tests still reach the ledger calls
+        config.populate_instruments_from_rpc(vec![orderbook_proto::orderbook::Instrument {
+            instrument_id: "USDC".to_string(),
+            symbol: "USDC".to_string(),
+            registry: Some("usdc-reg::1220bb".to_string()),
+            ..Default::default()
+        }]);
         MulticallSettler {
             config,
             amulet_cache: crate::holdings_cache::HoldingsCache::new(false).cc(),
@@ -535,6 +542,15 @@ impl MulticallSettler {
         mut holding_cids: Vec<String>,
     ) -> Result<Prepared> {
         let config = &self.config;
+        // Only holdings of THIS instrument under its registrar may enter the pool;
+        // an instrument without one is refused before any ledger call.
+        let pool_instrument = if allocation_instrument_id.eq_ignore_ascii_case("cc")
+            || allocation_instrument_id.eq_ignore_ascii_case("amulet")
+        {
+            None
+        } else {
+            Some(config.try_resolve_instrument(allocation_instrument_id)?)
+        };
         let connect_wait =
             ledger_client::connect_wait(config.connection_timeout_secs, config.request_timeout_secs);
         let mut client = within("ledger connect", connect_wait, create_client(config)).await?;
@@ -543,14 +559,7 @@ impl MulticallSettler {
         // CIP-56 Holdings for that instrument and add them to the multicall's
         // unified holding pool. Amulets cover the fee payments; CIP-56 holdings
         // cover the allocation input.
-        if !allocation_instrument_id.eq_ignore_ascii_case("cc")
-            && !allocation_instrument_id.eq_ignore_ascii_case("amulet")
-        {
-            // Only holdings of THIS instrument under its configured registrar
-            // may enter the pool — mixing registrars fails the on-ledger
-            // allocation. `resolve_instrument` gives the on-chain id + the
-            // GetInstruments/DB registry (same source the atomic path trusts).
-            let (on_chain_id, registry) = config.resolve_instrument(allocation_instrument_id);
+        if let Some((on_chain_id, registry)) = pool_instrument {
             let cip56 = within(
                 "CIP-56 holdings lookup",
                 ledger_client::stream_wait(config.request_timeout_secs),
@@ -938,6 +947,21 @@ mod settle_tests {
             assert!(result.is_err() && unknown(&result).is_none(), "{instrument}: {result:?}");
             assert_eq!(amulet_state(&s.amulet_cache).await, "free", "{instrument}");
         }
+    }
+
+    // An allocation instrument without a registrar used to pool holdings of every registrar
+    #[tokio::test]
+    async fn an_unregistered_allocation_instrument_is_refused_before_any_call() {
+        let ledger = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let s = with_amulet(&ledger.url).await;
+        let err = settle(&s, "UNLISTED", Decimal::ONE).await.unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with(agent_logic::config::UNRESOLVED_INSTRUMENT),
+            "{err:#}"
+        );
+        assert_eq!(amulet_state(&s.amulet_cache).await, "free");
+        assert_eq!(ledger.connections(), 0, "refused before connecting");
+        ledger.stop().await;
     }
 
     #[tokio::test]

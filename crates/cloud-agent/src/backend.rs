@@ -250,6 +250,11 @@ impl SettlementBackend for CloudSettlementBackend {
         base_instrument: &str,
         quote_instrument: &str,
     ) -> Result<StepResult> {
+        // Both legs need a registry admin from local config: an empty one would
+        // skip the verifier's admin check, so nothing is prepared without them.
+        let (del_id, del_admin) = self.config.try_resolve_instrument(base_instrument)?;
+        let (pay_id, pay_admin) = self.config.try_resolve_instrument(quote_instrument)?;
+
         if self.confirm && !self.dry_run {
             agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
@@ -259,10 +264,6 @@ impl SettlementBackend for CloudSettlementBackend {
         }
 
         let mut client = self.create_client().await?;
-
-        // Resolve instrument IDs and registries from local config (not RPC)
-        let (del_id, del_admin) = self.config.resolve_instrument(base_instrument);
-        let (pay_id, pay_admin) = self.config.resolve_instrument(quote_instrument);
 
         let expectation = OperationExpectation::AcceptDvp {
             seller_party: self.config.party_id.clone(),
@@ -462,6 +463,54 @@ mod runtime_tests {
         assert!(histogram.priced);
         assert_eq!(histogram.total, 0);
         shutdown.signal();
+    }
+
+    // A leg the registry lacked used to be verified against an empty admin
+    #[tokio::test]
+    async fn accept_dvp_refuses_an_unresolvable_leg_before_preparing() {
+        let ledger = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let shutdown = Shutdown::new();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = ledger.url.clone();
+        config.dso_party = "dso::1220aa".to_string();
+        config.populate_instruments_from_rpc(vec![orderbook_proto::orderbook::Instrument {
+            instrument_id: "CC".to_string(),
+            instrument_type: "token".to_string(),
+            symbol: "CC".to_string(),
+            registry: Some("dso::1220aa".to_string()),
+            ..Default::default()
+        }]);
+        let backend = CloudSettlementBackend::new(
+            config,
+            false,
+            false,
+            true,
+            false,
+            agent_logic::confirm::new_confirm_lock(),
+            LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0),
+            shutdown.clone(),
+            HoldingsCache::new(false),
+        )
+        .unwrap();
+        for (base, quote) in [("UNLISTED", "CC"), ("CC", "UNLISTED")] {
+            let err = backend
+                .accept_dvp("p1", "00dvp", "1", "2", base, quote)
+                .await
+                .unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.starts_with(agent_logic::config::UNRESOLVED_INSTRUMENT)
+                    && text.contains("'UNLISTED'"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            ledger.calls("PrepareTransaction"),
+            0,
+            "nothing was prepared, even with --force"
+        );
+        shutdown.signal();
+        ledger.stop().await;
     }
 }
 

@@ -13,7 +13,7 @@ use agent_logic::secret::Zeroizing;
 use cloud_agent::{
     InfoCommands, PreapprovalCommands, TransferCommands, SignCommands,
     UserServiceCommands, SubscriptionCommands, LockCommands, FaucetCommands,
-    AtomicCommands,
+    AtomicCommands, AtomicVenueCommands,
     populate_instruments, run_cloud_agent, run_fill, run_info, run_preapproval,
     run_subscription, run_transfer, run_sign, run_user_service, run_faucet,
     run_lock, run_atomic, run_generate_private_key, run_onboard, read_env_value,
@@ -241,6 +241,14 @@ fn positive_number(s: &str) -> Result<f64, String> {
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Bound on the instrument registry fetch that precedes configured commands.
 const INSTRUMENTS_BUDGET: Duration = Duration::from_secs(60);
+/// How long the `agent` daemon retries the instrument registry before it refuses to start.
+const DAEMON_REGISTRY_BUDGET: Duration = Duration::from_secs(300);
+/// Registry retry pacing: waits double from 2s to 30s; no attempt starts with under 1s left.
+const REGISTRY_BACKOFF: Backoff = Backoff {
+    first: Duration::from_secs(2),
+    max: Duration::from_secs(30),
+    floor: Duration::from_secs(1),
+};
 /// Bound on the anonymous `info network` query.
 const NETWORK_INFO_BUDGET: Duration = Duration::from_secs(90);
 /// How long the terminal prompt waits for the private key.
@@ -514,13 +522,12 @@ fn scrub_private_key_env() {
 async fn run_configured(job: ConfiguredCommand) -> Result<()> {
     let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic } = job;
 
-    // Populate instrument registry (CC → Amulet + DSO, USDC → registry, …) from
-    // orderbook-rpc. Required by any command that builds DVP/transfer expectations.
-    // Best-effort: failures are logged but don't block commands that don't need it
-    // (e.g. `sign`, `generate-private-key`).
-    if let Err(e) = populate_instruments_within(&mut base_config, INSTRUMENTS_BUDGET).await {
-        tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
-    }
+    // Checks that need no network fail before any registry wait
+    preflight(&base_config, &command)?;
+
+    // Instrument registry (CC → Amulet + DSO, USDC → registry, …) from orderbook-rpc;
+    // `registry_need` decides whether a failure stops the command or is only logged.
+    load_registry(&mut base_config, registry_need(&command), REGISTRY_BACKOFF).await?;
     let base_config = base_config;
 
     // Install the best-effort error reporter (ReportErrors -> orderbook-rpc)
@@ -538,6 +545,159 @@ async fn populate_instruments_within(config: &mut BaseConfig, budget: Duration) 
     tokio::time::timeout(budget, populate_instruments(config))
         .await
         .map_err(|_| anyhow!("no response within {budget:?}"))?
+}
+
+/// The startup checks the daemon and the fill loop would only run after the registry wait.
+fn preflight(config: &BaseConfig, command: &Commands) -> Result<()> {
+    match command {
+        Commands::Agent { orders_only, .. } => {
+            cloud_agent::env::validate()?;
+            cloud_agent::agent_preflight(config, *orders_only)
+        }
+        Commands::Buy { .. } | Commands::Sell { .. } => cloud_agent::env::validate(),
+        _ => Ok(()),
+    }
+}
+
+/// How a command depends on the instrument registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryNeed {
+    /// Retry for up to this long, then refuse to run without a usable registry.
+    Required(Duration),
+    /// One bounded attempt; an instrument it lacks fails where it is used.
+    BestEffort,
+}
+
+/// Commands that settle trades or put registry admins on the ledger require the registry.
+fn registry_need(command: &Commands) -> RegistryNeed {
+    match command {
+        Commands::Agent { .. } => RegistryNeed::Required(DAEMON_REGISTRY_BUDGET),
+        Commands::Buy { .. } | Commands::Sell { .. } => RegistryNeed::Required(INSTRUMENTS_BUDGET),
+        Commands::Atomic { command } => match command {
+            AtomicCommands::Setup { .. }
+            | AtomicCommands::Split { .. }
+            | AtomicCommands::Venue {
+                command: AtomicVenueCommands::Create { .. },
+            } => RegistryNeed::Required(INSTRUMENTS_BUDGET),
+            AtomicCommands::Keygen
+            | AtomicCommands::Tickets { .. }
+            | AtomicCommands::Status { .. }
+            | AtomicCommands::Venue {
+                command:
+                    AtomicVenueCommands::List
+                    | AtomicVenueCommands::RotateKey { .. }
+                    | AtomicVenueCommands::Retire { .. },
+            } => RegistryNeed::BestEffort,
+        },
+        Commands::Info { .. }
+        | Commands::Preapproval { .. }
+        | Commands::Subscription { .. }
+        | Commands::Transfer { .. }
+        | Commands::Sign { .. }
+        | Commands::UserService { .. }
+        | Commands::Faucet { .. }
+        | Commands::Lock { .. }
+        | Commands::GeneratePrivateKey
+        | Commands::Onboard { .. } => RegistryNeed::BestEffort,
+    }
+}
+
+/// Retry pacing: waits double from `first` up to `max`, and no attempt starts
+/// with less than `floor` of the budget left.
+#[derive(Clone, Copy, Debug)]
+struct Backoff {
+    first: Duration,
+    max: Duration,
+    floor: Duration,
+}
+
+/// Fill the instrument registry as `need` demands; a required one must also pass
+/// validation, or the command stops.
+async fn load_registry(
+    config: &mut BaseConfig,
+    need: RegistryNeed,
+    backoff: Backoff,
+) -> Result<()> {
+    let RegistryNeed::Required(budget) = need else {
+        if let Err(e) = populate_instruments_within(config, INSTRUMENTS_BUDGET).await {
+            tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
+        }
+        return Ok(());
+    };
+    let base = config.clone();
+    let loaded = retry_within(
+        "Instrument registry load",
+        budget,
+        INSTRUMENTS_BUDGET,
+        backoff,
+        || {
+            let mut scratch = base.clone();
+            async move {
+                populate_instruments(&mut scratch).await?;
+                usable_registry(scratch)
+            }
+        },
+    )
+    .await;
+    match loaded {
+        Ok(loaded) => {
+            *config = loaded;
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Refusing to run without a usable instrument registry: {e:#}");
+            Err(e.context(
+                "instrument registry unavailable: settlement verification needs every instrument's registry admin",
+            ))
+        }
+    }
+}
+
+/// `config` once its registry passes validation; a failure says the listing itself loaded.
+fn usable_registry(config: BaseConfig) -> Result<BaseConfig> {
+    config
+        .validate_instrument_registry()
+        .context("listing loaded but unusable")?;
+    Ok(config)
+}
+
+/// Run `attempt` until it succeeds or `budget` runs out; each try gets at most
+/// `per_try`, and giving up reports the last failure.
+async fn retry_within<T, F, Fut>(
+    what: &str,
+    budget: Duration,
+    per_try: Duration,
+    backoff: Backoff,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let deadline = agent_logic::clock::deadline_after(budget);
+    let mut wait = backoff.first;
+    let mut tries: u32 = 0;
+    loop {
+        tries = tries.saturating_add(1);
+        let bound = per_try.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let failure = match tokio::time::timeout(bound, attempt()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(e)) => e,
+            Err(_) => anyhow!("no response within {bound:?}"),
+        };
+        // Give up rather than start a try at the deadline or with under `floor` left
+        let left_after_wait = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .saturating_sub(wait);
+        if left_after_wait.is_zero() || left_after_wait < backoff.floor {
+            return Err(failure.context(format!(
+                "{what}: gave up after {tries} attempt(s) within {budget:?}"
+            )));
+        }
+        tracing::warn!("{what} failed (attempt {tries}): {failure:#}; retrying in {wait:?}");
+        tokio::time::sleep(wait).await;
+        wait = wait.saturating_mul(2).min(backoff.max);
+    }
 }
 
 /// The anonymous `info network` query, bounded by `budget`.
@@ -963,6 +1123,215 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(format!("{err:#}").contains("no response within 300ms"), "{err:#}");
         assert!(config.instrument_registries.is_empty());
+    }
+
+    #[test]
+    fn commands_that_settle_or_write_admins_require_the_registry() {
+        let need = |args: &[&str]| registry_need(&parse(args).unwrap().command);
+        assert_eq!(
+            need(&["agent"]),
+            RegistryNeed::Required(DAEMON_REGISTRY_BUDGET)
+        );
+        for args in [
+            &["buy", "--market", "M", "--amount", "1"][..],
+            &["sell", "--market", "M", "--amount", "1"],
+            &["atomic", "setup"],
+            &[
+                "atomic",
+                "split",
+                "--market",
+                "A-B",
+                "--instrument",
+                "base",
+                "--splits",
+                "1x1",
+            ],
+            &["atomic", "venue", "create", "--market", "A-B"],
+        ] {
+            assert_eq!(
+                need(args),
+                RegistryNeed::Required(INSTRUMENTS_BUDGET),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["atomic", "status"][..],
+            &["atomic", "venue", "list"],
+            &["atomic", "venue", "retire", "--market", "A-B"],
+            &["atomic", "tickets", "issue", "--count", "1"],
+            &["info", "balance"],
+            &["preapproval", "fetch"],
+            &["transfer", "send-cc", "--receiver", "r", "--amount", "1"],
+        ] {
+            assert_eq!(need(args), RegistryNeed::BestEffort, "{args:?}");
+        }
+    }
+
+    const FAST: Backoff = Backoff {
+        first: Duration::from_millis(50),
+        max: Duration::from_millis(100),
+        floor: Duration::from_millis(10),
+    };
+
+    // The daemon used to log a warning and run on whatever the fetch left behind
+    #[tokio::test]
+    async fn a_required_registry_that_never_loads_stops_the_command() {
+        let (_server, url) = silent_server();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = url;
+        let started = Instant::now();
+        let err = load_registry(
+            &mut config,
+            RegistryNeed::Required(Duration::from_millis(400)),
+            FAST,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with("instrument registry unavailable"),
+            "{text}"
+        );
+        assert!(
+            text.contains("gave up after") && text.contains("no response within"),
+            "{text}"
+        );
+        assert!(config.instrument_registries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_best_effort_registry_failure_still_runs_the_command() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = url;
+        load_registry(&mut config, RegistryNeed::BestEffort, FAST)
+            .await
+            .unwrap();
+        assert!(config.instrument_registries.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_listing_says_it_loaded() {
+        let err = usable_registry(BaseConfig::test_minimal().unwrap()).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "listing loaded but unusable: orderbook-rpc listed no instruments"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_retries_stop_at_the_first_success() {
+        let mut calls = 0u32;
+        let got = retry_within(
+            "t",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            FAST,
+            || {
+                calls += 1;
+                let n = calls;
+                async move {
+                    if n < 3 {
+                        Err(anyhow!("not yet"))
+                    } else {
+                        Ok(n)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, 3);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn a_silent_registry_attempt_is_cut_off_and_the_budget_ends_the_retries() {
+        let started = Instant::now();
+        let mut calls = 0u32;
+        let err = retry_within(
+            "t",
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            FAST,
+            || {
+                calls += 1;
+                std::future::pending::<Result<()>>()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(calls >= 2, "{calls}");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no response within") && text.contains("gave up after"),
+            "{text}"
+        );
+    }
+
+    // A last try squeezed into the end of the budget used to report its own timeout, not the real cause
+    #[tokio::test]
+    async fn a_give_up_reports_the_last_real_failure() {
+        let cases = [
+            // The next wait would reach the deadline
+            (
+                Duration::from_millis(100),
+                Backoff {
+                    first: Duration::from_millis(200),
+                    ..FAST
+                },
+            ),
+            // What the wait would leave is below the floor
+            (
+                Duration::from_millis(300),
+                Backoff {
+                    first: Duration::from_millis(50),
+                    floor: Duration::from_millis(280),
+                    ..FAST
+                },
+            ),
+        ];
+        for (budget, backoff) in cases {
+            let mut calls = 0u32;
+            let err = retry_within("t", budget, Duration::from_secs(1), backoff, || {
+                calls += 1;
+                async { Err::<(), _>(anyhow!("not yet")) }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1, "{backoff:?}");
+            let expected = format!("t: gave up after 1 attempt(s) within {budget:?}: not yet");
+            assert_eq!(format!("{err:#}"), expected, "{backoff:?}");
+        }
+    }
+
+    // Bad env settings used to surface only after the registry wait
+    #[test]
+    fn the_agent_mode_check_runs_before_the_registry_wait() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.rfq_v2_only = true;
+        let agent = parse(&["agent", "--orders-only"]).unwrap().command;
+        let err = preflight(&config, &agent).unwrap_err().to_string();
+        assert!(
+            err.contains("--orders-only conflicts with rfq_v2_only"),
+            "{err}"
+        );
+        let buy = parse(&["buy", "--market", "M", "--amount", "1"])
+            .unwrap()
+            .command;
+        preflight(&config, &buy).unwrap();
     }
 
     #[tokio::test]

@@ -205,11 +205,28 @@ fn bad_retry_and_timer_settings_stop_the_agent_and_the_fill_loop() {
     for (k, v) in bad {
         let path = agent_env(&format!("bad-{k}"), &format!("{k}={v}"));
         let env = path.to_str().unwrap();
-        let (fill, _) = cloud_agent(&["--env-file", env, "buy", "--market", "CC-USDC", "--amount", "1"]);
-        let (agent, _) = cloud_agent(&["--env-file", env, "--config", toml.to_str().unwrap(), "agent"]);
+        let (fill, fill_took) = cloud_agent(&[
+            "--env-file",
+            env,
+            "buy",
+            "--market",
+            "CC-USDC",
+            "--amount",
+            "1",
+        ]);
+        let (agent, agent_took) = cloud_agent(&[
+            "--env-file",
+            env,
+            "--config",
+            toml.to_str().unwrap(),
+            "agent",
+        ]);
         let _ = std::fs::remove_file(&path);
         assert_clean_failure(&fill, k);
         assert_clean_failure(&agent, k);
+        // The checks run before the instrument registry wait, which this rpc would make long
+        assert!(fill_took < Duration::from_secs(30), "{k}: {fill_took:?}");
+        assert!(agent_took < Duration::from_secs(30), "{k}: {agent_took:?}");
     }
     let _ = std::fs::remove_file(&toml);
 }
