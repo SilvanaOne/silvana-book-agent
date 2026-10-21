@@ -422,7 +422,8 @@ impl BaseConfig {
     /// are `pub`: callers then set `markets`, `liquidity_provider`,
     /// registries (via [`BaseConfig::populate_instruments_from_rpc`]) and the
     /// quote key (via [`BaseConfig::set_atomic_quote_scalar`]) directly, and
-    /// SHOULD call [`BaseConfig::validate_v2`] before running RFQ V2 — the
+    /// SHOULD call [`BaseConfig::validate_v2`] before running RFQ V2 and
+    /// [`BaseConfig::validate_instrument_registry`] before settling — the
     /// env path's validation lives in `assemble` and does not run here.
     #[allow(clippy::too_many_arguments)]
     pub fn for_party(
@@ -1203,8 +1204,8 @@ impl BaseConfig {
 
     /// Populate `cc_token_id`, `onboarded_registries` and `instrument_registries`
     /// from instruments fetched over the orderbook-rpc `GetInstruments` endpoint.
-    /// Call this once at startup before running settlement / fill / transfer logic
-    /// that uses [`BaseConfig::resolve_instrument`].
+    /// Call this once at startup; settlement logic then needs
+    /// [`BaseConfig::validate_instrument_registry`] to pass.
     ///
     /// Canton Coin is the instrument on the DSO registry (falling back to the
     /// first `instrument_type == "token"`); its id drives the CC → Amulet
@@ -1283,7 +1284,8 @@ impl BaseConfig {
     /// (`instruments.symbol` — identical to the id for legacy tokens, an
     /// opaque id such as a UUID for issuer-minted ones).
     /// Registry comes from instruments fetched via `populate_instruments_from_rpc`.
-    /// Returns empty strings if instrument not found (verification skipped).
+    /// An unknown instrument gets an empty registry: display and accounting only;
+    /// anything that checks an admin uses [`BaseConfig::try_resolve_instrument`].
     pub fn resolve_instrument(&self, instrument_id: &str) -> (String, String) {
         let on_chain_id = if Some(instrument_id) == self.cc_token_id.as_deref() {
             "Amulet".to_string()
@@ -1299,6 +1301,49 @@ impl BaseConfig {
             .cloned()
             .unwrap_or_default();
         (on_chain_id, registry)
+    }
+
+    /// [`BaseConfig::resolve_instrument`] for verification: no registry admin is an
+    /// error, never an empty string. Canton Coin falls back to the DSO party.
+    pub fn try_resolve_instrument(&self, instrument_id: &str) -> Result<(String, String)> {
+        let is_cc = Some(instrument_id) == self.cc_token_id.as_deref();
+        let recorded = self
+            .instrument_registries
+            .get(instrument_id)
+            .filter(|registry| !registry.trim().is_empty());
+        let admin = match recorded {
+            Some(registry) => registry.clone(),
+            None if is_cc && !self.dso_party.trim().is_empty() => self.dso_party.clone(),
+            None => bail!(
+                "{UNRESOLVED_INSTRUMENT}: instrument '{instrument_id}' has no registry admin among \
+                 the {} loaded instruments (delisted, not visible to this party, or the registry \
+                 did not load)",
+                self.instrument_wire_ids.len()
+            ),
+        };
+        let (on_chain_id, _) = self.resolve_instrument(instrument_id);
+        Ok((on_chain_id, admin))
+    }
+
+    /// Fails unless the registry can back settlement verification: instruments
+    /// listed, registries recorded, and Canton Coin resolvable.
+    pub fn validate_instrument_registry(&self) -> Result<()> {
+        if self.instrument_wire_ids.is_empty() {
+            bail!("orderbook-rpc listed no instruments");
+        }
+        if !self.instrument_registries.values().any(|r| !r.trim().is_empty()) {
+            bail!(
+                "none of the {} listed instruments carries a registry party",
+                self.instrument_wire_ids.len()
+            );
+        }
+        let cc = self.cc_token_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "no Canton Coin instrument: none is registered under the DSO party and none \
+                 has type 'token'"
+            )
+        })?;
+        self.try_resolve_instrument(cc).map(|_| ())
     }
 
     /// Resolve an instrument given EITHER its internal id or its wire id.
@@ -1331,6 +1376,10 @@ impl BaseConfig {
         ResolvedInstrument { wire_id: None, registry: None }
     }
 }
+
+/// Carried by every [`BaseConfig::try_resolve_instrument`] error, so callers can
+/// tell an unresolvable instrument from other failures.
+pub const UNRESOLVED_INSTRUMENT: &str = "unresolved-instrument";
 
 /// Outcome of [`BaseConfig::resolve_instrument_or_wire`].
 #[derive(Debug, Clone, Default)]
@@ -2199,6 +2248,133 @@ mod tests {
         assert_eq!(config.internal_id_for_wire("USDCx"), None);
         assert_eq!(config.internal_id_for_wire("ACME"), None, "idempotent on internal ids");
         assert_eq!(config.internal_id_for_wire("nonexistent"), None);
+    }
+
+    fn listed(id: &str, kind: &str, symbol: &str, registry: Option<&str>) -> Instrument {
+        Instrument {
+            instrument_id: id.into(),
+            instrument_type: kind.into(),
+            symbol: symbol.into(),
+            registry: registry.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    // An unknown or registry-less instrument used to resolve to an empty admin, which verification skips
+    #[test]
+    fn try_resolve_instrument_refuses_what_the_registry_cannot_verify() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".into();
+        config.populate_instruments_from_rpc(vec![
+            listed(
+                "ACME",
+                "fiat",
+                "0a1b2c3d-1111-4222-8333-444455556666",
+                Some("issuer-reg::1220cc"),
+            ),
+            listed("CC", "token", "CC", Some("dso::1220aa")),
+            listed("NOREG", "fiat", "NOREG", None),
+            listed("BLANK", "fiat", "BLANK", Some("  ")),
+        ]);
+        assert_eq!(
+            config.try_resolve_instrument("ACME").unwrap(),
+            (
+                "0a1b2c3d-1111-4222-8333-444455556666".to_string(),
+                "issuer-reg::1220cc".to_string()
+            )
+        );
+        assert_eq!(
+            config.try_resolve_instrument("CC").unwrap(),
+            ("Amulet".to_string(), "dso::1220aa".to_string())
+        );
+        for missing in ["UNLISTED", "NOREG", "BLANK", ""] {
+            let err = config
+                .try_resolve_instrument(missing)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(UNRESOLVED_INSTRUMENT) && err.contains(&format!("'{missing}'")),
+                "{err}"
+            );
+            assert!(err.contains("among the 4 loaded instruments"), "{err}");
+        }
+        assert_eq!(
+            config.resolve_instrument("UNLISTED"),
+            ("UNLISTED".to_string(), String::new()),
+            "the display resolver is unchanged"
+        );
+        assert!(
+            BaseConfig::test_minimal()
+                .unwrap()
+                .try_resolve_instrument("CC")
+                .is_err()
+        );
+    }
+
+    // Canton Coin's admin is the DSO party even when the listing omits its registry
+    #[test]
+    fn canton_coin_falls_back_to_the_dso_party() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".into();
+        config.populate_instruments_from_rpc(vec![listed("CC", "token", "CC", None)]);
+        assert_eq!(config.cc_token_id.as_deref(), Some("CC"));
+        assert_eq!(
+            config.resolve_instrument("CC"),
+            ("Amulet".to_string(), String::new())
+        );
+        assert_eq!(
+            config.try_resolve_instrument("CC").unwrap(),
+            ("Amulet".to_string(), "dso::1220aa".to_string())
+        );
+        config.dso_party.clear();
+        assert!(
+            config
+                .try_resolve_instrument("CC")
+                .unwrap_err()
+                .to_string()
+                .starts_with(UNRESOLVED_INSTRUMENT)
+        );
+    }
+
+    // The daemon used to run on an empty or CC-less registry
+    #[test]
+    fn validate_instrument_registry_needs_instruments_registries_and_canton_coin() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".into();
+        let err = |c: &BaseConfig| c.validate_instrument_registry().unwrap_err().to_string();
+        assert_eq!(err(&config), "orderbook-rpc listed no instruments");
+        config.populate_instruments_from_rpc(vec![listed("TKN", "fiat", "TKN", None)]);
+        assert_eq!(
+            err(&config),
+            "none of the 1 listed instruments carries a registry party"
+        );
+        config.populate_instruments_from_rpc(vec![listed("TKN", "fiat", "TKN", Some("  "))]);
+        assert_eq!(
+            err(&config),
+            "none of the 1 listed instruments carries a registry party"
+        );
+        config.populate_instruments_from_rpc(vec![listed(
+            "TKN",
+            "fiat",
+            "TKN",
+            Some("tkn-reg::1220bb"),
+        )]);
+        assert!(
+            err(&config).starts_with("no Canton Coin instrument"),
+            "{}",
+            err(&config)
+        );
+        config.populate_instruments_from_rpc(vec![
+            listed("TKN", "fiat", "TKN", Some("tkn-reg::1220bb")),
+            listed("CC", "token", "CC", None),
+        ]);
+        config.validate_instrument_registry().unwrap();
+        config.dso_party.clear();
+        assert!(
+            err(&config).starts_with(UNRESOLVED_INSTRUMENT),
+            "{}",
+            err(&config)
+        );
     }
 
     #[test]

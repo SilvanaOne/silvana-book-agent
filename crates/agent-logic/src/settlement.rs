@@ -43,7 +43,7 @@ use orderbook_proto::{
 use crate::auth::generate_jwt;
 use crate::clock;
 use crate::client::OrderbookClient;
-use crate::config::BaseConfig;
+use crate::config::{BaseConfig, UNRESOLVED_INSTRUMENT};
 use crate::liquidity::{self, LiquidityManager};
 use crate::order_tracker::{OrderTracker, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
@@ -388,6 +388,9 @@ pub struct SettlementExecutor<B: SettlementBackend> {
     /// Rejects never complete, as against a server that never answers
     #[cfg(test)]
     reject_black_hole: bool,
+    /// Error events reported by the executor itself
+    #[cfg(test)]
+    reported_errors: Vec<orderbook_proto::settlement::ErrorEvent>,
 }
 
 impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
@@ -428,6 +431,8 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             stub_lookup_hangs: false,
             #[cfg(test)]
             reject_black_hole: false,
+            #[cfg(test)]
+            reported_errors: Vec::new(),
         })
     }
 
@@ -533,6 +538,18 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 Err(e) => debug!("[{}] Best-effort cancel RPC failed: {}", pid, e),
             }
         });
+    }
+
+    /// Queue one error report for a proposal abandoned over an unresolvable leg.
+    fn report_unresolved_leg(&mut self, proposal_id: &str, error: &str) {
+        let market_id = self
+            .active_settlements
+            .get(proposal_id)
+            .map(|s| s.proposal.market_id.as_str());
+        let event = unresolved_leg_event(&self.config.party_id, proposal_id, market_id, error);
+        #[cfg(test)]
+        self.reported_errors.push(event.clone());
+        crate::error_reporter::report(event);
     }
 
     /// rfq_v2_only: actively abort an encountered V1 settlement instead of
@@ -1835,7 +1852,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 );
             }
             AdvanceResult::Error { proposal_id, error } => {
-                let is_permanent = error.contains("deadline-exceeded")
+                let unresolvable = error.contains(UNRESOLVED_INSTRUMENT);
+                let is_permanent = unresolvable
+                    || error.contains("deadline-exceeded")
                     || error.contains("DA.Exception.PreconditionFailed")
                     || error.contains("PreconditionFailed")
                     || error.contains("PRECONDITION_FAILED");
@@ -1867,7 +1886,15 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     // reaches a terminal DB status and stops being re-surfaced by
                     // poll_pending_proposals. Best-effort; read stage before removal.
                     if self.is_pre_allocation(&proposal_id) {
-                        self.notify_server_cancel(&proposal_id, "agent abandoned: deadline/error exhausted");
+                        let reason = if unresolvable {
+                            "agent abandoned: an instrument has no registry admin"
+                        } else {
+                            "agent abandoned: deadline/error exhausted"
+                        };
+                        self.notify_server_cancel(&proposal_id, reason);
+                    }
+                    if unresolvable {
+                        self.report_unresolved_leg(&proposal_id, &error);
                     }
                     self.release_commitment(&proposal_id);
                     {
@@ -2541,6 +2568,58 @@ fn implausible_amount(proposal: &SettlementProposal) -> Option<(&'static str, &s
     .find(|(_, raw)| Decimal::from_str(raw).is_ok_and(|v| v < Decimal::ZERO || v > max))
 }
 
+/// The registry check's verdict on one settlement step.
+#[derive(Debug, PartialEq, Eq)]
+enum LegCheck {
+    /// Both legs resolve, or the step commits to nothing.
+    Pass,
+    /// A leg does not resolve, but the DVP terms were fixed at the accept.
+    Warn(String),
+    /// A leg does not resolve and the step must not run.
+    Refuse(String),
+}
+
+/// Checks both legs of `proposal` against the registry before `action` runs.
+fn leg_check(config: &BaseConfig, proposal: &SettlementProposal, action: NextAction) -> LegCheck {
+    let unresolved = || {
+        [
+            proposal.base_instrument.as_str(),
+            proposal.quote_instrument.as_str(),
+        ]
+        .into_iter()
+        .find_map(|id| config.try_resolve_instrument(id).err())
+        .map(|e| format!("{e:#}"))
+    };
+    match action {
+        NextAction::Preconfirm
+        | NextAction::PayDvpFee
+        | NextAction::CreateDvp
+        | NextAction::AcceptDvp => unresolved().map_or(LegCheck::Pass, LegCheck::Refuse),
+        NextAction::PayAllocFee | NextAction::Allocate => {
+            unresolved().map_or(LegCheck::Pass, LegCheck::Warn)
+        }
+        NextAction::Wait | NextAction::MulticallAccept | NextAction::None => LegCheck::Pass,
+    }
+}
+
+/// The error event for a settlement abandoned over an unresolvable leg.
+fn unresolved_leg_event(
+    party_id: &str,
+    proposal_id: &str,
+    market_id: Option<&str>,
+    error: &str,
+) -> orderbook_proto::settlement::ErrorEvent {
+    let event = crate::error_reporter::ErrorEventBuilder::new("VALIDATION_ERROR", error)
+        .error_code(UNRESOLVED_INSTRUMENT)
+        .module("settlement")
+        .party(party_id)
+        .settlement_proposal_id(proposal_id);
+    match market_id {
+        Some(market_id) => event.market_id(market_id).build(),
+        None => event.build(),
+    }
+}
+
 /// Reserve the resources for a settlement whose counterparty has committed
 /// (server returned a post-preconfirm action). Idempotent; strictly on
 /// locally-stored terms (`state.proposal` + the tracker's adoption record).
@@ -2815,6 +2894,17 @@ async fn advance_single<B: SettlementBackend>(
         ) {
             return AdvanceResult::Error { proposal_id, error };
         }
+    }
+
+    // Unresolvable legs: no preconfirm, reservation, fee, DVP or accept; the
+    // allocation steps only warn, as the DVP terms were fixed at the accept.
+    match leg_check(&config, &state.proposal, my_action) {
+        LegCheck::Pass => {}
+        LegCheck::Warn(reason) => warn!(
+            "[{}] {:?} goes ahead on the accepted DVP terms: {}",
+            proposal_id, my_action, reason
+        ),
+        LegCheck::Refuse(error) => return AdvanceResult::Error { proposal_id, error },
     }
 
     // Reserve on the first post-preconfirm action: any action other than
@@ -4814,5 +4904,426 @@ mod tests {
         let exec = plain_executor(&BaseConfig::test_minimal().unwrap()).unwrap();
         assert!(exec.cache_stats().await.is_none());
         assert!(exec.holdings_histogram("CC").await.is_none());
+    }
+
+    /// A registry that lists test_proposal's legs (USDCx, CCY) and Canton Coin.
+    fn registry_config() -> BaseConfig {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".to_string();
+        let listed =
+            |id: &str, kind: &str, registry: &str| orderbook_proto::orderbook::Instrument {
+                instrument_id: id.to_string(),
+                instrument_type: kind.to_string(),
+                symbol: id.to_string(),
+                registry: Some(registry.to_string()),
+                ..Default::default()
+            };
+        config.populate_instruments_from_rpc(vec![
+            listed("USDCx", "fiat", "usdc-reg::1220bb"),
+            listed("CCY", "fiat", "ccy-reg::1220cc"),
+            listed("CC", "token", "dso::1220aa"),
+        ]);
+        config
+    }
+
+    // AcceptDvp used to carry an empty admin for a leg the registry lacked, which the verifier skips
+    #[test]
+    fn a_leg_without_a_registry_admin_stops_every_committing_step() {
+        let committing = [
+            NextAction::Preconfirm,
+            NextAction::PayDvpFee,
+            NextAction::CreateDvp,
+            NextAction::AcceptDvp,
+        ];
+        let allocation = [NextAction::PayAllocFee, NextAction::Allocate];
+        let passive = [
+            NextAction::Wait,
+            NextAction::MulticallAccept,
+            NextAction::None,
+        ];
+        let config = registry_config();
+        let known = test_proposal("p1");
+        let mut unlisted = test_proposal("p2");
+        unlisted.base_instrument = "UNLISTED".to_string();
+        for action in committing.into_iter().chain(allocation).chain(passive) {
+            assert_eq!(
+                leg_check(&config, &known, action),
+                LegCheck::Pass,
+                "{action:?}"
+            );
+        }
+        for action in committing {
+            let LegCheck::Refuse(reason) = leg_check(&config, &unlisted, action) else {
+                panic!("{action:?} was not refused")
+            };
+            assert!(
+                reason.starts_with(UNRESOLVED_INSTRUMENT) && reason.contains("'UNLISTED'"),
+                "{reason}"
+            );
+            let empty = BaseConfig::test_minimal().unwrap();
+            assert!(
+                matches!(leg_check(&empty, &known, action), LegCheck::Refuse(_)),
+                "an empty registry refuses {action:?}"
+            );
+        }
+        for action in allocation {
+            let verdict = leg_check(&config, &unlisted, action);
+            assert!(
+                matches!(&verdict, LegCheck::Warn(r) if r.starts_with(UNRESOLVED_INSTRUMENT)),
+                "{action:?}: {verdict:?}"
+            );
+        }
+        for action in passive {
+            assert_eq!(
+                leg_check(&config, &unlisted, action),
+                LegCheck::Pass,
+                "{action:?}"
+            );
+        }
+    }
+
+    // The refusal is permanent: one abandon and one error report, never a retry loop
+    #[tokio::test]
+    async fn an_unresolvable_leg_abandons_the_settlement_at_once() {
+        let (mut exec, lm) = committed_executor().await;
+        exec.active_settlements
+            .get_mut("p1")
+            .unwrap()
+            .proposal
+            .market_id = "USDCx-CCY".to_string();
+        let mut unlisted = test_proposal("p1");
+        unlisted.base_instrument = "UNLISTED".to_string();
+        let LegCheck::Refuse(reason) =
+            leg_check(&registry_config(), &unlisted, NextAction::AcceptDvp)
+        else {
+            panic!("the unlisted leg was not refused")
+        };
+        let error = format!("AcceptDvp failed: {reason}");
+        exec.apply_result(AdvanceResult::Error {
+            proposal_id: "p1".to_string(),
+            error,
+        })
+        .await;
+        drain_spawned().await;
+        assert!(!exec.active_settlements.contains_key("p1"));
+        assert!(exec.rejected_proposals.contains("p1"));
+        assert!(!exec.failed_settlements.contains_key("p1"));
+        assert_eq!(
+            lm.available("USDCx").await,
+            Decimal::from(5000),
+            "the reservation is released"
+        );
+        let [event] = exec.reported_errors.as_slice() else {
+            panic!(
+                "expected one error report, got {}",
+                exec.reported_errors.len()
+            )
+        };
+        assert_eq!(event.error_type, "VALIDATION_ERROR");
+        assert_eq!(event.error_code.as_deref(), Some(UNRESOLVED_INSTRUMENT));
+        assert_eq!(event.settlement_proposal_id.as_deref(), Some("p1"));
+        assert_eq!(event.market_id.as_deref(), Some("USDCx-CCY"));
+        assert_eq!(event.party_id.as_deref(), Some("test-party"));
+        assert!(
+            event.error_message.contains("'UNLISTED'"),
+            "{}",
+            event.error_message
+        );
+
+        // Any other error keeps the settlement for a retry and reports nothing
+        let (mut exec, _lm) = committed_executor().await;
+        let error = "AcceptDvp failed: connection reset".to_string();
+        exec.apply_result(AdvanceResult::Error {
+            proposal_id: "p1".to_string(),
+            error,
+        })
+        .await;
+        assert!(exec.active_settlements.contains_key("p1"));
+        assert_eq!(
+            exec.failed_settlements.get("p1").map(|f| f.retry_count),
+            Some(1)
+        );
+        assert!(exec.reported_errors.is_empty());
+    }
+
+    /// Records every backend call; each one fails.
+    #[derive(Default)]
+    struct RecordingBackend(std::sync::Mutex<Vec<&'static str>>);
+
+    impl RecordingBackend {
+        fn record(&self, call: &'static str) -> Result<StepResult> {
+            sync::lock(&self.0).push(call);
+            Err(anyhow::anyhow!("recording backend: {call} is not answered"))
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            sync::lock(&self.0).clone()
+        }
+    }
+
+    #[async_trait]
+    impl SettlementBackend for RecordingBackend {
+        async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
+            self.record("pay_fee")
+        }
+        async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+            self.record("propose_dvp")
+        }
+        async fn accept_dvp(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<StepResult> {
+            self.record("accept_dvp")
+        }
+        async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+            self.record("allocate")
+        }
+        async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
+            Ok(Vec::new())
+        }
+        fn queue_depth(&self) -> (u64, u64) {
+            (0, 0)
+        }
+    }
+
+    /// Writes pre-encoded message bytes; reads every request as `()`.
+    #[derive(Clone, Copy, Default)]
+    struct RawCodec;
+    struct RawEncoder;
+    struct UnitDecoder;
+
+    impl tonic::codec::Encoder for RawEncoder {
+        type Item = Vec<u8>;
+        type Error = tonic::Status;
+        fn encode(
+            &mut self,
+            item: Vec<u8>,
+            dst: &mut tonic::codec::EncodeBuf<'_>,
+        ) -> Result<(), tonic::Status> {
+            use tokio::io::AsyncReadExt;
+            let mut rest = item.as_slice();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            while !rest.is_empty() {
+                let mut copy = std::pin::pin!(rest.read_buf(dst));
+                if !matches!(copy.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(n)) if n > 0) {
+                    return Err(tonic::Status::internal("short write"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl tonic::codec::Decoder for UnitDecoder {
+        type Item = ();
+        type Error = tonic::Status;
+        fn decode(
+            &mut self,
+            _: &mut tonic::codec::DecodeBuf<'_>,
+        ) -> Result<Option<()>, tonic::Status> {
+            Ok(Some(()))
+        }
+    }
+
+    impl tonic::codec::Codec for RawCodec {
+        type Encode = Vec<u8>;
+        type Decode = ();
+        type Encoder = RawEncoder;
+        type Decoder = UnitDecoder;
+        fn encoder(&mut self) -> RawEncoder {
+            RawEncoder
+        }
+        fn decoder(&mut self) -> UnitDecoder {
+            UnitDecoder
+        }
+    }
+
+    /// Answers a unary call with fixed message bytes.
+    struct Fixed(Vec<u8>);
+
+    impl tonic::server::UnaryService<()> for Fixed {
+        type Response = Vec<u8>;
+        type Future = tonic::codegen::BoxFuture<tonic::Response<Vec<u8>>, tonic::Status>;
+        fn call(&mut self, _: tonic::Request<()>) -> Self::Future {
+            let reply = std::mem::take(&mut self.0);
+            Box::pin(async move { Ok(tonic::Response::new(reply)) })
+        }
+    }
+
+    /// Answers GetSettlementStatus with `status` and other calls with an empty
+    /// message; records each request path.
+    #[derive(Clone)]
+    struct StatusServer {
+        status: Vec<u8>,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tonic::server::NamedService for StatusServer {
+        const NAME: &'static str = "silvana.settlement.v1.SettlementService";
+    }
+
+    impl<B> tonic::codegen::Service<tonic::codegen::http::Request<B>> for StatusServer
+    where
+        B: tonic::codegen::Body + Send + 'static,
+        B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+    {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: tonic::codegen::http::Request<B>) -> Self::Future {
+            let path = req.uri().path().to_string();
+            let reply = if path.ends_with("/GetSettlementStatus") {
+                self.status.clone()
+            } else {
+                Vec::new()
+            };
+            sync::lock(&self.calls).push(path);
+            // Every request is read as one empty message
+            let (parts, _) = req.into_parts();
+            let body = tonic::body::Body::new(String::from("\0\0\0\0\0"));
+            let req = tonic::codegen::http::Request::from_parts(parts, body);
+            Box::pin(async move {
+                Ok(tonic::server::Grpc::new(RawCodec)
+                    .unary(Fixed(reply), req)
+                    .await)
+            })
+        }
+    }
+
+    /// GetSettlementStatusResponse with only `seller_next_action` (field 25) set.
+    fn seller_status(action: NextAction) -> Vec<u8> {
+        vec![0xC8, 0x01, action as u8]
+    }
+
+    /// What one advance did: its result, the backend and server calls, the reservation.
+    struct Advanced {
+        result: AdvanceResult,
+        backend: Vec<&'static str>,
+        server: Vec<String>,
+        reserved: bool,
+    }
+
+    /// Advance the seller's `state` once against a server whose status names `action`.
+    async fn advance_with(action: NextAction, state: SettlementState) -> Advanced {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = registry_config();
+        config.orderbook_grpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = StatusServer {
+            status: seller_status(action),
+            calls: calls.clone(),
+        };
+        let serve = tonic::transport::Server::builder()
+            .add_service(server)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
+        let serving = try_spawn("status server", serve).expect("a test runtime");
+        let backend = Arc::new(RecordingBackend::default());
+        let lm = ready_lm().await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(
+            0,
+            crate::secret::Secret::seal(&mut [0u8; 32]).unwrap(),
+        )));
+        let pid = state.proposal.proposal_id.clone();
+        tracker
+            .lock()
+            .await
+            .record_settlement_order(&pid, 0, Decimal::ONE);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let advance = advance_single(
+            pid.clone(),
+            state,
+            config,
+            backend.clone(),
+            tracker,
+            Some(lm.clone()),
+            false,
+            log,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(30), advance)
+            .await
+            .expect("the advance is bounded");
+        serving.abort();
+        let server = sync::lock(&calls).clone();
+        let reserved = lm.has_commitment(&pid).await;
+        Advanced {
+            result,
+            backend: backend.calls(),
+            server,
+            reserved,
+        }
+    }
+
+    /// A seller state for test_proposal("p1") with an unresolvable quote leg.
+    fn unlisted_quote_state() -> SettlementState {
+        let mut proposal = test_proposal("p1");
+        proposal.quote_instrument = "UNLISTED".to_string();
+        let mut state = SettlementState::new(proposal, false);
+        state.dvp_proposal_cid = Some("00proposal".to_string());
+        state.dvp_cid = Some("00dvp".to_string());
+        state
+    }
+
+    // Without the check these steps reserved and reached the backend or the server first
+    #[tokio::test]
+    async fn the_leg_check_runs_before_any_reservation_backend_or_step_call() {
+        for action in [
+            NextAction::Preconfirm,
+            NextAction::PayDvpFee,
+            NextAction::CreateDvp,
+            NextAction::AcceptDvp,
+        ] {
+            let run = advance_with(action, unlisted_quote_state()).await;
+            let AdvanceResult::Error { error, .. } = run.result else {
+                panic!("{action:?} was not refused")
+            };
+            assert!(
+                error.starts_with(UNRESOLVED_INSTRUMENT) && error.contains("'UNLISTED'"),
+                "{action:?}: {error}"
+            );
+            assert!(run.backend.is_empty(), "{action:?}: {:?}", run.backend);
+            assert!(!run.reserved, "{action:?} reserved");
+            assert_eq!(
+                run.server,
+                ["/silvana.settlement.v1.SettlementService/GetSettlementStatus"],
+                "{action:?}"
+            );
+        }
+    }
+
+    // The accept fixed the DVP terms, so the allocation steps go ahead with a warning
+    #[tokio::test]
+    async fn the_allocation_steps_go_ahead_with_a_warning() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let run = advance_with(NextAction::PayAllocFee, unlisted_quote_state()).await;
+        assert!(matches!(
+            run.result,
+            AdvanceResult::StepCompleted {
+                stage: SettlementStage::AllocationFeePaid,
+                ..
+            }
+        ));
+        assert_eq!(run.backend, ["pay_fee"]);
+        assert!(run.reserved);
+        // No counterparty witnesses yet: Allocate waits instead of being refused
+        let run = advance_with(NextAction::Allocate, unlisted_quote_state()).await;
+        assert!(matches!(run.result, AdvanceResult::Wait { .. }));
+        assert!(run.reserved);
+        assert_eq!(
+            logs.count("goes ahead on the accepted DVP terms: unresolved-instrument"),
+            2
+        );
     }
 }

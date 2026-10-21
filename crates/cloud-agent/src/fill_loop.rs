@@ -567,6 +567,11 @@ pub async fn run_fill_loop(
         FillDirection::Buy => quote_instrument.clone(),
         FillDirection::Sell => base_instrument.clone(),
     };
+    // An unverifiable non-CC allocation leg would fail every settle after an LP
+    // committed; refuse it once, before the first quote.
+    if !params.atomic && Some(allocation_instrument.as_str()) != config.cc_token_id.as_deref() {
+        config.try_resolve_instrument(&allocation_instrument)?;
+    }
 
     // Shutdown signal for the fill loop (Ctrl-C sets persistent flag + wakes sleeps)
     let shutdown_flag = Arc::new(AtomicBool::new(false));

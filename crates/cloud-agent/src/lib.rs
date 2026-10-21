@@ -551,9 +551,41 @@ impl BalanceProvider for CloudBalanceProvider {
     }
 }
 
+/// The daemon's mode checks, which need no network: [`run_cloud_agent`] runs
+/// them first, and a caller may run them before any wait of its own.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+pub fn agent_preflight(config: &BaseConfig, orders_only: bool) -> Result<()> {
+    if config.rfq_v2_only && orders_only {
+        anyhow::bail!(
+            "--orders-only conflicts with rfq_v2_only = true (agent.toml / RFQ_V2_ONLY): \
+             v2-only mode disables order placement, so the agent would do nothing"
+        );
+    }
+    // Embedders may skip validate_v2(); with V1 and orders off nothing would quote
+    if config.rfq_v2_only && !rfq_v2_stack_active(config) {
+        anyhow::bail!(
+            "rfq_v2_only = true but the RFQ V2 stack is not active — requires a \
+             [liquidity_provider] section, [liquidity_provider.rfq_v2].enabled = true \
+             and the atomic quote key; nothing to quote, refusing to run"
+        );
+    }
+    Ok(())
+}
+
+/// RFQ V2 runs when the LP section enables it and a quote key is loaded.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+fn rfq_v2_stack_active(config: &BaseConfig) -> bool {
+    config
+        .liquidity_provider
+        .as_ref()
+        .and_then(|lp| lp.rfq_v2.as_ref())
+        .is_some_and(|v2| v2.enabled)
+        && config.atomic_quote_key.is_some()
+}
+
 #[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn run_cloud_agent(
-    config: BaseConfig,
+    mut config: BaseConfig,
     settlement_only: bool,
     orders_only: bool,
     no_restore: bool,
@@ -565,6 +597,11 @@ pub async fn run_cloud_agent(
     version_info: Option<&str>,
 ) -> Result<()> {
     env::validate()?;
+    agent_preflight(&config, orders_only)?;
+    // Embedders that skip the CLI's registry load must not settle on an unusable one
+    config.validate_instrument_registry().context(
+        "refusing to start: the instrument registry cannot back settlement verification",
+    )?;
     if let Some(v) = version_info {
         info!("Starting Orderbook Cloud Agent (build: {})", v);
     } else {
@@ -580,13 +617,6 @@ pub async fn run_cloud_agent(
     // Ensure the error reporter is installed for the production agent path,
     // for library embedders that bypass the CLI. Idempotent.
     agent_logic::error_reporter::init_from_config(&config);
-
-    if config.rfq_v2_only && orders_only {
-        anyhow::bail!(
-            "--orders-only conflicts with rfq_v2_only = true (agent.toml / RFQ_V2_ONLY): \
-             v2-only mode disables order placement, so the agent would do nothing"
-        );
-    }
 
     // Create LiquidityManager early so it can be shared with RfqHandler and Backend
     let liquidity_manager = agent_logic::liquidity::LiquidityManager::new(
@@ -644,6 +674,9 @@ pub async fn run_cloud_agent(
         }
     }
 
+    // A market with a leg the registry cannot resolve is left out of every quoting path
+    disable_unresolvable_markets(&mut config, &market_instrument_ids);
+
     // Single Shutdown shared by every background task (LP stream, mid-price
     // poller, ACS / merge / payment-queue / topup workers, runner main loop).
     // The runner's Ctrl-C handler signals it on first Ctrl-C; every loop with
@@ -669,21 +702,7 @@ pub async fn run_cloud_agent(
         .as_ref()
         .and_then(|lp| lp.rfq_v2.clone())
         .filter(|v2| v2.enabled);
-    let rfq_v2_active = config.liquidity_provider.is_some()
-        && rfq_v2_cfg.is_some()
-        && config.atomic_quote_key.is_some();
-
-    // Belt-and-braces for library embedders that build BaseConfig directly and
-    // skip validate_v2(): with V1 and orders disabled, an inactive V2 stack
-    // means the agent would run while quoting nothing. Unreachable via the CLI
-    // path (config::assemble enforces the same requirements).
-    if config.rfq_v2_only && !rfq_v2_active {
-        anyhow::bail!(
-            "rfq_v2_only = true but the RFQ V2 stack is not active — requires a \
-             [liquidity_provider] section, [liquidity_provider.rfq_v2].enabled = true \
-             and the atomic quote key; nothing to quote, refusing to run"
-        );
-    }
+    let rfq_v2_active = rfq_v2_stack_active(&config);
 
     // ONE shared multi-instrument holdings pool for RFQ v1 + V2. The splitter
     // reserve (largest holding per instrument) only exists in V2 mode so plain
@@ -1025,6 +1044,7 @@ pub async fn setup_rfq_v2(
         Vec<String>,
         Option<(rust_decimal::Decimal, u32)>,
     )> = Vec::new();
+    let mut skipped_markets: usize = 0;
 
     for market in &config.markets {
         if !market.enabled {
@@ -1037,19 +1057,16 @@ pub async fn setup_rfq_v2(
             continue;
         };
 
-        // Orderbook instrument ids: server market data, else market_id split.
-        let (base_instr, quote_instr) = market_instrument_ids
-            .get(&market.market_id)
-            .cloned()
-            .unwrap_or_else(|| {
-                let parts: Vec<&str> = market.market_id.split('-').collect();
-                match parts.as_slice() {
-                    [base, quote] => (base.to_string(), quote.to_string()),
-                    _ => (market.market_id.clone(), String::new()),
+        // A venue expecting a leg the registry cannot resolve never validates
+        let ((base_ocid, base_admin), (quote_ocid, quote_admin)) =
+            match market_legs(config, &market.market_id, market_instrument_ids) {
+                Ok(legs) => legs,
+                Err(e) => {
+                    skipped_markets = skipped_markets.saturating_add(1);
+                    tracing::error!("RFQ V2 disabled for {}: {:#}", market.market_id, e);
+                    continue;
                 }
-            });
-        let (base_ocid, base_admin) = config.resolve_instrument(&base_instr);
-        let (quote_ocid, quote_admin) = config.resolve_instrument(&quote_instr);
+            };
         let base_is_cc = base_ocid == "Amulet";
         let quote_is_cc = quote_ocid == "Amulet";
         let base_key = if base_is_cc {
@@ -1115,33 +1132,7 @@ pub async fn setup_rfq_v2(
     // back to per-market ladders applied to both legs (first market wins per
     // instrument).
     let split_targets: Vec<split_worker::SplitTarget> = if !v2cfg.denominations.is_empty() {
-        let mut out = Vec::new();
-        for (symbol, ladder) in &v2cfg.denominations {
-            let (on_chain_id, admin) = config.resolve_instrument(symbol);
-            let is_cc = on_chain_id == "Amulet";
-            if !is_cc && admin.is_empty() {
-                tracing::warn!(
-                    "rfq_v2.denominations: cannot resolve instrument '{}' — ladder ignored",
-                    symbol
-                );
-                continue;
-            }
-            let key = if is_cc {
-                CC_INSTRUMENT.to_string()
-            } else {
-                instrument_key(&admin, &on_chain_id)
-            };
-            out.push(split_worker::SplitTarget {
-                instrument: split_worker::SplitInstrument {
-                    key,
-                    is_cc,
-                    on_chain_id,
-                    admin,
-                },
-                denominations: ladder.clone(),
-            });
-        }
-        out
+        split_targets_from_denominations(config, &v2cfg.denominations)
     } else {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -1199,7 +1190,8 @@ pub async fn setup_rfq_v2(
 
     if market_v2.is_empty() {
         return Err(anyhow!(
-            "liquidity_provider.rfq_v2 is enabled but no enabled market has [markets.rfq.v2] enabled"
+            "liquidity_provider.rfq_v2 is enabled but no enabled market has [markets.rfq.v2] enabled \
+             with both instruments in the registry ({skipped_markets} skipped)"
         ));
     }
 
@@ -1325,6 +1317,96 @@ pub async fn setup_rfq_v2(
         let pending = state_for_snap.snapshot_pending();
         (tickets, pending)
     }))
+}
+
+/// Both legs of `market_id` as on-chain (id, admin): server market data, else the
+/// market id split. An error names a leg the registry cannot resolve.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+fn market_legs(
+    config: &BaseConfig,
+    market_id: &str,
+    market_instrument_ids: &std::collections::HashMap<String, (String, String)>,
+) -> Result<((String, String), (String, String))> {
+    let (base, quote) = market_instrument_ids
+        .get(market_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            let parts: Vec<&str> = market_id.split('-').collect();
+            match parts.as_slice() {
+                [base, quote] => (base.to_string(), quote.to_string()),
+                _ => (market_id.to_string(), String::new()),
+            }
+        });
+    Ok((
+        config.try_resolve_instrument(&base)?,
+        config.try_resolve_instrument(&quote)?,
+    ))
+}
+
+/// Disable every enabled market with a leg the registry cannot resolve, with one
+/// ERROR each; returns how many. Entries already disabled are not checked.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+fn disable_unresolvable_markets(
+    config: &mut BaseConfig,
+    market_instrument_ids: &std::collections::HashMap<String, (String, String)>,
+) -> usize {
+    let unresolvable: Vec<(usize, anyhow::Error)> = config
+        .markets
+        .iter()
+        .enumerate()
+        .filter(|(_, market)| market.enabled)
+        .filter_map(|(i, market)| {
+            market_legs(config, &market.market_id, market_instrument_ids)
+                .err()
+                .map(|e| (i, e))
+        })
+        .collect();
+    for (i, e) in &unresolvable {
+        if let Some(market) = config.markets.get_mut(*i) {
+            tracing::error!(
+                "Market {} disabled for quoting and orders: {:#}",
+                market.market_id,
+                e
+            );
+            market.enabled = false;
+        }
+    }
+    unresolvable.len()
+}
+
+/// One split target per ladder whose instrument resolves (Canton Coin's admin
+/// falls back to the DSO party); any other ladder is skipped with a WARN.
+#[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
+fn split_targets_from_denominations(
+    config: &BaseConfig,
+    denominations: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<split_worker::SplitTarget> {
+    let mut out = Vec::new();
+    for (symbol, ladder) in denominations {
+        let (on_chain_id, admin) = match config.try_resolve_instrument(symbol) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                tracing::warn!("rfq_v2.denominations: {:#} — ladder ignored", e);
+                continue;
+            }
+        };
+        let is_cc = on_chain_id == "Amulet";
+        let key = if is_cc {
+            holdings_cache::CC_INSTRUMENT.to_string()
+        } else {
+            holdings_cache::instrument_key(&admin, &on_chain_id)
+        };
+        out.push(split_worker::SplitTarget {
+            instrument: split_worker::SplitInstrument {
+                key,
+                is_cc,
+                on_chain_id,
+                admin,
+            },
+            denominations: ladder.clone(),
+        });
+    }
+    out
 }
 
 /// Run a buyer/seller fill loop with background settlement processing
@@ -4983,20 +5065,10 @@ pub fn atomic_resolve_market_pair(
     let (base, quote) = market_id
         .split_once('-')
         .ok_or_else(|| anyhow!("market id '{}' must have the form BASE-QUOTE", market_id))?;
-    let (base_id, base_admin) = config.resolve_instrument(base);
-    let (quote_id, quote_admin) = config.resolve_instrument(quote);
-    if base_admin.is_empty() || quote_admin.is_empty() {
-        return Err(anyhow!(
-            "cannot resolve instrument admins for market {} (base {}: '{}', quote {}: '{}') — \
-             instrument registry not populated",
-            market_id,
-            base,
-            base_admin,
-            quote,
-            quote_admin
-        ));
-    }
-    Ok(((base_id, base_admin), (quote_id, quote_admin)))
+    let context = || format!("cannot resolve instrument admins for market {market_id}");
+    let base = config.try_resolve_instrument(base).with_context(context)?;
+    let quote = config.try_resolve_instrument(quote).with_context(context)?;
+    Ok((base, quote))
 }
 
 /// Split own holdings of one instrument into denomination rungs.
@@ -5684,13 +5756,7 @@ pub async fn run_atomic(
                     ));
                 }
             };
-            let (on_chain_id, admin) = config.resolve_instrument(target);
-            if on_chain_id != "Amulet" && admin.is_empty() {
-                return Err(anyhow!(
-                    "cannot resolve registry admin for instrument '{}' — instrument registry not populated",
-                    target
-                ));
-            }
+            let (on_chain_id, admin) = config.try_resolve_instrument(target)?;
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
@@ -6221,6 +6287,300 @@ mod daemon_tests {
         assert!(matches!(result, Ok(Err(_))), "the handshake bound should end the connect");
         assert!(started.elapsed() < Duration::from_secs(20));
         drop(listener);
+    }
+
+    fn listed(
+        id: &str,
+        kind: &str,
+        registry: Option<&str>,
+    ) -> orderbook_proto::orderbook::Instrument {
+        orderbook_proto::orderbook::Instrument {
+            instrument_id: id.to_string(),
+            instrument_type: kind.to_string(),
+            symbol: id.to_string(),
+            registry: registry.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A registry with Canton Coin and one token.
+    fn registry_config() -> BaseConfig {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".to_string();
+        config.populate_instruments_from_rpc(vec![
+            listed("CC", "token", Some("dso::1220aa")),
+            listed("TKN", "fiat", Some("tkn-reg::1220bb")),
+        ]);
+        config
+    }
+
+    fn market(id: &str, enabled: bool) -> agent_logic::config::MarketConfig {
+        serde_json::from_str(&format!(r#"{{"market_id":"{id}","enabled":{enabled}}}"#)).unwrap()
+    }
+
+    fn unresolved(e: &anyhow::Error) -> bool {
+        format!("{e:#}").contains(agent_logic::config::UNRESOLVED_INSTRUMENT)
+    }
+
+    // A leg the registry lacked used to give the venue an empty expected admin, which never validates
+    #[test]
+    fn a_market_needs_both_legs_in_the_registry() {
+        let config = registry_config();
+        let cc = ("Amulet".to_string(), "dso::1220aa".to_string());
+        let tkn = ("TKN".to_string(), "tkn-reg::1220bb".to_string());
+        let served = HashMap::from([(
+            "TKN-QUOTE".to_string(),
+            ("CC".to_string(), "TKN".to_string()),
+        )]);
+        assert_eq!(
+            market_legs(&config, "TKN-QUOTE", &served).unwrap(),
+            (cc.clone(), tkn.clone()),
+            "server data first"
+        );
+        assert_eq!(
+            market_legs(&config, "CC-TKN", &HashMap::new()).unwrap(),
+            (cc, tkn),
+            "split fallback"
+        );
+        for id in ["UNLISTED-CC", "CC-UNLISTED", "CC", "CC-TKN-CC"] {
+            let err = market_legs(&config, id, &HashMap::new()).unwrap_err();
+            assert!(unresolved(&err), "{id}: {err:#}");
+        }
+    }
+
+    // Such markets used to be quoted and gridded, then refused at settlement
+    #[test]
+    fn enabled_markets_with_an_unresolvable_leg_are_disabled_at_startup() {
+        let logs = crate::test_util::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::ERROR);
+        let mut config = registry_config();
+        config.markets = vec![
+            market("CC-TKN", true),
+            market("UNLISTED-CC", true),
+            market("OLD-CC", false),
+            market("TKN-QUOTE", true),
+        ];
+        let served = HashMap::from([(
+            "TKN-QUOTE".to_string(),
+            ("TKN".to_string(), "GONE".to_string()),
+        )]);
+        assert_eq!(disable_unresolvable_markets(&mut config, &served), 2);
+        let enabled: Vec<&str> = config
+            .enabled_markets()
+            .iter()
+            .map(|m| m.market_id.as_str())
+            .collect();
+        assert_eq!(enabled, ["CC-TKN"]);
+        assert_eq!(
+            logs.count("disabled for quoting and orders: unresolved-instrument"),
+            2
+        );
+        assert_eq!(
+            logs.count("OLD-CC"),
+            0,
+            "an entry already disabled is not checked"
+        );
+    }
+
+    // A ladder with no registry admin used to be keyed '::<id>'; CC takes the DSO party
+    #[test]
+    fn denomination_ladders_need_a_registry_admin() {
+        let logs = crate::test_util::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".to_string();
+        config.populate_instruments_from_rpc(vec![
+            listed("CC", "token", None),
+            listed("TKN", "fiat", Some("tkn-reg::1220bb")),
+        ]);
+        let ladder = |spec: &str| vec![spec.to_string()];
+        let ladders = HashMap::from([
+            ("CC".to_string(), ladder("10x2")),
+            ("TKN".to_string(), ladder("5x4")),
+            ("UNLISTED".to_string(), ladder("1x1")),
+        ]);
+        let mut targets = split_targets_from_denominations(&config, &ladders);
+        targets.sort_by(|a, b| a.instrument.key.cmp(&b.instrument.key));
+        let got: Vec<(&str, bool, &str, &str, &[String])> = targets
+            .iter()
+            .map(|t| {
+                let i = &t.instrument;
+                (
+                    i.key.as_str(),
+                    i.is_cc,
+                    i.on_chain_id.as_str(),
+                    i.admin.as_str(),
+                    t.denominations.as_slice(),
+                )
+            })
+            .collect();
+        let cc_ladder = ladder("10x2");
+        let tkn_ladder = ladder("5x4");
+        assert_eq!(
+            got,
+            [
+                ("CC", true, "Amulet", "dso::1220aa", cc_ladder.as_slice()),
+                (
+                    "tkn-reg::1220bb::TKN",
+                    false,
+                    "TKN",
+                    "tkn-reg::1220bb",
+                    tkn_ladder.as_slice()
+                ),
+            ]
+        );
+        assert_eq!(
+            logs.count("rfq_v2.denominations: unresolved-instrument: instrument 'UNLISTED'"),
+            1
+        );
+        assert_eq!(logs.count("ladder ignored"), 1);
+    }
+
+    // With every v2 market skipped, setup fails and counts what it skipped
+    #[tokio::test]
+    async fn rfq_v2_setup_skips_a_market_with_an_unresolvable_leg() {
+        let mut config = registry_config();
+        config.liquidity_provider =
+            Some(serde_json::from_str(r#"{"name":"LP test","rfq_v2":{"enabled":true}}"#).unwrap());
+        config.markets = vec![serde_json::from_str(
+            r#"{"market_id":"UNLISTED-CC","rfq":{"min_quantity":"1","max_quantity":"10","v2":{"enabled":true}}}"#,
+        )
+        .unwrap()];
+        let v2cfg = config
+            .liquidity_provider
+            .as_ref()
+            .and_then(|lp| lp.rfq_v2.clone())
+            .unwrap();
+        let quote_key = agent_logic::config::AtomicQuoteKey::from_scalar_hex(
+            &atomic_quote::gen_keypair().unwrap().priv_scalar_hex,
+        )
+        .unwrap();
+        let handler = Arc::new(rfq_handler::RfqHandler::new(&config).unwrap());
+        let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        let served = HashMap::new();
+        let setup = setup_rfq_v2(
+            &config,
+            &v2cfg,
+            &quote_key,
+            &served,
+            handler,
+            HoldingsCache::new(true),
+            lm,
+            None,
+            true,
+            None,
+            Shutdown::new(),
+        );
+        let Err(err) = tokio::time::timeout(Duration::from_secs(5), setup)
+            .await
+            .unwrap()
+        else {
+            panic!("setup must fail with no usable v2 market")
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("with both instruments in the registry (1 skipped)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_agent_preflight_refuses_modes_that_would_quote_nothing() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        agent_preflight(&config, true).unwrap();
+        config.rfq_v2_only = true;
+        let err = agent_preflight(&config, true).unwrap_err().to_string();
+        assert!(
+            err.contains("--orders-only conflicts with rfq_v2_only"),
+            "{err}"
+        );
+        let err = agent_preflight(&config, false).unwrap_err().to_string();
+        assert!(err.contains("the RFQ V2 stack is not active"), "{err}");
+    }
+
+    // An embedder that skips the CLI's registry load used to run on an empty registry
+    #[tokio::test]
+    async fn the_daemon_refuses_an_unusable_registry_before_any_connection() {
+        let ledger = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = ledger.url.clone();
+        let run = run_cloud_agent(
+            config, false, false, true, false, false, false, false, false, None,
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(
+                "refusing to start: the instrument registry cannot back settlement verification"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("orderbook-rpc listed no instruments"),
+            "{text}"
+        );
+        assert_eq!(ledger.connections(), 0);
+        ledger.stop().await;
+    }
+
+    // Venue creation used to report an unpopulated registry when it only lacked the instrument
+    #[test]
+    fn a_venue_pair_needs_both_legs_in_the_registry() {
+        let config = registry_config();
+        assert_eq!(
+            atomic_resolve_market_pair(&config, "CC-TKN").unwrap(),
+            (
+                ("Amulet".to_string(), "dso::1220aa".to_string()),
+                ("TKN".to_string(), "tkn-reg::1220bb".to_string())
+            )
+        );
+        for id in ["UNLISTED-CC", "CC-UNLISTED"] {
+            let err = format!("{:#}", atomic_resolve_market_pair(&config, id).unwrap_err());
+            let expected =
+                format!("cannot resolve instrument admins for market {id}: unresolved-instrument");
+            assert!(err.starts_with(&expected), "{err}");
+        }
+        let err = atomic_resolve_market_pair(&config, "CCTKN")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must have the form BASE-QUOTE"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_split_of_an_unresolvable_leg_is_refused_before_any_call() {
+        let ledger = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let mut config = registry_config();
+        config.orderbook_grpc_url = ledger.url.clone();
+        let split = |market: &str| AtomicCommands::Split {
+            market: market.to_string(),
+            instrument: "base".to_string(),
+            splits: "1x1".to_string(),
+        };
+        let err = run_atomic(
+            config.clone(),
+            split("UNLISTED-CC"),
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(unresolved(&err), "{err:#}");
+        assert_eq!(ledger.connections(), 0, "refused before connecting");
+        let run = run_atomic(config, split("TKN-CC"), false, false, false, false, None);
+        let _ = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("the split is bounded");
+        assert!(
+            ledger.connections() > 0,
+            "a resolvable leg goes on to the ledger"
+        );
+        ledger.stop().await;
     }
 }
 
