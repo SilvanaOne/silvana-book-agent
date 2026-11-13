@@ -184,6 +184,9 @@ use message_signing::{
     canonical_params_lock_holdings, canonical_params_process_lock_unlock_requests,
     canonical_params_resize_lock, canonical_params_terminate_lock,
     canonical_params_faucet, canonical_params_prepay_traffic,
+    canonical_params_usdcx_request_agreement, canonical_params_usdcx_mint,
+    canonical_params_usdcx_burn, canonical_params_usdcx_reclaim_holding,
+    canonical_params_usdcx_update_pre_approval, canonical_params_usdcx_terminate_agreement,
 };
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use tx_verifier::OperationExpectation;
@@ -260,6 +263,19 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
         Params::PrepayTraffic(p) => canonical_params_prepay_traffic(
             &p.amount, p.description.as_deref(), &p.command_id,
         ),
+        Params::UsdcxRequestAgreement(p) => {
+            canonical_params_usdcx_request_agreement(p.pre_approval, &p.request_id)?
+        }
+        Params::UsdcxMint(p) => canonical_params_usdcx_mint(&p.deposit_attestation_cid)?,
+        Params::UsdcxBurn(p) => canonical_params_usdcx_burn(
+            &p.amount, &p.destination_recipient, &p.request_id,
+            &p.input_holding_cids, p.max_input_holdings,
+        )?,
+        Params::UsdcxReclaimHolding(p) => {
+            canonical_params_usdcx_reclaim_holding(&p.revoked_withdraw_attestation_cid)?
+        }
+        Params::UsdcxUpdatePreApproval(p) => canonical_params_usdcx_update_pre_approval(p.pre_approval)?,
+        Params::UsdcxTerminateAgreement(p) => canonical_params_usdcx_terminate_agreement(&p.reason)?,
     };
     Ok(canonical_prepare_request(req.operation, &params_canonical))
 }
@@ -420,6 +436,25 @@ pub(crate) async fn within<T>(
         Ok(result) => result,
         Err(_) => Err(anyhow!("{what} did not finish within {budget:?}")),
     }
+}
+
+/// What a [`SubmitOptions::pre_sign`] hook sees: the verified prepared
+/// transaction of one attempt, before it is signed.
+pub struct PreSignContext<'a> {
+    /// The command id of the prepared transaction (verified for strict operations).
+    pub command_id: &'a str,
+    pub transaction_id: &'a str,
+    pub verification: &'a tx_verifier::VerificationResult,
+}
+
+/// A hook run before each signature; an error aborts that attempt unsigned.
+pub type PreSign<'a> = &'a mut (dyn FnMut(&PreSignContext<'_>) -> Result<()> + Send);
+
+/// Options of [`DAppProviderClient::submit_transaction_guarded`].
+pub struct SubmitOptions<'a> {
+    /// Attempts (prepare → sign → execute); at least one.
+    pub max_retries: u32,
+    pub pre_sign: Option<PreSign<'a>>,
 }
 
 /// Client for the DAppProviderService gRPC API (CIP-0103). Clones share the
@@ -903,6 +938,26 @@ impl DAppProviderClient {
             .await
     }
 
+    /// [`Self::submit_transaction`] with a chosen number of attempts and a
+    /// hook that runs on every attempt after the prepared transaction passed
+    /// verification and before it is signed. An error from the hook stops the
+    /// submission with nothing signed for that attempt.
+    pub async fn submit_transaction_guarded(
+        &mut self,
+        req: PrepareTransactionRequest,
+        expectation: &OperationExpectation,
+        verbose: bool,
+        dry_run: bool,
+        force: bool,
+        opts: SubmitOptions<'_>,
+    ) -> Result<ExecuteTransactionResponse> {
+        let mut uncertain = None;
+        let attempts = opts.max_retries.max(1);
+        self.submit_attempts(req, expectation, verbose, dry_run, force, attempts, opts.pre_sign, &mut uncertain)
+            .await
+            .map_err(|e| mark_uncertain(e, uncertain.as_deref()))
+    }
+
     async fn submit_with_retries(
         &mut self,
         req: PrepareTransactionRequest,
@@ -913,7 +968,7 @@ impl DAppProviderClient {
         max_retries: u32,
     ) -> Result<ExecuteTransactionResponse> {
         let mut uncertain = None;
-        self.submit_attempts(req, expectation, verbose, dry_run, force, max_retries, &mut uncertain)
+        self.submit_attempts(req, expectation, verbose, dry_run, force, max_retries, None, &mut uncertain)
             .await
             .map_err(|e| mark_uncertain(e, uncertain.as_deref()))
     }
@@ -928,6 +983,7 @@ impl DAppProviderClient {
         dry_run: bool,
         force: bool,
         max_retries: u32,
+        mut pre_sign: Option<PreSign<'_>>,
         uncertain: &mut Option<String>,
     ) -> Result<ExecuteTransactionResponse> {
         let budget = SubmitBudget::new(SUBMIT_BUDGET);
@@ -1052,7 +1108,8 @@ impl DAppProviderClient {
             }
 
             if !verification.accepted {
-                if force {
+                // A strict operation is never signed past a rejection.
+                if force && !expectation.requires_hash_match() {
                     warn!(
                         "Transaction verification REJECTED but --force is set, proceeding: {}",
                         verification.rejection_reason.as_deref().unwrap_or("unknown")
@@ -1075,6 +1132,18 @@ impl DAppProviderClient {
                     );
                     anyhow::bail!("Transaction verification REJECTED: {}", reason);
                 }
+            }
+
+            if expectation.requires_hash_match() && verification.computed_hash == [0u8; 32] {
+                anyhow::bail!("Transaction verification gave no hash to sign for a strict operation");
+            }
+            if let Some(hook) = pre_sign.as_mut() {
+                hook(&PreSignContext {
+                    command_id: &prepared.command_id,
+                    transaction_id: &prepared.transaction_id,
+                    verification: &verification,
+                })
+                .context("refused before signing")?;
             }
 
             // 3. Determine which hash to sign
@@ -1771,11 +1840,13 @@ fn server_failure_is_definite(msg: &str) -> bool {
     if msg.contains("SUBMISSION_ALREADY_IN_FLIGHT") {
         return false;
     }
-    const PRE_SUBMIT: [&str; 4] = [
+    const PRE_SUBMIT: [&str; 5] = [
         "Transaction session ",
         "fees_json mismatch",
         "Invalid party ID format",
         "Missing offset in ledger-end response",
+        // The ledger service refused a USDCx operation before submitting it.
+        "USDCX_NOT_SUBMITTED",
     ];
     if msg.starts_with("Transaction failed:")
         || PRE_SUBMIT.iter().any(|p| msg.starts_with(p))
@@ -3217,6 +3288,7 @@ mod bounded_io_tests {
             "Missing offset in ledger-end response",
             "Execute submission failed (HTTP 400 Bad Request): {}",
             "Execute submission failed (HTTP 503 Service Unavailable): SEQUENCER_BACKPRESSURE",
+            "USDCX_NOT_SUBMITTED: the burn record could not be written",
         ] {
             assert!(server_failure_is_definite(definite), "{definite}");
         }
@@ -3228,10 +3300,84 @@ mod bounded_io_tests {
             "Execute submission failed (HTTP 408 Request Timeout): {}",
             "Transaction failed: SUBMISSION_ALREADY_IN_FLIGHT",
             "error decoding response body",
+            "USDCX_OUTCOME_UNKNOWN command_id=usdcx-burn-ab: Execute submission failed (HTTP 400 Bad Request): {}",
             "",
         ] {
             assert!(!server_failure_is_definite(ambiguous), "{ambiguous}");
         }
+    }
+
+    /// One guarded submit attempt against `ledger`; returns its error.
+    async fn submit_guarded_once(
+        ledger: SigningLedger,
+        expectation: &OperationExpectation,
+        force: bool,
+        hook: &mut (dyn FnMut(&PreSignContext<'_>) -> Result<()> + Send),
+    ) -> anyhow::Error {
+        let (url, server) = serve(tonic::service::Routes::new(ledger)).await;
+        let mut c = DAppProviderClient::from_channel(lazy_channel(&url), "party", "agent", &key(), 3600, None, &server_key())
+            .unwrap()
+            .with_bounds(short_bounds());
+        let opts = SubmitOptions { max_retries: 1, pre_sign: Some(hook) };
+        let submit = c.submit_transaction_guarded(preapproval_request(), expectation, false, false, force, opts);
+        let err = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded").unwrap_err();
+        server.abort();
+        err
+    }
+
+    #[tokio::test]
+    async fn the_pre_sign_hook_runs_before_signing_and_can_stop_it() {
+        // An expectation the inspector does not check, so the empty fake transaction passes
+        let expectation = OperationExpectation::IssueTickets { lp_party: "lp".into(), ticket_count: 1 };
+        let mut seen = Vec::new();
+        let mut refuse = |ctx: &PreSignContext<'_>| -> Result<()> {
+            seen.push(ctx.command_id.to_string());
+            anyhow::bail!("guard says no")
+        };
+        let err = submit_guarded_once(
+            SigningLedger::failing("Transaction failed: rejected", 4), &expectation, false, &mut refuse,
+        )
+        .await;
+        let text = format!("{err:#}");
+        assert!(text.contains("refused before signing") && text.contains("guard says no"), "{text}");
+        assert!(!is_ambiguous_execute_error(&err), "nothing was signed or executed: {text}");
+        assert_eq!(seen, vec!["cmd-1".to_string()]);
+
+        // An accepting hook lets the attempt sign and execute.
+        let mut calls = 0;
+        let mut allow = |_: &PreSignContext<'_>| -> Result<()> {
+            calls += 1;
+            Ok(())
+        };
+        let err = submit_guarded_once(
+            SigningLedger::failing("Transaction failed: rejected", 4), &expectation, false, &mut allow,
+        )
+        .await;
+        assert!(format!("{err:#}").contains("Transaction failed: rejected"), "{err:#}");
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn force_never_signs_a_rejected_strict_operation() {
+        // The fake prepared transaction is empty: the USDCx inspector rejects it.
+        let expectation = OperationExpectation::UsdcxUpdatePreApproval {
+            party: "party".into(),
+            network: "mainnet".into(),
+            pre_approval: true,
+        };
+        assert!(expectation.requires_hash_match());
+        let mut hook_ran = false;
+        let mut hook = |_: &PreSignContext<'_>| -> Result<()> {
+            hook_ran = true;
+            Ok(())
+        };
+        let err = submit_guarded_once(
+            SigningLedger::failing("Transaction failed: rejected", 4), &expectation, true, &mut hook,
+        )
+        .await;
+        let text = format!("{err:#}");
+        assert!(text.contains("Transaction verification REJECTED"), "{text}");
+        assert!(!hook_ran, "nothing may be signed");
     }
 
     #[tokio::test]

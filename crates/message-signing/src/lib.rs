@@ -338,6 +338,94 @@ pub fn canonical_params_faucet(token_name: &str, token_admin: &str, ticket: &str
 }
 
 // ============================================================================
+// Canonical payload builders — USDCx bridge (BridgeUserAgreement operations)
+//
+// Every field is covered. Values are interpolated without escaping, so each
+// one is refused when it holds a line break (it could forge extra lines), and
+// list elements also when they hold the list separator.
+// ============================================================================
+
+/// `value`, unless it holds a line break.
+fn usdcx_value<'a>(key: &str, value: &'a str) -> Result<&'a str> {
+    if value.contains(['\n', '\r']) {
+        return Err(anyhow!("{key} must not contain a line break"));
+    }
+    Ok(value)
+}
+
+pub fn canonical_params_usdcx_request_agreement(
+    pre_approval: bool,
+    request_id: &str,
+) -> Result<String> {
+    Ok(format!(
+        "param_type=UsdcxRequestAgreement\npre_approval={}\nrequest_id={}\n",
+        pre_approval,
+        usdcx_value("request_id", request_id)?
+    ))
+}
+
+pub fn canonical_params_usdcx_mint(deposit_attestation_cid: &str) -> Result<String> {
+    Ok(format!(
+        "param_type=UsdcxMint\ndeposit_attestation_cid={}\n",
+        usdcx_value("deposit_attestation_cid", deposit_attestation_cid)?
+    ))
+}
+
+pub fn canonical_params_usdcx_burn(
+    amount: &str,
+    destination_recipient: &str,
+    request_id: &str,
+    input_holding_cids: &[String],
+    max_input_holdings: Option<u32>,
+) -> Result<String> {
+    let mut s = format!(
+        "param_type=UsdcxBurn\namount={}\ndestination_recipient={}\nrequest_id={}\n",
+        usdcx_value("amount", amount)?,
+        usdcx_value("destination_recipient", destination_recipient)?,
+        usdcx_value("request_id", request_id)?
+    );
+    // Appended only when set, like the CIP-56 transfer's.
+    if !input_holding_cids.is_empty() {
+        for cid in input_holding_cids {
+            usdcx_value("input_holding_cids", cid)?;
+            if cid.is_empty() || cid.contains(',') {
+                return Err(anyhow!(
+                    "input_holding_cids must be non-empty and must not contain ','"
+                ));
+            }
+        }
+        s.push_str(&format!("input_holding_cids={}\n", input_holding_cids.join(",")));
+    }
+    if let Some(n) = max_input_holdings {
+        s.push_str(&format!("max_input_holdings={}\n", n));
+    }
+    Ok(s)
+}
+
+pub fn canonical_params_usdcx_reclaim_holding(
+    revoked_withdraw_attestation_cid: &str,
+) -> Result<String> {
+    Ok(format!(
+        "param_type=UsdcxReclaimHolding\nrevoked_withdraw_attestation_cid={}\n",
+        usdcx_value("revoked_withdraw_attestation_cid", revoked_withdraw_attestation_cid)?
+    ))
+}
+
+pub fn canonical_params_usdcx_update_pre_approval(pre_approval: bool) -> Result<String> {
+    Ok(format!(
+        "param_type=UsdcxUpdatePreApproval\npre_approval={}\n",
+        pre_approval
+    ))
+}
+
+pub fn canonical_params_usdcx_terminate_agreement(reason: &str) -> Result<String> {
+    Ok(format!(
+        "param_type=UsdcxTerminateAgreement\nreason={}\n",
+        usdcx_value("reason", reason)?
+    ))
+}
+
+// ============================================================================
 // Canonical payload builders — RFQ V2 (AtomicDVP), PrepareAtomicTransactionRequest
 //
 // V2 operation identity is the params oneof ARM (the v1 TransactionOperation
@@ -1299,6 +1387,188 @@ mod tests {
         assert!(merge.contains("input_holding_cids=c1,c2\n"));
         assert!(merge.starts_with(&legacy));
         assert!(!canonical_params_accept_cip56("cid").is_empty());
+        assert!(!canonical_params_usdcx_request_agreement(true, "r-1").unwrap().is_empty());
+        assert!(!canonical_params_usdcx_mint("cid").unwrap().is_empty());
+        assert!(!canonical_params_usdcx_burn("10", "0xab", "r-1", &[], None).unwrap().is_empty());
+        assert!(!canonical_params_usdcx_reclaim_holding("cid").unwrap().is_empty());
+        assert!(!canonical_params_usdcx_update_pre_approval(false).unwrap().is_empty());
+        assert!(!canonical_params_usdcx_terminate_agreement("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn usdcx_canonicals_cover_every_field_in_order() {
+        assert_eq!(
+            canonical_params_usdcx_request_agreement(true, "r-1").unwrap(),
+            "param_type=UsdcxRequestAgreement\npre_approval=true\nrequest_id=r-1\n"
+        );
+        assert_eq!(
+            canonical_params_usdcx_mint("00ab").unwrap(),
+            "param_type=UsdcxMint\ndeposit_attestation_cid=00ab\n"
+        );
+        let plain = canonical_params_usdcx_burn("10.5", "0xab", "r-1", &[], None).unwrap();
+        assert_eq!(
+            plain,
+            "param_type=UsdcxBurn\namount=10.5\ndestination_recipient=0xab\nrequest_id=r-1\n"
+        );
+        let full = canonical_params_usdcx_burn(
+            "10.5", "0xab", "r-1", &["c1".to_string(), "c2".to_string()], Some(3),
+        )
+        .unwrap();
+        assert_eq!(full, format!("{plain}input_holding_cids=c1,c2\nmax_input_holdings=3\n"));
+        assert_eq!(
+            canonical_params_usdcx_reclaim_holding("00cd").unwrap(),
+            "param_type=UsdcxReclaimHolding\nrevoked_withdraw_attestation_cid=00cd\n"
+        );
+        assert_eq!(
+            canonical_params_usdcx_update_pre_approval(false).unwrap(),
+            "param_type=UsdcxUpdatePreApproval\npre_approval=false\n"
+        );
+        assert_eq!(
+            canonical_params_usdcx_terminate_agreement("done").unwrap(),
+            "param_type=UsdcxTerminateAgreement\nreason=done\n"
+        );
+    }
+
+    #[test]
+    fn usdcx_canonicals_refuse_values_that_could_forge_lines() {
+        for bad in ["a\nb", "a\rb", "\n", "x\r\n"] {
+            assert!(canonical_params_usdcx_request_agreement(true, bad).is_err(), "{bad:?}");
+            assert!(canonical_params_usdcx_mint(bad).is_err(), "{bad:?}");
+            assert!(canonical_params_usdcx_burn(bad, "0xab", "r", &[], None).is_err(), "{bad:?}");
+            assert!(canonical_params_usdcx_burn("1", bad, "r", &[], None).is_err(), "{bad:?}");
+            assert!(canonical_params_usdcx_burn("1", "0xab", bad, &[], None).is_err(), "{bad:?}");
+            assert!(
+                canonical_params_usdcx_burn("1", "0xab", "r", &[bad.to_string()], None).is_err(),
+                "{bad:?}"
+            );
+            assert!(canonical_params_usdcx_reclaim_holding(bad).is_err(), "{bad:?}");
+            assert!(canonical_params_usdcx_terminate_agreement(bad).is_err(), "{bad:?}");
+        }
+        // A list element can't smuggle in the separator or be empty.
+        for bad in ["c1,c2", ""] {
+            assert!(
+                canonical_params_usdcx_burn("1", "0xab", "r", &[bad.to_string()], None).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The USDCx golden vectors: for a fixed seed and fixed inputs, each
+    /// canonical, its SHA-256 and its signature. Ed25519 is deterministic, so
+    /// they regenerate byte-identically; another implementation (such as a
+    /// TypeScript port) must reproduce them.
+    fn usdcx_vectors() -> serde_json::Value {
+        let seed: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let party = format!("vector-party::1220{}", "ab".repeat(32));
+        let request_id = "6f1c2c7e-4b8a-4c41-9a3e-2d5b7f0c9e11";
+        let recipient = "0x1234567890abcdef1234567890abcdef12345678";
+        let attestation_cid = format!("00{}", "11".repeat(34));
+        let revoked_cid = format!("00{}", "22".repeat(34));
+        let holdings = [format!("00{}", "33".repeat(34)), format!("00{}", "44".repeat(34))];
+        let prepare = |operation: i32, params: String| canonical_prepare_request(operation, &params);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "prepare.usdcx_request_agreement",
+                prepare(22, canonical_params_usdcx_request_agreement(false, request_id).unwrap()),
+            ),
+            (
+                "prepare.usdcx_mint",
+                prepare(23, canonical_params_usdcx_mint(&attestation_cid).unwrap()),
+            ),
+            (
+                "prepare.usdcx_burn",
+                prepare(24, canonical_params_usdcx_burn("10.5", recipient, request_id, &[], None).unwrap()),
+            ),
+            (
+                "prepare.usdcx_burn.inputs_and_cap",
+                prepare(
+                    24,
+                    canonical_params_usdcx_burn("10.5", recipient, request_id, &holdings, Some(2)).unwrap(),
+                ),
+            ),
+            (
+                "prepare.usdcx_reclaim_holding",
+                prepare(25, canonical_params_usdcx_reclaim_holding(&revoked_cid).unwrap()),
+            ),
+            (
+                "prepare.usdcx_update_pre_approval",
+                prepare(26, canonical_params_usdcx_update_pre_approval(true).unwrap()),
+            ),
+            (
+                "prepare.usdcx_terminate_agreement",
+                prepare(27, canonical_params_usdcx_terminate_agreement("no longer needed").unwrap()),
+            ),
+            (
+                "execute_request",
+                canonical_execute_request("tx-0001", "c2lnbmF0dXJl"),
+            ),
+            (
+                "tx_fees_authorization",
+                canonical_tx_fees_authorization(
+                    &party,
+                    "tx-0001",
+                    r#"[{"amount":"0.0123","currency":"CC","kind":"traffic"}]"#,
+                ),
+            ),
+        ];
+        let vectors: Vec<serde_json::Value> = cases
+            .into_iter()
+            .map(|(name, canonical)| {
+                let digest: String = Sha256::digest(&canonical)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let signature = sign_canonical(&seed, &canonical);
+                serde_json::json!({
+                    "name": name,
+                    "canonical": String::from_utf8(canonical).unwrap(),
+                    "sha256Hex": digest,
+                    "signatureB64": signature.signature_b64,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema": "silvana.message-signing.usdcx-vectors.v1",
+            "signingScheme": SIGNING_SCHEME,
+            "regenerate": "cargo test -p message-signing usdcx_vectors_print -- --ignored --nocapture",
+            "seedHex": seed.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "publicKeyB64url": URL_SAFE_NO_PAD.encode(public),
+            "vectors": vectors,
+        })
+    }
+
+    #[test]
+    fn usdcx_vectors_match_the_fixture() {
+        const FIXTURE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/usdcx-vectors.json"
+        ));
+        let fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(
+            fixture,
+            usdcx_vectors(),
+            "a USDCx canonical changed: that breaks every other signer; regenerate the fixture \
+             only with a coordinated change (see its `regenerate`)"
+        );
+        // Each signature verifies against the published key.
+        let public = parse_public_key(fixture["publicKeyB64url"].as_str().unwrap()).unwrap();
+        for v in fixture["vectors"].as_array().unwrap() {
+            verify_canonical(
+                &public,
+                v["canonical"].as_str().unwrap().as_bytes(),
+                v["signatureB64"].as_str().unwrap(),
+                SIGNING_SCHEME,
+            )
+            .unwrap();
+        }
+    }
+
+    /// Prints the USDCx golden vectors (see `usdcx_vectors`).
+    #[test]
+    #[ignore]
+    fn usdcx_vectors_print() {
+        println!("{}", serde_json::to_string_pretty(&usdcx_vectors()).unwrap());
     }
 
     #[test]
