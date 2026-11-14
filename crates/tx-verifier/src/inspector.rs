@@ -29,7 +29,7 @@ const VERBOSE_DUMP_MAX_BYTES: usize = 256 * 1024;
 // ============================================================================
 
 /// Get a named field from a Record
-fn get_record_field<'a>(record: &'a Record, label: &str) -> Option<&'a Value> {
+pub(crate) fn get_record_field<'a>(record: &'a Record, label: &str) -> Option<&'a Value> {
     record
         .fields
         .iter()
@@ -38,7 +38,7 @@ fn get_record_field<'a>(record: &'a Record, label: &str) -> Option<&'a Value> {
 }
 
 /// Unwrap a Value as Record
-fn as_record(value: &Value) -> Option<&Record> {
+pub(crate) fn as_record(value: &Value) -> Option<&Record> {
     match value.sum.as_ref()? {
         Sum::Record(r) => Some(r),
         _ => None,
@@ -46,7 +46,7 @@ fn as_record(value: &Value) -> Option<&Record> {
 }
 
 /// Get Party string from a Value
-fn get_party(value: &Value) -> Option<&str> {
+pub(crate) fn get_party(value: &Value) -> Option<&str> {
     match value.sum.as_ref()? {
         Sum::Party(s) => Some(s.as_str()),
         _ => None,
@@ -54,7 +54,7 @@ fn get_party(value: &Value) -> Option<&str> {
 }
 
 /// Get Numeric string from a Value
-fn get_numeric(value: &Value) -> Option<&str> {
+pub(crate) fn get_numeric(value: &Value) -> Option<&str> {
     match value.sum.as_ref()? {
         Sum::Numeric(s) => Some(s.as_str()),
         _ => None,
@@ -62,7 +62,7 @@ fn get_numeric(value: &Value) -> Option<&str> {
 }
 
 /// Get Text string from a Value
-fn get_text(value: &Value) -> Option<&str> {
+pub(crate) fn get_text(value: &Value) -> Option<&str> {
     match value.sum.as_ref()? {
         Sum::Text(s) => Some(s.as_str()),
         _ => None,
@@ -70,7 +70,7 @@ fn get_text(value: &Value) -> Option<&str> {
 }
 
 /// Unwrap a Value as List (slice of elements)
-fn as_list(value: &Value) -> Option<&[Value]> {
+pub(crate) fn as_list(value: &Value) -> Option<&[Value]> {
     match value.sum.as_ref()? {
         Sum::List(l) => Some(&l.elements),
         _ => None,
@@ -115,7 +115,7 @@ fn build_nodes_dict(tx: &proto_v2::interactive::DamlTransaction) -> NodesDict<'_
 }
 
 /// Extract v1 NodeType from a DamlNode
-fn get_node_type(node: &daml_transaction::Node) -> Option<&NodeType> {
+pub(crate) fn get_node_type(node: &daml_transaction::Node) -> Option<&NodeType> {
     let versioned = node.versioned_node.as_ref()?;
     match versioned {
         daml_transaction::node::VersionedNode::V1(n) => n.node_type.as_ref(),
@@ -218,7 +218,7 @@ fn prepared_json_for_log(prepared_transaction_bytes: &[u8]) -> String {
 }
 
 /// Dump full PreparedTransaction and OperationExpectation as JSON (verbose mode only).
-fn log_verbose(prepared_transaction_bytes: &[u8], expectation: &OperationExpectation) {
+pub(crate) fn log_verbose(prepared_transaction_bytes: &[u8], expectation: &OperationExpectation) {
     let tx_json = prepared_json_for_log(prepared_transaction_bytes);
     let expect_json = serde_json::to_string_pretty(expectation)
         .unwrap_or_else(|e| format!("(serialize error: {})", e));
@@ -1358,7 +1358,7 @@ fn inspect_recurring_prepaid(
 // ============================================================================
 
 /// Get ContractId string from a Value
-fn get_contract_id(value: &Value) -> Option<&str> {
+pub(crate) fn get_contract_id(value: &Value) -> Option<&str> {
     match value.sum.as_ref()? {
         Sum::ContractId(s) => Some(s.as_str()),
         _ => None,
@@ -1369,7 +1369,7 @@ fn get_contract_id(value: &Value) -> Option<&str> {
 // Node summary helper
 // ============================================================================
 
-fn node_summary(tx: &proto_v2::interactive::DamlTransaction) -> String {
+pub(crate) fn node_summary(tx: &proto_v2::interactive::DamlTransaction) -> String {
     let node_count = tx.nodes.len();
     let exercise_count = tx
         .nodes
@@ -2441,6 +2441,20 @@ pub fn inspect(
         OperationExpectation::CancelTickets { ticket_count, .. } => {
             format!("CancelTickets({} tickets)", ticket_count)
         }
+        OperationExpectation::UsdcxRequestAgreement { pre_approval, .. } => {
+            format!("UsdcxRequestAgreement(preApproval {})", pre_approval)
+        }
+        OperationExpectation::UsdcxMint { deposit_attestation_cid, .. } => {
+            format!("UsdcxMint({})", short(deposit_attestation_cid, 16))
+        }
+        OperationExpectation::UsdcxBurn { amount, .. } => format!("UsdcxBurn({})", amount),
+        OperationExpectation::UsdcxReclaimHolding { revoked_withdraw_attestation_cid, .. } => {
+            format!("UsdcxReclaimHolding({})", short(revoked_withdraw_attestation_cid, 16))
+        }
+        OperationExpectation::UsdcxUpdatePreApproval { pre_approval, .. } => {
+            format!("UsdcxUpdatePreApproval({})", pre_approval)
+        }
+        OperationExpectation::UsdcxTerminateAgreement { .. } => "UsdcxTerminateAgreement".to_string(),
     };
 
     // Verbose: dump full JSON
@@ -2560,6 +2574,17 @@ pub fn inspect(
             let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
                 .context("Failed to decode PreparedTransaction protobuf")?;
             inspect_recurring_prepaid(&prepared, party, app_party, amount)
+        }
+        // USDCx bridge operations: strict, fail-closed inspection.
+        OperationExpectation::UsdcxRequestAgreement { .. }
+        | OperationExpectation::UsdcxMint { .. }
+        | OperationExpectation::UsdcxBurn { .. }
+        | OperationExpectation::UsdcxReclaimHolding { .. }
+        | OperationExpectation::UsdcxUpdatePreApproval { .. }
+        | OperationExpectation::UsdcxTerminateAgreement { .. } => {
+            crate::usdcx_inspect::inspect(prepared_transaction_bytes, expectation)?
+                .map(|i| i.result)
+                .context("USDCx expectation without a USDCx inspector")
         }
         // TransferCip56 (send-side) not yet implemented
         _ => {

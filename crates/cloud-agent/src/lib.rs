@@ -52,6 +52,8 @@ pub mod ticket_pool;
 pub mod topup;
 pub mod transfer_all;
 pub mod updates_worker;
+#[cfg(feature = "usdcx")]
+pub mod usdcx;
 pub mod venue_registry;
 
 pub use accept_settle::MulticallSettler;

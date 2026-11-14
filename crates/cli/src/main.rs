@@ -21,6 +21,7 @@ use cloud_agent::{
     run_sign_standalone,
     fill_loop,
     config,
+    usdcx::{UsdcxCommands, UsdcxOptions},
 };
 
 // ============================================================================
@@ -134,6 +135,20 @@ enum Commands {
     Atomic {
         #[command(subcommand)]
         command: AtomicCommands,
+    },
+    /// USDCx bridge: Ethereum USDC <-> Canton USDCx (Circle xReserve)
+    Usdcx {
+        /// mainnet or testnet (default: the network of SYNCHRONIZER_ID)
+        #[arg(long)]
+        network: Option<String>,
+        /// Directory of the local USDCx state (default: ~/.silvana-agent/usdcx)
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Do not ask for confirmations
+        #[arg(long)]
+        yes: bool,
+        #[command(subcommand)]
+        command: UsdcxCommands,
     },
     /// Buy a specified amount via RFQ, repeating until filled
     Buy {
@@ -271,7 +286,14 @@ fn main() -> Result<()> {
     agent_logic::panic_hook::install();
 
     match prepare(cli)? {
-        Some(job) => run_on_runtime(job.run(), SHUTDOWN_GRACE),
+        Some(job) => match run_on_runtime(job.run(), SHUTDOWN_GRACE) {
+            // Something was or may have been submitted and is not finished.
+            Err(e) if cloud_agent::usdcx::is_pending(&e) => {
+                agent_logic::errln!("Error: {e:#}");
+                std::process::exit(3);
+            }
+            other => other,
+        },
         None => Ok(()),
     }
 }
@@ -372,6 +394,8 @@ struct ConfiguredCommand {
     command: Commands,
     flags: Flags,
     quote_for_atomic: Option<Zeroizing<String>>,
+    /// The Ethereum key typed for `usdcx deposit` (never stored).
+    eth_key: Option<Zeroizing<String>>,
 }
 
 impl Job {
@@ -504,11 +528,27 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
 
     scrub_private_key_env();
 
+    // `usdcx deposit` sends from Ethereum with a key typed here, before
+    // anything runs; it lives only in memory and is zeroized on drop.
+    let eth_key = match &cli.command {
+        Commands::Usdcx { command, .. } if command.needs_ethereum_key() && !flags.dry_run => {
+            if std::env::var("ETHEREUM_RPC_URL").map(|v| v.trim().is_empty()).unwrap_or(true) {
+                bail!(
+                    "ETHEREUM_RPC_URL is required to send the deposit from here — or use \
+                     --print-only to send it from a wallet"
+                );
+            }
+            Some(prompt_ethereum_key()?)
+        }
+        _ => None,
+    };
+
     Ok(Some(Job::Command(Box::new(ConfiguredCommand {
         config: base_config,
         command: cli.command,
         flags,
         quote_for_atomic,
+        eth_key,
     }))))
 }
 
@@ -520,7 +560,7 @@ fn scrub_private_key_env() {
 }
 
 async fn run_configured(job: ConfiguredCommand) -> Result<()> {
-    let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic } = job;
+    let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic, eth_key } = job;
 
     // Checks that need no network fail before any registry wait
     preflight(&base_config, &command)?;
@@ -537,7 +577,7 @@ async fn run_configured(job: ConfiguredCommand) -> Result<()> {
     // Idempotent; a no-op for commands that never report.
     agent_logic::error_reporter::init_from_config(&base_config);
 
-    dispatch(base_config, command, flags, quote_for_atomic).await
+    dispatch(base_config, command, flags, quote_for_atomic, eth_key).await
 }
 
 /// [`populate_instruments`] bounded by `budget`; an elapsed fetch leaves `config` as it was.
@@ -597,6 +637,7 @@ fn registry_need(command: &Commands) -> RegistryNeed {
         | Commands::UserService { .. }
         | Commands::Faucet { .. }
         | Commands::Lock { .. }
+        | Commands::Usdcx { .. }
         | Commands::GeneratePrivateKey
         | Commands::Onboard { .. } => RegistryNeed::BestEffort,
     }
@@ -712,6 +753,7 @@ async fn dispatch(
     command: Commands,
     flags: Flags,
     quote_for_atomic: Option<Zeroizing<String>>,
+    eth_key: Option<Zeroizing<String>>,
 ) -> Result<()> {
     let Flags { verbose, dry_run, force, confirm } = flags;
     match command {
@@ -733,6 +775,10 @@ async fn dispatch(
         Commands::Faucet { command } => run_faucet(base_config, command, verbose).await,
         Commands::Lock { command } => run_lock(base_config, command, verbose, dry_run, force, confirm).await,
         Commands::Atomic { command } => run_atomic(base_config, command, verbose, dry_run, force, confirm, quote_for_atomic).await,
+        Commands::Usdcx { network, state_dir, yes, command } => {
+            let options = UsdcxOptions { network, state_dir, yes };
+            cloud_agent::usdcx::run_usdcx(base_config, options, command, verbose, dry_run, force, confirm, eth_key).await
+        }
         Commands::Buy { market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token } => {
             run_fill(base_config, fill_loop::FillDirection::Buy, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token, verbose, dry_run, force, confirm).await
         }
@@ -903,6 +949,45 @@ fn terminal_available() -> bool {
     {
         std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
+}
+
+/// Read an Ethereum private key (hex) without echo from the controlling
+/// terminal. It is used for one deposit and never stored.
+fn prompt_ethereum_key() -> Result<Zeroizing<String>> {
+    if !terminal_available() {
+        bail!(
+            "usdcx deposit asks for the Ethereum key at a prompt: run it in a terminal, or use \
+             --print-only to send the deposit from a wallet"
+        );
+    }
+    let restore = terminal_restorer();
+    read_key_within(
+        KEY_PROMPT_TIMEOUT,
+        || {
+            read_ethereum_key_with_retry(|| {
+                rpassword::prompt_password("Ethereum private key (hex, input hidden, never stored): ")
+            })
+        },
+        restore,
+    )
+}
+
+/// One retry on a malformed key; the key is 32 bytes of hex, `0x` optional.
+fn read_ethereum_key_with_retry(
+    mut read: impl FnMut() -> std::io::Result<String>,
+) -> Result<Zeroizing<String>> {
+    for attempt in 0..2 {
+        let raw = Zeroizing::new(read().context("could not read the Ethereum key from the terminal")?);
+        let trimmed = raw.trim();
+        let key = Zeroizing::new(trimmed.strip_prefix("0x").unwrap_or(trimmed).to_string());
+        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(key);
+        }
+        if attempt == 0 {
+            agent_logic::errln!("Invalid key: expected 32 bytes of hex");
+        }
+    }
+    bail!("invalid Ethereum private key")
 }
 
 /// One retry on a decode error; a read failure carries a `--private-key` hint.
@@ -1357,7 +1442,7 @@ mod tests {
         };
         for command in [Commands::GeneratePrivateKey, onboard] {
             let config = BaseConfig::test_minimal().unwrap();
-            let err = dispatch(config, command, Flags::default(), None).await.unwrap_err();
+            let err = dispatch(config, command, Flags::default(), None, None).await.unwrap_err();
             assert!(format!("{err:#}").contains("dispatched before config load"), "{err:#}");
         }
     }

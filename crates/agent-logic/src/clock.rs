@@ -82,6 +82,16 @@ pub fn uuid_v7() -> Result<Uuid> {
     uuid_v7_at(SystemTime::now(), &random)
 }
 
+/// A random UUID (v4) from the OS RNG; replaces `Uuid::new_v4`, which panics
+/// when the random source fails.
+pub fn uuid_v4() -> Result<Uuid> {
+    let mut random = [0u8; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|e| anyhow!("OS random source failed: {e}"))?;
+    Ok(uuid::Builder::from_random_bytes(random).into_uuid())
+}
+
 fn uuid_v7_at(t: SystemTime, random: &[u8; 10]) -> Result<Uuid> {
     let since = since_epoch(t).ok_or_else(|| anyhow!("system clock reads before 1970"))?;
     let ms = u64::try_from(since.as_millis()).context("system clock out of range")?;
@@ -188,5 +198,14 @@ mod tests {
         }
         let distinct: std::collections::HashSet<u64> = (0..64).map(|_| jitter_ms(u64::MAX)).collect();
         assert!(distinct.len() > 1, "jitter must vary");
+    }
+
+    #[test]
+    fn uuid_v4_is_a_random_version_4_uuid() {
+        let a = uuid_v4().unwrap();
+        let b = uuid_v4().unwrap();
+        assert_eq!(a.get_version_num(), 4);
+        assert_eq!(a.get_variant(), uuid::Variant::RFC4122);
+        assert_ne!(a, b);
     }
 }

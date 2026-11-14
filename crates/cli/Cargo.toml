@@ -11,7 +11,7 @@ path = "src/main.rs"
 vergen-gitcl = "1"
 
 [dependencies]
-cloud-agent = { path = "../cloud-agent" }
+cloud-agent = { path = "../cloud-agent", features = ["usdcx"] }
 agent-logic = { path = "../agent-logic" }
 orderbook-proto = { path = "../orderbook-proto" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

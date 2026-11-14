@@ -1,0 +1,63 @@
+{
+  "publicKeyB64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+  "regenerate": "cargo test -p message-signing usdcx_vectors_print -- --ignored --nocapture",
+  "schema": "silvana.message-signing.usdcx-vectors.v1",
+  "seedHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "signingScheme": "ed25519-sha256-v1",
+  "vectors": [
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=22\nparam_type=UsdcxRequestAgreement\npre_approval=false\nrequest_id=6f1c2c7e-4b8a-4c41-9a3e-2d5b7f0c9e11\n",
+      "name": "prepare.usdcx_request_agreement",
+      "sha256Hex": "28eb0ceff0adf910ba45f9cf431f8427e7e2489309e51341e78fe07ab6bbfbbb",
+      "signatureB64": "XmapgB9Nl6xnWt+hGlqSl1s+lEzMaZf5Gn/6xq4ZhSvBOe8OY1gQZb2rzS6+ejbYRN73E4/ylI2iHSSlHX3eCQ=="
+    },
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=23\nparam_type=UsdcxMint\ndeposit_attestation_cid=0011111111111111111111111111111111111111111111111111111111111111111111\n",
+      "name": "prepare.usdcx_mint",
+      "sha256Hex": "5ab51d1b18dbefee9f6eb63501ff64cdf36f9d3c99cf1bc9cea4f066e9ffd44b",
+      "signatureB64": "QiQxyuvsr80FENtq6zYVLhGlvIKPH8DKwo8FdcwjfoOw0v+OsLQfaKEJ924zsnI+RXI+xZ0vT3Oxgu2+agcXBg=="
+    },
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=24\nparam_type=UsdcxBurn\namount=10.5\ndestination_recipient=0x1234567890abcdef1234567890abcdef12345678\nrequest_id=6f1c2c7e-4b8a-4c41-9a3e-2d5b7f0c9e11\n",
+      "name": "prepare.usdcx_burn",
+      "sha256Hex": "c850b0e34f8137dbd67e4adc0b965df8d788a14f131775e5c0a5179f91499749",
+      "signatureB64": "o68MCHz2Bn4gDtp53wo2tT42F0pViLbxSzPPUxlgw1lUmVF/+9OfAedY7fqBc+TmTXvx0IlYi1UoG75+MRfXDQ=="
+    },
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=24\nparam_type=UsdcxBurn\namount=10.5\ndestination_recipient=0x1234567890abcdef1234567890abcdef12345678\nrequest_id=6f1c2c7e-4b8a-4c41-9a3e-2d5b7f0c9e11\ninput_holding_cids=0033333333333333333333333333333333333333333333333333333333333333333333,0044444444444444444444444444444444444444444444444444444444444444444444\nmax_input_holdings=2\n",
+      "name": "prepare.usdcx_burn.inputs_and_cap",
+      "sha256Hex": "97bb134eb4ff93d13de1969e60ca72c7d83e3e64115aa7fccbd7429cad93827d",
+      "signatureB64": "y8ca4MJb40pvcvkRW1+GSyfDGHT3b5tWCVX1tLsGGqP7x3cQ89OGhy7gIt9IBMO6Cp2GprPWhOlqREw3n0ZiAA=="
+    },
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=25\nparam_type=UsdcxReclaimHolding\nrevoked_withdraw_attestation_cid=0022222222222222222222222222222222222222222222222222222222222222222222\n",
+      "name": "prepare.usdcx_reclaim_holding",
+      "sha256Hex": "1112dfb7bc6a3bd0bc00dd176fbdc558a11933eccc6ba0480edbb878c02fc996",
+      "signatureB64": "IeUzDzMJNGw78bh8E2CLbeM9LwZwLxrBINrWBA07GndJ9bPxGzqtMuvznHcaPbzEoXxXPoVUYmY4bZwCK5MqAw=="
+    },
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=26\nparam_type=UsdcxUpdatePreApproval\npre_approval=true\n",
+      "name": "prepare.usdcx_update_pre_approval",
+      "sha256Hex": "fbec3fb3bce6e83faf91dc4d858f38e60b2e62a45f6ea11fad41b9b29073f80f",
+      "signatureB64": "fLDLvD/HDouukbbCFGXwBWk8Knau28vovCL8iJA6XOeXgk+wHGj5Q+aohOt9Xws+Zn17qo9DiCjVRvh9aBGpDQ=="
+    },
+    {
+      "canonical": "msg_type=PrepareTransactionRequest\noperation=27\nparam_type=UsdcxTerminateAgreement\nreason=no longer needed\n",
+      "name": "prepare.usdcx_terminate_agreement",
+      "sha256Hex": "72ec6b911c30cd773cd44e8f7844e94ff23e594a50362e2c52d3298816d54507",
+      "signatureB64": "MgYlAd8O8k/WhEedT2RdEzr2hU2JZdStokeoUvug/F30IoFoNdKuBxDQAtUwSVykvQZ/Gw0uipVOqm7kIhPkCw=="
+    },
+    {
+      "canonical": "msg_type=ExecuteTransactionRequest\ntransaction_id=tx-0001\nsignature=c2lnbmF0dXJl\n",
+      "name": "execute_request",
+      "sha256Hex": "a618b520b20af3624e75d529b0598b585e0f413b88d0870be11cbf0a2869576f",
+      "signatureB64": "UUbnGJLHGSfY6hM5dgsXk5DO8m/feNKuoe0E5OHjgHrpxRq/Lg50kku9JRmfi9v4hI1RDrZFg+GfoHlkUDYpCw=="
+    },
+    {
+      "canonical": "msg_type=TxFeesAuthorization\nparty_id=vector-party::1220abababababababababababababababababababababababababababababababab\ntransaction_id=tx-0001\nfees_json=[{\"amount\":\"0.0123\",\"currency\":\"CC\",\"kind\":\"traffic\"}]\n",
+      "name": "tx_fees_authorization",
+      "sha256Hex": "dbd944d502259cdaf9529112af7f5d50eb4f688d428ed0a9f08623eec4570258",
+      "signatureB64": "TsW+IxjJxnlIPeiY7b9+Wu5TH74/14dAbH3Vqiarc+YZ5rxPsl81/lqxlRjjr/5C3d/KfhvZwasfO6yZUWXvDA=="
+    }
+  ]
+}

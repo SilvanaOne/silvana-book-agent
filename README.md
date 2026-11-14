@@ -505,6 +505,31 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `sign multihash --input <B64>`                                                                | Sign a Canton 34-byte multihash                         |
 | `sign message --input <TEXT>`                                                                 | Sign a UTF-8 text message                               |
 | `sign binary --input <HEX>`                                                                   | Sign hex-encoded binary data                            |
+| `usdcx status` / `usdcx onboard` / `usdcx deposit` / `usdcx mint` / `usdcx burn` / `usdcx track` | USDCx bridge (see below)                             |
+
+### USDCx bridge (Ethereum USDC ⇄ Canton USDCx)
+
+The `usdcx` commands move USDC between Ethereum and Canton through Circle's xReserve and Digital Asset's USDCx bridge (MainNet and TestNet). Canton operations are typed ledger-service operations: the server builds the transaction, the agent verifies it strictly (pinned Digital Asset parties and bridge package, matching hash; `--force` is refused) and signs it with the party's key.
+
+| Command | Description |
+| --- | --- |
+| `usdcx status` | Agreement, pending deposits and withdrawals, USDCx balance, where deposits go |
+| `usdcx onboard [--pre-approval] [--request-id <UUID>]` | Request the bridge agreement and wait for Digital Asset (about a minute) |
+| `usdcx deposit --amount <N> --print-only [--from <0x…>]` | Print Digital Asset's deposit page and the two transactions to send from your own wallet |
+| `usdcx deposit --amount <N> [--no-mint]` | Send the deposit from here: the Ethereum key is typed at a hidden prompt and never stored (needs `ETHEREUM_RPC_URL`); then mint it on Canton |
+| `usdcx mint [--attestation-cid <CID>] [--wait]` | Mint a deposit's `DepositAttestation` (not needed with pre-approval: Digital Asset mints directly) |
+| `usdcx burn --amount <N> --to <0x…> [--request-id <UUID>] [--fee-on-top]` | Burn USDCx; Circle releases the USDC on Ethereum minus its fee |
+| `usdcx reclaim --revoked-cid <CID>` | Take back the USDCx of a withdrawal Digital Asset revoked |
+| `usdcx pre-approval --enable\|--disable` | Switch direct minting of deposits |
+| `usdcx offboard [--reason <TEXT>]` | End the bridge agreement |
+| `usdcx track [--eth-tx <0x…>] [--wait]` | Continue open withdrawals and deposits; `--eth-tx` registers a deposit sent from a wallet |
+
+Options: `--network mainnet|testnet` (default: the network of `SYNCHRONIZER_ID`), `--state-dir <DIR>` (default `~/.silvana-agent/usdcx`), `--yes` (no confirmations), and the global `--dry-run` (prepare and verify only).
+
+- **Never send a plain USDC transfer to the xReserve address**: it carries no Canton recipient and does not reach Canton. Deposit only on the network's Ethereum chain (chain id 1 on MainNet).
+- **Withdrawals are guarded locally.** `burn` prints its request id before anything is sent and records every signature in `<state-dir>/<network>/<party>/burns.json` before making it. If a run is interrupted or its outcome is unclear, continue with `usdcx track` or `usdcx burn --request-id <the printed id>` with the same amount and destination — never by starting a new withdrawal: a new one is refused while an earlier one may still commit.
+- **Exit codes**: 0 done; 1 nothing was committed (the command may be run again); 3 something was or may have been submitted and is not finished (continue as above).
+- Every operation pays the ledger service's traffic fee; top up with `transfer prepay-traffic` first.
 
 ### gRPC API
 

@@ -8,6 +8,10 @@
 //! - On hash MATCH: return computed hash (caller signs it)
 //! - On hash MISMATCH: WARN + return sentinel (caller falls back to server hash)
 //! - Always `accepted: true` — never blocks transactions during debugging
+//!
+//! USDCx bridge operations are the exception: they are inspected fail-closed
+//! ([`OperationExpectation::requires_hash_match`]), and a hash mismatch or a
+//! hash that could not be computed rejects them.
 
 #![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 
@@ -18,6 +22,8 @@ pub mod inspector;
 mod test_support;
 mod text;
 pub mod types;
+pub mod usdcx;
+mod usdcx_inspect;
 
 pub use types::{InspectionResult, OperationExpectation, VerificationResult};
 
@@ -54,7 +60,19 @@ pub fn verify_and_hash(
     let mut warnings = Vec::new();
 
     // Step 1: Inspect transaction fields against expectation
-    let inspection = inspector::inspect(prepared_transaction_bytes, expectation, verbose)?;
+    let (inspection, burn_holding_cids) =
+        match usdcx_inspect::inspect(prepared_transaction_bytes, expectation)? {
+            Some(usdcx) => {
+                if verbose {
+                    inspector::log_verbose(prepared_transaction_bytes, expectation);
+                }
+                (usdcx.result, usdcx.burn_holding_cids)
+            }
+            None => (
+                inspector::inspect(prepared_transaction_bytes, expectation, verbose)?,
+                Vec::new(),
+            ),
+        };
     if !inspection.accepted {
         return Ok(VerificationResult {
             accepted: false,
@@ -62,9 +80,11 @@ pub fn verify_and_hash(
             summary: inspection.summary,
             warnings: inspection.warnings,
             rejection_reason: inspection.rejection_reason,
+            burn_holding_cids: Vec::new(),
         });
     }
     warnings.extend(inspection.warnings);
+    let strict = expectation.requires_hash_match();
 
     // Step 2: Compute hash from PreparedTransaction
     let computed_hash = hasher::compute_hash(prepared_transaction_bytes, hashing_scheme_version)?;
@@ -83,6 +103,21 @@ pub fn verify_and_hash(
                 summary: format!("{}\nHash verified — MATCH.", inspection.summary),
                 warnings,
                 rejection_reason: None,
+                burn_holding_cids,
+            });
+        } else if strict {
+            return Ok(VerificationResult {
+                accepted: false,
+                computed_hash: [0u8; 32],
+                summary: format!("{}\nHash MISMATCH.", inspection.summary),
+                warnings,
+                rejection_reason: Some(format!(
+                    "Hash mismatch: server={}, computed={}; this operation is signed only with a \
+                     matching hash",
+                    hex::encode(&server_hash_bytes),
+                    hex::encode(computed_hash),
+                )),
+                burn_holding_cids: Vec::new(),
             });
         } else {
             debug!(
@@ -102,8 +137,24 @@ pub fn verify_and_hash(
                 summary: format!("{}\nHash MISMATCH (debug mode — using server hash).", inspection.summary),
                 warnings,
                 rejection_reason: None,
+                burn_holding_cids,
             });
         }
+    }
+
+    if strict {
+        return Ok(VerificationResult {
+            accepted: false,
+            computed_hash: [0u8; 32],
+            summary: format!("{}\nHash computation failed.", inspection.summary),
+            warnings,
+            rejection_reason: Some(
+                "The transaction hash could not be computed; this operation is signed only with a \
+                 matching hash"
+                    .to_string(),
+            ),
+            burn_holding_cids: Vec::new(),
+        });
     }
 
     // Hasher returned sentinel (computation failed) — fall back to server hash
@@ -113,5 +164,6 @@ pub fn verify_and_hash(
         summary: format!("{}\nHash computation failed — using server hash.", inspection.summary),
         warnings,
         rejection_reason: None,
+        burn_holding_cids,
     })
 }

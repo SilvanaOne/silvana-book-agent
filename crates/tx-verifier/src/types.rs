@@ -164,6 +164,80 @@ pub enum OperationExpectation {
         lp_party: String,
         ticket_count: usize,
     },
+    /// USDCx bridge: create the party's BridgeUserAgreementRequest. Every
+    /// `Usdcx*` expectation names its network (`mainnet` or `testnet`), whose
+    /// pinned parties and synchronizer the inspection checks.
+    UsdcxRequestAgreement {
+        party: String,
+        network: String,
+        pre_approval: bool,
+        /// `usdcx::onboard_command_id(party, request_id)`.
+        command_id: String,
+    },
+    /// USDCx bridge: mint a DepositAttestation of the party.
+    UsdcxMint {
+        party: String,
+        network: String,
+        deposit_attestation_cid: String,
+        /// `usdcx::mint_command_id(deposit_attestation_cid)`.
+        command_id: String,
+    },
+    /// USDCx bridge: burn USDCx for a release of USDC on Ethereum.
+    UsdcxBurn {
+        party: String,
+        network: String,
+        /// Decimal, compared exactly.
+        amount: String,
+        /// `0x` + 40 lowercase hex.
+        destination_recipient: String,
+        request_id: String,
+        /// `usdcx::burn_command_id(request_id)`.
+        command_id: String,
+    },
+    /// USDCx bridge: take back the USDCx of a revoked withdrawal.
+    UsdcxReclaimHolding {
+        party: String,
+        network: String,
+        revoked_withdraw_attestation_cid: String,
+        /// `usdcx::reclaim_command_id(revoked_withdraw_attestation_cid)`.
+        command_id: String,
+    },
+    /// USDCx bridge: switch direct minting of deposits on or off. Its choice
+    /// consumes the agreement, so it needs no deterministic command id.
+    UsdcxUpdatePreApproval {
+        party: String,
+        network: String,
+        pre_approval: bool,
+    },
+    /// USDCx bridge: end the party's agreement (consuming, like pre-approval).
+    UsdcxTerminateAgreement {
+        party: String,
+        network: String,
+        reason: String,
+    },
+}
+
+impl OperationExpectation {
+    /// A USDCx bridge operation.
+    pub fn is_usdcx(&self) -> bool {
+        matches!(
+            self,
+            Self::UsdcxRequestAgreement { .. }
+                | Self::UsdcxMint { .. }
+                | Self::UsdcxBurn { .. }
+                | Self::UsdcxReclaimHolding { .. }
+                | Self::UsdcxUpdatePreApproval { .. }
+                | Self::UsdcxTerminateAgreement { .. }
+        )
+    }
+
+    /// Whether only a self-computed hash equal to the server's may be signed:
+    /// a mismatch, or a hash that could not be computed, rejects instead of
+    /// falling back to the server's hash. Callers must not override a
+    /// rejection of such an operation.
+    pub fn requires_hash_match(&self) -> bool {
+        self.is_usdcx()
+    }
 }
 
 /// Result of transaction verification
@@ -180,6 +254,10 @@ pub struct VerificationResult {
     pub warnings: Vec<String>,
     /// Rejection reason if accepted=false
     pub rejection_reason: Option<String>,
+    /// The holdings a USDCx burn spends, as inspected (empty otherwise): a
+    /// caller that guards against signing two burns for one withdrawal
+    /// compares them across signatures.
+    pub burn_holding_cids: Vec<String>,
 }
 
 /// Result of transaction field inspection (before hashing)

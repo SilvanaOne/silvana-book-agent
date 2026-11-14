@@ -46,6 +46,21 @@ uuid = { version = "1", features = ["v7"] }
 once_cell = "1"
 csv = "1"
 
+# The `usdcx` bridge commands (feature `usdcx`): Ethereum client, Circle's
+# xReserve API and the local state files.
+alloy = { version = ">=1.0.41, <1.8", default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "contract", "provider-http", "rpc-types", "network", "signer-local"], optional = true }
+# alloy 1.8 moved the provider and transport to reqwest 0.13: keep one reqwest (0.12).
+alloy-provider = { version = ">=1.0.41, <1.8", default-features = false, optional = true }
+alloy-transport-http = { version = ">=1.0.41, <1.8", default-features = false, optional = true }
+alloy-primitives = { version = "1.4.1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+serde = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[features]
+# `usdcx` commands: move USDC between Ethereum and Canton (enabled by the cli).
+usdcx = ["dep:alloy", "dep:alloy-provider", "dep:alloy-transport-http", "dep:alloy-primitives", "dep:reqwest", "dep:serde", "dep:zeroize"]
+
 [dev-dependencies]
 # `test-util` (not part of tokio's "full") gives tests a pausable clock, so the
 # DvpProposal GC gate's 15-minute timeout is reachable without waiting for it.
