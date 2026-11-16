@@ -1642,6 +1642,10 @@ pub struct RfqMarketConfig {
     /// the base are rejected as unsupported. Not per-venue.
     #[serde(default)]
     pub disable_bid_side: bool,
+    /// false = RFQ V2 only on this market: V1 requests are refused, since they
+    /// carry no requesting party for the trailing-net term. Not per-venue.
+    #[serde(default = "default_enabled")]
+    pub v1_enabled: bool,
     #[serde(default)]
     pub quote_valid_secs: Option<u32>,
     /// DVP allocation deadline in seconds from DVP creation (default 15 minutes)

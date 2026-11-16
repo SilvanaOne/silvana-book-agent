@@ -952,6 +952,15 @@ impl RfqHandler {
         &self.lp_config.name
     }
 
+    /// True when the pair's RFQ config opts out of V1 (`v1_enabled = false`).
+    fn v1_disabled_for(&self, market_id: &str) -> bool {
+        self.markets
+            .iter()
+            .find(|m| m.market_id == market_id)
+            .and_then(|m| m.rfq.as_ref())
+            .is_some_and(|r| !r.v1_enabled)
+    }
+
     /// Handle an incoming (v1) RFQ request
     pub async fn handle_rfq_request(&self, request: RfqRequest) -> RfqResponse {
         let rfq_id = request.rfq_id.clone();
@@ -966,6 +975,17 @@ impl RfqHandler {
                 RejectInfo::new(
                     RfqRejectionReason::TemporarilyUnavailable,
                     "LP is RFQ V2 (AtomicDVP) only",
+                ),
+            ));
+        }
+
+        if self.v1_disabled_for(&request.market_id) {
+            debug!("RFQ V1 request {} refused: market {} is V2-only", rfq_id, request.market_id);
+            return RfqResponse::Reject(self.build_reject(
+                rfq_id,
+                RejectInfo::new(
+                    RfqRejectionReason::MarketNotSupported,
+                    "RFQ V1 not offered for this market",
                 ),
             ));
         }
@@ -1101,6 +1121,43 @@ mod price_rfq_tests {
                 panic!("expected quote with switch off: {:?}", r.reason_detail)
             }
         }
+    }
+
+    /// `v1_enabled = false` refuses V1 for that market only; the V2 pricing
+    /// path for the same market is untouched, and the default stays V1-on.
+    #[tokio::test]
+    async fn v1_disabled_market_refuses_v1_but_still_prices_v2() {
+        let req = || RfqRequest {
+            rfq_id: "rfq-1".to_string(),
+            market_id: "EDELx-USDC".to_string(),
+            direction: 1,
+            quantity: "1000".to_string(),
+            ..Default::default()
+        };
+        assert!(handler().markets[0].rfq.as_ref().is_some_and(|r| r.v1_enabled), "default on");
+
+        let mut h = handler();
+        if let Some(rfq) = h.markets[0].rfq.as_mut() {
+            rfq.v1_enabled = false;
+        }
+        match h.handle_rfq_request(req()).await {
+            RfqResponse::Reject(r) => {
+                assert_eq!(r.reason, RfqRejectionReason::MarketNotSupported as i32);
+                assert!(r.reason_detail.unwrap_or_default().contains("V1"));
+            }
+            RfqResponse::Quote(_) => panic!("must not quote V1 on a V2-only market"),
+        }
+        // The shared pricing path (what V2 calls) still prices the market.
+        let priced = h
+            .price_rfq("q-1", "EDELx-USDC", 1, "1000", "", false, None, None, None)
+            .await;
+        assert!(priced.is_ok(), "V2 pricing must be unaffected");
+
+        let parsed: MarketConfig = serde_json::from_str(
+            r#"{"market_id":"X-CC","rfq":{"min_quantity":"1","max_quantity":"2","v1_enabled":false}}"#,
+        )
+        .unwrap();
+        assert!(parsed.rfq.is_some_and(|r| !r.v1_enabled), "parses from toml/json");
     }
 
     /// Quote-denominated buy: "pay 50 USDC" prices at $50 (clears the $10
