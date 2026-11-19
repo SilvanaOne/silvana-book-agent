@@ -33,6 +33,7 @@ use agent_logic::confirm::Unanswered;
 use agent_logic::rpc_client::OrderbookRpcClient;
 use agent_logic::state::{SavedFillState, UnresolvedKind, UnresolvedRound};
 use agent_logic::clock;
+use agent_logic::num::Px;
 use orderbook_proto::settlement::{DvpStepStatusEnum, GetSettlementStatusResponse, SettlementStage};
 use orderbook_proto::SettlementProposalMessage;
 
@@ -736,8 +737,8 @@ pub async fn run_fill_loop(
         };
 
         info!(
-            "[round {}] Requesting quotes: {} {:.6} @ limit {:.6} (remaining={:.6})",
-            round, dir_str, request_amount, price_limit, remaining
+            "[round {}] Requesting quotes: {} {:.6} @ limit {} (remaining={:.6})",
+            round, dir_str, request_amount, Px(price_limit, 6), remaining
         );
 
         // ---- RFQ V2 atomic round (one-transaction settle) ----------------
@@ -857,15 +858,15 @@ pub async fn run_fill_loop(
             let adapted_max = match best_max {
                 Some(v) if v < request_amount => v,
                 _ => {
-                    warn!("[round {}] No acceptable quotes within limit {:.6}", round, price_limit);
+                    warn!("[round {}] No acceptable quotes within limit {}", round, Px(price_limit, 6));
                     if interruptible_sleep(interval, &fill_shutdown, &shutdown_flag).await {
                     }
                     continue;
                 }
             };
             info!(
-                "[round {}] No quotes at limit {:.6}. LP max={:.6}, retrying with adapted amount",
-                round, price_limit, adapted_max
+                "[round {}] No quotes at limit {}. LP max={:.6}, retrying with adapted amount",
+                round, Px(price_limit, 6), adapted_max
             );
             request_amount = adapted_max;
             let retry_resp = match client
@@ -1665,13 +1666,13 @@ async fn atomic_round(
         let adapted_max = match best_max {
             Some(v) if v < request_amount => v,
             _ => {
-                warn!("[round {}] No acceptable atomic quotes within limit {:.6}", round, price_limit);
+                warn!("[round {}] No acceptable atomic quotes within limit {}", round, Px(price_limit, 6));
                 return AtomicRoundResult::Retry;
             }
         };
         info!(
-            "[round {}] No atomic quotes at limit {:.6}. LP max={:.6}, retrying with adapted amount",
-            round, price_limit, adapted_max
+            "[round {}] No atomic quotes at limit {}. LP max={:.6}, retrying with adapted amount",
+            round, Px(price_limit, 6), adapted_max
         );
         request_amount = adapted_max;
         let retry_resp = match client

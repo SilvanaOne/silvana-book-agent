@@ -43,6 +43,34 @@ impl fmt::Display for Dp {
     }
 }
 
+/// Displays an `f64` like `{:.n}` (n capped at 64), but a nonzero value below
+/// 1e-3 gets enough places for six significant digits, capped at 24 places.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Px(pub f64, pub usize);
+
+const PX_MAX_PLACES: usize = 24;
+const PX_MAX_N: usize = 64;
+const PX_POW10: [f64; PX_MAX_PLACES] = [
+    1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14,
+    1e-15, 1e-16, 1e-17, 1e-18, 1e-19, 1e-20, 1e-21, 1e-22, 1e-23, 1e-24,
+];
+
+impl fmt::Display for Px {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Px(v, n) = *self;
+        // A runtime precision above u16::MAX panics inside fmt.
+        let n = n.min(PX_MAX_N);
+        let a = v.abs();
+        let places = if v.is_finite() && a > 0.0 && a < 1e-3 {
+            let zeros = PX_POW10.iter().take_while(|&&p| a < p).count();
+            n.max(zeros.saturating_add(6).min(PX_MAX_PLACES))
+        } else {
+            n
+        };
+        write!(f, "{v:.places$}")
+    }
+}
+
 /// The first `n` characters of `s` (all of `s` if shorter).
 pub fn short(s: &str, n: usize) -> &str {
     s.char_indices()
@@ -77,6 +105,25 @@ mod tests {
 
     fn d(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
+    }
+
+    // Tiny values keep six significant digits; ordinary ones print exactly as {:.n}
+    #[test]
+    fn px_keeps_tiny_values_significant() {
+        assert_eq!(Px(1.8463e-8, 6).to_string(), "0.0000000184630");
+        assert_eq!(Px(1.8463189766e-8, 6).to_string(), "0.0000000184632");
+        assert_eq!(Px(-1.6012e-9, 6).to_string(), "-0.00000000160120");
+        assert_eq!(Px(2e-4, 6).to_string(), "0.000200000");
+        assert_eq!(Px(9.99e-4, 6).to_string(), "0.000999000");
+        assert_eq!(Px(1.6e-9, 20).to_string(), format!("{:.20}", 1.6e-9));
+        assert_eq!(Px(1e-30, 6).to_string(), format!("{:.24}", 1e-30));
+        for (v, n) in [(0.0794, 6), (0.0794123456789, 10), (1234.5678, 6), (1e-3, 6), (0.0, 6), (-0.5, 4)] {
+            assert_eq!(Px(v, n).to_string(), format!("{v:.n$}"), "{v} {n}");
+        }
+        assert_eq!(Px(f64::NAN, 6).to_string(), "NaN");
+        assert_eq!(Px(f64::INFINITY, 6).to_string(), "inf");
+        // An absurd precision is capped instead of panicking inside fmt.
+        assert_eq!(Px(0.08, usize::MAX).to_string(), format!("{:.64}", 0.08));
     }
 
     // Iterator::sum panics here; dec_sum reports the overflow

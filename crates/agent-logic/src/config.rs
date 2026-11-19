@@ -571,6 +571,11 @@ impl BaseConfig {
                         v2m.max_input_holdings
                     ));
                 }
+                check_market_quote_valid_secs(
+                    &market.market_id,
+                    v2m,
+                    self.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()),
+                )?;
                 if v2m.enabled && !rfq_v2_enabled {
                     return Err(anyhow!(
                         "Market {} has [markets.rfq.v2] enabled but \
@@ -893,6 +898,11 @@ impl BaseConfig {
                         v2m.max_input_holdings
                     ));
                 }
+                check_market_quote_valid_secs(
+                    &market.market_id,
+                    v2m,
+                    agent.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()),
+                )?;
                 if global_ladders && !v2m.denominations.is_empty() {
                     tracing::warn!(
                         "Market {}: per-market [markets.rfq.v2].denominations is superseded by \
@@ -1401,6 +1411,24 @@ fn check_range<T: PartialOrd + Display>(name: &str, value: T, range: RangeInclus
     }
     let (lo, hi) = range.into_inner();
     bail!("{name}={value} is outside {lo}..={hi}")
+}
+
+/// A market's `[markets.rfq.v2] atomic_quote_valid_secs` lies between the
+/// minimum and the LP-level window (the cap when no LP-level config is set).
+fn check_market_quote_valid_secs(
+    market_id: &str,
+    v2m: &RfqV2MarketConfig,
+    lp_v2: Option<&RfqV2Config>,
+) -> Result<()> {
+    let Some(secs) = v2m.atomic_quote_valid_secs else {
+        return Ok(());
+    };
+    let max = lp_v2.map_or(RFQ_V2_MAX_QUOTE_VALID_SECS, |v2| v2.atomic_quote_valid_secs);
+    check_range(
+        &format!("Market {market_id}: [markets.rfq.v2] atomic_quote_valid_secs"),
+        secs,
+        RFQ_V2_MIN_MARKET_QUOTE_VALID_SECS..=max,
+    )
 }
 
 /// `[liquidity_provider.rfq_v2]` values that feed timers and quote validity.
@@ -1953,6 +1981,10 @@ pub struct RfqV2MarketConfig {
     /// settle for consolidation.
     #[serde(default = "default_max_input_holdings")]
     pub max_input_holdings: usize,
+    /// Signed-quote validity for this market, in seconds; may only shorten the
+    /// LP-level `atomic_quote_valid_secs`. None = the LP-level window.
+    #[serde(default)]
+    pub atomic_quote_valid_secs: Option<u64>,
 }
 
 /// Liquidity provider configuration (LP agents only)
@@ -1981,6 +2013,9 @@ pub struct LiquidityProviderConfig {
 pub const RFQ_V2_MAX_QUOTE_VALID_SECS: u64 = 3600;
 /// Largest accepted `settle_grace_secs`.
 pub const RFQ_V2_MAX_SETTLE_GRACE_SECS: u64 = 3600;
+/// Smallest accepted per-market `atomic_quote_valid_secs`: the longest
+/// confirm-time split wait plus the margins a taker needs to settle.
+pub const RFQ_V2_MIN_MARKET_QUOTE_VALID_SECS: u64 = 60;
 
 /// RFQ V2 LP-level configuration (`[liquidity_provider.rfq_v2]`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3371,5 +3406,46 @@ enabled = true
         config.markets = vec![market];
         config.recompute_deadline_windows();
         config.validate_v2().unwrap();
+    }
+
+    #[test]
+    fn market_quote_validity_may_only_shorten_the_lp_window() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.liquidity_provider = Some(LiquidityProviderConfig {
+            name: "LP test".to_string(),
+            max_concurrent_rfqs: default_max_concurrent_rfqs(),
+            default_quote_valid_secs: default_quote_valid_secs(),
+            min_notional_usd: 0.0,
+            rfq_v2: Some(RfqV2Config { enabled: true, ..RfqV2Config::default() }),
+        });
+        let kf = atomic_quote::gen_keypair().unwrap();
+        config.set_atomic_quote_scalar(&kf.priv_scalar_hex).unwrap();
+        let market_with = |secs: Option<u64>| -> MarketConfig {
+            let line = secs.map(|s| format!("atomic_quote_valid_secs = {s}")).unwrap_or_default();
+            toml::from_str(&format!(
+                "market_id = \"TKN-CC\"\n\n[rfq]\nmin_quantity = \"5\"\nmax_quantity = \"1000\"\n\n\
+                 [rfq.v2]\nenabled = true\n{line}\n"
+            ))
+            .unwrap()
+        };
+
+        for (secs, ok) in [(None, true), (Some(60), true), (Some(120), true), (Some(30), false), (Some(59), false), (Some(121), false)] {
+            let market = market_with(secs);
+            assert_eq!(market.rfq.as_ref().unwrap().v2.as_ref().unwrap().atomic_quote_valid_secs, secs);
+            config.markets = vec![market];
+            config.recompute_deadline_windows();
+            match config.validate_v2() {
+                Ok(()) => assert!(ok, "{secs:?} accepted"),
+                Err(e) => {
+                    assert!(!ok, "{secs:?} rejected: {e}");
+                    assert!(e.to_string().contains("atomic_quote_valid_secs"), "got: {e}");
+                }
+            }
+        }
+
+        // Without an LP-level config the cap is the largest accepted window.
+        let v2m: RfqV2MarketConfig =
+            toml::from_str("enabled = true\natomic_quote_valid_secs = 3600\n").unwrap();
+        check_market_quote_valid_secs("X-Y", &v2m, None).unwrap();
     }
 }
