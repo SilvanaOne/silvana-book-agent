@@ -18,10 +18,11 @@ use agent_logic::config::{
 };
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::net_position::NetPositionTracker;
-use agent_logic::num::Dp;
+use agent_logic::num::{Dp, Px};
 use agent_logic::pool_impact::{self, ImpactSide, MarketMid};
 use agent_logic::runner::QuotedTrade;
-use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, RoundingStrategy};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -75,9 +76,7 @@ pub enum RfqResponse {
 }
 
 /// A priced (accepted) RFQ — shared output of the v1/V2 pricing pipeline.
-/// The `*_str` fields are the exact v1 wire strings (`{:.10}` renders of the
-/// f64 computation); the Decimals are parsed from those strings so both
-/// representations agree digit-for-digit.
+/// The Decimals are parsed from the 10-decimal `*_str` wire strings and agree digit-for-digit.
 pub(crate) struct PricedQuote {
     #[allow(dead_code)] // consumed by the user-mode phase (atomic_swap)
     pub market_id: String,
@@ -164,6 +163,29 @@ fn v1_fee_headroom_usd(notional_usd: Option<f64>) -> Option<Decimal> {
     Decimal::new(3, 1)
         .checked_add(alloc)?
         .checked_mul(Decimal::from(4))
+}
+
+/// The requested base as an exact Decimal cut to 10 decimals toward zero, kept
+/// only when it agrees with `priced`, the f64 every check and the quote leg use.
+fn exact_base_quantity(quantity_str: &str, priced: f64) -> Option<Decimal> {
+    let s = quantity_str.trim();
+    let parsed = match s.split_once(['e', 'E']) {
+        // from_scientific rounds a long mantissa; take it only when the mantissa is exact.
+        Some((mantissa, _)) => {
+            Decimal::from_str_exact(mantissa).and_then(|_| Decimal::from_scientific(s))
+        }
+        None => Decimal::from_str_exact(s),
+    };
+    let d = parsed.ok()?.round_dp_with_strategy(10, RoundingStrategy::ToZero);
+    let tolerance = priced.abs() * 1e-12 + 1e-10;
+    ((d.to_f64()? - priced).abs() <= tolerance).then_some(d)
+}
+
+/// `d` with 10 decimals like the f64 `{:.10}` strings, fewer only past the
+/// mantissa (`{:.10}` on a Decimal can overflow its fixed buffer).
+fn render_10dp(mut d: Decimal) -> String {
+    d.rescale(10);
+    d.to_string()
 }
 
 impl RfqHandler {
@@ -625,7 +647,7 @@ impl RfqHandler {
             || !quantity.is_finite()
             || price <= 0.0
         {
-            warn!("RFQ {}: computed invalid price {:.6} or quantity {:.6}", rfq_id, price, quote_quantity);
+            warn!("RFQ {}: computed invalid price {} or quantity {:.6}", rfq_id, Px(price, 6), quote_quantity);
             return Err(RejectInfo::new(
                 RfqRejectionReason::TemporarilyUnavailable,
                 "Price computation error",
@@ -844,7 +866,13 @@ impl RfqHandler {
 
         // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
         let price_str = format!("{price:.10}");
-        let quantity_dec_str = format!("{quantity:.10}");
+        // A base-sized request signs its own digits; the f64 only prices it.
+        let exact_base = if requested_quote_quantity.is_none() {
+            exact_base_quantity(quantity_str, quantity)
+        } else {
+            None
+        };
+        let quantity_dec_str = exact_base.map_or_else(|| format!("{quantity:.10}"), render_10dp);
         let quote_quantity_str = format!("{quote_quantity:.10}");
         let (Ok(price_dec), Ok(quantity_dec), Ok(quote_quantity_dec)) = (
             Decimal::from_str(&price_str),
@@ -860,6 +888,17 @@ impl RfqHandler {
                 "Price computation error",
             ));
         };
+        // A leg that rounds to zero at 10 decimals could never settle.
+        if quantity_dec.is_zero() || quote_quantity_dec.is_zero() {
+            warn!(
+                "RFQ {}: a leg rounds to zero (quantity {}, quote {})",
+                rfq_id, quantity_dec_str, quote_quantity_str
+            );
+            return Err(RejectInfo::new(
+                RfqRejectionReason::TemporarilyUnavailable,
+                "Price computation error",
+            ));
+        }
         let lp_pays_amount = if direction == 1 {
             quantity_dec
         } else {
@@ -871,12 +910,12 @@ impl RfqHandler {
         // actually applied — a stress-capped aggressive quote (side_spread < 0)
         // must not falsely advertise OVERLOAD/depletion widening.
         info!(
-            "RFQ {}: quoting {} {} @ {:.6} (mid={:.6}, spread={:.2}%{}{}{}{})",
+            "RFQ {}: quoting {} {} @ {} (mid={}, spread={:.2}%{}{}{}{})",
             rfq_id,
             quantity,
             market_id,
-            price,
-            mid_price,
+            Px(price, 6),
+            Px(mid_price, 6),
             effective_spread,
             if side_spread >= 0.0 && spread_multiplier >= 3.0 { " OVERLOAD 3x" } else if side_spread >= 0.0 && spread_multiplier > 1.0 { " LOW-ISS 2x" } else { "" },
             if side_spread >= 0.0 && depletion_coeff > 0.0 { format!(" depl={:.1}", depletion_coeff) } else { String::new() },
@@ -1936,6 +1975,158 @@ mod price_rfq_tests {
             .expect("must reject");
         assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
         assert_eq!(err.reason_detail.as_deref(), Some("Price computation error"));
+    }
+
+    // A quote leg that rounds to zero at 10 decimals is refused, never signed
+    #[tokio::test]
+    async fn zero_rounded_leg_rejects() {
+        let h = handler_at(1e-14, "10000");
+        let err = h
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None, None)
+            .await
+            .err()
+            .expect("must reject");
+        assert!(matches!(err.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(err.reason_detail.as_deref(), Some("Price computation error"));
+
+        // A small but representable leg still quotes.
+        let ok = handler_at(1e-9, "10000")
+            .price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None, None)
+            .await;
+        assert!(ok.is_ok(), "{:?}", ok.err().map(|e| e.reason_detail));
+    }
+
+    // A large base request signs its exact digits, cut toward zero past 10 decimals
+    #[tokio::test]
+    async fn base_request_signs_its_exact_digits() {
+        let h = handler_at(MID, "1000000000000");
+        for (dir, req, want) in [
+            (2, "40360000000.1234567890", "40360000000.1234567890"),
+            (1, "40360000000.1234567890", "40360000000.1234567890"),
+            (2, "12345678901.1235", "12345678901.1235000000"),
+            (2, "40360000000.12345678909", "40360000000.1234567890"),
+            (1, "1000.99999999999", "1000.9999999999"),
+        ] {
+            let priced = h
+                .price_rfq("t", "EDELx-USDC", dir, req, "", false, None, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{req} must quote: {:?}", e.reason_detail));
+            assert_eq!(priced.quantity_str, want, "{req}");
+            assert_eq!(priced.quantity, dec(want), "{req}");
+            assert!(priced.quantity <= dec(req), "{req}: signed base above the request");
+            // The confirm signs this Decimal; it must decimal-equal the quoted string.
+            assert_eq!(dec(&atomic_quote::render_decimal(priced.quantity).unwrap()), dec(&priced.quantity_str));
+            let lp_leg = if dir == 1 { priced.quantity } else { priced.quote_quantity };
+            assert_eq!(priced.lp_pays.1, lp_leg, "{req}");
+        }
+
+        // The V1 quote and the recorded trade carry the same base string.
+        let req = RfqRequest {
+            rfq_id: "rfq-1".to_string(),
+            market_id: "EDELx-USDC".to_string(),
+            direction: 2,
+            quantity: "40360000000.1234567890".to_string(),
+            ..Default::default()
+        };
+        match h.handle_rfq_request(req).await {
+            RfqResponse::Quote(q) => assert_eq!(q.quantity, "40360000000.1234567890"),
+            RfqResponse::Reject(r) => panic!("expected a quote: {:?}", r.reason_detail),
+        }
+        let trades = h.quoted_trades.lock().await;
+        assert_eq!(trades.last().map(|t| t.base_quantity.as_str()), Some("40360000000.1234567890"));
+    }
+
+    // At a tiny price the quote leg uses the full-precision price, not the price string
+    #[tokio::test]
+    async fn tiny_price_quote_leg_keeps_full_precision() {
+        let mid = 2.0123456789e-9;
+        let base = "40360000000.1234567890";
+        let priced = handler_at(mid, "1000000000000")
+            .price_rfq("t", "EDELx-USDC", 2, base, "", false, None, None, None)
+            .await
+            .expect("must quote");
+        assert_eq!(priced.price_str, "0.0000000020");
+        assert_eq!(priced.quantity_str, base);
+        assert_eq!(priced.quote_quantity_str, format!("{:.10}", f(base) * mid));
+        assert!((f(&priced.quote_quantity_str) - f(base) * 2e-9).abs() > 0.4);
+    }
+
+    // Scientific-notation base requests still quote, at their exact value
+    #[tokio::test]
+    async fn scientific_base_request_quotes() {
+        let mut h = handler();
+        h.markets = vec![serde_json::from_str(
+            r#"{"market_id":"EDELx-USDC","rfq":{"min_quantity":"0.0000000001","max_quantity":"1000000000000","bid_spread_percent":0.0,"offer_spread_percent":0.0}}"#,
+        )
+        .unwrap()];
+        for (req, want) in [
+            ("9.088e-7", "0.0000009088"),
+            ("4.036E10", "40360000000.0000000000"),
+            ("1.5e+3", "1500.0000000000"),
+            ("1.23456789012345e3", "1234.5678901234"),
+        ] {
+            let priced = h
+                .price_rfq("t", "EDELx-USDC", 2, req, "", false, None, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{req} must quote: {:?}", e.reason_detail));
+            assert_eq!(priced.quantity_str, want, "{req}");
+        }
+    }
+
+    // A string whose exact parse would disagree with the priced f64 signs the priced amount
+    #[tokio::test]
+    async fn base_parse_never_diverges_from_the_priced_amount() {
+        for (mid, max, req) in [
+            (0.01, "1000000", "5.0000000000000000000000000000000001e4"),
+            (0.01, "1000000", "9.9999000000000000000000000000000001e1"),
+            (0.01, "1000000", "99999.000000000000000000000000000001"),
+            (0.01, "1000000", "50000.00000000000000000000000000000000001"),
+            (0.01, "1000000", "5e4"),
+            (2e-9, "100000000000", "0.00000000000000009999999999995e27"),
+        ] {
+            let h = handler_at(mid, max);
+            for dir in [1, 2] {
+                let priced = h
+                    .price_rfq("t", "EDELx-USDC", dir, req, "", false, None, None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{req} must quote: {:?}", e.reason_detail));
+                let want = f64::from_str(req).unwrap();
+                assert_eq!(priced.quantity_str, format!("{want:.10}"), "{req} dir {dir}");
+            }
+        }
+    }
+
+    // Ordinary base requests render as the f64 strings did; quote-sized requests are unchanged
+    #[tokio::test]
+    async fn ordinary_requests_render_as_before() {
+        let h = handler();
+        for req in ["1000", "50", "99.99", "1234.5", "9999.123456789"] {
+            for dir in [1, 2] {
+                let priced = h
+                    .price_rfq("t", "EDELx-USDC", dir, req, "", false, None, None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{req} must quote: {:?}", e.reason_detail));
+                let q = f(req);
+                assert_eq!(priced.quantity_str, format!("{q:.10}"), "{req}");
+                assert_eq!(priced.quote_quantity_str, format!("{:.10}", q * MID), "{req}");
+                assert_eq!(priced.price_str, format!("{MID:.10}"));
+                assert_eq!(priced.quantity.scale(), 10, "{req}");
+            }
+        }
+        let priced = h
+            .price_rfq("t", "EDELx-USDC", 1, "", "50", false, None, None, None)
+            .await
+            .expect("quote-sized request must quote");
+        assert_eq!(priced.quantity_str, format!("{:.10}", 50.0 / MID));
+    }
+
+    #[test]
+    fn render_10dp_pads_without_overflowing() {
+        assert_eq!(render_10dp(dec("1000")), "1000.0000000000");
+        assert_eq!(render_10dp(dec("0.0000009088")), "0.0000009088");
+        // Past the mantissa it keeps fewer decimals instead of overflowing.
+        assert_eq!(render_10dp(dec("6000000000000000000000000000")), "6000000000000000000000000000.0");
+        assert_eq!(render_10dp(Decimal::MAX), Decimal::MAX.to_string());
     }
 
     // A max_quantity that is not a positive number closes the market instead of lifting the cap

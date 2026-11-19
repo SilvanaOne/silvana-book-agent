@@ -31,7 +31,7 @@ use agent_logic::config::{
 };
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::net_position::NetPositionTracker;
-use agent_logic::num::Dp;
+use agent_logic::num::{Dp, Px};
 use agent_logic::{clock, supervise, sync};
 use agent_logic::pool_impact::{self, ImpactSide, MarketMid};
 use agent_logic::state::SavedPendingV2;
@@ -383,17 +383,22 @@ impl RfqV2State {
         Duration::from_secs(RFQ_V2_MAX_QUOTE_VALID_SECS.saturating_add(RFQ_V2_MAX_SETTLE_GRACE_SECS))
     }
 
+    /// Signed validity for `market_id`: its `[markets.rfq.v2]` override, never
+    /// longer than the LP-level window.
+    fn market_quote_valid_secs(&self, market_id: &str) -> u64 {
+        let lp = self.v2.atomic_quote_valid_secs;
+        self.market_v2
+            .get(market_id)
+            .and_then(|m| m.atomic_quote_valid_secs)
+            .map_or(lp, |secs| secs.min(lp))
+    }
+
     /// The window of a confirm that started at `now` (`start_micros` on the
     /// wall clock); `None` when it does not fit an `Instant` or the signed micros.
-    fn quote_window(&self, now: Instant, start_micros: i64) -> Option<QuoteWindow> {
-        let ttl_secs = self
-            .v2
-            .atomic_quote_valid_secs
-            .checked_add(self.v2.settle_grace_secs)?;
+    fn quote_window(&self, now: Instant, start_micros: i64, valid_secs: u64) -> Option<QuoteWindow> {
+        let ttl_secs = valid_secs.checked_add(self.v2.settle_grace_secs)?;
         let expires_at = now.checked_add(Duration::from_secs(ttl_secs))?;
-        let valid_micros = i64::try_from(self.v2.atomic_quote_valid_secs)
-            .ok()?
-            .checked_mul(1_000_000)?;
+        let valid_micros = i64::try_from(valid_secs).ok()?.checked_mul(1_000_000)?;
         Some(QuoteWindow {
             expires_at,
             valid_until_micros: start_micros.checked_add(valid_micros)?,
@@ -841,19 +846,19 @@ impl RfqV2State {
                     let (net_now, impact_now, fair_now) = seen;
                     if saturated {
                         warn!(
-                            "Confirm {}: impact saturated (fair price {:.10} <= 0 at net {:.0}) \
+                            "Confirm {}: impact saturated (fair price {} <= 0 at net {:.0}) \
                              — rejecting rather than failing open",
-                            quote_id, fair_now, net_now
+                            quote_id, Px(fair_now, 10), net_now
                         );
                     }
                     if !accepted {
                         warn!(
-                            "Confirm {}: held price {:.10} is taker-favourable vs fair {:.10} \
+                            "Confirm {}: held price {} is taker-favourable vs fair {} \
                              (mid_now={}, R now={} was={}, net now={:.0} was={:.0}, \
                              impact now={:.3}% was={:.3}%) — rejecting stale quote",
                             quote_id,
-                            held,
-                            fair_now,
+                            Px(held, 10),
+                            Px(fair_now, 10),
                             mid_now,
                             depth.base_reserve,
                             inputs.base_reserve,
@@ -879,7 +884,8 @@ impl RfqV2State {
         }
 
         // The validity window must be representable before anything is committed.
-        let Some(window) = self.quote_window(now, start_micros) else {
+        let valid_secs = self.market_quote_valid_secs(&market_id);
+        let Some(window) = self.quote_window(now, start_micros, valid_secs) else {
             self.release_on_reject(&quote_id, &[], false).await;
             return Err(self.reject(
                 &req,
@@ -2348,6 +2354,41 @@ pub(crate) mod tests {
         state.sweep(Instant::now() + ttl + Duration::from_secs(1)).await;
         assert_eq!(state.pending_kind("q1"), Some("Expired"));
         assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+    }
+
+    // A market override signs and reserves for its own shorter window
+    #[tokio::test]
+    async fn confirm_signs_the_market_override_window() {
+        let lm = lm_with_usdcx(1000).await;
+        let mut state = signable_state(lm.clone(), RfqV2Config::default(), &[]).await;
+        state.market_v2.insert(
+            MARKET.to_string(),
+            serde_json::from_str(r#"{"enabled":true,"atomic_quote_valid_secs":60}"#).unwrap(),
+        );
+        state
+            .register_indicative("q1", MARKET, QuoteSide::Sell, &priced_sell(500, 90), None, None)
+            .await
+            .unwrap();
+        let env = state.handle_confirm(confirm_req("q1")).await.unwrap();
+        let quote = env.quote.unwrap();
+        let signed = quote.valid_until_micros - quote.created_at_micros;
+        let full = 60 * 1_000_000 + 10_000_000;
+        assert!(signed <= full && signed > full - 1_000_000, "{signed} vs {full}");
+
+        let ttl = Duration::from_secs(60 + RfqV2Config::default().settle_grace_secs);
+        state.sweep(Instant::now() + ttl - Duration::from_secs(5)).await;
+        assert_eq!(state.pending_kind("q1"), Some("Confirmed"));
+        state.sweep(Instant::now() + ttl + Duration::from_secs(1)).await;
+        assert_eq!(state.pending_kind("q1"), Some("Expired"));
+        assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
+
+        // An override above the LP-level window is capped by it.
+        state.market_v2.insert(
+            MARKET.to_string(),
+            serde_json::from_str(r#"{"enabled":true,"atomic_quote_valid_secs":3600}"#).unwrap(),
+        );
+        assert_eq!(state.market_quote_valid_secs(MARKET), RfqV2Config::default().atomic_quote_valid_secs);
+        assert_eq!(state.market_quote_valid_secs("OTHER-MKT"), RfqV2Config::default().atomic_quote_valid_secs);
     }
 
     // A signed validity that overflows the clock rejects and releases what the
