@@ -3359,25 +3359,38 @@ mod bounded_io_tests {
 
     #[tokio::test]
     async fn force_never_signs_a_rejected_strict_operation() {
-        // The fake prepared transaction is empty: the USDCx inspector rejects it.
-        let expectation = OperationExpectation::UsdcxUpdatePreApproval {
+        // The fake prepared transaction is empty: the USDCx and AcceptDvp inspectors reject it.
+        let usdcx = OperationExpectation::UsdcxUpdatePreApproval {
             party: "party".into(),
             network: "mainnet".into(),
             pre_approval: true,
         };
-        assert!(expectation.requires_hash_match());
-        let mut hook_ran = false;
-        let mut hook = |_: &PreSignContext<'_>| -> Result<()> {
-            hook_ran = true;
-            Ok(())
+        let accept_dvp = OperationExpectation::AcceptDvp {
+            seller_party: "party".into(),
+            proposal_id: "p1".into(),
+            dvp_proposal_cid: "00ab".into(),
+            expected_delivery_amount: "1".into(),
+            expected_payment_amount: "2".into(),
+            expected_delivery_instrument_id: "BASE".into(),
+            expected_delivery_instrument_admin: "admin".into(),
+            expected_payment_instrument_id: "QUOTE".into(),
+            expected_payment_instrument_admin: "admin".into(),
         };
-        let err = submit_guarded_once(
-            SigningLedger::failing("Transaction failed: rejected", 4), &expectation, true, &mut hook,
-        )
-        .await;
-        let text = format!("{err:#}");
-        assert!(text.contains("Transaction verification REJECTED"), "{text}");
-        assert!(!hook_ran, "nothing may be signed");
+        for expectation in [usdcx, accept_dvp] {
+            assert!(expectation.requires_hash_match());
+            let mut hook_ran = false;
+            let mut hook = |_: &PreSignContext<'_>| -> Result<()> {
+                hook_ran = true;
+                Ok(())
+            };
+            let err = submit_guarded_once(
+                SigningLedger::failing("Transaction failed: rejected", 4), &expectation, true, &mut hook,
+            )
+            .await;
+            let text = format!("{err:#}");
+            assert!(text.contains("Transaction verification REJECTED"), "{text}");
+            assert!(!hook_ran, "nothing may be signed");
+        }
     }
 
     #[tokio::test]

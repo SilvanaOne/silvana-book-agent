@@ -37,6 +37,7 @@ pub mod shutdown;
 pub mod sign;
 pub mod state;
 pub mod stdio;
+pub mod strategy;
 pub mod supervise;
 pub mod sync;
 #[cfg(test)]

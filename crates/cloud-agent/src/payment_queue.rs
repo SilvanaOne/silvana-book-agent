@@ -436,17 +436,7 @@ impl PaymentQueue {
             }
 
             // Update queue depth counters
-            {
-                let (mut alloc, mut fees) = (0u64, 0u64);
-                for item in heap.iter() {
-                    match &item.request {
-                        PaymentRequest::Allocate { .. } => alloc = alloc.saturating_add(1),
-                        PaymentRequest::PayFee { .. } => fees = fees.saturating_add(1),
-                    }
-                }
-                queued_allocations.store(alloc, AtomicOrdering::Relaxed);
-                queued_fees.store(fees, AtomicOrdering::Relaxed);
-            }
+            store_depth(&heap, &queued_allocations, &queued_fees);
 
             // Ensure shared channel is initialized before dispatching
             let channel = match shared.get(&config).await {
@@ -560,6 +550,8 @@ impl PaymentQueue {
             for item in deferred {
                 heap.push(item);
             }
+            // Otherwise dispatched items stay counted until new work arrives
+            store_depth(&heap, &queued_allocations, &queued_fees);
 
             // If nothing was dispatched and heap is non-empty, backoff before retrying
             if !dispatched_any && !heap.is_empty() {
@@ -589,6 +581,19 @@ impl PaymentQueue {
     }
 }
 
+
+/// Publish the allocation and fee counts still queued, for the heartbeat.
+fn store_depth(heap: &BinaryHeap<QueuedPayment>, allocations: &AtomicU64, fees: &AtomicU64) {
+    let (mut alloc, mut fee) = (0u64, 0u64);
+    for item in heap.iter() {
+        match &item.request {
+            PaymentRequest::Allocate { .. } => alloc = alloc.saturating_add(1),
+            PaymentRequest::PayFee { .. } => fee = fee.saturating_add(1),
+        }
+    }
+    allocations.store(alloc, AtomicOrdering::Relaxed);
+    fees.store(fee, AtomicOrdering::Relaxed);
+}
 
 // ============================================================================
 // Amulet selection helpers
@@ -1467,6 +1472,20 @@ mod scheduler_tests {
             shutdown,
         )
         .unwrap()
+    }
+
+    // The heartbeat kept showing a dispatched fee as queued until other work arrived
+    #[tokio::test]
+    async fn the_fee_count_drops_once_the_fee_is_dispatched() {
+        let fake = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let shutdown = Shutdown::new();
+        let queue = queue_on(&fake, shutdown.clone());
+        let paid = tokio::time::timeout(Duration::from_secs(10), queue.submit_pay_fee("p1", "dvp")).await;
+        let depth = queue.queue_depth();
+        shutdown.signal();
+        fake.stop().await;
+        assert!(paid.is_ok(), "the fee is answered");
+        assert_eq!(depth, (0, 0));
     }
 
     // An overload forecast does not hold back the fee, which is paid off-chain

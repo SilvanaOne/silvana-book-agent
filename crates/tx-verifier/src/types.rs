@@ -231,12 +231,10 @@ impl OperationExpectation {
         )
     }
 
-    /// Whether only a self-computed hash equal to the server's may be signed:
-    /// a mismatch, or a hash that could not be computed, rejects instead of
-    /// falling back to the server's hash. Callers must not override a
-    /// rejection of such an operation.
+    /// Whether only a self-computed hash equal to the server's may be signed (USDCx and AcceptDvp):
+    /// a mismatch or an uncomputable hash rejects, and callers must not override a rejection.
     pub fn requires_hash_match(&self) -> bool {
-        self.is_usdcx()
+        self.is_usdcx() || matches!(self, Self::AcceptDvp { .. })
     }
 }
 

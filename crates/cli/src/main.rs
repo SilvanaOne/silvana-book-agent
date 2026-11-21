@@ -428,6 +428,10 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
         force: cli.force,
         confirm: cli.confirm,
     };
+    // Before the registry load, so a refused dry run makes no connection
+    if flags.dry_run && matches!(cli.command, Commands::Agent { .. }) {
+        anyhow::bail!(cloud_agent::AGENT_DRY_RUN_REFUSAL);
+    }
 
     // Handle commands that don't need config first
     if let Commands::GeneratePrivateKey = &cli.command {
@@ -1457,6 +1461,15 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("cloud-agent").chain(args.iter().copied()))
+    }
+
+    // A dry-run agent used to place real orders before any settlement step ran dry
+    #[test]
+    fn a_dry_run_agent_is_refused_before_any_setup() {
+        for args in [["--dry-run", "agent"], ["agent", "--dry-run"]] {
+            let err = prepare(parse(&args).unwrap()).err().unwrap();
+            assert_eq!(err.to_string(), cloud_agent::AGENT_DRY_RUN_REFUSAL, "{args:?}");
+        }
     }
 
     #[test]

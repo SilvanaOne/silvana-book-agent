@@ -9,9 +9,8 @@
 //! - On hash MISMATCH: WARN + return sentinel (caller falls back to server hash)
 //! - Always `accepted: true` — never blocks transactions during debugging
 //!
-//! USDCx bridge operations are the exception: they are inspected fail-closed
-//! ([`OperationExpectation::requires_hash_match`]), and a hash mismatch or a
-//! hash that could not be computed rejects them.
+//! USDCx bridge operations and AcceptDvp are the exception: they are inspected fail-closed and
+//! signed only with a matching hash ([`OperationExpectation::requires_hash_match`]).
 
 #![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 
@@ -45,11 +44,11 @@ use tracing::debug;
 /// `VerificationResult` with the self-computed hash to sign.
 ///
 /// # Behavior
-/// - Inspector accepts all transactions (stub — Phase A)
+/// - The inspector checks the transaction against `expectation` and refuses a mismatch
 /// - Hasher computes the full 3-layer SHA-256 hash
 /// - On hash match: returns computed hash (caller signs it — identical to server hash)
-/// - On hash mismatch: returns `[0u8; 32]` sentinel (caller falls back to server hash)
-/// - Always `accepted: true` — debugging mode, never blocks
+/// - On hash mismatch: returns `[0u8; 32]` sentinel (caller falls back to server hash),
+///   except that an operation with `requires_hash_match` is refused
 pub fn verify_and_hash(
     prepared_transaction_bytes: &[u8],
     server_hash_base64: &str,

@@ -97,6 +97,45 @@ pub(crate) enum Fake {
     StreamRefuse,
     /// GetLedgerEnd answers offset 7 and GetUpdates one checkpoint at offset 50; the rest as `Answer`.
     Progress,
+    /// GetPrepaidTrafficBalance and GetBalances (one CC holding) answer these amounts; the rest as `Answer`.
+    Balances { balance: &'static str, available: &'static str, cc: &'static str },
+}
+
+/// Append protobuf varint `v` to `out`.
+fn varint(mut v: usize, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A length-delimited protobuf field.
+fn bytes_field(field: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![(field << 3) | 2];
+    varint(value.len(), &mut out);
+    out.extend_from_slice(value);
+    out
+}
+
+/// GetPrepaidTrafficBalanceResponse with no credit and zero lifetime totals.
+fn prepaid_balance(balance: &str, available: &str) -> Vec<u8> {
+    [(1, balance), (2, "0"), (3, available), (4, "0"), (5, "0")]
+        .into_iter()
+        .flat_map(|(field, value)| bytes_field(field, value.as_bytes()))
+        .collect()
+}
+
+/// GetBalancesResponse with one Canton Coin holding of `cc`.
+fn cc_balances(cc: &str) -> Vec<u8> {
+    let mut holding = bytes_field(1, b"Amulet");
+    holding.extend(bytes_field(3, cc.as_bytes()));
+    holding.extend([0x30, 0x01]);
+    bytes_field(1, &holding)
 }
 
 /// GetLedgerEndResponse { offset: 7 }.
@@ -217,7 +256,7 @@ impl tonic::server::ServerStreamingService<()> for Streams {
         let head = tokio_stream::iter(self.head.clone().into_iter().map(Ok::<Vec<u8>, Status>));
         Box::pin(async move {
             let stream: RawStream = match mode {
-                Fake::Answer | Fake::Slow(_) | Fake::Progress => Box::pin(head),
+                Fake::Answer | Fake::Slow(_) | Fake::Progress | Fake::Balances { .. } => Box::pin(head),
                 Fake::Stall | Fake::StreamStall => Box::pin(head.chain(tokio_stream::pending())),
                 Fake::StreamFail => Box::pin(head.chain(tokio_stream::iter([Err(Status::internal("boom"))]))),
                 Fake::StreamRefuse => return Err(Status::internal("refused")),
@@ -241,7 +280,12 @@ impl tonic::server::UnaryService<()> for Unary {
             match mode {
                 Fake::Stall => std::future::pending::<()>().await,
                 Fake::Slow(delay) => tokio::time::sleep(delay).await,
-                Fake::Answer | Fake::StreamStall | Fake::StreamFail | Fake::StreamRefuse | Fake::Progress => {}
+                Fake::Answer
+                | Fake::StreamStall
+                | Fake::StreamFail
+                | Fake::StreamRefuse
+                | Fake::Progress
+                | Fake::Balances { .. } => {}
             }
             Ok(Response::new(reply))
         })
@@ -286,7 +330,14 @@ where
                 let head = if progress && updates { vec![CHECKPOINT_50.to_vec()] } else { vec![Vec::new(), Vec::new()] };
                 grpc.server_streaming(Streams { mode, head }, req).await
             } else {
-                let reply = if progress && ledger_end { LEDGER_END_7.to_vec() } else { Vec::new() };
+                let reply = match mode {
+                    _ if progress && ledger_end => LEDGER_END_7.to_vec(),
+                    Fake::Balances { balance, available, .. } if path.ends_with("/GetPrepaidTrafficBalance") => {
+                        prepaid_balance(balance, available)
+                    }
+                    Fake::Balances { cc, .. } if path.ends_with("/GetBalances") => cc_balances(cc),
+                    _ => Vec::new(),
+                };
                 grpc.unary(Unary { mode, reply }, req).await
             })
         })

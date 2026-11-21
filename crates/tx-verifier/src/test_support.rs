@@ -5,7 +5,7 @@ use prost::Message;
 use crate::decode::canton_proto::com::daml::ledger::api::v2 as v2;
 use v2::interactive::metadata::input_contract::Contract as InputContractOneof;
 use v2::interactive::metadata::{InputContract, SubmitterInfo};
-use v2::interactive::transaction::v1::{node::NodeType, Create, Exercise, Node as V1Node, Rollback};
+use v2::interactive::transaction::v1::{node::NodeType, Create, Exercise, Fetch, Node as V1Node, Rollback};
 use v2::interactive::{daml_transaction, DamlTransaction, Metadata, PreparedTransaction};
 use v2::value::Sum;
 use v2::{Identifier, Record, RecordField, Value};
@@ -96,6 +96,18 @@ pub(crate) fn create(template: Identifier, argument: Value, signatories: &[&str]
     }
 }
 
+/// Fetch with every field the hasher requires; `contract_id` must be hex to hash.
+pub(crate) fn fetch(template: Identifier, contract_id: &str, acting: &[&str]) -> Fetch {
+    Fetch {
+        lf_version: "2.1".into(),
+        contract_id: contract_id.into(),
+        package_name: "pkg".into(),
+        template_id: Some(template),
+        acting_parties: acting.iter().map(|p| p.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
 fn node(id: &str, node_type: NodeType) -> Node {
     Node {
         node_id: id.into(),
@@ -111,6 +123,10 @@ pub(crate) fn exercise_node(id: &str, ex: Exercise) -> Node {
 
 pub(crate) fn create_node(id: &str, c: Create) -> Node {
     node(id, NodeType::Create(c))
+}
+
+pub(crate) fn fetch_node(id: &str, f: Fetch) -> Node {
+    node(id, NodeType::Fetch(f))
 }
 
 pub(crate) fn rollback_node(id: &str, children: Vec<String>) -> Node {

@@ -5,11 +5,15 @@
 //! submitting a `PrepayTraffic` ledger op (CC transfer to PARTY_PREPAID_TRAFFIC)
 //! whenever the balance drops below the configured minimum.
 //!
-//! Two attachment points (wired by the caller — see `lib.rs`):
+//! Attachment points (wired by the caller — see `lib.rs`):
 //! 1. After every successful `submit_transaction` (fire-and-forget).
 //! 2. On a 10-minute background timer (catches idle drift).
+//! 3. After each settlement step the backend runs, paid or refused.
 //!
-//! Both share a re-entrancy guard so the topup itself (which submits a tx)
+//! With a fee source attached it also tops up when the available balance
+//! is below the largest fee reserved for an in-flight settlement.
+//!
+//! All three share a re-entrancy guard so the topup itself (which submits a tx)
 //! never recurses or stacks up under load. The runner owns its OWN
 //! DAppProviderClient (separate JWT + gRPC connection from the main agent
 //! client) so the topup's submit_transaction does NOT trigger the per-tx
@@ -30,8 +34,10 @@ use tracing::{debug, info, warn};
 use tx_verifier::OperationExpectation;
 
 use agent_logic::clock;
+use agent_logic::liquidity::LiquidityManager;
 use agent_logic::shutdown::Shutdown;
 use agent_logic::supervise::{self, Policy};
+use agent_logic::sync;
 use orderbook_proto::ledger::{
     prepare_transaction_request::Params, PrepareTransactionRequest, PrepayTrafficParams,
     TransactionOperation,
@@ -46,6 +52,14 @@ const TOPUP_BUDGET: Duration = Duration::from_secs(300);
 /// Period of the background balance check.
 const CHECK_INTERVAL: Duration = Duration::from_secs(600);
 
+/// Quiet period of the runner's own checks after a submit ends or the wallet is short of CC.
+const TOPUP_COOLDOWN: Duration = Duration::from_secs(90);
+
+/// Capacity of the nudge channel; a full channel drops further nudges.
+const NUDGE_SLOTS: usize = 16;
+
+type HeldSince = Arc<std::sync::Mutex<Option<Instant>>>;
+
 /// Shared state for the auto-topup hook.
 ///
 /// Owns its own `DAppProviderClient` so the topup's `submit_transaction`
@@ -58,6 +72,8 @@ pub struct TopupRunner {
     min_cc: Decimal,
     topup_cc: Decimal,
     in_flight: Arc<TokioMutex<()>>,
+    fee_demand: Option<Arc<LiquidityManager>>,
+    held_since: HeldSince,
 }
 
 impl TopupRunner {
@@ -76,9 +92,26 @@ impl TopupRunner {
                 min_cc,
                 topup_cc,
                 in_flight: Arc::new(TokioMutex::new(())),
+                fee_demand: None,
+                held_since: HeldSince::default(),
             }),
             _ => None,
         }
+    }
+
+    /// Also top up when balance plus credit is below the largest fee reserved for an in-flight settlement.
+    pub fn with_fee_demand(mut self, lm: Arc<LiquidityManager>) -> Self {
+        self.fee_demand = Some(lm);
+        self
+    }
+
+    fn hold_off(&self) {
+        *sync::lock(&self.held_since) = Some(Instant::now());
+    }
+
+    fn held_off(&self) -> bool {
+        sync::lock(&self.held_since)
+            .is_some_and(|at| Instant::now().saturating_duration_since(at) < TOPUP_COOLDOWN)
     }
 
     /// Check the prepaid traffic balance and top up if it's below the
@@ -88,10 +121,23 @@ impl TopupRunner {
     /// Re-entrancy: if another `maybe_topup` is already running, this call
     /// returns immediately.
     pub async fn maybe_topup(&self) {
+        self.check(false).await;
+    }
+
+    /// The runner's timer and nudges, which hold off after a submit or a CC shortfall.
+    async fn scheduled_topup(&self) {
+        self.check(true).await;
+    }
+
+    async fn check(&self, honor_hold_off: bool) {
         let Ok(guard) = Arc::clone(&self.in_flight).try_lock_owned() else {
             debug!("Auto-topup already in progress, skipping");
             return;
         };
+        if honor_hold_off && self.held_off() {
+            debug!("Auto-topup holding off after the last submit or CC shortfall");
+            return;
+        }
         if let Err(e) = self.run_inner(guard, clock::deadline_after(TOPUP_BUDGET)).await {
             warn!(error = %e, "Auto-topup attempt failed");
         }
@@ -100,18 +146,25 @@ impl TopupRunner {
     async fn run_inner(&self, guard: OwnedMutexGuard<()>, deadline: Instant) -> Result<()> {
         let mut client = self.client.clone();
         let pt = within(deadline, client.get_prepaid_traffic_balance()).await?;
+        let demand = match &self.fee_demand {
+            Some(lm) => within(deadline, async { Ok(lm.largest_fee_commitment().await) }).await?,
+            None => Decimal::ZERO,
+        };
 
-        if pt.balance_cc >= self.min_cc {
+        if !needs_topup(pt.balance_cc, pt.available_cc, self.min_cc, demand) {
             debug!(
                 balance_cc = %pt.balance_cc,
+                available_cc = %pt.available_cc,
                 min_cc = %self.min_cc,
-                "Prepaid balance above minimum, no topup"
+                demand_cc = %demand,
+                "Prepaid balance covers the minimum and pending fees, no topup"
             );
             return Ok(());
         }
 
         let cc_balance = within(deadline, self.fetch_cc_balance()).await?;
         if cc_balance < self.topup_cc {
+            self.hold_off();
             warn!(
                 cc_balance = %cc_balance,
                 topup_cc = %self.topup_cc,
@@ -123,7 +176,9 @@ impl TopupRunner {
 
         info!(
             balance_cc = %pt.balance_cc,
+            available_cc = %pt.available_cc,
             min_cc = %self.min_cc,
+            demand_cc = %demand,
             topup_cc = %self.topup_cc,
             "Auto-topping up prepaid traffic balance"
         );
@@ -199,7 +254,7 @@ impl TopupRunner {
                 .await
                 .map(|r| r.update_id)
         };
-        let task = spawn_submit(guard, submit)?;
+        let task = spawn_submit(guard, Arc::clone(&self.held_since), submit)?;
         wait_submit(command_prefix.to_string(), self.topup_cc, task, deadline).await
     }
 
@@ -218,11 +273,11 @@ impl TopupRunner {
     ///
     /// The background task:
     /// - Listens on an mpsc channel for nudges from the per-tx hook.
-    /// - Fires `maybe_topup` every 10 minutes regardless.
-    /// Both go through `maybe_topup`'s try_lock guard, so they coalesce
-    /// cleanly — a flood of per-tx nudges results in one topup attempt.
+    /// - Checks every 10 minutes regardless.
+    ///
+    /// Both drop the nudges already queued first, so a flood of nudges costs one check.
     pub fn spawn(self: Arc<Self>, shutdown: Shutdown) -> Result<TopupTrigger> {
-        let (tx, rx) = mpsc::channel::<()>(16);
+        let (tx, rx) = mpsc::channel::<()>(NUDGE_SLOTS);
         let rx = Arc::new(TokioMutex::new(rx));
         let s = shutdown.clone();
         supervise::spawn_supervised("topup runner", shutdown, Policy::Restart, move || {
@@ -245,14 +300,30 @@ async fn run(runner: Arc<TopupRunner>, rx: Arc<TokioMutex<mpsc::Receiver<()>>>, 
                 break;
             }
             _ = ticker.tick() => {
-                runner.maybe_topup().await;
+                drain(&mut rx);
+                runner.scheduled_topup().await;
             }
             Some(_) = rx.recv() => {
-                runner.maybe_topup().await;
+                drain(&mut rx);
+                runner.scheduled_topup().await;
             }
             else => break,
         }
     }
+}
+
+/// Drop the nudges already queued; the check that follows covers them.
+fn drain(rx: &mut mpsc::Receiver<()>) {
+    for _ in 0..NUDGE_SLOTS {
+        if rx.try_recv().is_err() {
+            break;
+        }
+    }
+}
+
+/// Below the floor, or below the largest fee reserved for an in-flight settlement.
+fn needs_topup(balance: Decimal, available: Decimal, min: Decimal, demand: Decimal) -> bool {
+    balance < min || available < demand
 }
 
 /// `call` within the attempt's deadline.
@@ -262,13 +333,29 @@ async fn within<T>(deadline: Instant, call: impl Future<Output = Result<T>>) -> 
         .map_err(|_| anyhow!("no answer within the {}s topup budget", TOPUP_BUDGET.as_secs()))?
 }
 
-/// Run `submit` in its own task, holding `guard` until it ends.
-fn spawn_submit<F>(guard: OwnedMutexGuard<()>, submit: F) -> Result<JoinHandle<Result<String>>>
+/// Starts the hold-off when dropped: after a submit returns, panics or is cancelled.
+struct HoldOffOnDrop(HeldSince);
+
+impl Drop for HoldOffOnDrop {
+    fn drop(&mut self) {
+        *sync::lock(&self.0) = Some(Instant::now());
+    }
+}
+
+/// Run `submit` in its own task, holding `guard` until it ends; the hold-off
+/// starts only then, so a credit that lands late still has the full cooldown.
+fn spawn_submit<F>(
+    guard: OwnedMutexGuard<()>,
+    held_since: HeldSince,
+    submit: F,
+) -> Result<JoinHandle<Result<String>>>
 where
     F: Future<Output = Result<String>> + Send + 'static,
 {
     supervise::try_spawn("prepaid traffic topup", async move {
         let _guard = guard;
+        // Dropped before the guard, so the hold-off is in place when the lock frees
+        let _hold = HoldOffOnDrop(held_since);
         submit.await
     })
     .ok_or_else(|| anyhow!("no tokio runtime for the topup submit"))
@@ -320,11 +407,15 @@ pub struct TopupTrigger {
 }
 
 impl TopupTrigger {
-    /// Try to nudge the topup runner. Non-blocking and silently drops the
-    /// nudge if the channel is full — `maybe_topup`'s try_lock guard
-    /// already coalesces, so an extra dropped nudge is harmless.
+    /// Try to nudge the topup runner. Non-blocking; a full channel drops the
+    /// nudge, which is harmless because queued nudges are merged into one check.
     pub fn nudge(&self) {
         let _ = self.tx.try_send(());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_sender(tx: mpsc::Sender<()>) -> Self {
+        Self { tx }
     }
 }
 
@@ -354,14 +445,24 @@ mod tests {
         TopupRunner::new(client, config.party_id, Some(Decimal::ONE), Some(Decimal::TEN)).unwrap()
     }
 
+    fn balances(balance: &'static str, available: &'static str, cc: &'static str) -> crate::test_util::Fake {
+        crate::test_util::Fake::Balances { balance, available, cc }
+    }
+
+    /// Move the hold-off back by the cooldown, so it has just run out.
+    fn backdate(runner: &TopupRunner) {
+        *sync::lock(&runner.held_since) = Instant::now().checked_sub(TOPUP_COOLDOWN);
+    }
+
     // A slow submit is waited for up to the budget, then left running and
-    // holding off the next attempt until it ends
+    // holding off the next attempt until it ends; the hold-off starts then
     #[tokio::test(start_paused = true)]
     async fn a_slow_submit_is_left_running_and_holds_off_the_next_attempt() {
         let lock = Arc::new(TokioMutex::new(()));
+        let held = HeldSince::default();
         let done = Arc::new(AtomicBool::new(false));
         let d = done.clone();
-        let task = spawn_submit(lock.clone().try_lock_owned().unwrap(), async move {
+        let task = spawn_submit(lock.clone().try_lock_owned().unwrap(), held.clone(), async move {
             tokio::time::sleep(Duration::from_secs(600)).await;
             d.store(true, Ordering::SeqCst);
             Ok("u1".to_string())
@@ -371,9 +472,11 @@ mod tests {
         wait_submit("auto-topup".into(), Decimal::TEN, task, deadline).await.unwrap();
         assert!(Instant::now() >= deadline);
         assert!(lock.try_lock().is_err(), "the running submit holds the in-flight lock");
+        assert!(sync::lock(&held).is_none(), "the hold-off waits for the submit to end");
         tokio::time::sleep(Duration::from_secs(400)).await;
         assert!(done.load(Ordering::SeqCst), "the submit was not cancelled");
         assert!(lock.try_lock().is_ok());
+        assert!(sync::lock(&held).is_some(), "the hold-off starts when the submit ends");
     }
 
     // The runner's own submit: past its deadline it keeps running and keeps the lock
@@ -400,13 +503,17 @@ mod tests {
     async fn submit_failures_within_the_budget_are_returned() {
         let lock = Arc::new(TokioMutex::new(()));
         let deadline = clock::deadline_after(TOPUP_BUDGET);
-        let failed = spawn_submit(lock.clone().try_lock_owned().unwrap(), async { Err(anyhow!("rejected")) }).unwrap();
+        let held = HeldSince::default();
+        let failed = spawn_submit(lock.clone().try_lock_owned().unwrap(), held.clone(), async { Err(anyhow!("rejected")) }).unwrap();
         let err = wait_submit("auto-topup".into(), Decimal::TEN, failed, deadline).await.unwrap_err();
         assert_eq!(err.to_string(), "rejected");
-        let panicked = spawn_submit(lock.clone().try_lock_owned().unwrap(), async { panic!("submit bug") }).unwrap();
+        assert!(sync::lock(&held).is_some(), "a refused submit also holds off the next check");
+        let held = HeldSince::default();
+        let panicked = spawn_submit(lock.clone().try_lock_owned().unwrap(), held.clone(), async { panic!("submit bug") }).unwrap();
         let err = wait_submit("auto-topup".into(), Decimal::TEN, panicked, deadline).await.unwrap_err();
         assert!(err.to_string().starts_with("topup submit task failed"), "{err}");
         assert!(lock.try_lock().is_ok(), "the lock is released after a panic");
+        assert!(sync::lock(&held).is_some(), "a panicked submit also holds off the next check");
     }
 
     #[tokio::test]
@@ -422,6 +529,99 @@ mod tests {
     async fn a_balance_read_that_never_answers_is_bounded() {
         let err = within(Instant::now() + TOPUP_BUDGET, std::future::pending::<Result<()>>()).await.unwrap_err();
         assert!(err.to_string().contains("300s topup budget"), "{err}");
+    }
+
+    #[test]
+    fn a_topup_is_needed_below_the_floor_or_short_of_the_pending_fee() {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        // balance, available, min, demand
+        assert!(needs_topup(d("9"), d("9"), d("10"), d("0")), "below the floor");
+        assert!(!needs_topup(d("10"), d("10"), d("10"), d("0")), "at the floor, nothing pending");
+        assert!(needs_topup(d("40"), d("40"), d("10"), d("41")), "short of the largest pending fee");
+        assert!(!needs_topup(d("40"), d("50"), d("10"), d("41")), "credit covers the pending fee");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_topup_holds_off_the_next_one_for_the_cooldown() {
+        let runner = runner();
+        assert!(!runner.held_off());
+        runner.hold_off();
+        assert!(runner.held_off());
+        tokio::time::sleep(TOPUP_COOLDOWN).await;
+        assert!(!runner.held_off());
+    }
+
+    // Settlement steps nudge the runner; only its own checks honour the hold-off
+    #[tokio::test]
+    async fn scheduled_checks_hold_off_but_a_direct_call_does_not() {
+        let ledger = crate::test_util::FakeLedger::start(balances("100", "100", "100")).await;
+        let runner = runner_at(&ledger.url);
+        runner.hold_off();
+        runner.scheduled_topup().await;
+        assert_eq!(ledger.calls("GetPrepaidTrafficBalance"), 0);
+        runner.maybe_topup().await;
+        assert_eq!(ledger.calls("GetPrepaidTrafficBalance"), 1, "a direct call checks at once");
+        backdate(&runner);
+        runner.scheduled_topup().await;
+        assert_eq!(ledger.calls("GetPrepaidTrafficBalance"), 2);
+        assert_eq!(ledger.calls("PrepareTransaction"), 0, "the balance is above the floor");
+        ledger.stop().await;
+    }
+
+    // A fee reserved for an in-flight settlement above the available balance tops up
+    #[tokio::test]
+    async fn a_reserved_fee_above_the_available_balance_tops_up() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::from(20)).await.unwrap();
+        for (with_demand, topups) in [(true, 1), (false, 0)] {
+            let ledger = crate::test_util::FakeLedger::start(balances("10", "10", "100")).await;
+            let mut runner = runner_at(&ledger.url);
+            if with_demand {
+                runner = runner.with_fee_demand(lm.clone());
+            }
+            runner.maybe_topup().await;
+            assert_eq!(ledger.calls("PrepareTransaction"), topups, "with_demand={with_demand}");
+            assert_eq!(ledger.calls("GetBalances"), topups, "with_demand={with_demand}");
+            ledger.stop().await;
+        }
+    }
+
+    // A wallet short of CC used to be read again, with a WARN, on every settlement step
+    #[tokio::test]
+    async fn a_cc_short_wallet_is_checked_once_per_hold_off() {
+        let ledger = crate::test_util::FakeLedger::start(balances("0", "0", "5")).await;
+        let runner = runner_at(&ledger.url);
+        runner.scheduled_topup().await;
+        runner.scheduled_topup().await;
+        assert_eq!(ledger.calls("GetBalances"), 1);
+        assert_eq!(ledger.calls("PrepareTransaction"), 0, "5 CC is short of the 10 CC topup");
+        backdate(&runner);
+        runner.scheduled_topup().await;
+        assert_eq!(ledger.calls("GetBalances"), 2);
+        ledger.stop().await;
+    }
+
+    // A burst of settlement steps costs one balance check
+    #[tokio::test]
+    async fn a_burst_of_nudges_costs_one_check() {
+        let ledger = crate::test_util::FakeLedger::start(balances("100", "100", "100")).await;
+        let shutdown = Shutdown::new();
+        let trigger = Arc::new(runner_at(&ledger.url)).spawn(shutdown.clone()).unwrap();
+        for _ in 0..5 {
+            trigger.nudge();
+        }
+        let checked = tokio::time::timeout(Duration::from_secs(10), async {
+            while ledger.calls("GetPrepaidTrafficBalance") == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        checked.await.expect("the nudges were checked");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(ledger.calls("GetPrepaidTrafficBalance"), 1);
+        shutdown.signal();
+        ledger.stop().await;
     }
 
     #[test]

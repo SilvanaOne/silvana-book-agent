@@ -113,6 +113,8 @@ pub struct CloudSettlementBackend {
     /// Cloned from the runner's `Shutdown` so Ctrl-C reaches every worker
     /// the moment it fires, not only after the main loop has exited.
     shutdown: Shutdown,
+    /// Prepaid top-up nudge, fired after every settlement step.
+    topup: Option<crate::topup::TopupTrigger>,
 }
 
 impl CloudSettlementBackend {
@@ -150,53 +152,22 @@ impl CloudSettlementBackend {
         // spawns an all-instrument merge; the fill path spawns a CC-only merge.
 
         let amulet_cache = cache.cc();
-        Ok(Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, mid_prices: None, shutdown })
+        Ok(Self { config, verbose, dry_run, force, confirm, confirm_lock, payment_queue, holdings_cache: cache, amulet_cache, liquidity_manager, mid_prices: None, shutdown, topup: None })
     }
 
-    /// Wire the RfqHandler's shared mid-price map so the LIQUIDITY heartbeat can
-    /// bucket the holdings histogram by USD. Call only when RFQ V2 is enabled.
-    pub fn with_mid_prices(
-        mut self,
-        mid_prices: Arc<RwLock<HashMap<String, agent_logic::pool_impact::MarketMid>>>,
-    ) -> Self {
-        self.mid_prices = Some(mid_prices);
+    /// Nudge the prepaid top-up runner after each settlement step, paid or refused.
+    pub fn with_topup_trigger(mut self, trigger: crate::topup::TopupTrigger) -> Self {
+        self.topup = Some(trigger);
         self
     }
 
-    /// Create a new DAppProviderClient for this request
-    async fn create_client(&self) -> Result<DAppProviderClient> {
-        DAppProviderClient::new(
-            &self.config.orderbook_grpc_url,
-            &self.config.party_id,
-            &self.config.role,
-            &self.config.private_key,
-            self.config.token_ttl_secs,
-            Some(self.config.node_name.as_str()),
-            &self.config.ledger_service_public_key,
-            Some(self.config.connection_timeout_secs),
-            Some(self.config.request_timeout_secs),
-        )
-        .await
+    fn nudge_topup(&self) {
+        if let Some(t) = &self.topup {
+            t.nudge();
+        }
     }
 
-    /// Public accessor for the CC cache view (used by multicall settlement path).
-    pub fn amulet_cache(&self) -> &CcView {
-        &self.amulet_cache
-    }
-
-    /// Public accessor for the shared multi-instrument holdings cache.
-    pub fn holdings_cache(&self) -> &Arc<HoldingsCache> {
-        &self.holdings_cache
-    }
-}
-
-#[async_trait]
-impl SettlementBackend for CloudSettlementBackend {
-    async fn pay_fee(&self, proposal_id: &str, fee_type: &str) -> Result<StepResult> {
-        self.payment_queue.submit_pay_fee(proposal_id, fee_type).await
-    }
-
-    async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
+    async fn propose_dvp_inner(&self, proposal_id: &str) -> Result<StepResult> {
         if self.confirm && !self.dry_run {
             agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
@@ -241,7 +212,7 @@ impl SettlementBackend for CloudSettlementBackend {
         })
     }
 
-    async fn accept_dvp(
+    async fn accept_dvp_inner(
         &self,
         proposal_id: &str,
         dvp_proposal_cid: &str,
@@ -250,8 +221,8 @@ impl SettlementBackend for CloudSettlementBackend {
         base_instrument: &str,
         quote_instrument: &str,
     ) -> Result<StepResult> {
-        // Both legs need a registry admin from local config: an empty one would
-        // skip the verifier's admin check, so nothing is prepared without them.
+        // Both legs need a registry admin from local config; the verifier refuses an
+        // empty one, so nothing is prepared without them.
         let (del_id, del_admin) = self.config.try_resolve_instrument(base_instrument)?;
         let (pay_id, pay_admin) = self.config.try_resolve_instrument(quote_instrument)?;
 
@@ -305,8 +276,84 @@ impl SettlementBackend for CloudSettlementBackend {
         })
     }
 
+    /// Wire the RfqHandler's shared mid-price map so the LIQUIDITY heartbeat can
+    /// bucket the holdings histogram by USD. Call only when RFQ V2 is enabled.
+    pub fn with_mid_prices(
+        mut self,
+        mid_prices: Arc<RwLock<HashMap<String, agent_logic::pool_impact::MarketMid>>>,
+    ) -> Self {
+        self.mid_prices = Some(mid_prices);
+        self
+    }
+
+    /// Create a new DAppProviderClient for this request
+    async fn create_client(&self) -> Result<DAppProviderClient> {
+        DAppProviderClient::new(
+            &self.config.orderbook_grpc_url,
+            &self.config.party_id,
+            &self.config.role,
+            &self.config.private_key,
+            self.config.token_ttl_secs,
+            Some(self.config.node_name.as_str()),
+            &self.config.ledger_service_public_key,
+            Some(self.config.connection_timeout_secs),
+            Some(self.config.request_timeout_secs),
+        )
+        .await
+    }
+
+    /// Public accessor for the CC cache view (used by multicall settlement path).
+    pub fn amulet_cache(&self) -> &CcView {
+        &self.amulet_cache
+    }
+
+    /// Public accessor for the shared multi-instrument holdings cache.
+    pub fn holdings_cache(&self) -> &Arc<HoldingsCache> {
+        &self.holdings_cache
+    }
+}
+
+#[async_trait]
+impl SettlementBackend for CloudSettlementBackend {
+    async fn pay_fee(&self, proposal_id: &str, fee_type: &str) -> Result<StepResult> {
+        let paid = self.payment_queue.submit_pay_fee(proposal_id, fee_type).await;
+        self.nudge_topup();
+        paid
+    }
+
+    async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
+        let proposed = self.propose_dvp_inner(proposal_id).await;
+        self.nudge_topup();
+        proposed
+    }
+
+    async fn accept_dvp(
+        &self,
+        proposal_id: &str,
+        dvp_proposal_cid: &str,
+        expected_delivery_amount: &str,
+        expected_payment_amount: &str,
+        base_instrument: &str,
+        quote_instrument: &str,
+    ) -> Result<StepResult> {
+        let accepted = self
+            .accept_dvp_inner(
+                proposal_id,
+                dvp_proposal_cid,
+                expected_delivery_amount,
+                expected_payment_amount,
+                base_instrument,
+                quote_instrument,
+            )
+            .await;
+        self.nudge_topup();
+        accepted
+    }
+
     async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult> {
-        self.payment_queue.submit_allocate(proposal_id, dvp_cid, allocation_cc).await
+        let allocated = self.payment_queue.submit_allocate(proposal_id, dvp_cid, allocation_cc).await;
+        self.nudge_topup();
+        allocated
     }
 
     fn queue_depth(&self) -> (u64, u64) {
@@ -463,6 +510,43 @@ mod runtime_tests {
         assert!(histogram.priced);
         assert_eq!(histogram.total, 0);
         shutdown.signal();
+    }
+
+    // Each settlement step nudges the prepaid top-up runner, paid or refused
+    #[tokio::test]
+    async fn settlement_steps_nudge_the_topup_runner() {
+        let ledger = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let shutdown = Shutdown::new();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = ledger.url.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let backend = CloudSettlementBackend::new(
+            config,
+            false,
+            false,
+            false,
+            false,
+            agent_logic::confirm::new_confirm_lock(),
+            LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0),
+            shutdown.clone(),
+            HoldingsCache::new(false),
+        )
+        .unwrap()
+        .with_topup_trigger(crate::topup::TopupTrigger::from_sender(tx));
+        let bounded = std::time::Duration::from_secs(10);
+        assert!(tokio::time::timeout(bounded, backend.pay_fee("p1", "dvp")).await.unwrap().is_err());
+        assert!(tokio::time::timeout(bounded, backend.propose_dvp("p1")).await.unwrap().is_err());
+        let refused = backend.accept_dvp("p1", "00dvp", "1", "2", "UNLISTED", "CC");
+        assert!(tokio::time::timeout(bounded, refused).await.unwrap().is_err());
+        // No CC leg, so the allocation is not held back for coins
+        assert!(tokio::time::timeout(bounded, backend.allocate("p1", "00dvp", None)).await.unwrap().is_err());
+        let mut nudges = 0;
+        while rx.try_recv().is_ok() {
+            nudges += 1;
+        }
+        assert_eq!(nudges, 4);
+        shutdown.signal();
+        ledger.stop().await;
     }
 
     // A leg the registry lacked used to be verified against an empty admin

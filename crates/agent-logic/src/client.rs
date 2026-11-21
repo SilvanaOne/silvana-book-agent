@@ -9,9 +9,11 @@ use indexmap::IndexMap;
 use orderbook_proto::{
     orderbook::{
         AcceptQuoteRequest, AcceptQuoteResponse, CancelOrderRequest, CancelOrderResponse,
-        GetInstrumentsRequest, GetMarketsRequest, GetOrdersRequest, GetRoundsDataRequest,
-        GetRoundsDataResponse, GetSettlementProposalsRequest, Instrument, Market, Order,
-        OrderStatus, OrderType, RequestQuotesRequest, RequestQuotesResponse, SettlementProposal,
+        GetInstrumentsRequest, GetMarketsRequest, GetMinOrderValueRequest,
+        GetMinOrderValueResponse, GetOrderbookDepthRequest, GetOrdersRequest, GetRoundsDataRequest,
+        GetRoundsDataResponse, GetSettlementProposalsRequest, GetSettlementsRequest, Instrument,
+        Market, Order, OrderStatus, OrderType, OrderbookDepth, RequestQuotesRequest,
+        RequestQuotesResponse, Settlement, SettlementProposal,
         SettlementStatus, SettlementUpdate, SubmitOrderRequest, SubmitOrderResponse,
         SubscribeSettlementsRequest, TimeInForce, orderbook_service_client::OrderbookServiceClient,
     },
@@ -45,6 +47,8 @@ const MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_INSTRUMENT_PAGES: usize = 100;
 /// Most pages one `get_pending_proposals` listing fetches.
 const MAX_PROPOSAL_PAGES: usize = 200;
+/// Most pages one `get_settlements` listing fetches.
+const MAX_SETTLEMENT_PAGES: usize = 100;
 
 /// External account authentication data
 #[derive(Clone)]
@@ -229,13 +233,44 @@ impl OrderbookClient {
         signed_data: Vec<u8>,
         nonce: u64,
     ) -> Result<SubmitOrderResponse> {
+        self.submit_order_tif(
+            market_id,
+            order_type,
+            price,
+            quantity,
+            trader_order_ref,
+            signature,
+            signed_data,
+            nonce,
+            TimeInForce::Gtc,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::submit_order`] with a time in force; `expires_at` is for GTD.
+    /// The time in force is not part of the signed order.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_order_tif(
+        &mut self,
+        market_id: &str,
+        order_type: OrderType,
+        price: String,
+        quantity: String,
+        trader_order_ref: Option<String>,
+        signature: Option<String>,
+        signed_data: Vec<u8>,
+        nonce: u64,
+        time_in_force: TimeInForce,
+        expires_at: Option<prost_types::Timestamp>,
+    ) -> Result<SubmitOrderResponse> {
         let request = Request::new(SubmitOrderRequest {
             market_id: market_id.to_string(),
             order_type: order_type as i32,
             price,
             quantity,
-            time_in_force: TimeInForce::Gtc as i32, // Good Till Cancel
-            expires_at: None,
+            time_in_force: time_in_force as i32,
+            expires_at,
             trader_order_ref,
             credentials: None,
             requirements: None,
@@ -254,6 +289,80 @@ impl OrderbookClient {
             .map_err(submit_order_error)?;
 
         Ok(response.into_inner())
+    }
+
+    /// Aggregated book levels; `only_liquidity_providers` keeps just LP orders.
+    pub async fn get_orderbook_depth(
+        &mut self,
+        market_id: &str,
+        depth: u32,
+        only_liquidity_providers: bool,
+    ) -> Result<OrderbookDepth> {
+        let request = Request::new(GetOrderbookDepthRequest {
+            market_id: market_id.to_string(),
+            depth: Some(depth),
+            only_liquidity_providers: Some(only_liquidity_providers),
+        });
+        let inner = within(self.deadline, self.orderbook_client.get_orderbook_depth(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_orderbook_depth failed: {}", e.message()))?
+            .into_inner();
+        if !inner.success {
+            anyhow::bail!("get_orderbook_depth failed: {}", inner.message);
+        }
+        Ok(inner.orderbook.unwrap_or_default())
+    }
+
+    /// Minimum order value, and the base quantity that clears it at `price`.
+    pub async fn get_min_order_value(
+        &mut self,
+        market_id: &str,
+        price: Option<String>,
+    ) -> Result<GetMinOrderValueResponse> {
+        let request = Request::new(GetMinOrderValueRequest {
+            market_id: Some(market_id.to_string()),
+            price,
+        });
+        let inner = within(self.deadline, self.orderbook_client.get_min_order_value(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_min_order_value failed: {}", e.message()))?
+            .into_inner();
+        if !inner.success {
+            anyhow::bail!("get_min_order_value failed: {}", inner.message);
+        }
+        Ok(inner)
+    }
+
+    /// Own completed settlements, paged; `from_time` bounds the listing.
+    pub async fn get_settlements(
+        &mut self,
+        market_id: Option<&str>,
+        from_time: Option<prost_types::Timestamp>,
+    ) -> Result<Vec<Settlement>> {
+        const PAGE_SIZE: u32 = 100;
+        let client = self.orderbook_client.clone();
+        let deadline = self.deadline;
+        let market_id = market_id.map(str::to_string);
+        collect_pages("get_settlements", MAX_SETTLEMENT_PAGES, move |offset| {
+            let mut client = client.clone();
+            let (market_id, from_time) = (market_id.clone(), from_time);
+            async move {
+                let request = Request::new(GetSettlementsRequest {
+                    market_id,
+                    from_time,
+                    to_time: None,
+                    limit: Some(PAGE_SIZE),
+                    offset: Some(offset),
+                });
+                let inner = within(deadline, client.get_settlements(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_settlements failed: {}", e.message()))?
+                    .into_inner();
+                let short = u32::try_from(inner.settlements.len()).is_ok_and(|n| n < PAGE_SIZE);
+                Ok(Page { total: inner.total, ends: short, items: inner.settlements })
+            }
+        })
+        .await
     }
 
     /// Cancel an existing order
@@ -642,6 +751,32 @@ mod tests {
         let connect = OrderbookClient::create_channel(&url, opts);
         let result = tokio::time::timeout(Duration::from_secs(10), connect).await;
         assert!(matches!(result, Ok(Err(_))), "the handshake bound should end the connect");
+        drop(listener);
+    }
+
+    // The strategy wrappers are bounded by the same client deadline
+    #[tokio::test]
+    async fn strategy_calls_on_a_silent_server_end_at_the_client_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let channel = Channel::from_shared(config.orderbook_grpc_url.clone()).unwrap().connect_lazy();
+        let mut client = OrderbookClient::with_channel(channel, &config).unwrap();
+        client.deadline = Duration::from_millis(200);
+        let bound = Duration::from_secs(5);
+        let deadline_hit = |e: anyhow::Error| e.to_string().contains("client deadline");
+
+        let r = tokio::time::timeout(bound, client.get_orderbook_depth("CC-USDCx", 20, true)).await.unwrap();
+        assert!(deadline_hit(r.unwrap_err()));
+        let r = tokio::time::timeout(bound, client.get_min_order_value("CC-USDCx", Some("1".into()))).await.unwrap();
+        assert!(deadline_hit(r.unwrap_err()));
+        let r = tokio::time::timeout(bound, client.get_settlements(Some("CC-USDCx"), None)).await.unwrap();
+        assert!(deadline_hit(r.unwrap_err()));
+        let submit = client.submit_order_tif(
+            "CC-USDCx", OrderType::Bid, "1".into(), "1".into(), None, None, Vec::new(), 1, TimeInForce::Ioc, None,
+        );
+        let e = tokio::time::timeout(bound, submit).await.unwrap().unwrap_err();
+        assert!(e.to_string().contains("client deadline"), "{e}");
         drop(listener);
     }
 

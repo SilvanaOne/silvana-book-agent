@@ -33,3 +33,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v7"] }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }

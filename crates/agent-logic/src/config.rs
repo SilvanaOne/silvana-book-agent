@@ -11,7 +11,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use orderbook_proto::orderbook::Instrument;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Display;
 use std::fs;
 use std::ops::RangeInclusive;
@@ -21,6 +21,11 @@ use zeroize::Zeroize;
 
 use crate::auth::get_public_key_hex;
 use crate::secret::{Secret, Zeroizing};
+
+pub use crate::strategy::config::{
+    ArbitrageConfig, CommonParams, GridParams, MarketMakerConfig, MeanReversionConfig, MomentumConfig,
+    NoiseTakerConfig, RebalancerConfig, StrategyConfig, StrategyMode, TradeSide, TwapConfig,
+};
 
 // ============================================================================
 // Agent TOML (agent.toml) — agent-specific settings only
@@ -179,6 +184,9 @@ pub struct BaseConfig {
     pub balance_stale_after_secs: u64,
     pub markets: Vec<MarketConfig>,
 
+    /// `[markets.strategy]` tables by market id; a market without one runs the grid.
+    pub strategies: BTreeMap<String, StrategyConfig>,
+
     /// Venue/branch-scoped overrides of `[markets.rfq]` params (RFQ V2 only) —
     /// TOML `[[venue_overrides]]`, resolved per request by
     /// [`resolve_rfq_config`].
@@ -332,6 +340,7 @@ impl BaseConfig {
             canton_op_timeout_secs: 60,
             balance_stale_after_secs: 120,
             markets: Vec::new(),
+            strategies: BTreeMap::new(),
             venue_overrides: Vec::new(),
             node_name: String::new(),
             venue_branch: None,
@@ -381,7 +390,9 @@ impl BaseConfig {
             .with_context(|| format!("Failed to read {}", agent_toml_path.as_ref().display()))?;
         let agent: AgentToml = toml::from_str(&agent_toml_str)
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
-        Self::assemble(agent, overrides)
+        let strategies = crate::strategy::config::parse_strategies(&agent_toml_str)
+            .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
+        Self::assemble_with(agent, strategies, overrides)
     }
 
     /// Lenient loader — if `agent.toml` is missing, use serde defaults
@@ -398,18 +409,20 @@ impl BaseConfig {
         agent_toml_path: P,
         overrides: ConfigOverrides,
     ) -> Result<Self> {
-        let agent: AgentToml = if agent_toml_path.as_ref().exists() {
+        let (agent, strategies): (AgentToml, _) = if agent_toml_path.as_ref().exists() {
             let s = fs::read_to_string(agent_toml_path.as_ref()).with_context(|| {
                 format!("Failed to read {}", agent_toml_path.as_ref().display())
             })?;
-            toml::from_str(&s).with_context(|| {
-                format!("Failed to parse {}", agent_toml_path.as_ref().display())
-            })?
+            let parse_err = || format!("Failed to parse {}", agent_toml_path.as_ref().display());
+            (
+                toml::from_str(&s).with_context(parse_err)?,
+                crate::strategy::config::parse_strategies(&s).with_context(parse_err)?,
+            )
         } else {
             // Empty string round-trips to AgentToml with all serde defaults.
-            toml::from_str("").context("AgentToml serde defaults must parse")?
+            (toml::from_str("").context("AgentToml serde defaults must parse")?, BTreeMap::new())
         };
-        Self::assemble(agent, overrides)
+        Self::assemble_with(agent, strategies, overrides)
     }
 
     /// Programmatic constructor for embedding the agent as a LIBRARY — e.g. a
@@ -466,6 +479,7 @@ impl BaseConfig {
             canton_op_timeout_secs: default_canton_op_timeout_secs(),
             balance_stale_after_secs: default_balance_stale_after_secs(),
             markets: Vec::new(),
+            strategies: BTreeMap::new(),
             venue_overrides: Vec::new(),
             node_name: node_name.to_string(),
             venue_branch: crate::auth::venue_branch_from_env("VENUE_BRANCH"),
@@ -636,7 +650,17 @@ impl BaseConfig {
     /// env vars. Instrument/registry info is populated later by
     /// [`BaseConfig::populate_instruments_from_rpc`]. Shared between
     /// strict/lenient loaders.
-    fn assemble(mut agent: AgentToml, overrides: ConfigOverrides) -> Result<Self> {
+    #[cfg(test)]
+    fn assemble(agent: AgentToml, overrides: ConfigOverrides) -> Result<Self> {
+        Self::assemble_with(agent, BTreeMap::new(), overrides)
+    }
+
+    /// [`BaseConfig::assemble`] with the strategy tables from the second TOML pass.
+    fn assemble_with(
+        mut agent: AgentToml,
+        strategies: BTreeMap<String, StrategyConfig>,
+        overrides: ConfigOverrides,
+    ) -> Result<Self> {
         // Instrument registry placeholders — filled by populate_instruments_from_rpc
         // after the cloud-agent fetches them over gRPC at startup.
         let onboarded_registries: Vec<String> = Vec::new();
@@ -1141,6 +1165,7 @@ impl BaseConfig {
             canton_op_timeout_secs: agent.canton_op_timeout_secs,
             balance_stale_after_secs: agent.balance_stale_after_secs,
             markets: agent.markets,
+            strategies,
             venue_overrides: agent.venue_overrides,
             node_name,
             // Production cloud-agent deployments set VENUE_BRANCH=agent (VA13).
@@ -1204,7 +1229,12 @@ impl BaseConfig {
         if let Some(v2) = self.liquidity_provider.as_ref().and_then(|lp| lp.rfq_v2.as_ref()) {
             validate_rfq_v2_ranges(v2)?;
         }
-        Ok(())
+        crate::strategy::config::validate_strategies(self)
+    }
+
+    /// The market's strategy; the grid when it has no `[markets.strategy]` table.
+    pub fn strategy_for(&self, market_id: &str) -> &StrategyConfig {
+        self.strategies.get(market_id).unwrap_or(&crate::strategy::config::GRID)
     }
 
     /// Get list of enabled markets
@@ -1636,7 +1666,7 @@ pub struct MarketConfig {
 }
 
 /// A single price level in the grid
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PriceLevel {
     pub delta_percent: f64,
     pub quantity: String,
@@ -3447,5 +3477,99 @@ enabled = true
         let v2m: RfqV2MarketConfig =
             toml::from_str("enabled = true\natomic_quote_valid_secs = 3600\n").unwrap();
         check_market_quote_valid_secs("X-Y", &v2m, None).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod strategy_table_tests {
+    use super::*;
+
+    // The first pass ignores strategy tables, so MarketConfig stays as it was
+    #[test]
+    fn agent_toml_still_parses_a_file_with_strategy_tables() {
+        let toml = r#"
+            [[markets]]
+            market_id = "HTEST-USDC"
+            [markets.strategy]
+            kind = "rebalancer"
+            target_share = 0.25
+        "#;
+        let agent: AgentToml = toml::from_str(toml).unwrap();
+        assert_eq!(agent.markets.len(), 1);
+        assert!(agent.markets[0].bid_levels.is_empty());
+        let strategies = crate::strategy::config::parse_strategies(toml).unwrap();
+        assert_eq!(strategies.get("HTEST-USDC").map(StrategyConfig::kind), Some("rebalancer"));
+    }
+
+    // Copies of the two examples in the README's Strategies section
+    const README_MAKER: &str = r#"
+role = "trader"
+auto_settle = true
+poll_interval_secs = 5
+
+[[markets]]
+market_id = "CC-USDC"
+enabled = true
+
+[markets.strategy]
+kind = "market_maker"
+levels = 3
+half_spread_bps = 15
+level_step_bps = 15
+level_usd = 60
+max_inventory_usd = 500
+skew_bps = 20
+"#;
+
+    const README_TAKER: &str = r#"
+role = "trader"
+auto_settle = true
+poll_interval_secs = 5
+
+[[markets]]
+market_id = "CC-USDC"
+enabled = true
+
+[markets.strategy]
+kind = "twap"
+side = "buy"
+total_quantity = "2000"
+start_at = "2026-12-01T10:00:00Z"
+duration_secs = 3600
+slice_secs = 240
+max_slip_bps = 15
+"#;
+
+    #[test]
+    fn the_readme_strategy_examples_parse_and_validate() {
+        for (toml, kind) in [(README_MAKER, "market_maker"), (README_TAKER, "twap")] {
+            let agent: AgentToml = toml::from_str(toml).unwrap();
+            let mut config = BaseConfig::test_minimal().unwrap();
+            config.markets = agent.markets;
+            config.liquidity_provider = agent.liquidity_provider;
+            config.strategies = crate::strategy::config::parse_strategies(toml).unwrap();
+            config.validate_ranges().unwrap();
+            assert_eq!(config.strategy_for("CC-USDC").kind(), kind);
+        }
+        let StrategyConfig::MarketMaker(mm) = parse_one(README_MAKER) else { panic!() };
+        assert_eq!((mm.levels, mm.half_spread_bps, mm.level_usd, mm.skew_bps), (3, 15.0, 60.0, 20.0));
+        let StrategyConfig::Twap(tw) = parse_one(README_TAKER) else { panic!() };
+        assert_eq!((tw.total_quantity.as_deref(), tw.duration_secs, tw.passive_secs), (Some("2000"), 3600, 60));
+    }
+
+    fn parse_one(toml: &str) -> StrategyConfig {
+        crate::strategy::config::parse_strategies(toml).unwrap().remove("CC-USDC").unwrap()
+    }
+
+    #[test]
+    fn markets_without_a_table_run_the_grid() {
+        let config = BaseConfig::test_minimal().unwrap();
+        assert!(config.strategies.is_empty());
+        assert!(config.strategy_for("CC-USDC").is_grid());
+        let key = bs58::encode([7u8; 32]).into_string();
+        let ledger = bs58::encode([9u8; 32]).into_string();
+        let config = BaseConfig::for_party("p::1220", &key, "http://x", "s", "o", "d", "n", &ledger).unwrap();
+        assert!(config.strategies.is_empty());
+        assert!(config.strategy_for("CC-USDC").is_grid());
     }
 }

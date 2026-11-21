@@ -450,6 +450,12 @@ impl LiquidityManager {
                 .any(|t| t.allocation_commitments.contains_key(proposal_id))
     }
 
+    /// Largest CC fee reserved for one settlement; zero when none.
+    pub async fn largest_fee_commitment(&self) -> Decimal {
+        let s = self.state.read().await;
+        s.fee_commitments.entries.values().copied().max().unwrap_or(Decimal::ZERO).max(Decimal::ZERO)
+    }
+
     /// Try to commit resources for a settlement.
     ///
     /// Checks **both** the allocation token balance **and** CC for fees.
@@ -1226,6 +1232,20 @@ mod tests {
         let stats = lm.stats().await;
         assert_eq!(stats.len(), 1);
         assert!(stats.iter().all(|s| s.available == Decimal::MAX));
+    }
+
+    // The top-up's fee demand: the largest single reservation, never below zero
+    #[tokio::test]
+    async fn the_largest_fee_commitment_is_the_biggest_entry_or_zero() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        assert_eq!(lm.largest_fee_commitment().await, Decimal::ZERO);
+        for (pid, fee) in [("a", 2), ("b", 7), ("c", 3)] {
+            lm.state.write().await.fee_commitments.entries.insert(pid.into(), Decimal::from(fee));
+        }
+        assert_eq!(lm.largest_fee_commitment().await, Decimal::from(7));
+        let negative = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        negative.state.write().await.fee_commitments.entries.insert("a".into(), Decimal::from(-5));
+        assert_eq!(negative.largest_fee_commitment().await, Decimal::ZERO);
     }
 
     // A fee too large for fixed-precision formatting is logged capped

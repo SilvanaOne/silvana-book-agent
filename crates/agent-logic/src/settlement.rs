@@ -89,6 +89,9 @@ const MAX_ADVANCE_SPAWNS_PER_CYCLE: usize = 50;
 /// cause, and without burning through retries in seconds during an RPC outage.
 const EXPIRED_RETRY_SECS: u64 = 30;
 
+/// Consecutive Waits (about 3.5 min of cooldown) after which a stalled proposal is reported once at INFO.
+const STILL_WAITING_REPORT: u32 = 4;
+
 /// Stream-touched proposals spawned without start jitter; the rest are staggered.
 const STREAM_IMMEDIATE_SPAWNS: usize = 4;
 
@@ -201,23 +204,123 @@ fn cid_since_found(result: &AdvanceResult, gained_proposal_cid: bool, gained_dvp
 /// mean only the COUNTERPARTY allocated), so it never triggers leave-alone
 /// below Settling.
 fn v1_settlement_leave_alone(status: &GetSettlementStatusResponse, is_buyer: bool) -> bool {
-    fn at_least_submitted(step: Option<&orderbook_proto::DvpStepStatus>) -> bool {
-        matches!(
-            step.map(|s| s.status),
-            Some(s) if s == DvpStepStatusEnum::DvpStepStatusSubmitted as i32
-                || s == DvpStepStatusEnum::DvpStepStatusCompleted as i32
-                || s == DvpStepStatusEnum::DvpStepStatusConfirmed as i32
-        )
-    }
     let my_alloc = if is_buyer {
         status.allocation_buyer.as_ref()
     } else {
         status.allocation_seller.as_ref()
     };
     // Settling=10, Settled=11, Failed=12, Cancelled=13 (contiguous tail).
-    at_least_submitted(my_alloc)
-        || at_least_submitted(status.settlement.as_ref())
+    step_at_least_submitted(my_alloc)
+        || step_at_least_submitted(status.settlement.as_ref())
         || status.stage >= orderbook_proto::SettlementStage::Settling as i32
+}
+
+/// Submitted, Completed or Confirmed.
+fn step_at_least_submitted(step: Option<&orderbook_proto::DvpStepStatus>) -> bool {
+    matches!(
+        step.map(|s| s.status),
+        Some(s) if s == DvpStepStatusEnum::DvpStepStatusSubmitted as i32
+            || s == DvpStepStatusEnum::DvpStepStatusCompleted as i32
+            || s == DvpStepStatusEnum::DvpStepStatusConfirmed as i32
+    )
+}
+
+/// Completed or Confirmed.
+fn step_reached(step: Option<&orderbook_proto::DvpStepStatus>) -> bool {
+    matches!(
+        step.map(|s| s.status),
+        Some(s) if s == DvpStepStatusEnum::DvpStepStatusCompleted as i32
+            || s == DvpStepStatusEnum::DvpStepStatusConfirmed as i32
+    )
+}
+
+/// RFQ takers settle in one multicall outside this executor; other proposals are stepped.
+fn multicall_capable(proposal: &SettlementProposal) -> bool {
+    proposal.origin == "rfq"
+}
+
+/// A fee step waits while the DVP request is reported but not yet on-chain;
+/// a status without the request step keeps the old behaviour.
+fn fee_waits_for_dvp(action: NextAction, status: &GetSettlementStatusResponse) -> bool {
+    matches!(action, NextAction::PayDvpFee | NextAction::PayAllocFee)
+        && status.dvp_request.is_some()
+        && !step_reached(status.dvp_request.as_ref())
+        && !step_reached(status.dvp_accept.as_ref())
+        && !step_reached(status.settlement.as_ref())
+}
+
+/// Counterparty (DVP fee, allocation fee, allocation) statuses still awaited before
+/// allocating: an LP waits for all three, a trader only for the two fees.
+fn allocate_wait(
+    lp_mode: bool,
+    is_buyer: bool,
+    status: &GetSettlementStatusResponse,
+) -> Option<(i32, i32, i32)> {
+    let (fee, alloc_fee, alloc) = if is_buyer {
+        (
+            &status.dvp_processing_fee_seller,
+            &status.allocation_processing_fee_seller,
+            &status.allocation_seller,
+        )
+    } else {
+        (
+            &status.dvp_processing_fee_buyer,
+            &status.allocation_processing_fee_buyer,
+            &status.allocation_buyer,
+        )
+    };
+    let of = |s: &Option<orderbook_proto::DvpStepStatus>| s.as_ref().map_or(0, |s| s.status);
+    let confirmed = DvpStepStatusEnum::DvpStepStatusConfirmed as i32;
+    let seen = (of(fee), of(alloc_fee), of(alloc));
+    let ready = seen.0 == confirmed && seen.1 == confirmed && (!lp_mode || seen.2 == confirmed);
+    (!ready).then_some(seen)
+}
+
+/// This side's processing fee, as the fee arms of `advance_single` see it.
+struct FeeStep<'a> {
+    fee_type: &'static str,
+    label: &'static str,
+    amount: &'a str,
+    own_step: Option<&'a orderbook_proto::DvpStepStatus>,
+    submitted_event: SettlementEventType,
+    stage: SettlementStage,
+}
+
+/// Debit first, record after: a failed debit leaves no row and backs off, so the
+/// server asks for the fee again. A zero fee is recorded without a debit.
+async fn pay_fee_step<B: SettlementBackend>(
+    backend: &B,
+    rpc_client: &mut OrderbookRpcClient,
+    proposal_id: String,
+    party_id: &str,
+    is_buyer: bool,
+    step: FeeStep<'_>,
+) -> AdvanceResult {
+    let already_submitted = step_at_least_submitted(step.own_step);
+    let zero_fee = Decimal::from_str(step.amount).is_ok_and(|v| v.is_zero());
+    if zero_fee {
+        if already_submitted {
+            // Nothing to debit; a repeated prompt waits instead of re-running.
+            return AdvanceResult::Wait { proposal_id };
+        }
+    } else if let Err(e) = backend.pay_fee(&proposal_id, step.fee_type).await {
+        return AdvanceResult::Error {
+            proposal_id,
+            error: format!("{} debit failed: {:#}", step.label, e),
+        };
+    }
+    if !already_submitted {
+        record_step_submitted(rpc_client, &proposal_id, party_id, is_buyer, step.submitted_event)
+            .await;
+    }
+    AdvanceResult::StepCompleted {
+        proposal_id,
+        stage: step.stage,
+        dvp_proposal_cid: None,
+        dvp_cid: None,
+        allocation_cid: None,
+        pending_traffic: 0,
+    }
 }
 
 /// Extract the 48-bit ms-since-epoch timestamp from a UUID-v7 string.
@@ -579,7 +682,10 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     return;
                 }
             };
-        let status = match rpc_client.get_settlement_status(&proposal_id).await {
+        let status = match rpc_client
+            .get_settlement_status_with(&proposal_id, multicall_capable(proposal))
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 warn!("[{}] rfq_v2_only abort: GetSettlementStatus failed: {:#} — retrying next poll", proposal_id, e);
@@ -1838,6 +1944,9 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     });
                 entry.retry_count = 0; // Not a failure — don't accumulate
                 entry.wait_count = entry.wait_count.saturating_add(1);
+                if entry.wait_count == STILL_WAITING_REPORT {
+                    info!("[{}] Still waiting on the counterparty after {} checks", proposal_id, entry.wait_count);
+                }
                 let mut delay = FailedSettlement::wait_delay(entry.wait_count);
                 if expired {
                     // Past-deadline: keep advancing at a bounded cadence so the
@@ -2853,7 +2962,10 @@ async fn advance_single<B: SettlementBackend>(
     };
 
     // Get settlement status from server
-    let status = match rpc_client.get_settlement_status(&proposal_id).await {
+    let status = match rpc_client
+        .get_settlement_status_with(&proposal_id, multicall_capable(&state.proposal))
+        .await
+    {
         Ok(s) => s,
         Err(e) => return AdvanceResult::Error {
             proposal_id,
@@ -2907,6 +3019,12 @@ async fn advance_single<B: SettlementBackend>(
         LegCheck::Refuse(error) => return AdvanceResult::Error { proposal_id, error },
     }
 
+    // Fees wait for the DVP proposal, so one that is never made costs nothing.
+    if fee_waits_for_dvp(my_action, &status) {
+        debug!("[{}] {:?} deferred until the DVP proposal exists", proposal_id, my_action);
+        return AdvanceResult::Wait { proposal_id };
+    }
+
     // Reserve on the first post-preconfirm action: any action other than
     // Preconfirm/Wait/None means the counterparty has committed its side
     // (the server only emits progress actions after both preconfirmations,
@@ -2914,9 +3032,10 @@ async fn advance_single<B: SettlementBackend>(
     // Until then nothing is reserved, so one-sided proposals cost no
     // inventory. Idempotent; a failure (balance dropped since the adoption
     // advisory check) routes through the Error backoff/retry path.
+    // A multicall accept is never run here, so it reserves nothing.
     if !matches!(
         my_action,
-        NextAction::Preconfirm | NextAction::Wait | NextAction::None
+        NextAction::Preconfirm | NextAction::Wait | NextAction::MulticallAccept | NextAction::None
     ) {
         if let Err(e) =
             ensure_reserved(&state, &config, &liquidity_manager, &tracker, &proposal_id).await
@@ -2961,34 +3080,29 @@ async fn advance_single<B: SettlementBackend>(
         }
         NextAction::PayDvpFee => {
             action_log.lock().await.push((proposal_id.clone(), "PayDvpFee"));
-            let submitted_event = if state.is_buyer {
-                SettlementEventType::DvpProcessingFeeBuyerSubmitted
+            // Off-chain debit from the prepaid balance; the ledger refuses a second
+            // debit of the same fee, so buyer and seller each pay theirs once.
+            let step = if state.is_buyer {
+                FeeStep {
+                    fee_type: "dvp",
+                    label: "DVP processing fee",
+                    amount: &state.proposal.dvp_processing_fee_buyer,
+                    own_step: status.dvp_processing_fee_buyer.as_ref(),
+                    submitted_event: SettlementEventType::DvpProcessingFeeBuyerSubmitted,
+                    stage: SettlementStage::DvpFeePaid,
+                }
             } else {
-                SettlementEventType::DvpProcessingFeeSellerSubmitted
+                FeeStep {
+                    fee_type: "dvp",
+                    label: "DVP processing fee",
+                    amount: &state.proposal.dvp_processing_fee_seller,
+                    own_step: status.dvp_processing_fee_seller.as_ref(),
+                    submitted_event: SettlementEventType::DvpProcessingFeeSellerSubmitted,
+                    stage: SettlementStage::DvpFeePaid,
+                }
             };
-            // Record _Submitted immediately — server allows next step for agents (LPs)
-            record_step_submitted(
-                &mut rpc_client, &proposal_id, &config.party_id,
-                state.is_buyer, submitted_event,
-            ).await;
-            // Trigger the off-chain processing-fee debit via PreparePayFee /
-            // ExecutePayFee. The ledger looks up our role from the proposal
-            // and debits our share of the DVP processing fee. The
-            // (source='pay_fee', external_id='dvp:<role>:<proposal_id>')
-            // UNIQUE constraint dedupes per-role retries while letting
-            // buyer and seller each pay their own DVP fee on the same
-            // proposal.
-            if let Err(e) = backend.pay_fee(&proposal_id, "dvp").await {
-                warn!("[{}] DVP processing fee debit failed: {:#}", proposal_id, e);
-            }
-            AdvanceResult::StepCompleted {
-                proposal_id,
-                stage: SettlementStage::DvpFeePaid,
-                dvp_proposal_cid: None,
-                dvp_cid: None,
-                allocation_cid: None,
-                pending_traffic: 0,
-            }
+            pay_fee_step(&*backend, &mut rpc_client, proposal_id, &config.party_id, state.is_buyer, step)
+                .await
         }
         NextAction::CreateDvp => {
             action_log.lock().await.push((proposal_id.clone(), "CreateDvp"));
@@ -3045,7 +3159,8 @@ async fn advance_single<B: SettlementBackend>(
                         proposal_id,
                         stage: SettlementStage::DvpAccepted,
                         dvp_proposal_cid: None,
-                        dvp_cid: Some(result.contract_id),
+                        // An unreported Dvp id is left to the on-chain sync.
+                        dvp_cid: Some(result.contract_id).filter(|cid| !cid.is_empty()),
                         allocation_cid: None,
                         pending_traffic: 0,
                     }
@@ -3058,63 +3173,37 @@ async fn advance_single<B: SettlementBackend>(
         }
         NextAction::PayAllocFee => {
             action_log.lock().await.push((proposal_id.clone(), "PayAllocFee"));
-            let submitted_event = if state.is_buyer {
-                SettlementEventType::AllocationProcessingFeeBuyerSubmitted
+            // Same debit path as the DVP fee, keyed 'allocate:<role>:<proposal_id>'.
+            let step = if state.is_buyer {
+                FeeStep {
+                    fee_type: "allocate",
+                    label: "Allocation processing fee",
+                    amount: &state.proposal.allocation_processing_fee_buyer,
+                    own_step: status.allocation_processing_fee_buyer.as_ref(),
+                    submitted_event: SettlementEventType::AllocationProcessingFeeBuyerSubmitted,
+                    stage: SettlementStage::AllocationFeePaid,
+                }
             } else {
-                SettlementEventType::AllocationProcessingFeeSellerSubmitted
+                FeeStep {
+                    fee_type: "allocate",
+                    label: "Allocation processing fee",
+                    amount: &state.proposal.allocation_processing_fee_seller,
+                    own_step: status.allocation_processing_fee_seller.as_ref(),
+                    submitted_event: SettlementEventType::AllocationProcessingFeeSellerSubmitted,
+                    stage: SettlementStage::AllocationFeePaid,
+                }
             };
-            // Record _Submitted immediately — server allows next step for agents (LPs)
-            record_step_submitted(
-                &mut rpc_client, &proposal_id, &config.party_id,
-                state.is_buyer, submitted_event,
-            ).await;
-            // Trigger the off-chain processing-fee debit via PreparePayFee /
-            // ExecutePayFee. The (source='pay_fee',
-            // external_id='allocate:<role>:<proposal_id>') UNIQUE
-            // constraint dedupes per-role retries while letting buyer and
-            // seller each pay their own allocation fee on the same proposal.
-            if let Err(e) = backend.pay_fee(&proposal_id, "allocate").await {
-                warn!("[{}] Allocation processing fee debit failed: {:#}", proposal_id, e);
-            }
-            AdvanceResult::StepCompleted {
-                proposal_id,
-                stage: SettlementStage::AllocationFeePaid,
-                dvp_proposal_cid: None,
-                dvp_cid: None,
-                allocation_cid: None,
-                pending_traffic: 0,
-            }
+            pay_fee_step(&*backend, &mut rpc_client, proposal_id, &config.party_id, state.is_buyer, step)
+                .await
         }
         NextAction::Allocate => {
-            // LP allocates last — wait for operator to witness counterparty's
-            // DVP fee, allocation fee, and allocation on-chain. Checking only
-            // the allocation is not enough: a cheating user can record
-            // *_completed events for their fees without actually transferring
-            // them to the orderbook-fee party, leaving the orderbook short.
-            let (cp_dvp_fee, cp_alloc_fee, cp_alloc) = if state.is_buyer {
-                (
-                    status.dvp_processing_fee_seller.as_ref(),
-                    status.allocation_processing_fee_seller.as_ref(),
-                    status.allocation_seller.as_ref(),
-                )
-            } else {
-                (
-                    status.dvp_processing_fee_buyer.as_ref(),
-                    status.allocation_processing_fee_buyer.as_ref(),
-                    status.allocation_buyer.as_ref(),
-                )
-            };
-            const CONFIRMED: i32 = 4; // DVP_STEP_STATUS_CONFIRMED
-            let cp_dvp_fee_status = cp_dvp_fee.map(|s| s.status).unwrap_or(0);
-            let cp_alloc_fee_status = cp_alloc_fee.map(|s| s.status).unwrap_or(0);
-            let cp_alloc_status = cp_alloc.map(|s| s.status).unwrap_or(0);
-            if cp_dvp_fee_status != CONFIRMED
-                || cp_alloc_fee_status != CONFIRMED
-                || cp_alloc_status != CONFIRMED
-            {
+            // Operator-witnessed counterparty fees (and, for an LP, its allocation) come first.
+            let lp_mode = config.liquidity_provider.is_some();
+            if let Some((dvp_fee, alloc_fee, alloc)) = allocate_wait(lp_mode, state.is_buyer, &status) {
                 info!(
-                    "[{}] Allocate: waiting for counterparty witnesses — dvp_fee={} alloc_fee={} alloc={} (need 4 each)",
-                    proposal_id, cp_dvp_fee_status, cp_alloc_fee_status, cp_alloc_status
+                    "[{}] Allocate: waiting for counterparty witnesses — dvp_fee={} alloc_fee={} alloc={} (need 4{})",
+                    proposal_id, dvp_fee, alloc_fee, alloc,
+                    if lp_mode { " each" } else { " for both fees" }
                 );
                 return AdvanceResult::Wait { proposal_id };
             }
@@ -3155,8 +3244,16 @@ async fn advance_single<B: SettlementBackend>(
                 is_buyer: state.is_buyer,
             }
         }
-        NextAction::Wait | NextAction::MulticallAccept => {
-            debug!("[{}] NextAction: Wait (counterparty's turn or multicall)", proposal_id);
+        NextAction::Wait => {
+            debug!("[{}] NextAction: Wait (counterparty's turn)", proposal_id);
+            AdvanceResult::Wait { proposal_id }
+        }
+        NextAction::MulticallAccept => {
+            action_log.lock().await.push((proposal_id.clone(), "MulticallAccept"));
+            warn!(
+                "[{}] Server asked for a multicall accept, which this executor does not run; waiting",
+                proposal_id
+            );
             AdvanceResult::Wait { proposal_id }
         }
         NextAction::None => {
@@ -5046,18 +5143,32 @@ mod tests {
         assert!(exec.reported_errors.is_empty());
     }
 
-    /// Records every backend call; each one fails.
+    /// Records every backend call; each one fails unless `pays` names the contract id to answer.
     #[derive(Default)]
-    struct RecordingBackend(std::sync::Mutex<Vec<&'static str>>);
+    struct RecordingBackend {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        pays: Option<&'static str>,
+    }
 
     impl RecordingBackend {
+        fn paying(contract_id: &'static str) -> Self {
+            Self { pays: Some(contract_id), ..Default::default() }
+        }
+
         fn record(&self, call: &'static str) -> Result<StepResult> {
-            sync::lock(&self.0).push(call);
-            Err(anyhow::anyhow!("recording backend: {call} is not answered"))
+            sync::lock(&self.calls).push(call);
+            match self.pays {
+                Some(cid) => Ok(StepResult {
+                    contract_id: cid.to_string(),
+                    update_id: "u1".to_string(),
+                    traffic_total: 0,
+                }),
+                None => Err(anyhow::anyhow!("recording backend: {call} is not answered")),
+            }
         }
 
         fn calls(&self) -> Vec<&'static str> {
-            sync::lock(&self.0).clone()
+            sync::lock(&self.calls).clone()
         }
     }
 
@@ -5091,11 +5202,11 @@ mod tests {
         }
     }
 
-    /// Writes pre-encoded message bytes; reads every request as `()`.
+    /// Writes pre-encoded message bytes; reads every request as its raw bytes.
     #[derive(Clone, Copy, Default)]
     struct RawCodec;
     struct RawEncoder;
-    struct UnitDecoder;
+    struct RawDecoder;
 
     impl tonic::codec::Encoder for RawEncoder {
         type Item = Vec<u8>;
@@ -5118,48 +5229,61 @@ mod tests {
         }
     }
 
-    impl tonic::codec::Decoder for UnitDecoder {
-        type Item = ();
+    impl tonic::codec::Decoder for RawDecoder {
+        type Item = Vec<u8>;
         type Error = tonic::Status;
         fn decode(
             &mut self,
-            _: &mut tonic::codec::DecodeBuf<'_>,
-        ) -> Result<Option<()>, tonic::Status> {
-            Ok(Some(()))
+            src: &mut tonic::codec::DecodeBuf<'_>,
+        ) -> Result<Option<Vec<u8>>, tonic::Status> {
+            use prost::bytes::Buf;
+            Ok(Some(src.copy_to_bytes(src.remaining()).to_vec()))
         }
     }
 
     impl tonic::codec::Codec for RawCodec {
         type Encode = Vec<u8>;
-        type Decode = ();
+        type Decode = Vec<u8>;
         type Encoder = RawEncoder;
-        type Decoder = UnitDecoder;
+        type Decoder = RawDecoder;
         fn encoder(&mut self) -> RawEncoder {
             RawEncoder
         }
-        fn decoder(&mut self) -> UnitDecoder {
-            UnitDecoder
+        fn decoder(&mut self) -> RawDecoder {
+            RawDecoder
         }
     }
 
-    /// Answers a unary call with fixed message bytes.
-    struct Fixed(Vec<u8>);
+    /// Answers a unary call with fixed message bytes; for a status read it
+    /// records the `supports_multicall` the request carried.
+    struct Fixed {
+        reply: Vec<u8>,
+        multicall: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
+    }
 
-    impl tonic::server::UnaryService<()> for Fixed {
+    impl tonic::server::UnaryService<Vec<u8>> for Fixed {
         type Response = Vec<u8>;
         type Future = tonic::codegen::BoxFuture<tonic::Response<Vec<u8>>, tonic::Status>;
-        fn call(&mut self, _: tonic::Request<()>) -> Self::Future {
-            let reply = std::mem::take(&mut self.0);
+        fn call(&mut self, req: tonic::Request<Vec<u8>>) -> Self::Future {
+            if let Some(asked) = &self.multicall {
+                let request = <orderbook_proto::GetSettlementStatusRequest as prost::Message>::decode(
+                    req.get_ref().as_slice(),
+                )
+                .expect("a GetSettlementStatusRequest");
+                sync::lock(asked).push(request.supports_multicall);
+            }
+            let reply = std::mem::take(&mut self.reply);
             Box::pin(async move { Ok(tonic::Response::new(reply)) })
         }
     }
 
-    /// Answers GetSettlementStatus with `status` and other calls with an empty
-    /// message; records each request path.
+    /// Answers GetSettlementStatus with the next scripted status (the last one
+    /// repeats) and other calls with an empty message; records each request path.
     #[derive(Clone)]
     struct StatusServer {
-        status: Vec<u8>,
+        statuses: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
         calls: Arc<std::sync::Mutex<Vec<String>>>,
+        multicall: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     impl tonic::server::NamedService for StatusServer {
@@ -5184,53 +5308,133 @@ mod tests {
 
         fn call(&mut self, req: tonic::codegen::http::Request<B>) -> Self::Future {
             let path = req.uri().path().to_string();
-            let reply = if path.ends_with("/GetSettlementStatus") {
-                self.status.clone()
+            let status = path.ends_with("/GetSettlementStatus");
+            let reply = if status {
+                let mut statuses = sync::lock(&self.statuses);
+                if statuses.len() > 1 {
+                    statuses.pop_front().unwrap_or_default()
+                } else {
+                    statuses.front().cloned().unwrap_or_default()
+                }
             } else {
                 Vec::new()
             };
             sync::lock(&self.calls).push(path);
-            // Every request is read as one empty message
-            let (parts, _) = req.into_parts();
-            let body = tonic::body::Body::new(String::from("\0\0\0\0\0"));
-            let req = tonic::codegen::http::Request::from_parts(parts, body);
+            let multicall = status.then(|| self.multicall.clone());
             Box::pin(async move {
                 Ok(tonic::server::Grpc::new(RawCodec)
-                    .unary(Fixed(reply), req)
+                    .unary(Fixed { reply, multicall }, req)
                     .await)
             })
         }
     }
 
-    /// GetSettlementStatusResponse with only `seller_next_action` (field 25) set.
-    fn seller_status(action: NextAction) -> Vec<u8> {
-        vec![0xC8, 0x01, action as u8]
+    /// Append protobuf varint `v` to `out`.
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
     }
 
-    /// What one advance did: its result, the backend and server calls, the reservation.
+    /// GetSettlementStatusResponse field: a side's next action (buyer 24, seller 25).
+    fn next(field: u64, action: NextAction) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint(field << 3, &mut out);
+        varint(action as u64, &mut out);
+        out
+    }
+
+    /// GetSettlementStatusResponse field: a DvpStepStatus with only `status` set.
+    fn step(field: u64, status: DvpStepStatusEnum) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint((field << 3) | 2, &mut out);
+        out.extend([0x02, 0x10, status as u8]);
+        out
+    }
+
+    // Step fields of GetSettlementStatusResponse
+    const DVP_FEE_BUYER: u64 = 10;
+    const DVP_FEE_SELLER: u64 = 11;
+    const ALLOC_FEE_BUYER: u64 = 12;
+    const DVP_REQUEST: u64 = 14;
+    const DVP_ACCEPT: u64 = 15;
+    const ALLOCATION_BUYER: u64 = 16;
+    const SELLER_NEXT: u64 = 25;
+    const CONFIRMED: DvpStepStatusEnum = DvpStepStatusEnum::DvpStepStatusConfirmed;
+    const COMPLETED: DvpStepStatusEnum = DvpStepStatusEnum::DvpStepStatusCompleted;
+
+    /// GetSettlementStatusResponse with only `seller_next_action` (field 25) set.
+    fn seller_status(action: NextAction) -> Vec<u8> {
+        next(SELLER_NEXT, action)
+    }
+
+    /// A registry config in LP mode.
+    fn lp_config() -> BaseConfig {
+        let mut config = registry_config();
+        config.liquidity_provider = Some(crate::config::LiquidityProviderConfig {
+            name: "lp".to_string(),
+            max_concurrent_rfqs: 1,
+            default_quote_valid_secs: 30,
+            min_notional_usd: 0.0,
+            rfq_v2: None,
+        });
+        config
+    }
+
+    /// What one advance did: its result, the backend and server calls, the reservation,
+    /// and the `supports_multicall` of each status read.
     struct Advanced {
         result: AdvanceResult,
         backend: Vec<&'static str>,
         server: Vec<String>,
         reserved: bool,
+        multicall: Vec<bool>,
     }
 
     /// Advance the seller's `state` once against a server whose status names `action`.
     async fn advance_with(action: NextAction, state: SettlementState) -> Advanced {
+        advance_against(
+            vec![seller_status(action)],
+            registry_config(),
+            RecordingBackend::default(),
+            state,
+            false,
+        )
+        .await
+    }
+
+    /// Advance `state` against scripted statuses: once, or through `step_until_done`
+    /// as the executor runs it when `until_done` is set.
+    async fn advance_against(
+        statuses: Vec<Vec<u8>>,
+        mut config: BaseConfig,
+        backend: RecordingBackend,
+        state: SettlementState,
+        until_done: bool,
+    ) -> Advanced {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = registry_config();
         config.orderbook_grpc_url = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let multicall = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = StatusServer {
-            status: seller_status(action),
+            statuses: Arc::new(std::sync::Mutex::new(statuses.into())),
             calls: calls.clone(),
+            multicall: multicall.clone(),
         };
         let serve = tonic::transport::Server::builder()
             .add_service(server)
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
         let serving = try_spawn("status server", serve).expect("a test runtime");
-        let backend = Arc::new(RecordingBackend::default());
+        let backend = Arc::new(backend);
         let lm = ready_lm().await;
+        // The buyer side reserves the quote leg
+        lm.update_token_balance("CCY", Decimal::from(5000)).await;
         let tracker = Arc::new(Mutex::new(OrderTracker::new(
             0,
             crate::secret::Secret::seal(&mut [0u8; 32]).unwrap(),
@@ -5241,27 +5445,40 @@ mod tests {
             .await
             .record_settlement_order(&pid, 0, Decimal::ONE);
         let log = Arc::new(Mutex::new(Vec::new()));
-        let advance = advance_single(
-            pid.clone(),
-            state,
-            config,
-            backend.clone(),
-            tracker,
-            Some(lm.clone()),
-            false,
-            log,
-        );
-        let result = tokio::time::timeout(Duration::from_secs(30), advance)
-            .await
-            .expect("the advance is bounded");
+        let advance = |s: SettlementState, shutting_down: bool| {
+            advance_single(
+                pid.clone(),
+                s,
+                config.clone(),
+                backend.clone(),
+                tracker.clone(),
+                Some(lm.clone()),
+                shutting_down,
+                log.clone(),
+            )
+        };
+        let result = if until_done {
+            let shutdown = Shutdown::new();
+            let steps = step_until_done(&pid, state, &shutdown, advance);
+            tokio::time::timeout(Duration::from_secs(30), steps)
+                .await
+                .expect("the steps are bounded")
+                .0
+        } else {
+            tokio::time::timeout(Duration::from_secs(30), advance(state, false))
+                .await
+                .expect("the advance is bounded")
+        };
         serving.abort();
         let server = sync::lock(&calls).clone();
         let reserved = lm.has_commitment(&pid).await;
+        let multicall = sync::lock(&multicall).clone();
         Advanced {
             result,
             backend: backend.calls(),
             server,
             reserved,
+            multicall,
         }
     }
 
@@ -5307,14 +5524,12 @@ mod tests {
     async fn the_allocation_steps_go_ahead_with_a_warning() {
         let logs = crate::test_logs::LogBuf::default();
         let _guard = logs.capture(tracing::Level::WARN);
+        // The fee is attempted; this backend refuses it, so the step backs off
         let run = advance_with(NextAction::PayAllocFee, unlisted_quote_state()).await;
-        assert!(matches!(
-            run.result,
-            AdvanceResult::StepCompleted {
-                stage: SettlementStage::AllocationFeePaid,
-                ..
-            }
-        ));
+        let AdvanceResult::Error { error, .. } = &run.result else {
+            panic!("a refused fee debit is an error")
+        };
+        assert!(error.starts_with("Allocation processing fee debit failed"), "{error}");
         assert_eq!(run.backend, ["pay_fee"]);
         assert!(run.reserved);
         // No counterparty witnesses yet: Allocate waits instead of being refused
@@ -5325,5 +5540,253 @@ mod tests {
             logs.count("goes ahead on the accepted DVP terms: unresolved-instrument"),
             2
         );
+    }
+
+    /// A listed state for test_proposal("p1") with the DvpProposal id known.
+    fn listed_state(is_buyer: bool) -> SettlementState {
+        let mut state = SettlementState::new(test_proposal("p1"), is_buyer);
+        state.dvp_proposal_cid = Some("00proposal".to_string());
+        state
+    }
+
+    /// A status naming this side's next action, plus the counterparty's two fees confirmed.
+    fn side_status(is_buyer: bool, action: NextAction, counterparty_fees: bool) -> Vec<u8> {
+        let mut out = next(if is_buyer { 24 } else { SELLER_NEXT }, action);
+        if counterparty_fees {
+            let (dvp_fee, alloc_fee) = if is_buyer { (11, 13) } else { (DVP_FEE_BUYER, ALLOC_FEE_BUYER) };
+            out.extend(step(dvp_fee, CONFIRMED));
+            out.extend(step(alloc_fee, CONFIRMED));
+        }
+        out
+    }
+
+    fn rows(run: &Advanced) -> usize {
+        run.server.iter().filter(|p| p.ends_with("/RecordSettlementEvent")).count()
+    }
+
+    fn step_status(status: DvpStepStatusEnum) -> Option<orderbook_proto::DvpStepStatus> {
+        Some(orderbook_proto::DvpStepStatus { status: status as i32, ..Default::default() })
+    }
+
+    #[test]
+    fn only_rfq_proposals_ask_for_a_multicall_accept() {
+        let mut proposal = test_proposal("p1");
+        for (origin, multicall) in [("rfq", true), ("orderbook", false), ("", false)] {
+            proposal.origin = origin.to_string();
+            assert_eq!(multicall_capable(&proposal), multicall, "{origin:?}");
+        }
+    }
+
+    // Every status read used to ask for a multicall accept, which this executor never runs
+    #[tokio::test]
+    async fn the_status_read_carries_the_multicall_flag_of_the_origin() {
+        for (origin, multicall) in [("orderbook", false), ("", false), ("rfq", true)] {
+            let mut state = listed_state(false);
+            state.proposal.origin = origin.to_string();
+            let run = advance_with(NextAction::Wait, state).await;
+            assert_eq!(run.multicall, [multicall], "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn fees_wait_for_the_dvp_only_while_the_request_is_pending() {
+        let pending = DvpStepStatusEnum::DvpStepStatusPending;
+        let with_request = |s: DvpStepStatusEnum| GetSettlementStatusResponse {
+            dvp_request: step_status(s),
+            ..Default::default()
+        };
+        let accepted = GetSettlementStatusResponse {
+            dvp_request: step_status(pending),
+            dvp_accept: step_status(COMPLETED),
+            ..Default::default()
+        };
+        for action in [NextAction::PayDvpFee, NextAction::PayAllocFee] {
+            assert!(fee_waits_for_dvp(action, &with_request(pending)), "{action:?}");
+            assert!(!fee_waits_for_dvp(action, &with_request(COMPLETED)), "{action:?}");
+            assert!(!fee_waits_for_dvp(action, &with_request(CONFIRMED)), "{action:?}");
+            assert!(!fee_waits_for_dvp(action, &accepted), "{action:?}");
+            // A status without the request step keeps the old behaviour
+            assert!(!fee_waits_for_dvp(action, &GetSettlementStatusResponse::default()), "{action:?}");
+        }
+        for action in [NextAction::CreateDvp, NextAction::AcceptDvp, NextAction::Allocate] {
+            assert!(!fee_waits_for_dvp(action, &with_request(pending)), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn an_lp_waits_for_the_counterparty_allocation_and_a_trader_only_for_its_fees() {
+        let fees = GetSettlementStatusResponse {
+            dvp_processing_fee_buyer: step_status(CONFIRMED),
+            allocation_processing_fee_buyer: step_status(CONFIRMED),
+            ..Default::default()
+        };
+        // The seller checks the buyer's steps
+        assert_eq!(allocate_wait(false, false, &fees), None, "a trader allocates on confirmed fees");
+        assert_eq!(allocate_wait(true, false, &fees), Some((4, 4, 0)), "an LP also waits for the allocation");
+        let allocated = GetSettlementStatusResponse {
+            allocation_buyer: step_status(CONFIRMED),
+            ..fees.clone()
+        };
+        assert_eq!(allocate_wait(true, false, &allocated), None);
+        let submitted = GetSettlementStatusResponse {
+            dvp_processing_fee_buyer: step_status(DvpStepStatusEnum::DvpStepStatusSubmitted),
+            allocation_processing_fee_buyer: step_status(CONFIRMED),
+            ..Default::default()
+        };
+        assert_eq!(allocate_wait(false, false, &submitted), Some((2, 4, 0)));
+        assert_eq!(allocate_wait(true, false, &submitted), Some((2, 4, 0)));
+        // The buyer checks the seller's steps, not its own
+        assert_eq!(allocate_wait(false, true, &fees), Some((0, 0, 0)));
+    }
+
+    // A refused debit used to count as paid and re-run every second for hours
+    #[tokio::test]
+    async fn a_failed_fee_debit_backs_off_instead_of_spinning() {
+        let status = side_status(false, NextAction::PayDvpFee, false);
+        let run = advance_against(vec![status], registry_config(), RecordingBackend::default(), listed_state(false), true)
+            .await;
+        let AdvanceResult::Error { error, .. } = &run.result else {
+            panic!("a refused debit is an error")
+        };
+        assert!(error.starts_with("DVP processing fee debit failed"), "{error}");
+        assert_eq!(run.backend, ["pay_fee"], "one attempt, then the error backoff");
+        assert_eq!(rows(&run), 0, "no submitted row: {:?}", run.server);
+    }
+
+    #[tokio::test]
+    async fn a_paid_fee_writes_one_submitted_row() {
+        let status = side_status(false, NextAction::PayDvpFee, false);
+        let run = advance_against(vec![status], registry_config(), RecordingBackend::paying(""), listed_state(false), false)
+            .await;
+        assert!(matches!(run.result, AdvanceResult::StepCompleted { stage: SettlementStage::DvpFeePaid, .. }));
+        assert_eq!(run.backend, ["pay_fee"]);
+        assert_eq!(rows(&run), 1, "{:?}", run.server);
+    }
+
+    // A Submitted row whose debit never landed is paid now, with no second row
+    #[tokio::test]
+    async fn a_retry_writes_no_second_row() {
+        let mut status = side_status(false, NextAction::PayDvpFee, false);
+        status.extend(step(DVP_FEE_SELLER, DvpStepStatusEnum::DvpStepStatusSubmitted));
+        let run = advance_against(vec![status], registry_config(), RecordingBackend::paying(""), listed_state(false), false)
+            .await;
+        assert!(matches!(run.result, AdvanceResult::StepCompleted { .. }));
+        assert_eq!(run.backend, ["pay_fee"]);
+        assert_eq!(rows(&run), 0, "{:?}", run.server);
+    }
+
+    // A zero fee keeps the record-only path; a repeat prompt waits instead of re-running
+    #[tokio::test]
+    async fn a_zero_fee_is_recorded_without_a_debit() {
+        let mut state = listed_state(false);
+        state.proposal.dvp_processing_fee_seller = "0.0000000000".to_string();
+        let status = side_status(false, NextAction::PayDvpFee, false);
+        let run = advance_against(vec![status.clone()], registry_config(), RecordingBackend::default(), state.clone(), false)
+            .await;
+        assert!(matches!(run.result, AdvanceResult::StepCompleted { stage: SettlementStage::DvpFeePaid, .. }));
+        assert!(run.backend.is_empty(), "{:?}", run.backend);
+        assert_eq!(rows(&run), 1, "{:?}", run.server);
+        let repeat = [status, step(DVP_FEE_SELLER, DvpStepStatusEnum::DvpStepStatusSubmitted)].concat();
+        let run = advance_against(vec![repeat], registry_config(), RecordingBackend::default(), state, false).await;
+        assert!(matches!(run.result, AdvanceResult::Wait { .. }));
+        assert!(run.backend.is_empty(), "{:?}", run.backend);
+    }
+
+    // Paying before the DVP existed cost both fees whenever the proposer never created it
+    #[tokio::test]
+    async fn fee_steps_wait_until_the_dvp_exists() {
+        let pending = [
+            side_status(false, NextAction::PayDvpFee, false),
+            step(DVP_REQUEST, DvpStepStatusEnum::DvpStepStatusPending),
+        ]
+        .concat();
+        let run = advance_against(vec![pending], registry_config(), RecordingBackend::paying(""), listed_state(false), false)
+            .await;
+        assert!(matches!(run.result, AdvanceResult::Wait { .. }));
+        assert!(run.backend.is_empty(), "{:?}", run.backend);
+        assert!(!run.reserved, "nothing is reserved before the DVP exists");
+        let created = [side_status(false, NextAction::PayDvpFee, false), step(DVP_REQUEST, COMPLETED)].concat();
+        let run = advance_against(vec![created], registry_config(), RecordingBackend::paying(""), listed_state(false), false)
+            .await;
+        assert!(matches!(run.result, AdvanceResult::StepCompleted { .. }));
+        assert_eq!(run.backend, ["pay_fee"]);
+    }
+
+    #[tokio::test]
+    async fn a_multicall_accept_waits_without_reserving() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let run = advance_with(NextAction::MulticallAccept, listed_state(false)).await;
+        assert!(matches!(run.result, AdvanceResult::Wait { .. }));
+        assert!(run.backend.is_empty(), "{:?}", run.backend);
+        assert!(!run.reserved);
+        assert_eq!(logs.count("multicall accept"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreported_dvp_id_is_left_to_the_sync() {
+        for (cid, expected) in [("", None), ("00dvp", Some("00dvp"))] {
+            let status = side_status(false, NextAction::AcceptDvp, false);
+            let run = advance_against(vec![status], registry_config(), RecordingBackend::paying(cid), listed_state(false), false)
+                .await;
+            let AdvanceResult::StepCompleted { dvp_cid, .. } = &run.result else {
+                panic!("the accept did not complete")
+            };
+            assert_eq!(dvp_cid.as_deref(), expected, "{cid:?}");
+        }
+    }
+
+    // A trader acceptor used to sit at MulticallAccept until the deadline; stepped,
+    // it accepts, pays both fees and reaches its allocation in one task
+    #[tokio::test]
+    async fn a_trader_acceptor_accepts_pays_and_allocates_in_one_task() {
+        for is_buyer in [false, true] {
+            let accepted = step(DVP_ACCEPT, COMPLETED);
+            let statuses = vec![
+                side_status(is_buyer, NextAction::AcceptDvp, false),
+                [side_status(is_buyer, NextAction::PayDvpFee, false), accepted.clone()].concat(),
+                [side_status(is_buyer, NextAction::PayAllocFee, false), accepted.clone()].concat(),
+                [side_status(is_buyer, NextAction::Allocate, true), accepted].concat(),
+            ];
+            let run = advance_against(
+                statuses,
+                registry_config(),
+                RecordingBackend::paying("00dvp"),
+                listed_state(is_buyer),
+                true,
+            )
+            .await;
+            let AdvanceResult::NeedsAllocate { dvp_cid, is_buyer: side, .. } = &run.result else {
+                panic!("the acceptor (buyer={is_buyer}) did not reach its allocation")
+            };
+            assert_eq!(dvp_cid, "00dvp");
+            assert_eq!(*side, is_buyer);
+            assert_eq!(run.backend, ["accept_dvp", "pay_fee", "pay_fee"], "buyer={is_buyer}");
+            assert_eq!(rows(&run), 3, "accept plus one row per fee: {:?}", run.server);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_lp_still_allocates_last() {
+        let fees = side_status(false, NextAction::Allocate, true);
+        let mut state = listed_state(false);
+        state.dvp_cid = Some("00dvp".to_string());
+        let run = advance_against(vec![fees.clone()], lp_config(), RecordingBackend::default(), state.clone(), false)
+            .await;
+        assert!(matches!(run.result, AdvanceResult::Wait { .. }), "the LP waits for the buyer's allocation");
+        let allocated = [fees, step(ALLOCATION_BUYER, CONFIRMED)].concat();
+        let run = advance_against(vec![allocated], lp_config(), RecordingBackend::default(), state, false).await;
+        assert!(matches!(run.result, AdvanceResult::NeedsAllocate { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_long_wait_is_reported_once_at_info() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let (mut exec, _lm) = committed_executor().await;
+        for _ in 0..7 {
+            exec.apply_result(AdvanceResult::Wait { proposal_id: "p1".to_string() }).await;
+        }
+        assert_eq!(logs.count("Still waiting on the counterparty"), 1);
     }
 }

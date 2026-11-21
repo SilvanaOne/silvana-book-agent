@@ -585,6 +585,10 @@ fn rfq_v2_stack_active(config: &BaseConfig) -> bool {
         && config.atomic_quote_key.is_some()
 }
 
+/// Orders and preconfirmations are never dry, so a dry-run agent would strand its counterparties.
+pub const AGENT_DRY_RUN_REFUSAL: &str =
+    "--dry-run is not supported for the agent command: it places real orders and preconfirms real matches";
+
 #[cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 pub async fn run_cloud_agent(
     mut config: BaseConfig,
@@ -598,6 +602,9 @@ pub async fn run_cloud_agent(
     confirm: bool,
     version_info: Option<&str>,
 ) -> Result<()> {
+    if dry_run {
+        anyhow::bail!(AGENT_DRY_RUN_REFUSAL);
+    }
     env::validate()?;
     agent_preflight(&config, orders_only)?;
     // Embedders that skip the CLI's registry load must not settle on an unusable one
@@ -834,6 +841,7 @@ pub async fn run_cloud_agent(
 
         Some(quoted_trades)
     } else {
+        info!("No [liquidity_provider]: settling order-book matches as a trader");
         None
     };
 
@@ -845,7 +853,7 @@ pub async fn run_cloud_agent(
         force,
         confirm,
         confirm_lock,
-        liquidity_manager,
+        liquidity_manager.clone(),
         lp_shutdown.clone(),
         holdings_cache,
     )?;
@@ -912,7 +920,8 @@ pub async fn run_cloud_agent(
             )
             .ok_or_else(|| {
                 anyhow!("auto-topup: MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC rejected")
-            })?;
+            })?
+            .with_fee_demand(liquidity_manager);
             info!(
                 min_cc = %min_cc,
                 topup_cc = %topup_cc,
@@ -927,6 +936,10 @@ pub async fn run_cloud_agent(
             None
         }
     };
+
+    if let Some(trigger) = &topup_trigger {
+        backend = backend.with_topup_trigger(trigger.clone());
+    }
 
     let ledger_client = if let Some(trigger) = topup_trigger {
         ledger_client.with_topup_trigger(trigger)
@@ -6524,6 +6537,24 @@ mod daemon_tests {
             text.contains("orderbook-rpc listed no instruments"),
             "{text}"
         );
+        assert_eq!(ledger.connections(), 0);
+        ledger.stop().await;
+    }
+
+    // A dry-run agent still placed real orders and preconfirmed real matches
+    #[tokio::test]
+    async fn the_agent_refuses_a_dry_run_before_any_connection() {
+        let ledger = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = ledger.url.clone();
+        let run = run_cloud_agent(
+            config, false, false, true, false, false, true, false, false, None,
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.to_string(), AGENT_DRY_RUN_REFUSAL);
         assert_eq!(ledger.connections(), 0);
         ledger.stop().await;
     }
