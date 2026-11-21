@@ -17,7 +17,7 @@ use orderbook_proto::orderbook::{Order, OrderType, SettlementProposal};
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::auth::{sign_order_data, verify_order_signature};
-use crate::state::{SavedSettlementOrder, SavedTrackedOrder};
+use crate::state::{SavedSettlementOrder, SavedTrackedOrder, StrategyStarts};
 
 /// Tracked order with quantity accounting
 pub struct TrackedOrder {
@@ -152,6 +152,8 @@ pub struct OrderTracker {
     /// Recent fills, oldest first, and the last sequence number given out
     fills: VecDeque<Fill>,
     fill_seq: u64,
+    /// Strategy start balances, saved with the state
+    strategy_starts: StrategyStarts,
     #[cfg(test)]
     fail_signing: bool,
 }
@@ -169,6 +171,7 @@ impl OrderTracker {
             failed_submits: VecDeque::new(),
             fills: VecDeque::new(),
             fill_seq: 0,
+            strategy_starts: StrategyStarts::default(),
             #[cfg(test)]
             fail_signing: false,
         }
@@ -613,6 +616,14 @@ impl OrderTracker {
     /// Sequence number of the latest fill (0 before any).
     pub fn last_fill_seq(&self) -> u64 {
         self.fill_seq
+    }
+
+    pub(crate) fn strategy_starts(&self) -> &StrategyStarts {
+        &self.strategy_starts
+    }
+
+    pub(crate) fn strategy_starts_mut(&mut self) -> &mut StrategyStarts {
+        &mut self.strategy_starts
     }
 
     /// Open settlements of tracked orders in `market_id`, with their pending amounts.

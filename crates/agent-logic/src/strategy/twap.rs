@@ -24,7 +24,8 @@ const MIN_REST_SECS: u64 = 5;
 struct Slice {
     /// Progress this slice works toward, in base units
     goal: f64,
-    passive_until: Instant,
+    /// Set on the first cycle the slice may act, so it always rests `passive_secs` first
+    passive_until: Option<Instant>,
     rested: bool,
 }
 
@@ -109,9 +110,9 @@ impl Twap {
         if (remaining - qty) * r < MIN_ORDER_USD {
             qty = remaining;
         }
-        self.slice = (behind > 0.0 && qty * r >= v.floor_value).then(|| Slice {
+        self.slice = (behind > 0.0 && qty * r >= v.floor_value).then_some(Slice {
             goal: done + qty,
-            passive_until: v.now.checked_add(Duration::from_secs(c.passive_secs)).unwrap_or(v.now),
+            passive_until: None,
             rested: c.passive_secs == 0,
         });
     }
@@ -120,7 +121,7 @@ impl Twap {
     #[cfg(test)]
     pub(crate) fn age(&mut self, by: Duration) {
         if let Some(slice) = self.slice.as_mut() {
-            slice.passive_until = slice.passive_until.checked_sub(by).unwrap_or(slice.passive_until);
+            slice.passive_until = slice.passive_until.map(|t| t.checked_sub(by).unwrap_or(t));
         }
         self.next_slice_at = self.next_slice_at.and_then(|t| t.checked_sub(by));
     }
@@ -234,14 +235,16 @@ impl Decide for Twap {
             return Decision::Take(None);
         }
         let (side, max_deviation_percent) = (self.side, self.cfg.max_slip_bps / 100.0);
+        let passive = Duration::from_secs(self.cfg.passive_secs);
         let Some(slice) = self.slice.as_mut() else { return Decision::Take(None) };
+        let passive_until = *slice.passive_until.get_or_insert_with(|| v.now.checked_add(passive).unwrap_or(v.now));
         // First a resting order for the passive part of the slice, then takes
-        let tif = if v.now < slice.passive_until {
+        let tif = if v.now < passive_until {
             if slice.rested {
                 return Decision::Take(None);
             }
             slice.rested = true;
-            let ttl_secs = slice.passive_until.saturating_duration_since(v.now).as_secs().max(MIN_REST_SECS);
+            let ttl_secs = passive_until.saturating_duration_since(v.now).as_secs().max(MIN_REST_SECS);
             TakeTif::Gtd { ttl_secs }
         } else {
             TakeTif::Ioc
@@ -384,6 +387,34 @@ mod tests {
         let Decision::Take(Some(w)) = t.decide(&v0) else { panic!("{}", t.status()) };
         assert!(matches!(w.tif, TakeTif::Gtd { .. }));
         assert!((21_250.0..=28_750.0).contains(&w.max_quantity), "{}", w.max_quantity);
+    }
+
+    // A slice begun while the gate was shut used to skip its rest once the gate opened
+    #[test]
+    fn a_slice_rests_its_passive_time_from_when_it_may_act() {
+        let mut t = Twap::new(cfg(TradeSide::Buy, None), "HTEST-USDC");
+        let mut v = view(None, 1e6, 1e6);
+        let (t0, w0) = (v.now, v.wall);
+        let at = |v: &mut MarketView<'_>, secs: u64| {
+            v.now = t0 + Duration::from_secs(secs);
+            v.wall = w0 + TimeDelta::seconds(i64::try_from(secs).unwrap());
+        };
+        v.can_take = false;
+        assert_eq!(t.decide(&v), Decision::Take(None));
+        assert_eq!(t.slices, 1);
+        // The gate opens 90 s into the slice: the full 60 s of rest come first
+        at(&mut v, 90);
+        v.can_take = true;
+        let tif = |d: Decision| match d {
+            Decision::Take(Some(w)) => w.tif,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(tif(t.decide(&v)), TakeTif::Gtd { ttl_secs: 60 });
+        at(&mut v, 149);
+        assert_eq!(t.decide(&v), Decision::Take(None));
+        at(&mut v, 150);
+        assert_eq!(tif(t.decide(&v)), TakeTif::Ioc);
+        assert_eq!(t.slices, 1);
     }
 
     // Without start_at it starts after its delay; with nothing filled it stops at the

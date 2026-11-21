@@ -19,6 +19,7 @@ use crate::net_position::NetPositionTracker;
 use crate::order_tracker::{FailedSubmit, MarketActivity, OrderTracker, PlacementGuard};
 use crate::pool_impact::{self, ImpactSide, PoolDepth};
 use crate::shutdown::Shutdown;
+use crate::state::{Held, StrategyStarts};
 use crate::strategy::book::{book_top, BookTop};
 use crate::strategy::gate::{GateInputs, Verdict};
 use crate::strategy::report::{format_report, ReportLine};
@@ -231,6 +232,8 @@ pub struct OrderManager {
     submit_log: Vec<(OrderType, String, String, TimeInForce)>,
     #[cfg(test)]
     stub_settlements: Option<Vec<orderbook_proto::orderbook::Settlement>>,
+    #[cfg(test)]
+    stub_decision: Option<Decision>,
 }
 
 /// Server minimum order size for a market, as last fetched.
@@ -354,6 +357,8 @@ impl OrderManager {
             submit_log: Vec::new(),
             #[cfg(test)]
             stub_settlements: None,
+            #[cfg(test)]
+            stub_decision: None,
         }
     }
 
@@ -1436,8 +1441,8 @@ impl OrderManager {
             Some(rt) => rt,
             None => {
                 let config = self.config.strategy_for(&market_id).clone();
-                let seq = self.tracker.lock().await.last_fill_seq();
-                let rt = StrategyRuntime::new(&config, &market_id, seq, Instant::now());
+                let fill_seq = self.tracker.lock().await.last_fill_seq();
+                let rt = StrategyRuntime::new(&config, &market_id, fill_seq, Instant::now());
                 if matches!(rt.state, StrategyState::Pending) {
                     warn!(
                         "Strategy {} [{}]: not available in this build yet; placing nothing",
@@ -1536,12 +1541,16 @@ impl OrderManager {
             self.load_history(market_id, from, rt, now, stop).await;
         }
         let tick = self.get_tick_size(market_id).await;
-        let activity = self.tracker.lock().await.market_activity(market_id);
         let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
-        let inventory = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, &activity);
-        if inventory.usable && rt.start.is_none() {
-            rt.start = Some(Start { base: inventory.base, quote: inventory.quote, price });
-        }
+        let (activity, inventory) = {
+            let mut tracker = self.tracker.lock().await;
+            let activity = tracker.market_activity(market_id);
+            let inventory = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, &activity);
+            if inventory.usable {
+                note_start(tracker.strategy_starts_mut(), market_id, rt, &inventory, price);
+            }
+            (activity, inventory)
+        };
 
         // A taker keeps only its take in flight; anything else resting is withdrawn
         if !maker {
@@ -1634,15 +1643,21 @@ impl OrderManager {
             can_take: verdict == Verdict::Open,
         };
         let decision = rt.state.decide(&view);
+        #[cfg(test)]
+        let decision = self.stub_decision.clone().unwrap_or(decision);
         match decision {
             Decision::Hold | Decision::Take(None) => {}
             Decision::Rest(ladder) => {
                 let at_cap = activity.open_settlements >= rt.state.max_inflight();
                 self.apply_ladder(market_id, &ladder, price, tick, &orders, at_cap, rt, stop, report).await;
             }
-            Decision::Take(Some(want)) => {
+            // One take at a time, whatever the strategy asks for
+            Decision::Take(Some(want)) if verdict == Verdict::Open => {
                 let take = TakeContext { price, tick, floor_value, lot_exp, inventory };
                 self.take(market_id, want, book, &orders, &take, rt, stop, report).await;
+            }
+            Decision::Take(Some(_)) => {
+                debug!("Strategy {} [{}]: take skipped, the gate is shut", market_id, rt.kind);
             }
         }
     }
@@ -1965,6 +1980,41 @@ impl OrderManager {
                 status,
             })
         );
+    }
+}
+
+/// Records the balances a strategy holds, and its start the first time.
+fn note_start(
+    starts: &mut StrategyStarts,
+    market_id: &str,
+    rt: &mut StrategyRuntime,
+    inventory: &Inventory,
+    price: f64,
+) {
+    let (kind, held) = (rt.kind, Held { base: inventory.base, quote: inventory.quote });
+    let start = *rt.start.get_or_insert_with(|| first_start(starts, market_id, kind, held, price));
+    starts.set(market_id, kind, start, held);
+}
+
+/// The start saved at the last stop, moved by what came in or went out meanwhile; else these balances.
+fn first_start(starts: &mut StrategyStarts, market_id: &str, kind: &str, held: Held, price: f64) -> Start {
+    match starts.take(market_id, kind, held, crate::clock::now_millis()) {
+        Some((s, shift)) if shift != Held::default() => {
+            warn!(
+                "Strategy {} [{}]: balances changed while stopped (base {:+.2}, quote {:+.2}); \
+                 start moved by as much (now base {:.2}, quote {:.2}), so only the position carries over",
+                market_id, kind, shift.base, shift.quote, s.base, s.quote
+            );
+            s
+        }
+        Some((s, _)) => {
+            info!(
+                "Strategy {} [{}]: start balances from the last stop (base {:.2}, quote {:.2})",
+                market_id, kind, s.base, s.quote
+            );
+            s
+        }
+        None => Start { base: held.base, quote: held.quote, price },
     }
 }
 
@@ -4123,6 +4173,85 @@ mod strategy_visit_tests {
         visit(&mut om).await;
         assert_eq!(om.submit_log, vec![first.clone(), first]);
         assert_eq!(om.strategies.get(ID).map(|rt| rt.stats.takes), Some(2));
+    }
+
+    // A take asked for while the gate is shut is not sent; the gate itself decides
+    #[tokio::test]
+    async fn a_take_asked_for_while_the_gate_is_shut_sends_nothing() {
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+        let side = OrderType::Offer;
+        let want = Want { side, max_quantity: 12_500.0, max_deviation_percent: 0.15, tif: TakeTif::Ioc };
+        om.stub_decision = Some(Decision::Take(Some(want)));
+        om.stub_orders = Some(vec![resting(42, OrderType::Offer, "0.0015990000", "12500")]);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1, "the last take is still listed");
+        om.stub_orders = Some(Vec::new());
+        back(&mut om, 151);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 2, "sent once the gate opens");
+    }
+
+    // Start balances saved at a stop within 6 hours are kept; older ones are taken again
+    #[tokio::test]
+    async fn a_restart_keeps_start_balances_saved_within_six_hours() {
+        use crate::state::{SavedStrategyStart, STRATEGY_START_MAX_AGE_MS};
+        let in_band = StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.5), ..Default::default() });
+        let saved_start = Start { base: 1_000_000.0, quote: 2400.0, price: 0.0015 };
+        let fresh = Start { base: 1_250_000.0, quote: 2000.0, price: 0.0016 };
+        let held = Held { base: fresh.base, quote: fresh.quote };
+        let now = crate::clock::now_millis();
+        for (age_ms, expected) in [(3_600_000, saved_start), (STRATEGY_START_MAX_AGE_MS + 60_000, fresh)] {
+            let mut om = strategy_manager(in_band.clone());
+            let saved = SavedStrategyStart::new(ID, "rebalancer", saved_start, held, now - age_ms).unwrap();
+            om.tracker.lock().await.strategy_starts_mut().restore(&[saved], now);
+            om.stub_book(0.0016, Vec::new());
+            om.stub_cancels = Some(Vec::new());
+            visit(&mut om).await;
+            assert!(om.submit_log.is_empty());
+            assert_eq!(om.strategies.get(ID).and_then(|rt| rt.start), Some(expected));
+            // The next save keeps them, stamped with its own time
+            let out = om.tracker.lock().await.strategy_starts().export(now + 5);
+            let out: Vec<_> = out.iter().map(|s| (s.saved_at_ms, s.start_at(now + 5))).collect();
+            assert_eq!(out, [(now + 5, Some(expected))]);
+        }
+    }
+
+    // Funds moved while stopped move the restored start, with one warning; a file without
+    // the balances at the save keeps the start as saved
+    #[tokio::test]
+    async fn a_restart_after_a_withdrawal_keeps_the_position_not_the_old_base() {
+        use crate::state::SavedStrategyStart;
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let in_band = StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.5), ..Default::default() });
+        let saved_start = Start { base: 1_000_000.0, quote: 2400.0, price: 0.0015 };
+        // Long 500k at the stop; the restart finds 1.25M base and 2000 quote
+        let at_save = Held { base: 1_500_000.0, quote: 1650.0 };
+        let now = crate::clock::now_millis();
+        let saved = SavedStrategyStart::new(ID, "rebalancer", saved_start, at_save, now - 60_000).unwrap();
+        let older = SavedStrategyStart { base_at_save: None, quote_at_save: None, ..saved.clone() };
+        let moved = Start { base: 750_000.0, quote: 2750.0, price: 0.0015 };
+        for (entry, expected) in [(saved, moved), (older, saved_start)] {
+            let mut om = strategy_manager(in_band.clone());
+            om.tracker.lock().await.strategy_starts_mut().restore(&[entry], now);
+            om.stub_book(0.0016, Vec::new());
+            om.stub_cancels = Some(Vec::new());
+            visit(&mut om).await;
+            assert_eq!(om.strategies.get(ID).and_then(|rt| rt.start), Some(expected));
+            // The next save holds the balances of the last cycle
+            let out = om.tracker.lock().await.strategy_starts().export(now + 5);
+            let written = (out[0].base_at_save.as_deref(), out[0].quote_at_save.as_deref());
+            assert_eq!(written, (Some("1250000"), Some("2000")));
+        }
+        assert_eq!(1_250_000.0 - moved.base, at_save.base - saved_start.base, "the position, not the old base");
+        assert_eq!(logs.count("balances changed while stopped (base -250000.00, quote +350.00)"), 1);
+        assert_eq!(logs.count("start moved by as much (now base 750000.00, quote 2750.00)"), 1);
+        assert_eq!(logs.count("start balances from the last stop (base 1000000.00, quote 2400.00)"), 1);
     }
 
     // The IOC is signed and tracked like a grid order, so its match verifies

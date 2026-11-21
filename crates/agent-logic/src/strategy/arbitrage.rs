@@ -50,7 +50,10 @@ impl Arbitrage {
 
 impl Decide for Arbitrage {
     fn observe(&mut self, price: f64, now: Instant) {
-        self.first.get_or_insert(now);
+        // After a gap longer than the window the watch starts again
+        if self.readings.back().is_none_or(|(at, _)| now.saturating_duration_since(*at) > STABLE_WINDOW) {
+            self.first = Some(now);
+        }
         self.readings.push_back((now, price));
         while self.readings.len() > 1
             && self.readings.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > STABLE_WINDOW)
@@ -182,8 +185,12 @@ mod tests {
         let v = view(Some(&book), 1e6, 1e6);
         fresh.observe(0.0016, v.now);
         assert_eq!(fresh.decide(&v), Decision::Take(None));
-        // An old reading leaves the window, so a later steady level counts as stable
+        // After a gap past the window the watch starts again: a minute of new readings first
         moving.age(STABLE_WINDOW);
+        moving.observe(0.0016, Instant::now());
+        assert_eq!(moving.decide(&view(Some(&book), 1e6, 1e6)), Decision::Take(None));
+        assert!(moving.status().ends_with("not stable"));
+        moving.age(STABLE_AFTER);
         moving.observe(0.0016, Instant::now());
         assert_eq!(want(moving.decide(&view(Some(&book), 1e6, 1e6))).side, OrderType::Bid);
     }
@@ -200,7 +207,7 @@ mod tests {
         let mut only_ask = book.clone();
         only_ask.agent_bid = None;
         assert_eq!(a.decide(&view(Some(&only_ask), 1e6 + 50_000.0, 1e6)), Decision::Take(None));
-        // Short $140: sells have $10 of room left, under the minimum; buys are capped at $100
+        // Short $140, past half the limit: sells stop; buys are capped at $100
         let short = view(Some(&book), 1e6 - 87_500.0, 1e6);
         let w = want(a.decide(&short));
         assert_eq!(w.side, OrderType::Bid);

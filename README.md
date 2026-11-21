@@ -105,6 +105,8 @@ Rules:
 - A strategy decides once per cycle. It pauses while the reference price is stale, has jumped more than 1% from the last reading, or is within 1% of `ref_floor` / `ref_cap`.
 - Takers send immediate-or-cancel (IOC) orders at exactly the best price of another agent, and only when that price beats the liquidity provider's quote and lies within the strategy's slippage limit. A take is never larger than one order at that level, so it settles once, and no new take goes out while the last one is listed or settling.
 - Makers rest orders inside the liquidity provider's quotes and re-quote when their target moves more than 2 bps.
+- Takers, and the makers that rest a single order (`rebalancer`, `mean_reversion`), send nothing new while a settlement of theirs is open in that market; `max_inflight` limits only `market_maker`, and the other kinds accept it so configurations that set it still load.
+- Position limits and the report's change count from the balances at the strategy's start; these are saved at a stop and kept if the agent restarts within 6 hours with the same kind on that market, otherwise taken again from the first usable balances. Funds moved in or out while the agent was stopped move the kept start by the same amount, with a warning, so only the position carries over.
 - Orders are worth at least 12 quote units and use round lots; rungs below the server's minimum order value are skipped (the grid skips them too).
 - Every 5 minutes each enabled market, the grid included, logs one line: balances, value at the reference price, change since the start and against simply holding, takes (filled and empty), fills, and the strategy's own state.
 
@@ -153,7 +155,7 @@ Keeps the base share of the portfolio value near `target_share`. It starts tradi
 | `max_slip_bps` | 15 | Taker price limit from the reference |
 | `max_usd_per_hour` | 600 | Value traded per rolling hour |
 | `flip_cooldown_secs` | 900 | Wait after a fill before trading the other way |
-| `max_inflight` | 1 (taker), 2 (maker) | Open settlements at which nothing new is sent |
+| `max_inflight` | 1 (taker), 2 (maker) | Accepted, but nothing new is sent while a settlement is open |
 
 ### `momentum`
 
@@ -172,7 +174,7 @@ Follows a crossover of a fast and a slow time-based EMA. A signal above `enter_b
 | `max_flips_per_hour` | 3 | Positions opened per rolling hour |
 | `warmup_secs` | 600 | History needed before trading |
 | `max_slip_bps` | 15 | Price limit from the reference |
-| `max_inflight` | 2 | Open settlements at which nothing new is sent |
+| `max_inflight` | 2 | Accepted, but nothing new is sent while a settlement is open |
 
 ### `mean_reversion`
 
@@ -191,7 +193,7 @@ Fades moves away from an EMA: the target position grows from zero at `entry_bps`
 | `warmup_secs` | 600 | History needed before trading |
 | `pause_after_stop_secs` | 900 | Pause after a stop |
 | `max_slip_bps` | 15 | Taker price limit from the reference |
-| `max_inflight` | 2 | Open settlements at which nothing new is sent |
+| `max_inflight` | 2 | Accepted, but nothing new is sent while a settlement is open |
 
 ### `noise_taker`
 
@@ -207,7 +209,7 @@ Trades at random times (exponential gaps, clamped to a quarter and four times th
 | `rest_probability` | 0.2 | Share of arrivals that rest a GTD order |
 | `rest_ttl_secs` | 45 | Life of that order |
 | `seed` | from the start time | Random seed; the seed is logged, so a run can be replayed |
-| `max_inflight` | 2 | Open settlements at which nothing new is sent |
+| `max_inflight` | 2 | Accepted, but nothing new is sent while a settlement is open |
 
 ### `twap`
 
@@ -227,18 +229,18 @@ Buys or sells `total_quantity` over `duration_secs` in jittered slices. Each sli
 | `time_jitter` | 0.2 | Random spread of the slice times |
 | `size_jitter` | 0.15 | Random spread of the slice sizes |
 | `seed` | from the start time | Random seed, logged |
-| `max_inflight` | 3 | Open settlements at which nothing new is sent |
+| `max_inflight` | 3 | Accepted, but nothing new is sent while a settlement is open |
 
 ### `arbitrage`
 
-Takes the best agent offer priced at least `min_edge_bps` under the reference, or the best agent bid as far above it, while the reference is fresh and its readings over the last 2 minutes stay within `ref_stable_bps`. It watches the reference for a minute before its first take, and past half its position limit it only reduces.
+Takes the best agent offer priced at least `min_edge_bps` under the reference, or the best agent bid as far above it, while the reference is fresh and its readings over the last 2 minutes stay within `ref_stable_bps`. It watches the reference for a minute before its first take, and again after a gap of more than 2 minutes between readings; past half its position limit it only reduces.
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `min_edge_bps` | 6 | Least distance of the agent price through the reference |
 | `clip_usd_max` | 100 | Largest take |
 | `max_position_usd` | 150 | Position limit |
-| `max_inflight` | 1 | Open settlements at which nothing new is sent |
+| `max_inflight` | 1 | Accepted, but nothing new is sent while a settlement is open |
 | `cooldown_secs` | 10 | Least time between takes |
 | `ref_max_age_secs` | 90 | Age of the reference price after which nothing is taken |
 | `ref_stable_bps` | 30 | Largest spread of the recent readings |

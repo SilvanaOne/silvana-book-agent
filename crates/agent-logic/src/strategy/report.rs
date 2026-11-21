@@ -27,7 +27,7 @@ pub(crate) fn format_report(r: &ReportLine<'_>) -> String {
     if let Some(s) = r.start {
         out.push_str(&format!(" ({:+.2})", r.quote - s.quote));
     }
-    out.push_str(&format!(" value {:.2} @ {}", value, Px(r.price, 4)));
+    out.push_str(&format!(" value {:.2} @ {}", value, Px(r.price, 6)));
     if let Some(s) = r.start {
         let start_value = s.base * s.price + s.quote;
         let hold_value = s.base * r.price + s.quote;
@@ -74,7 +74,7 @@ mod tests {
         });
         assert_eq!(
             line,
-            "Strategy HTEST-USDC [rebalancer]: base 1520.00 (+20.00) quote 1480.20 (-19.80) value 2985.00 @ 0.9900 \
+            "Strategy HTEST-USDC [rebalancer]: base 1520.00 (+20.00) quote 1480.20 (-19.80) value 2985.00 @ 0.990000 \
              (start 3000.00, -15.00 -0.50%, vs hold +0.00) takes 3 (2 filled, 1 empty) fills 5 (buy 30.00 / sell 10.00) | in band"
         );
         let bare = format_report(&ReportLine {
@@ -90,8 +90,25 @@ mod tests {
         });
         assert_eq!(
             bare,
-            "Strategy A-B [noise_taker]: base 1.00 quote 2.00 value 5.00 @ 3.0000 takes 0 (0 filled, 0 empty) fills 0 (buy 0.00 / sell 0.00)"
+            "Strategy A-B [noise_taker]: base 1.00 quote 2.00 value 5.00 @ 3.000000 takes 0 (0 filled, 0 empty) fills 0 (buy 0.00 / sell 0.00)"
         );
+        // A reference like 0.001595 used to print as 0.0016
+        let small = format_report(&ReportLine { base: 1_000_000.0, price: 0.001595, ..line_args("HTEST-USDC") });
+        assert!(small.contains(" value 1597.00 @ 0.001595 takes"), "{small}");
+    }
+
+    fn line_args(market_id: &str) -> ReportLine<'_> {
+        ReportLine {
+            market_id,
+            kind: "arbitrage",
+            base: 0.0,
+            quote: 2.0,
+            price: 1.0,
+            start: None,
+            stats: Stats::default(),
+            takes: true,
+            status: "",
+        }
     }
 
     #[test]
@@ -110,7 +127,7 @@ mod tests {
         // Start 66.10, now 66.00; holding would be worth 65.00
         assert_eq!(
             line,
-            "Strategy CC-USDC [grid]: base 100.00 (-10.00) quote 51.00 (+2.50) value 66.00 @ 0.1500 \
+            "Strategy CC-USDC [grid]: base 100.00 (-10.00) quote 51.00 (+2.50) value 66.00 @ 0.150000 \
              (start 66.10, -0.10 -0.15%, vs hold +1.00) fills 2 (buy 0.00 / sell 10.00) | rungs 3 bid / 3 offer"
         );
     }
