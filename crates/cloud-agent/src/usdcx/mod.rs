@@ -250,7 +250,7 @@ fn network(options: &UsdcxOptions, config: &BaseConfig) -> Result<&'static Usdcx
         }
         None => UsdcxNetwork::by_synchronizer(configured)?,
     };
-    if !configured.is_empty() && configured != net.synchronizer_id {
+    if !configured.is_empty() && !net.is_synchronizer(configured) {
         bail!(
             "the configured synchronizer {configured} is not the {} synchronizer {}",
             net.name,
@@ -395,4 +395,37 @@ fn minutes(m: u64) -> Result<Duration> {
     m.checked_mul(60)
         .map(Duration::from_secs)
         .ok_or_else(|| anyhow!("--timeout-mins {m} is too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tx_verifier::usdcx::{MAINNET, TESTNET};
+
+    /// The network chosen for the configured `synchronizer_id` and `--network` `name`.
+    fn network_of(synchronizer_id: &str, name: Option<&str>) -> Result<&'static str> {
+        let mut config = BaseConfig::test_minimal()?;
+        config.synchronizer_id = synchronizer_id.to_string();
+        let options = UsdcxOptions {
+            network: name.map(str::to_string),
+            ..Default::default()
+        };
+        network(&options, &config).map(|n| n.name)
+    }
+
+    #[test]
+    fn the_network_follows_the_logical_id_of_the_configured_synchronizer() {
+        let physical = format!("{}::36-7", MAINNET.synchronizer_id);
+        assert_eq!(network_of(&physical, None).unwrap(), "mainnet");
+        assert_eq!(network_of(&physical, Some("mainnet")).unwrap(), "mainnet");
+        assert!(network_of(&physical, Some("testnet")).is_err());
+        assert_eq!(
+            network_of(TESTNET.synchronizer_id, None).unwrap(),
+            "testnet"
+        );
+        let truncated = format!("{}::36", MAINNET.synchronizer_id);
+        assert!(network_of(&truncated, None).is_err());
+        assert!(network_of(&truncated, Some("mainnet")).is_err());
+        assert!(network_of("", None).is_err());
+    }
 }

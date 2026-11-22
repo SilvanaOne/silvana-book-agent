@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use agent_logic::clock;
 use agent_logic::config::BaseConfig;
+use agent_logic::num::short;
 use agent_logic::shutdown::Shutdown;
 use agent_logic::supervise::{self, Policy};
 use agent_logic::transport::RPC_TIMEOUT;
@@ -47,6 +48,12 @@ const MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Queued settle observations above this are logged as a backlog.
 const SETTLE_BACKLOG_WARN: usize = 1000;
 const SETTLE_BACKLOG_WARN_EVERY: Duration = Duration::from_secs(60);
+/// Longest handshake reason quoted in a log line, in characters.
+const HANDSHAKE_REASON_MAX_CHARS: usize = 256;
+/// An unchanged handshake note is repeated at WARN at most this often.
+const HANDSHAKE_NOTE_WARN_EVERY: Duration = Duration::from_secs(300);
+/// Distinct handshake notes remembered for that limit; the oldest is dropped first.
+const HANDSHAKE_NOTES_REMEMBERED: usize = 8;
 
 /// Time bounds of the LP streams.
 #[derive(Clone, Copy, Debug)]
@@ -207,6 +214,59 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Log text for a handshake reply: the trimmed reason quoted and clipped, or
+/// a note that a refusal gave none; `None` for a plain acceptance.
+fn handshake_note(label: &str, accepted: bool, reason: &str) -> Option<String> {
+    let reason = reason.trim();
+    if !reason.is_empty() {
+        Some(format!("{label}={accepted}, reason={:?}", short(reason, HANDSHAKE_REASON_MAX_CHARS)))
+    } else if accepted {
+        None
+    } else {
+        Some(format!("{label}=false, no reason given"))
+    }
+}
+
+/// Handshake notes logged at WARN and when; a note repeated within
+/// `HANDSHAKE_NOTE_WARN_EVERY` of its own last WARN goes to DEBUG.
+#[derive(Default)]
+struct NoteLog(std::sync::Mutex<Vec<(String, tokio::time::Instant)>>);
+
+impl NoteLog {
+    /// True, and recorded, for a note not logged at WARN within the last
+    /// `HANDSHAKE_NOTE_WARN_EVERY`.
+    fn due(&self, note: &str, now: tokio::time::Instant) -> bool {
+        let mut seen = agent_logic::sync::lock(&self.0);
+        if let Some((_, at)) = seen.iter_mut().find(|(prev, _)| prev == note) {
+            let due = now.saturating_duration_since(*at) >= HANDSHAKE_NOTE_WARN_EVERY;
+            if due {
+                *at = now;
+            }
+            return due;
+        }
+        let oldest = seen.iter().enumerate().min_by_key(|(_, (_, at))| *at).map(|(i, _)| i);
+        if let (true, Some(i)) = (seen.len() >= HANDSHAKE_NOTES_REMEMBERED, oldest) {
+            seen.swap_remove(i);
+        }
+        seen.push((note.to_owned(), now));
+        true
+    }
+
+    /// Forget every note, so the next one is logged at WARN.
+    fn clear(&self) {
+        agent_logic::sync::lock(&self.0).clear();
+    }
+
+    /// `what: note` at WARN when due, else at DEBUG.
+    fn log(&self, what: &str, note: &str) {
+        if self.due(note, tokio::time::Instant::now()) {
+            warn!("{what}: {note}");
+        } else {
+            debug!("{what}: {note}");
+        }
     }
 }
 
@@ -387,6 +447,9 @@ where
     let mut heartbeat = ticker(clock::deadline_after(timing.heartbeat), timing.heartbeat);
     let mut watchdog = IdleWatchdog::new(timing.idle);
     let mut client_seq: u64 = 0;
+    // A note from the last handshake ack; repeated at WARN while it applies.
+    let mut ack_note: Option<String> = None;
+    let note_log = NoteLog::default();
 
     loop {
         tokio::select! {
@@ -413,6 +476,9 @@ where
                     warn!("LP settlement stream send-failed on heartbeat, reconnecting ({e})");
                     return SessionEnd::SendFailed;
                 }
+                if let Some(note) = ack_note.as_deref().filter(|n| note_log.due(n, tokio::time::Instant::now())) {
+                    warn!("LP handshake note still applies: {note}");
+                }
             }
             msg_result = inbound.next() => {
                 let msg = match msg_result {
@@ -430,7 +496,15 @@ where
 
                 match msg.message {
                     Some(ServerMessage::HandshakeAck(ack)) => {
-                        info!("LP handshake acknowledged: accepted={}", ack.accepted);
+                        let reason = ack.rejection_reason.as_deref().unwrap_or_default();
+                        ack_note = handshake_note("accepted", ack.accepted, reason);
+                        match ack_note.as_deref() {
+                            Some(note) => note_log.log("LP handshake acknowledged", note),
+                            None => {
+                                note_log.clear();
+                                info!("LP handshake acknowledged: accepted={}", ack.accepted);
+                            }
+                        }
                     }
                     Some(ServerMessage::RfqRequest(request)) => {
                         if shutdown.is_shutting_down() {
@@ -500,6 +574,9 @@ struct AtomicCtx {
     rfq_handler: Arc<RfqHandler>,
     state: Arc<RfqV2State>,
     sweep_running: Arc<AtomicBool>,
+    /// Rate-limits handshake notes across reconnects, so a repeated refusal
+    /// is not logged at WARN on every attempt.
+    handshake_notes: NoteLog,
 }
 
 fn wrap(seq: u64, message: LpMessage) -> AtomicLpToServer {
@@ -605,6 +682,7 @@ async fn atomic_stream(
         rfq_handler,
         state: Arc::clone(&state),
         sweep_running: Arc::new(AtomicBool::new(false)),
+        handshake_notes: NoteLog::default(),
     };
     let retry_secs = timing.reconnect.as_secs();
 
@@ -759,7 +837,13 @@ where
 
                 match msg.message {
                     Some(AtomicServerMessage::HandshakeAck(ack)) => {
-                        info!("LP atomic handshake acknowledged: success={} session={}", ack.success, ack.session_id);
+                        match handshake_note("success", ack.success, &ack.error) {
+                            Some(note) => ctx.handshake_notes.log("LP atomic handshake acknowledged", &note),
+                            None => {
+                                ctx.handshake_notes.clear();
+                                info!("LP atomic handshake acknowledged: success={} session={}", ack.success, ack.session_id);
+                            }
+                        }
                     }
                     Some(AtomicServerMessage::Heartbeat(_)) => {
                         // Server-side keepalive; it arms the idle watchdog.
@@ -1209,6 +1293,64 @@ mod tests {
         assert!(backlog_warning_due(5000, Some(now), now + SETTLE_BACKLOG_WARN_EVERY));
     }
 
+    #[test]
+    fn handshake_notes_quote_the_reason_clipped_and_escaped() {
+        assert_eq!(handshake_note("accepted", true, ""), None);
+        assert_eq!(handshake_note("accepted", true, " \n"), None);
+        assert_eq!(handshake_note("accepted", false, "").as_deref(), Some("accepted=false, no reason given"));
+        assert_eq!(handshake_note("success", false, "\t ").as_deref(), Some("success=false, no reason given"));
+        assert_eq!(
+            handshake_note("accepted", true, " no LP status \n").as_deref(),
+            Some(r#"accepted=true, reason="no LP status""#)
+        );
+        assert_eq!(
+            handshake_note("success", false, "bad \"name\"\nnext").as_deref(),
+            Some(r#"success=false, reason="bad \"name\"\nnext""#)
+        );
+        let clipped = handshake_note("success", false, &"€".repeat(266)).unwrap();
+        assert_eq!(clipped, format!("success=false, reason=\"{}\"", "€".repeat(256)));
+        let controls = handshake_note("success", false, "a\u{1b}[31mb\rc\u{202e}d\u{2028}e").unwrap();
+        for raw in ['\u{1b}', '\r', '\u{202e}', '\u{2028}'] {
+            assert!(!controls.contains(raw), "{raw:?} must be escaped: {controls}");
+        }
+        for escaped in [r"\u{1b}", r"\r", r"\u{202e}", r"\u{2028}"] {
+            assert!(controls.contains(escaped), "{escaped} missing: {controls}");
+        }
+        let cut = handshake_note("success", false, &format!("{}\u{1b}[2J", "a".repeat(256))).unwrap();
+        assert_eq!(cut, format!("success=false, reason=\"{}\"", "a".repeat(256)));
+    }
+
+    #[test]
+    fn alternating_handshake_notes_are_each_limited_and_the_oldest_is_forgotten() {
+        let t0 = tokio::time::Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let log = NoteLog::default();
+        assert!(log.due("a", at(0)) && log.due("b", at(5)));
+        assert!(!log.due("a", at(10)) && !log.due("b", at(15)), "each reason keeps its own limit");
+        assert!(log.due("a", at(300)) && log.due("b", at(305)));
+        log.clear();
+        for n in 0..HANDSHAKE_NOTES_REMEMBERED {
+            assert!(log.due(&format!("n{n}"), at(400 + n as u64)));
+        }
+        assert!(log.due("extra", at(500)), "a ninth note evicts the oldest");
+        assert!(log.due("n0", at(501)), "the evicted note is new again");
+        assert!(!log.due("n2", at(502)), "a remembered note stays limited");
+    }
+
+    #[test]
+    fn a_handshake_note_is_due_when_new_changed_or_five_minutes_on() {
+        let t0 = tokio::time::Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let log = NoteLog::default();
+        assert!(log.due("refused", at(0)), "a first note");
+        assert!(!log.due("refused", at(299)), "the same note within five minutes");
+        assert!(log.due("refused", at(300)), "the same note five minutes on");
+        assert!(log.due("other", at(301)), "a changed note");
+        assert!(!log.due("other", at(302)));
+        log.clear();
+        assert!(log.due("other", at(303)), "a note after a clear");
+    }
+
     // ---- V1 session ----
 
     fn server_heartbeat_v1() -> Result<ServerToCantonMessage, tonic::Status> {
@@ -1335,6 +1477,70 @@ mod tests {
         assert_eq!(session.await.unwrap(), SessionEnd::Shutdown);
     }
 
+    fn ack_v1(accepted: bool, reason: Option<&str>) -> Result<ServerToCantonMessage, tonic::Status> {
+        Ok(ServerToCantonMessage {
+            message: Some(ServerMessage::HandshakeAck(orderbook_proto::settlement::HandshakeAck {
+                accepted,
+                rejection_reason: reason.map(str::to_owned),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
+    // No server heartbeat is sent, so the idle watchdog stays disarmed
+    #[tokio::test(start_paused = true)]
+    async fn a_v1_handshake_note_is_logged_and_repeated_every_five_minutes() {
+        let logs = crate::test_util::LogBuf::default();
+        let _capture = logs.capture(tracing::Level::WARN);
+        let reason = "no LP status for this name";
+        let shutdown = Shutdown::new();
+        let rfq = handler();
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (in_tx, stream) = inbound();
+        in_tx.send(ack_v1(true, Some(reason))).await.unwrap();
+        let start = tokio::time::Instant::now();
+        let session = settlement_session(&rfq, stream, &out_tx, &shutdown, fast());
+        tokio::pin!(session);
+        // (seconds since start, WARN lines quoting the reason, of which repeats)
+        for (secs, quoted, repeats) in [(60, 1, 0), (290, 1, 0), (310, 2, 1), (610, 3, 2)] {
+            let checkpoint = start + Duration::from_secs(secs);
+            assert!(tokio::time::timeout_at(checkpoint, &mut session).await.is_err(), "the session runs on");
+            while out_rx.try_recv().is_ok() {}
+            assert_eq!(logs.count(reason), quoted, "at {secs}s");
+            assert_eq!(logs.count("LP handshake note still applies"), repeats, "at {secs}s");
+        }
+        assert_eq!(logs.count("LP handshake acknowledged: accepted=true, reason=\"no LP status for this name\""), 1);
+        shutdown.signal();
+        assert_eq!(session.await, SessionEnd::Shutdown);
+        drop(in_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_v1_handshake_ack_is_not_a_warning() {
+        let logs = crate::test_util::LogBuf::default();
+        let _capture = logs.capture(tracing::Level::WARN);
+        let shutdown = Shutdown::new();
+        let rfq = handler();
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (in_tx, stream) = inbound();
+        in_tx.send(ack_v1(true, None)).await.unwrap();
+        in_tx.send(ack_v1(true, Some("  "))).await.unwrap();
+        let session = settlement_session(&rfq, stream, &out_tx, &shutdown, fast());
+        tokio::pin!(session);
+        for _ in 0..11 {
+            assert!(tokio::time::timeout(Duration::from_secs(59), &mut session).await.is_err(), "the session runs on");
+            while out_rx.try_recv().is_ok() {}
+        }
+        assert_eq!(logs.count("LP handshake"), 0);
+        // The capture works: a refusal without a reason is a warning
+        in_tx.send(ack_v1(false, None)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), &mut session).await.is_err());
+        assert_eq!(logs.count("LP handshake acknowledged: accepted=false, no reason given"), 1);
+        shutdown.signal();
+        assert_eq!(session.await, SessionEnd::Shutdown);
+    }
+
     // ---- V2 session ----
 
     fn ctx(state: RfqV2State) -> AtomicCtx {
@@ -1344,6 +1550,7 @@ mod tests {
             rfq_handler: handler(),
             state: Arc::new(state),
             sweep_running: Arc::new(AtomicBool::new(false)),
+            handshake_notes: NoteLog::default(),
         }
     }
 
@@ -1535,6 +1742,46 @@ mod tests {
         assert!(!session.is_finished(), "four minutes of messages, each within the idle window");
         shutdown.signal();
         assert_eq!(session.await.unwrap(), SessionEnd::Shutdown);
+    }
+
+    // One atomic session that gets a single ack before the server ends the stream
+    async fn one_atomic_handshake(ctx: &AtomicCtx, success: bool, error: &str) {
+        let shutdown = Shutdown::new();
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let (in_tx, stream) = inbound();
+        let ack = orderbook_proto::rfqv2::AtomicHandshakeAck { success, error: error.into(), ..Default::default() };
+        in_tx
+            .send(Ok(AtomicServerToLp { message: Some(AtomicServerMessage::HandshakeAck(ack)), ..Default::default() }))
+            .await
+            .unwrap();
+        drop(in_tx);
+        let end = tokio::time::timeout(Duration::from_secs(5), atomic_session(ctx, stream, &out_tx, &shutdown, fast()))
+            .await
+            .expect("the session ends with the stream");
+        assert_eq!(end, SessionEnd::Ended);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_v2_handshake_is_logged_once_per_five_minutes_across_reconnects() {
+        let logs = crate::test_util::LogBuf::default();
+        let _capture = logs.capture(tracing::Level::WARN);
+        let ctx = ctx(v2::state_with(v2::lm_with_usdcx(1000).await));
+        let too_long = "lp_name is too long";
+        for _ in 0..3 {
+            one_atomic_handshake(&ctx, false, too_long).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        assert_eq!(logs.count(too_long), 1, "repeats within five minutes are not warnings");
+        tokio::time::sleep(HANDSHAKE_NOTE_WARN_EVERY).await;
+        one_atomic_handshake(&ctx, false, too_long).await;
+        assert_eq!(logs.count(too_long), 2, "five minutes on, the refusal is a warning again");
+        assert_eq!(logs.count("LP atomic handshake acknowledged: success=false, reason=\"lp_name is too long\""), 2);
+
+        one_atomic_handshake(&ctx, false, "party mismatch").await;
+        assert_eq!(logs.count("party mismatch"), 1, "a changed reason is a warning at once");
+        one_atomic_handshake(&ctx, true, "").await;
+        one_atomic_handshake(&ctx, false, "party mismatch").await;
+        assert_eq!(logs.count("party mismatch"), 2, "a success in between resets the repeat window");
     }
 
     #[tokio::test(start_paused = true)]

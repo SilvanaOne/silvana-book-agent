@@ -439,7 +439,7 @@ fn parts<'a>(
             )
         })?;
     }
-    ensure(metadata.synchronizer_id == net.synchronizer_id, || {
+    ensure(net.is_synchronizer(&metadata.synchronizer_id), || {
         format!(
             "synchronizer is {}, expected {} ({})",
             metadata.synchronizer_id, net.synchronizer_id, net.name
@@ -1212,6 +1212,40 @@ mod tests {
             &e,
             "synchronizer",
         );
+    }
+
+    #[test]
+    fn a_burn_on_a_physical_id_of_the_pinned_synchronizer_is_accepted() {
+        let e = burn_expectation();
+        for suffix in ["::36-7", "::35-6"] {
+            accepted(
+                &mutated(|p| {
+                    p.metadata.as_mut().unwrap().synchronizer_id =
+                        format!("{}{suffix}", NET.synchronizer_id)
+                }),
+                &e,
+            );
+        }
+    }
+
+    #[test]
+    fn a_burn_on_another_synchronizer_is_rejected_in_any_form() {
+        let e = burn_expectation();
+        let pinned = NET.synchronizer_id;
+        for id in [
+            format!("{}::36-7", usdcx::TESTNET.synchronizer_id),
+            format!("{pinned}::36"),
+            format!("{pinned}::36-7::37-8"),
+            format!("{pinned}::a-7"),
+            format!("{pinned}a::36-7"),
+            String::new(),
+        ] {
+            rejected(
+                &mutated(|p| p.metadata.as_mut().unwrap().synchronizer_id = id),
+                &e,
+                "synchronizer",
+            );
+        }
     }
 
     #[test]

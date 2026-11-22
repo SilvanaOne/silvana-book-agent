@@ -8,6 +8,8 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
+use crate::text::logical_synchronizer_id;
+
 /// Instrument id of USDCx.
 pub const INSTRUMENT_ID: &str = "USDCx";
 /// Holding scheme of USDCx (the instrument configuration's default identifier).
@@ -68,6 +70,7 @@ pub const CHOICE_TERMINATE: &str = "BridgeUserAgreement_Terminate";
 #[derive(Debug)]
 pub struct UsdcxNetwork {
     pub name: &'static str,
+    /// The logical synchronizer id; prepared transactions may name it by a physical id.
     pub synchronizer_id: &'static str,
     /// USDCx instrument admin: the registrar and `crossChainRepresentative`.
     pub admin: &'static str,
@@ -102,17 +105,22 @@ impl UsdcxNetwork {
         }
     }
 
-    /// The network of a synchronizer.
+    /// The network of a synchronizer, named by its logical id or a physical id of it.
     pub fn by_synchronizer(synchronizer_id: &str) -> Result<&'static UsdcxNetwork> {
         [&MAINNET, &TESTNET]
             .into_iter()
-            .find(|n| n.synchronizer_id == synchronizer_id)
+            .find(|n| n.is_synchronizer(synchronizer_id))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "USDCx is not available on synchronizer {synchronizer_id} \
                      (MainNet and TestNet only)"
                 )
             })
+    }
+
+    /// Whether `id` names this network's synchronizer, by its logical id or a physical id of it.
+    pub fn is_synchronizer(&self, id: &str) -> bool {
+        logical_synchronizer_id(id) == self.synchronizer_id
     }
 }
 
@@ -170,6 +178,39 @@ mod tests {
             "mainnet"
         );
         assert!(UsdcxNetwork::by_synchronizer("global-domain::1220aa").is_err());
+    }
+
+    #[test]
+    fn a_network_is_named_by_its_logical_or_physical_synchronizer_id() {
+        let id = MAINNET.synchronizer_id;
+        let physical = format!("{id}::36-7");
+        assert!(MAINNET.is_synchronizer(id));
+        assert!(MAINNET.is_synchronizer(&physical));
+        assert!(!TESTNET.is_synchronizer(&physical));
+        for other in [
+            format!("{id}::36"),
+            format!("{id}::36-7::37-8"),
+            format!("{id}a::36-7"),
+        ] {
+            assert!(!MAINNET.is_synchronizer(&other), "{other}");
+        }
+        assert_eq!(
+            UsdcxNetwork::by_synchronizer(&physical).unwrap().name,
+            "mainnet"
+        );
+        assert_eq!(
+            UsdcxNetwork::by_synchronizer(&format!("{}::34-0", TESTNET.synchronizer_id))
+                .unwrap()
+                .name,
+            "testnet"
+        );
+        assert!(UsdcxNetwork::by_synchronizer("global-domain::1220aa::36-7").is_err());
+        for net in [&MAINNET, &TESTNET] {
+            assert_eq!(
+                logical_synchronizer_id(net.synchronizer_id),
+                net.synchronizer_id
+            );
+        }
     }
 
     /// Shared with the server's builders: both sides must derive the same ids.

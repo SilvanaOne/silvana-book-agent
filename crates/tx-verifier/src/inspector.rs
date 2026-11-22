@@ -19,7 +19,7 @@ use proto_v2::interactive::transaction::v1::node::NodeType;
 use proto_v2::interactive::transaction::v1::{Create, Exercise};
 use proto_v2::{value::Sum, Identifier, Record, Value};
 
-use crate::text::short;
+use crate::text::{logical_synchronizer_id, short};
 use crate::types::{InspectionResult, OperationExpectation};
 
 /// Verbose mode skips the JSON dump of transactions larger than this.
@@ -1651,8 +1651,11 @@ fn inspect_propose_dvp(
         });
     }
 
-    // --- Metadata: synchronizer_id ---
-    if !synchronizer_id.is_empty() && parts.metadata.synchronizer_id != synchronizer_id {
+    // --- Metadata: synchronizer_id, as logical ids (the transaction may name a physical id) ---
+    if !synchronizer_id.is_empty()
+        && logical_synchronizer_id(&parts.metadata.synchronizer_id)
+            != logical_synchronizer_id(synchronizer_id)
+    {
         warnings.push(format!(
             "synchronizer_id mismatch: expected={}, got={}",
             synchronizer_id, parts.metadata.synchronizer_id
@@ -2879,6 +2882,65 @@ mod tests {
         );
         assert!(r.accepted, "{r:?}");
         assert!(r.summary.contains("buyer €€€€€€€€ proposes prop"), "{}", r.summary);
+    }
+
+    /// The synchronizer warnings of an accepted ProposeDvp on `got` when `expected` is configured.
+    fn propose_dvp_synchronizer_warnings(got: &str, expected: &str) -> Vec<String> {
+        let mut ex = root_exercise("UserService_ProposeDvp", &[P]);
+        ex.template_id = Some(ident(
+            "Utility.Settlement.App.V1.Service.User",
+            "UserService",
+        ));
+        let mut p = single_exercise(ex, &[P]);
+        p.metadata.as_mut().unwrap().synchronizer_id = got.into();
+        let r = run(
+            &p,
+            OperationExpectation::ProposeDvp {
+                buyer_party: P.into(),
+                seller_party: Q.into(),
+                proposal_id: "prop".into(),
+                synchronizer_id: expected.into(),
+            },
+        );
+        assert!(r.accepted, "{got} vs {expected}: {r:?}");
+        r.warnings
+            .into_iter()
+            .filter(|w| w.contains("synchronizer_id"))
+            .collect()
+    }
+
+    #[test]
+    fn propose_dvp_compares_synchronizers_by_logical_id() {
+        const S: &str = "global-domain::1220cc";
+        let s_37_8 = format!("{S}::37-8");
+        let s_36_7 = format!("{S}::36-7");
+        for (got, expected) in [
+            (s_37_8.as_str(), S),
+            (S, S),
+            (S, s_37_8.as_str()),
+            (s_36_7.as_str(), s_37_8.as_str()),
+            (s_37_8.as_str(), ""),
+        ] {
+            let w = propose_dvp_synchronizer_warnings(got, expected);
+            assert!(w.is_empty(), "{got} vs {expected}: {w:?}");
+        }
+    }
+
+    #[test]
+    fn propose_dvp_still_warns_on_another_synchronizer() {
+        const S: &str = "global-domain::1220cc";
+        let twice = format!("{S}::36-7::37-8");
+        for got in [
+            "global-domain::1220dd::37-8",
+            "global-domain::1220dd",
+            twice.as_str(),
+            "",
+        ] {
+            let w = propose_dvp_synchronizer_warnings(got, S);
+            assert_eq!(w.len(), 1, "{got}: {w:?}");
+            let needle = format!("expected={S}, got={got}");
+            assert!(w.iter().all(|x| x.contains(&needle)), "{got}: {w:?}");
+        }
     }
 
     #[test]
