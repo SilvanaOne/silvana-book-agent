@@ -4,10 +4,10 @@
 //! settlement proposals against them. User orders (placed via frontend) are
 //! imported from the server on demand.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::Engine;
 use rust_decimal::Decimal;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -16,7 +16,8 @@ use tracing::{debug, info, warn};
 use orderbook_proto::orderbook::{Order, OrderType, SettlementProposal};
 use rust_decimal::prelude::ToPrimitive;
 
-use crate::auth::{sign_order_data, verify_order_signature};
+use crate::auth::verify_order_signature_with_public_key;
+use crate::signer::{AgentSigner, OrderToSign};
 use crate::state::{SavedSettlementOrder, SavedTrackedOrder, StrategyStarts};
 
 /// Tracked order with quantity accounting
@@ -140,6 +141,8 @@ pub struct MarketActivity {
 pub struct OrderTracker {
     start_time_ms: u64,
     private_key: crate::secret::Secret<32>,
+    /// The signer for `private_key`, resolved on first use.
+    signer: std::sync::OnceLock<AgentSigner>,
     orders: HashMap<u64, TrackedOrder>,
     /// Maps proposal_id → adoption record for active settlements
     settlement_orders: HashMap<String, SettlementOrderEntry>,
@@ -164,6 +167,7 @@ impl OrderTracker {
         Self {
             start_time_ms,
             private_key,
+            signer: std::sync::OnceLock::new(),
             orders: HashMap::new(),
             settlement_orders: HashMap::new(),
             placing: Arc::new(Mutex::new(HashMap::new())),
@@ -293,19 +297,19 @@ impl OrderTracker {
 
         let nonce = crate::clock::now_millis();
 
-        // Canonical JSON with sorted keys (BTreeMap guarantees alphabetical order)
-        let mut fields = BTreeMap::new();
-        fields.insert("market_id", serde_json::Value::String(market_id.to_string()));
-        fields.insert("nonce", serde_json::json!(nonce));
-        fields.insert("order_type", serde_json::Value::String(order_type.to_string()));
-        fields.insert("placed_by", serde_json::Value::String("agent".to_string()));
-        fields.insert("price", serde_json::Value::String(price.to_string()));
-        fields.insert("quantity", serde_json::Value::String(quantity.to_string()));
-        let signed_data_bytes =
-            serde_json::to_vec(&fields).context("failed to serialize order for signing")?;
-        let signature = sign_order_data(&*self.private_key.expose()?, &signed_data_bytes);
+        // Canonical JSON with sorted keys, built and signed by the signer
+        let signed = self.signer()?.sign_order(&OrderToSign { market_id, order_type, price, quantity, nonce })?;
 
-        Ok((signature, signed_data_bytes, nonce))
+        Ok((signed.signature, signed.signed_data, nonce))
+    }
+
+    /// The signer for the agent key.
+    fn signer(&self) -> Result<&AgentSigner> {
+        if let Some(signer) = self.signer.get() {
+            return Ok(signer);
+        }
+        let signer = crate::signer::resolve(&self.private_key)?;
+        Ok(self.signer.get_or_init(|| signer))
     }
 
     /// Track an order placed by the agent
@@ -421,11 +425,11 @@ impl OrderTracker {
         }
 
         // Verify signature
-        let key = match self.private_key.expose() {
-            Ok(key) => key,
+        let signer = match self.signer() {
+            Ok(signer) => signer,
             Err(e) => return VerifyResult::Rejected { reason: format!("Order {order_id}: signing key unavailable: {e}") },
         };
-        if !verify_order_signature(&key, &tracked.signed_data, &tracked.signature) {
+        if !verify_order_signature_with_public_key(signer.verifying_key(), &tracked.signed_data, &tracked.signature) {
             return VerifyResult::Rejected {
                 reason: format!("Order {} has invalid signature", order_id),
             };
@@ -466,11 +470,11 @@ impl OrderTracker {
         };
 
         // Verify signature with our key
-        let key = match self.private_key.expose() {
-            Ok(key) => key,
+        let signer = match self.signer() {
+            Ok(signer) => signer,
             Err(e) => return VerifyResult::Rejected { reason: format!("Order {order_id}: signing key unavailable: {e}") },
         };
-        if !verify_order_signature(&key, &order.signed_data, &signature) {
+        if !verify_order_signature_with_public_key(signer.verifying_key(), &order.signed_data, &signature) {
             return VerifyResult::Rejected {
                 reason: format!("Order {} signature verification failed (not signed by our key)", order_id),
             };
@@ -807,7 +811,7 @@ fn check_capacity(order: &TrackedOrder, order_id: u64, requested: &str) -> Verif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::sign_order_data;
+    use crate::auth::{sign_order_data, verify_order_signature};
     use orderbook_proto::orderbook::OrderType;
 
     fn test_private_key() -> [u8; 32] {

@@ -13,6 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Proto file paths
     let orderbook_proto = "../../proto/silvana/orderbook/v1/orderbook.proto";
+    // Same package (silvana.orderbook.v1): the agent-control client lands next to OrderbookService.
+    let agent_control_proto = "../../proto/silvana/orderbook/v1/agent_control.proto";
     let settlement_proto = "../../proto/silvana/settlement/v1/settlement.proto";
     let pricing_proto = "../../proto/silvana/pricing/v1/pricing.proto";
     let proto_includes = vec!["../../proto"];
@@ -38,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "fees.proto",
         "pay_fee.proto",
         "usdcx.proto",
+        "control.proto",
         "transactions.proto",
         "service.proto",
         "bridge.proto",
@@ -64,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .descriptor_pool("crate::ORDERBOOK_DESCRIPTOR_POOL")
         .configure(
             &mut config_orderbook,
-            &[orderbook_proto],
+            &[orderbook_proto, agent_control_proto],
             &proto_includes
         )
         .expect("Failed to configure reflection for orderbook proto");
@@ -76,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(&orderbook_descriptor_path)
         .compile_with_config(
             config_orderbook,
-            &[orderbook_proto],
+            &[orderbook_proto, agent_control_proto],
             &proto_includes
         )?;
 

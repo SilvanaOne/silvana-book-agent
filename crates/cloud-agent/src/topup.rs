@@ -240,6 +240,7 @@ impl TopupRunner {
                 amulet_cids: vec![],
             })),
             request_signature: None,
+            controller_command: None,
         };
         let mut client = self.client.clone();
         let submit = async move {

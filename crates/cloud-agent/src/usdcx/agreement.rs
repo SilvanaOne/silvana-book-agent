@@ -111,6 +111,7 @@ pub(crate) async fn onboard(
                 request_id: request_id.clone(),
             })),
             request_signature: None,
+            controller_command: None,
         };
         let opts = SubmitOptions {
             max_retries: 3,
@@ -204,6 +205,7 @@ pub(crate) async fn pre_approval(ctx: &mut Ctx, enable: bool) -> Result<()> {
             },
         )),
         request_signature: None,
+        controller_command: None,
     };
     // Its choice consumes the agreement: one attempt, then check the ledger.
     let opts = SubmitOptions {
@@ -265,6 +267,7 @@ pub(crate) async fn offboard(ctx: &mut Ctx, reason: &str) -> Result<()> {
             },
         )),
         request_signature: None,
+        controller_command: None,
     };
     let opts = SubmitOptions {
         max_retries: 1,

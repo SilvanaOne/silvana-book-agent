@@ -10,6 +10,7 @@ atomic-quote = { path = "../atomic-quote" }
 orderbook-proto = { path = "../orderbook-proto" }
 tx-verifier = { path = "../tx-verifier" }
 message-signing = { path = "../message-signing" }
+agent-control = { path = "../agent-control" }
 
 # gRPC
 tonic = { workspace = true, features = ["tls-webpki-roots"] }
@@ -33,6 +34,7 @@ async-trait = "0.1"
 base64.workspace = true
 ed25519-dalek = { workspace = true }
 rand.workspace = true
+sha2.workspace = true
 bs58 = "0.5"
 
 # Utilities
@@ -65,3 +67,6 @@ usdcx = ["dep:alloy", "dep:alloy-provider", "dep:alloy-transport-http", "dep:all
 # `test-util` (not part of tokio's "full") gives tests a pausable clock, so the
 # DvpProposal GC gate's 15-minute timeout is reachable without waiting for it.
 tokio = { workspace = true, features = ["test-util"] }
+# Prepared-transaction fixtures and deterministic control logs.
+prost = { workspace = true }
+agent-logic = { path = "../agent-logic", features = ["testkit"] }

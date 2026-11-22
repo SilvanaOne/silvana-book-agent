@@ -591,6 +591,7 @@ impl MulticallSettler {
                 &holding_cids,
             ))),
             request_signature: None,
+            controller_command: None,
         });
         let prep = within("traffic estimate", ledger_client::call_wait(config.request_timeout_secs), estimate)
             .await
@@ -621,6 +622,7 @@ impl MulticallSettler {
             operation: TransactionOperation::ExecuteMulticall as i32,
             params: Some(Params::ExecuteMulticall(params_final)),
             request_signature: None,
+            controller_command: None,
         };
         Ok(Prepared { client, holding_cids, request, expectation })
     }

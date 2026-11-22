@@ -1040,6 +1040,7 @@ async fn execute_allocate(
                     amulet_cids: reservation.cids().to_vec(),
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             &expectation,
             verbose,

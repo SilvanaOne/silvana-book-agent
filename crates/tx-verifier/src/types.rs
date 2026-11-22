@@ -236,6 +236,68 @@ impl OperationExpectation {
     pub fn requires_hash_match(&self) -> bool {
         self.is_usdcx() || matches!(self, Self::AcceptDvp { .. })
     }
+
+    /// Whether the inspector checks this operation's fields.
+    pub fn coverage(&self) -> Coverage {
+        match self {
+            Self::PayFee { .. }
+            | Self::ProposeDvp { .. }
+            | Self::AcceptDvp { .. }
+            | Self::Allocate { .. }
+            | Self::CancelDvpProposal { .. }
+            | Self::RejectDvpProposal { .. }
+            | Self::TransferCc { .. }
+            | Self::RequestPreapproval { .. }
+            | Self::RequestRecurringPrepaid { .. }
+            | Self::RequestRecurringPayasyougo { .. }
+            | Self::RequestUserService { .. }
+            | Self::AcceptCip56 { .. }
+            | Self::UsdcxRequestAgreement { .. }
+            | Self::UsdcxMint { .. }
+            | Self::UsdcxBurn { .. }
+            | Self::UsdcxReclaimHolding { .. }
+            | Self::UsdcxUpdatePreApproval { .. }
+            | Self::UsdcxTerminateAgreement { .. } => Coverage::Fields,
+            Self::PrepayTraffic { .. }
+            | Self::TransferCip56 { .. }
+            | Self::SplitCc { .. }
+            | Self::ExecuteMulticall { .. }
+            | Self::LockHoldings { .. }
+            | Self::ProcessLockUnlockRequests { .. }
+            | Self::ResizeLock { .. }
+            | Self::TerminateLock { .. }
+            | Self::AtomicDvpSettle { .. }
+            | Self::IssueTickets { .. }
+            | Self::SplitHoldings { .. }
+            | Self::CreateAtomicDvpVenue { .. }
+            | Self::UpdateVenueKey { .. }
+            | Self::RetireVenue { .. }
+            | Self::CancelTickets { .. } => Coverage::Unverified,
+        }
+    }
+}
+
+/// How the self-computed hash compared with the server's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HashCheck {
+    /// The server hash is the computed hash.
+    Match,
+    /// The server hash differs or is not 32 bytes; `server_hex` is empty when it is not base64.
+    Mismatch {
+        server_hex: String,
+        computed_hex: String,
+    },
+    /// No hash was computed.
+    Uncomputed { reason: String },
+}
+
+/// Whether the inspector checked the operation's fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// The fields were checked against the expectation.
+    Fields,
+    /// The fields were not checked.
+    Unverified,
 }
 
 /// Result of transaction verification
@@ -256,6 +318,10 @@ pub struct VerificationResult {
     /// caller that guards against signing two burns for one withdrawal
     /// compares them across signatures.
     pub burn_holding_cids: Vec<String>,
+    /// The hash comparison; a refusal before hashing is `Uncomputed`.
+    pub hash_check: HashCheck,
+    /// Whether the operation's fields were checked.
+    pub coverage: Coverage,
 }
 
 /// Result of transaction field inspection (before hashing)

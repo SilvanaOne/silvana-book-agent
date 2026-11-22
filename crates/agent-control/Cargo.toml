@@ -1,0 +1,20 @@
+[package]
+name = "agent-control"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Canonical encoding and verification of agent control documents"
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek = { workspace = true }
+hex.workspace = true
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+rust_decimal = { version = "1.36", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+curve25519-dalek = "4.1"

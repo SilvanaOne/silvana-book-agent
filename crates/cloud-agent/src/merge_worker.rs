@@ -231,6 +231,7 @@ async fn check_and_merge_instrument(
                     amulet_cids: cids.clone(),
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             OperationExpectation::SplitCc {
                 party: config.party_id.clone(),
@@ -252,6 +253,7 @@ async fn check_and_merge_instrument(
                     max_input_holdings: None,
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             OperationExpectation::TransferCip56 {
                 sender_party: config.party_id.clone(),

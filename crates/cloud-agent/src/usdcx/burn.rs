@@ -477,6 +477,7 @@ pub(crate) async fn burn(ctx: &mut Ctx, args: BurnArgs) -> Result<()> {
             max_input_holdings: None,
         })),
         request_signature: None,
+        controller_command: None,
     };
     let dir = ctx.dir.clone();
     let mut signed = false;
@@ -804,6 +805,7 @@ pub(crate) async fn reclaim(ctx: &mut Ctx, revoked_cid: &str) -> Result<()> {
             revoked_withdraw_attestation_cid: revoked_cid.to_string(),
         })),
         request_signature: None,
+        controller_command: None,
     };
     // The command id is keyed on the revoked attestation, which the reclaim
     // consumes: retries cannot commit twice.

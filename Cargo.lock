@@ -40,11 +40,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-control"
+version = "0.5.3"
+dependencies = [
+ "base64 0.22.1",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hex",
+ "p256",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "agent-logic"
 version = "0.5.3"
 dependencies = [
  "aes",
  "aes-gcm",
+ "agent-control",
  "anyhow",
  "async-trait",
  "atomic-quote",
@@ -55,6 +71,7 @@ dependencies = [
  "futures",
  "hex",
  "indexmap 2.13.0",
+ "message-signing",
  "orderbook-proto",
  "prost",
  "prost-types",
@@ -1542,6 +1559,7 @@ dependencies = [
 name = "cloud-agent"
 version = "0.5.3"
 dependencies = [
+ "agent-control",
  "agent-logic",
  "alloy",
  "alloy-primitives",
@@ -1561,6 +1579,7 @@ dependencies = [
  "message-signing",
  "once_cell",
  "orderbook-proto",
+ "prost",
  "prost-types",
  "rand 0.8.5",
  "reqwest",
@@ -1568,6 +1587,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3345,6 +3365,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "p256"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,6 +3596,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.115",
+]
+
+[[package]]
+name = "primeorder"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+dependencies = [
+ "elliptic-curve",
 ]
 
 [[package]]

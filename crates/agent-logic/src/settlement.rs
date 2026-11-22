@@ -40,7 +40,6 @@ use orderbook_proto::{
     RecordSettlementEventRequest, SettlementEventType, SettlementEventResult, RecordedByRole,
 };
 
-use crate::auth::generate_jwt;
 use crate::clock;
 use crate::client::OrderbookClient;
 use crate::config::{BaseConfig, UNRESOLVED_INSTRUMENT};
@@ -148,13 +147,7 @@ pub fn affects_grid(update: &SettlementUpdate) -> bool {
 
 /// A fresh JWT for the configured party.
 fn config_jwt(config: &BaseConfig) -> Result<String> {
-    generate_jwt(
-        &config.party_id,
-        &config.role,
-        &*config.private_key.expose()?,
-        config.token_ttl_secs,
-        Some(config.node_name.as_str()),
-    )
+    config.jwt()
 }
 
 /// Wall-clock seconds since the Unix epoch; 0 if the clock is before it.

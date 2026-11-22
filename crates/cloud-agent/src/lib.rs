@@ -35,6 +35,8 @@ pub mod acs_worker;
 pub mod atomic_swap;
 pub mod backend;
 pub mod config;
+pub mod control;
+pub mod control_survey;
 pub mod dvp_gc_worker;
 pub mod env;
 pub mod fill_loop;
@@ -611,6 +613,8 @@ pub async fn run_cloud_agent(
     config.validate_instrument_registry().context(
         "refusing to start: the instrument registry cannot back settlement verification",
     )?;
+    // Linked agents refuse to start on a missing, stale or forked control log.
+    control::attach(&config, control::AttachOptions { purpose: control::Purpose::Agent, force, no_reject }).await?;
     if let Some(v) = version_info {
         info!("Starting Orderbook Cloud Agent (build: {})", v);
     } else {
@@ -691,6 +695,7 @@ pub async fn run_cloud_agent(
     // The runner's Ctrl-C handler signals it on first Ctrl-C; every loop with
     // a clone wakes immediately.
     let lp_shutdown = Shutdown::new();
+    control_survey::spawn_summary(lp_shutdown.clone());
 
     // Issuance forecast poller — keeps the process-global coefficient fresh for
     // the RFQ overload gates and the DvpProposal GC.
@@ -1220,11 +1225,12 @@ pub async fn setup_rfq_v2(
         expected_venues,
     ));
 
+    let quote_signer = agent_logic::signer::resolve_quote(quote_key, &config.private_key)?;
     let mut state = rfq_v2::RfqV2State::new(
         config.party_id.clone(),
         lp_config.name.clone(),
         config.synchronizer_id.clone(),
-        quote_key.clone(),
+        quote_signer,
         v2cfg.clone(),
         market_v2,
         market_instruments,
@@ -1484,6 +1490,7 @@ pub async fn run_fill(
     // handling — both observe the same signal; `tokio::signal::ctrl_c()` is
     // idempotent across multiple awaiters.)
     let fill_backend_shutdown = Shutdown::new();
+    control_survey::spawn_summary(fill_backend_shutdown.clone());
     let s = fill_backend_shutdown.clone();
     let ctrl_c = agent_logic::supervise::try_spawn("fill backend Ctrl-C", async move {
         match tokio::signal::ctrl_c().await {
@@ -2050,6 +2057,7 @@ pub async fn run_preapproval(
                             operator,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2189,6 +2197,7 @@ pub async fn run_preapproval(
                                     },
                                 )),
                                 request_signature: None,
+                                controller_command: None,
                             },
                             &expectation,
                             verbose,
@@ -2280,6 +2289,7 @@ pub async fn run_subscription(
                             },
                         )),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2323,6 +2333,7 @@ pub async fn run_subscription(
                             },
                         )),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2414,6 +2425,7 @@ pub async fn run_transfer(
                             amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2532,6 +2544,7 @@ pub async fn run_transfer(
                             max_input_holdings,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2569,6 +2582,7 @@ pub async fn run_transfer(
                             contract_id: contract_id.clone(),
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2620,6 +2634,7 @@ pub async fn run_transfer(
                             amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2802,6 +2817,7 @@ pub async fn run_transfer(
                             holding_cids: selected_amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -2851,6 +2867,7 @@ pub async fn run_transfer(
                             amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -3207,7 +3224,7 @@ fn struct_field_string(
 }
 
 /// Read a key=value from .env file, returning None if not found or file doesn't exist.
-/// Surrounding quotes are stripped, matching what `write_server_config_to_env` writes.
+/// Keys match as in `upsert_env_value` (trimmed, optionally exported); quotes are stripped.
 pub fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
     let content = std::fs::read_to_string(env_file).ok()?;
     for line in content.lines() {
@@ -3215,49 +3232,52 @@ pub fn read_env_value(env_file: &std::path::Path, key: &str) -> Option<String> {
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        if let Some(val) = line.strip_prefix(key) {
-            if let Some(val) = val.strip_prefix('=') {
-                let val = val.trim();
-                let val = val
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-                    .unwrap_or(val);
-                return Some(val.to_string());
-            }
-        }
+        let line = line.strip_prefix("export").filter(|rest| rest.starts_with([' ', '\t'])).map_or(line, str::trim_start);
+        let Some(val) = line.strip_prefix(key).and_then(|rest| rest.trim_start().strip_prefix('=')) else {
+            continue;
+        };
+        let val = val.trim();
+        let val = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(val);
+        return Some(val.to_string());
     }
     None
 }
 
-/// Write or update a key=value in the .env file
+/// Write or update a key=value in the .env file, atomically and durably; the first line
+/// setting `key` (also indented or exported) is replaced and later ones are dropped.
 pub fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> Result<()> {
-    let mut lines: Vec<String> = if env_file.exists() {
-        std::fs::read_to_string(env_file)
-            .context("Failed to read .env file")?
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        Vec::new()
+    let content = match std::fs::read_to_string(env_file) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).context("Failed to read .env file"),
     };
-
-    let prefix = format!("{}=", key);
-    let new_line = format!("{}={}", key, value);
+    let sets_key = |line: &str| {
+        let line = line.trim_start();
+        let line = line.strip_prefix("export").filter(|rest| rest.starts_with([' ', '\t'])).map_or(line, str::trim_start);
+        line.strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    let new_line = format!("{key}={value}");
+    let mut lines: Vec<String> = Vec::new();
     let mut found = false;
-    for line in &mut lines {
-        if line.starts_with(&prefix) {
-            *line = new_line.clone();
-            found = true;
-            break;
+    for line in content.lines() {
+        if sets_key(line) {
+            if !found {
+                lines.push(new_line.clone());
+                found = true;
+            }
+            continue;
         }
+        lines.push(line.to_string());
     }
     if !found {
         lines.push(new_line);
     }
-
-    std::fs::write(env_file, lines.join("\n") + "\n").context("Failed to write .env file")?;
-    Ok(())
+    agent_logic::control_store::write_atomic(env_file, (lines.join("\n") + "\n").as_bytes(), 0o600)
+        .context("Failed to write .env file")
 }
 
 /// Write all server config values from GetAgentConfigResponse to .env
@@ -3275,13 +3295,17 @@ pub fn write_server_config_to_env(
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim().trim_matches('"');
-            // Don't overwrite agent-specific keys
+            // Don't overwrite agent-specific keys; control settings are never server data
             if matches!(
                 key,
                 "PARTY_AGENT"
                     | "PARTY_AGENT_PRIVATE_KEY"
                     | "PARTY_AGENT_PUBLIC_KEY"
                     | "ORDERBOOK_GRPC_URL"
+                    | agent_logic::control_store::MARKER_ENV
+                    | agent_logic::control_store::CONTROL_DIR_ENV
+                    | "PARTY_FEE"
+                    | "PARTY_PREPAID_TRAFFIC"
             ) {
                 continue;
             }
@@ -3329,14 +3353,38 @@ pub async fn create_raw_channel(grpc_url: &str) -> Result<tonic::transport::Chan
         .await
 }
 
-/// Sign an onboarding RPC request using the agent's private key
-pub fn sign_onboarding_request(private_key_bytes: &[u8; 32], canonical: &[u8]) -> MessageSignature {
-    let sig_data = message_signing::sign_canonical(private_key_bytes, canonical);
-    MessageSignature {
+/// Sign an onboarding RPC request with the agent's key
+pub fn sign_onboarding_request(
+    signer: &agent_logic::signer::AgentSigner,
+    canonical: &[u8],
+) -> Result<MessageSignature> {
+    let sig_data = signer.sign_request(canonical)?;
+    Ok(MessageSignature {
         signature: sig_data.signature_b64,
         public_key: sig_data.public_key_b64url,
         signing_scheme: sig_data.signing_scheme,
-    }
+    })
+}
+
+/// Writes PARTY_AGENT, but only for a party whose namespace belongs to `public_key`.
+fn write_party_agent(env_file: &std::path::Path, party_id: &str, public_key: &[u8; 32]) -> Result<()> {
+    agent_logic::config::require_party_matches_key(party_id, public_key)
+        .context("refusing to record PARTY_AGENT")?;
+    upsert_env_value(env_file, "PARTY_AGENT", party_id)
+}
+
+/// Records the party the server reports for this key; `missing` is the error when it reports none.
+fn record_server_party(
+    env_file: &std::path::Path,
+    party_id: Option<String>,
+    public_key: &[u8; 32],
+    missing: &str,
+) -> Result<String> {
+    let party_id = party_id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{missing}"))?;
+    write_party_agent(env_file, &party_id, public_key)?;
+    Ok(party_id)
 }
 
 pub async fn run_onboard(
@@ -3351,18 +3399,25 @@ pub async fn run_onboard(
 ) -> Result<()> {
     println!("=== Cloud Agent Self-Service Onboarding ===\n");
 
+    // RegisterAgent gets only AGT-<invite>; a commitment links once the agent is onboarded.
+    let (register_code, link_commitment) = split_onboarding_invite(&invite_code)?;
+
     // Step 1: Handle keys
     let (_, effective_key) = prepare_onboard_key(&env_file, private_key.as_ref(), &rpc)?;
+    let signer = agent_logic::signer::AgentSigner::from_base58(&effective_key)?;
+    let agent_public_key = signer.public_key();
 
     // If --party provided, write it and skip waiting list entirely
     if let Some(ref party_id) = party {
-        upsert_env_value(&env_file, "PARTY_AGENT", party_id)?;
+        write_party_agent(&env_file, party_id, &agent_public_key)?;
         println!("PARTY_AGENT={} (from --party flag)", party_id);
     }
 
     // Check if already fully onboarded (either from --party or from .env)
     if let Some(party_id) = read_env_value(&env_file, "PARTY_AGENT") {
         if !party_id.is_empty() {
+            agent_logic::config::require_party_matches_key(&party_id, &agent_public_key)
+                .with_context(|| format!("PARTY_AGENT in {}", env_file.display()))?;
             // Still need server config — fetch it if not already in .env
             if read_env_value(&env_file, "SYNCHRONIZER_ID").is_none() {
                 println!("\nFetching server configuration...");
@@ -3379,15 +3434,19 @@ pub async fn run_onboard(
                 maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
             }
             println!("\nPARTY_AGENT={} — checking ledger onboarding...", party_id);
+            if link_commitment.is_some() {
+                println!(
+                    "The invite's link part applies only when this run registers the agent; to link, ask \
+                     the owner for a link code and run `cloud-agent control link --code LNK-<code>`."
+                );
+            }
             return complete_ledger_onboarding(&env_file, &rpc, Some(&party_id), Some(&effective_key))
                 .await;
         }
     }
 
-    // Need private key bytes and public key for the waiting list flow
-    let private_key_bytes = agent_logic::config::decode_private_key(&effective_key)?;
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key_bytes);
-    let public_key_b58 = bs58::encode(signing_key.verifying_key().as_bytes()).into_string();
+    // The public key for the waiting list flow
+    let public_key_b58 = bs58::encode(agent_public_key).into_string();
 
     // Step 2: Connect to RPC (raw channel, no JWT auth needed)
     println!("\nConnecting to {}...", rpc);
@@ -3410,13 +3469,20 @@ pub async fn run_onboard(
 
     // Step 4: Register on waiting list (idempotent)
     println!("\nRegistering agent on waiting list...");
-    let canonical = message_signing::canonical_register_agent(&public_key_b58, Some(&invite_code));
-    let sig = sign_onboarding_request(&private_key_bytes, &canonical);
+    let canonical = message_signing::canonical_register_agent(&public_key_b58, Some(&register_code));
+    let sig = sign_onboarding_request(&signer, &canonical)?;
+    let evidence = agent_logic::control_store::RegisterEvidence {
+        public_key_hex: hex::encode(agent_public_key),
+        invite_code: register_code.clone(),
+        canonical_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &canonical),
+        signature_b64: sig.signature.clone(),
+        recorded_at: agent_logic::clock::now_secs_i64(),
+    };
 
     let register_resp = client
         .register_agent(RegisterAgentRequest {
             public_key: public_key_b58.clone(),
-            invite_code: Some(invite_code),
+            invite_code: Some(register_code.clone()),
             email: Some(email.clone()),
             agent_name: Some(agent_name.clone()),
             request_signature: Some(sig),
@@ -3447,7 +3513,7 @@ pub async fn run_onboard(
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
 
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
-        let sig = sign_onboarding_request(&private_key_bytes, &canonical);
+        let sig = sign_onboarding_request(&signer, &canonical)?;
 
         let status_resp = client
             .get_onboarding_status(GetOnboardingStatusRequest {
@@ -3465,7 +3531,7 @@ pub async fn run_onboard(
     if current_status == ProtoOnboardingStatus::SignatureRequired as i32 {
         // Fetch the multihash
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
-        let sig = sign_onboarding_request(&private_key_bytes, &canonical);
+        let sig = sign_onboarding_request(&signer, &canonical)?;
 
         let status_resp = client
             .get_onboarding_status(GetOnboardingStatusRequest {
@@ -3484,14 +3550,14 @@ pub async fn run_onboard(
             })?;
 
         println!("\nSigning multihash...");
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key_bytes);
-        let multihash_signature = agent_logic::sign::sign_multihash(&signing_key, &multihash)?;
+        let multihash_bytes = agent_logic::sign::decode_multihash(&multihash)?;
+        let multihash_signature = signer.sign_onboarding_multihash(&multihash_bytes)?;
 
         let canonical = message_signing::canonical_submit_onboarding_signature(
             &public_key_b58,
             &multihash_signature,
         );
-        let sig = sign_onboarding_request(&private_key_bytes, &canonical);
+        let sig = sign_onboarding_request(&signer, &canonical)?;
 
         let submit_resp = client
             .submit_onboarding_signature(SubmitOnboardingSignatureRequest {
@@ -3522,7 +3588,7 @@ pub async fn run_onboard(
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
 
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
-        let sig = sign_onboarding_request(&private_key_bytes, &canonical);
+        let sig = sign_onboarding_request(&signer, &canonical)?;
 
         let status_resp = client
             .get_onboarding_status(GetOnboardingStatusRequest {
@@ -3538,14 +3604,13 @@ pub async fn run_onboard(
         if current_status == ProtoOnboardingStatus::TopologyCreated as i32
             || current_status == ProtoOnboardingStatus::Onboarded as i32
         {
-            let party_id = status_resp
-                .party_id
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Status is TOPOLOGY_CREATED but no party_id was provided")
-                })?;
             // Step 8: Write party_id to .env
-            upsert_env_value(&env_file, "PARTY_AGENT", &party_id)?;
+            let party_id = record_server_party(
+                &env_file,
+                status_resp.party_id,
+                &agent_public_key,
+                "Status is TOPOLOGY_CREATED but no party_id was provided",
+            )?;
             println!("\nTopology created! PARTY_AGENT={}", party_id);
             break;
         }
@@ -3554,7 +3619,7 @@ pub async fn run_onboard(
     // If we got here from a status that already had topology, fetch party_id
     if read_env_value(&env_file, "PARTY_AGENT").is_none() {
         let canonical = message_signing::canonical_get_onboarding_status(&public_key_b58);
-        let sig = sign_onboarding_request(&private_key_bytes, &canonical);
+        let sig = sign_onboarding_request(&signer, &canonical)?;
 
         let status_resp = client
             .get_onboarding_status(GetOnboardingStatusRequest {
@@ -3565,17 +3630,159 @@ pub async fn run_onboard(
             .context("GetOnboardingStatus RPC failed")?
             .into_inner();
 
-        let party_id = status_resp
-            .party_id
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Onboarding completed but no party_id was provided"))?;
-        upsert_env_value(&env_file, "PARTY_AGENT", &party_id)?;
+        let party_id = record_server_party(
+            &env_file,
+            status_resp.party_id,
+            &agent_public_key,
+            "Onboarding completed but no party_id was provided",
+        )?;
         println!("\nPARTY_AGENT={}", party_id);
     }
 
     // Steps 9-11: Complete ledger onboarding
     let party_id = read_env_value(&env_file, "PARTY_AGENT");
-    complete_ledger_onboarding(&env_file, &rpc, party_id.as_deref(), Some(&effective_key)).await
+    complete_ledger_onboarding(&env_file, &rpc, party_id.as_deref(), Some(&effective_key)).await?;
+    after_registration(&env_file, &rpc, &effective_key, &evidence, link_commitment).await
+}
+
+/// The code RegisterAgent gets and the link commitment of `AGT-<invite>-<commitment>`.
+/// Any other code is sent as given, as before.
+fn split_onboarding_invite(code: &str) -> Result<(String, Option<agent_control::Commitment>)> {
+    let code = code.trim();
+    match agent_control::split_invite_code(code) {
+        Ok((bare, Some(commitment))) => Ok((bare, Some(commitment))),
+        Ok((_, None)) => Ok((code.to_string(), None)),
+        Err(e) => {
+            let upper = code.to_ascii_uppercase();
+            if upper.strip_prefix("AGT-").is_some_and(|rest| rest.contains('-')) {
+                anyhow::bail!("the invite code's link part is not valid ({}): check the code", e.code_name());
+            }
+            Ok((code.to_string(), None))
+        }
+    }
+}
+
+/// The config the control link of a freshly onboarded agent runs with, from its env file.
+fn onboarding_control_config(
+    env_file: &std::path::Path,
+    rpc: &str,
+    key: &agent_logic::secret::Zeroizing<String>,
+    process: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<BaseConfig> {
+    let file_vars = env::FileVars::load_if_exists(env_file)?;
+    let get = |name: &str| {
+        file_vars
+            .get_with(name, process)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let party = get("PARTY_AGENT").ok_or_else(|| anyhow::anyhow!("PARTY_AGENT is not recorded"))?;
+    let node_name = get("NODE_NAME").ok_or_else(|| anyhow::anyhow!("NODE_NAME is not recorded"))?;
+    let ledger_key = get("LEDGER_SERVICE_PUBLIC_KEY")
+        .ok_or_else(|| anyhow::anyhow!("LEDGER_SERVICE_PUBLIC_KEY is not recorded"))?;
+    let mut config = BaseConfig::for_party(&party, key, rpc, "", "", "", &node_name, &ledger_key)?;
+    config.role = get("AGENT_ROLE").unwrap_or_else(|| "agent".to_string());
+    config.token_ttl_secs = 3600;
+    config.canton_chain = get(agent_logic::control_store::CHAIN_ENV);
+    Ok(config)
+}
+
+/// After a verified onboarding: keeps the RegisterAgent evidence and, for an invite
+/// with a commitment, links the invite's controllers (typed confirmation required).
+async fn after_registration(
+    env_file: &std::path::Path,
+    rpc: &str,
+    key: &agent_logic::secret::Zeroizing<String>,
+    evidence: &agent_logic::control_store::RegisterEvidence,
+    commitment: Option<agent_control::Commitment>,
+) -> Result<()> {
+    use agent_logic::control_store::{ChainNetwork, ControlEnv, ControlStore, MARKER_ENV};
+    let config = match onboarding_control_config(env_file, rpc, key, &|name| std::env::var_os(name)) {
+        Ok(config) => config,
+        Err(e) if commitment.is_none() => {
+            tracing::warn!("agent control: no registration evidence kept: {e:#}");
+            return Ok(());
+        }
+        Err(e) => return Err(e.context("the agent is onboarded, but the invite's link cannot run")),
+    };
+    let ChainNetwork::Mapped(network) = control::network_of(&config) else {
+        if commitment.is_some() {
+            println!(
+                "\nCANTON_CHAIN is not devnet or mainnet, so the invite's link to its owner was skipped."
+            );
+        }
+        return Ok(());
+    };
+    let party = agent_control::PartyId::parse(&config.party_id)
+        .map_err(|_| anyhow::anyhow!("PARTY_AGENT={} is not a party id control accepts", config.party_id))?;
+    let process = ControlEnv::from_process();
+    let env = ControlEnv {
+        chain: config.canton_chain.clone(),
+        marker: read_env_value(env_file, MARKER_ENV).or(process.marker.clone()),
+        party: Some(config.party_id.clone()),
+        ..process
+    };
+    let store = ControlStore::open(&env.base()?, network, &party);
+    store.write_evidence(evidence)?;
+    println!("Registration evidence kept in {}", store.dir().display());
+    let Some(commitment) = commitment else {
+        return Ok(());
+    };
+    let invite = evidence.invite_code.clone();
+    let link = async {
+        let ctx = control::ControlContext::open(config, &env, Some(env_file.to_path_buf())).await?;
+        let control_rpc = control::ControlRpc::connect(&ctx.config).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut out = std::io::stdout();
+        control::link::run_invite_link(&ctx, &control_rpc, &control::prompt::Terminal, &mut out, &invite, commitment)
+            .await
+    };
+    link.await
+        .map(|_| ())
+        .map_err(|e| e.context("the agent is onboarded, but linking it to its owner failed; see `cloud-agent control show`"))
+}
+
+#[cfg(test)]
+mod onboarding_invite_tests {
+    use super::*;
+
+    const INVITE: &str = "AGT-A4DQOBYHA4DQOBYHA4DQOBYHA4";
+    const WITH_COMMITMENT: &str = "AGT-A4DQOBYHA4DQOBYHA4DQOBYHA4-7PDLYHDL3UPMASYI2D7E4FRQJA";
+
+    #[test]
+    fn register_agent_gets_only_the_bare_invite() {
+        let (bare, commitment) = split_onboarding_invite(WITH_COMMITMENT).unwrap();
+        assert_eq!(bare, INVITE);
+        assert_eq!(agent_control::format_invite_code(&bare, &commitment.unwrap()).unwrap(), WITH_COMMITMENT);
+        let (bare, commitment) = split_onboarding_invite(&WITH_COMMITMENT.to_ascii_lowercase()).unwrap();
+        assert!(bare == INVITE && commitment.is_some());
+        for code in [INVITE, "AGT-x", "LEGACY-CODE"] {
+            assert_eq!(split_onboarding_invite(code).unwrap(), (code.to_string(), None), "{code}");
+        }
+        let err = split_onboarding_invite(&format!("{INVITE}-NOTBASE32")).unwrap_err();
+        assert!(err.to_string().contains("link part is not valid"), "{err}");
+    }
+
+    #[test]
+    fn the_onboarding_link_reads_the_env_file() {
+        let dir = std::env::temp_dir().join(format!("onboard-link-{}", agent_logic::clock::now_micros_i64()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join(".env");
+        let seed = [0x4d; 32];
+        let key = agent_logic::secret::Zeroizing::new(bs58::encode(seed).into_string());
+        let party = agent_logic::control_store::testing::party_for(seed, "agent-1").unwrap();
+        let ledger = bs58::encode([9u8; 32]).into_string();
+        std::fs::write(
+            &env_file,
+            format!("PARTY_AGENT={party}\nNODE_NAME=n1\nLEDGER_SERVICE_PUBLIC_KEY={ledger}\nCANTON_CHAIN=devnet\n"),
+        )
+        .unwrap();
+        let config = onboarding_control_config(&env_file, "http://127.0.0.1:1", &key, &|_| None).unwrap();
+        assert_eq!(config.party_id, party.to_string());
+        assert_eq!(config.canton_chain.as_deref(), Some("devnet"));
+        assert_eq!(config.orderbook_grpc_url, "http://127.0.0.1:1");
+        std::fs::write(&env_file, format!("PARTY_AGENT={party}\n")).unwrap();
+        assert!(onboarding_control_config(&env_file, "http://127.0.0.1:1", &key, &|_| None).is_err());
+    }
 }
 
 /// Onboarding Step 1: resolve the agent key from the supplied value, the env
@@ -3588,9 +3795,8 @@ fn prepare_onboard_key(
     use agent_logic::secret::Zeroizing;
     let env_value = |name: &str| read_env_value(env_file, name).filter(|v| !v.is_empty());
     let public_key_of = |b58: &str| -> Result<String> {
-        let bytes = agent_logic::config::decode_private_key(b58)?;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
-        Ok(bs58::encode(signing_key.verifying_key().as_bytes()).into_string())
+        let signer = agent_logic::signer::AgentSigner::from_base58(b58)?;
+        Ok(bs58::encode(signer.public_key()).into_string())
     };
 
     if let Some(pk_b58) = supplied {
@@ -3742,6 +3948,9 @@ pub async fn complete_ledger_onboarding(
     // run, apply from the next start.
     let process = |name: &str| std::env::var_os(name);
     let (cfg, file_vars) = onboard_env(env_file, &process, party_override, key_override)?;
+    let agent_public_key = agent_logic::signer::resolve(&cfg.private_key)?.public_key();
+    agent_logic::config::require_party_matches_key(&cfg.party_id, &agent_public_key)
+        .context("refusing to complete onboarding")?;
 
     println!(
         "\nCompleting ledger onboarding for party {}...",
@@ -3837,6 +4046,7 @@ pub async fn complete_ledger_onboarding(
                             operator: amulet_operator,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     false,
@@ -3907,6 +4117,7 @@ pub async fn complete_ledger_onboarding(
                             operator: t.operator.clone(),
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     false,
@@ -3948,6 +4159,7 @@ pub async fn complete_ledger_onboarding(
                         party_name: None,
                     })),
                     request_signature: None,
+                    controller_command: None,
                 },
                 &expectation,
                 false,
@@ -4253,6 +4465,7 @@ pub async fn run_user_service(
                             party_name,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -4414,16 +4627,16 @@ pub fn run_info_party_from_env(party_override: Option<&str>, key: Option<&str>) 
 
 /// `sign` with an explicit key: signing needs no party and no agent config.
 pub fn run_sign_standalone(command: SignCommands, private_key: &str) -> Result<()> {
-    let key = agent_logic::sign::resolve_signing_key(&[0u8; 32], Some(private_key))?;
+    let signer = agent_logic::sign::resolve_signer(None, Some(private_key))?;
     match command {
         SignCommands::Multihash { input, .. } => {
-            println!("{}", agent_logic::sign::sign_multihash(&key, &input)?)
+            println!("{}", agent_logic::sign::sign_multihash(&signer, &input)?)
         }
         SignCommands::Message { input, .. } => {
-            println!("{}", agent_logic::sign::sign_message(&key, &input))
+            println!("{}", agent_logic::sign::sign_message(&signer, &input)?)
         }
         SignCommands::Binary { input, .. } => {
-            println!("{}", agent_logic::sign::sign_binary(&key, &input)?)
+            println!("{}", agent_logic::sign::sign_binary(&signer, &input)?)
         }
     }
     Ok(())
@@ -4432,25 +4645,16 @@ pub fn run_sign_standalone(command: SignCommands, private_key: &str) -> Result<(
 pub fn run_sign(config: BaseConfig, command: SignCommands) -> Result<()> {
     match command {
         SignCommands::Multihash { input, private_key } => {
-            let key = agent_logic::sign::resolve_signing_key(
-                &*config.private_key.expose()?,
-                private_key.as_deref(),
-            )?;
-            println!("{}", agent_logic::sign::sign_multihash(&key, &input)?);
+            let signer = agent_logic::sign::resolve_signer(Some(&config.private_key), private_key.as_deref())?;
+            println!("{}", agent_logic::sign::sign_multihash(&signer, &input)?);
         }
         SignCommands::Message { input, private_key } => {
-            let key = agent_logic::sign::resolve_signing_key(
-                &*config.private_key.expose()?,
-                private_key.as_deref(),
-            )?;
-            println!("{}", agent_logic::sign::sign_message(&key, &input));
+            let signer = agent_logic::sign::resolve_signer(Some(&config.private_key), private_key.as_deref())?;
+            println!("{}", agent_logic::sign::sign_message(&signer, &input)?);
         }
         SignCommands::Binary { input, private_key } => {
-            let key = agent_logic::sign::resolve_signing_key(
-                &*config.private_key.expose()?,
-                private_key.as_deref(),
-            )?;
-            println!("{}", agent_logic::sign::sign_binary(&key, &input)?);
+            let signer = agent_logic::sign::resolve_signer(Some(&config.private_key), private_key.as_deref())?;
+            println!("{}", agent_logic::sign::sign_binary(&signer, &input)?);
         }
     }
     Ok(())
@@ -4647,6 +4851,7 @@ pub async fn run_lock(
                             amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -4711,6 +4916,7 @@ pub async fn run_lock(
                             },
                         )),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -4781,6 +4987,7 @@ pub async fn run_lock(
                             amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -4814,6 +5021,7 @@ pub async fn run_lock(
                             amulet_cids,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -5357,6 +5565,7 @@ pub async fn atomic_split_denominations(
                             amulet_cids: input_cids.clone(),
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -5402,6 +5611,7 @@ pub async fn atomic_split_denominations(
                             splits,
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     verbose,
@@ -5534,6 +5744,7 @@ pub async fn run_atomic(
                                 },
                             )),
                             request_signature: None,
+                            controller_command: None,
                         },
                         &expectation,
                         verbose,
@@ -5609,6 +5820,7 @@ pub async fn run_atomic(
                                 new_quote_public_key_spki_hex: kf.pub_spki_hex,
                             })),
                             request_signature: None,
+                            controller_command: None,
                         },
                         &expectation,
                         verbose,
@@ -5656,6 +5868,7 @@ pub async fn run_atomic(
                                 venue_cid: venue.contract_id,
                             })),
                             request_signature: None,
+                            controller_command: None,
                         },
                         &expectation,
                         verbose,
@@ -5695,6 +5908,7 @@ pub async fn run_atomic(
                                     ticket_ids,
                                 })),
                                 request_signature: None,
+                                controller_command: None,
                             },
                             &expectation,
                             verbose,
@@ -5735,6 +5949,7 @@ pub async fn run_atomic(
                                     ticket_cids,
                                 })),
                                 request_signature: None,
+                                controller_command: None,
                             },
                             &expectation,
                             verbose,
@@ -5998,6 +6213,7 @@ pub async fn atomic_setup_agent(
                                     },
                                 )),
                                 request_signature: None,
+                                controller_command: None,
                             },
                             &expectation,
                             verbose,
@@ -6093,6 +6309,7 @@ pub async fn atomic_setup_agent(
                                     ticket_ids,
                                 })),
                                 request_signature: None,
+                                controller_command: None,
                             },
                             &expectation,
                             verbose,
@@ -7011,6 +7228,68 @@ mod onboard_key_tests {
         let content = std::fs::read_to_string(&env).unwrap();
         assert_eq!(content.matches("PARTY_AGENT_PRIVATE_KEY=").count(), 1);
         assert!(content.contains(&format!("PARTY_AGENT_PUBLIC_KEY={pub1}")));
+    }
+
+    /// A party id in the namespace of the key `pub_b58`.
+    fn party_of(pub_b58: &str) -> String {
+        let key = agent_logic::config::decode_public_key(pub_b58).unwrap();
+        format!("agent::{}", agent_logic::config::key_namespace(&key))
+    }
+
+    // The party the server reports is recorded only when it belongs to the key
+    #[test]
+    fn onboarding_refuses_a_server_party_that_does_not_match_the_key() {
+        let (_, pub1) = keypair();
+        let (_, pub2) = keypair();
+        let key = agent_logic::config::decode_public_key(&pub1).unwrap();
+        let env = scratch_env(Some("ORDERBOOK_GRPC_URL=http://rpc\nPARTY_AGENT_PUBLIC_KEY=x\n"));
+        let before = std::fs::read(&env).unwrap();
+        for wrong in [party_of(&pub2), "agent::no-namespace".to_string()] {
+            let err = record_server_party(&env, Some(wrong), &key, "none").unwrap_err();
+            assert!(format!("{err:#}").contains("refusing to record PARTY_AGENT"), "{err:#}");
+            assert_eq!(std::fs::read(&env).unwrap(), before, ".env is unchanged");
+        }
+        let err = record_server_party(&env, Some(String::new()), &key, "no party_id was provided").unwrap_err();
+        assert_eq!(err.to_string(), "no party_id was provided");
+        assert_eq!(std::fs::read(&env).unwrap(), before);
+
+        let own = party_of(&pub1);
+        assert_eq!(record_server_party(&env, Some(own.clone()), &key, "none").unwrap(), own);
+        assert_eq!(read_env_value(&env, "PARTY_AGENT"), Some(own));
+    }
+
+    // The --party flag and a PARTY_AGENT already in .env are checked before the RPC is contacted
+    #[tokio::test]
+    async fn onboarding_checks_the_party_flag_and_the_env_party() {
+        let (k1, _) = keypair();
+        let (_, pub2) = keypair();
+        let rpc = "http://127.0.0.1:1".to_string();
+        let env = scratch_env(None);
+        let err = run_onboard(rpc.clone(), Some(party_of(&pub2)), Some(k1.clone()), "AGT-x".into(), "n".into(), "e".into(), env.clone(), 1)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to record PARTY_AGENT"), "{err:#}");
+        assert_eq!(read_env_value(&env, "PARTY_AGENT"), None);
+
+        let content = format!("PARTY_AGENT={}\nPARTY_AGENT_PRIVATE_KEY={}\n", party_of(&pub2), *k1);
+        let env = scratch_env(Some(&content));
+        let err = run_onboard(rpc, None, None, "AGT-x".into(), "n".into(), "e".into(), env.clone(), 1)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("does not belong to this key"), "{err:#}");
+        assert_eq!(read_env_value(&env, "PARTY_AGENT"), Some(party_of(&pub2)), "left as it was");
+    }
+
+    #[test]
+    fn onboarding_requests_are_signed_through_the_seam() {
+        let (k1, pub1) = keypair();
+        let signer = agent_logic::signer::AgentSigner::from_base58(&k1).unwrap();
+        assert_eq!(bs58::encode(signer.public_key()).into_string(), pub1);
+        let canonical = message_signing::canonical_get_onboarding_status(&pub1);
+        let sig = sign_onboarding_request(&signer, &canonical).unwrap();
+        let seed = agent_logic::config::decode_private_key(&k1).unwrap();
+        assert_eq!(sig.signature, message_signing::sign_canonical(&seed, &canonical).signature_b64);
+        assert!(sign_onboarding_request(&signer, b"msg_type=TxFeesAuthorization\nparty_id=p\n").is_err());
     }
 
     #[test]

@@ -4,55 +4,53 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use zeroize::Zeroize;
 
-use crate::config::decode_private_key;
+use crate::secret::Secret;
+use crate::signer::{AgentSigner, ONBOARDING_MULTIHASH_LEN};
 
-/// Resolve signing key: use override if provided, else config key bytes.
-pub fn resolve_signing_key(
-    config_key: &[u8; 32],
-    private_key_override: Option<&str>,
-) -> Result<SigningKey> {
-    match private_key_override {
-        Some(pk) => {
-            let bytes = decode_private_key(pk)?;
-            Ok(SigningKey::from_bytes(&bytes))
-        }
-        None => Ok(SigningKey::from_bytes(config_key)),
+/// The signer for the override key if one is given, else for the configured key.
+pub fn resolve_signer(config_key: Option<&Secret<32>>, private_key_override: Option<&str>) -> Result<AgentSigner> {
+    match (private_key_override, config_key) {
+        (Some(pk), _) => AgentSigner::from_base58(pk),
+        (None, Some(key)) => crate::signer::resolve(key),
+        (None, None) => Err(anyhow!("no signing key configured")),
     }
 }
 
-/// Sign a 34-byte Canton multihash (base64-encoded input). Returns base64 signature.
-pub fn sign_multihash(signing_key: &SigningKey, base64_input: &str) -> Result<String> {
+/// Decode a base64 Canton multihash, which must be 34 bytes.
+pub fn decode_multihash(base64_input: &str) -> Result<Vec<u8>> {
     let bytes = BASE64
         .decode(base64_input.trim())
         .context("Invalid base64 encoding")?;
     anyhow::ensure!(
-        bytes.len() == 34,
+        bytes.len() == ONBOARDING_MULTIHASH_LEN,
         "Multihash must be 34 bytes. Got {} bytes.",
         bytes.len()
     );
-    let signature = signing_key.sign(&bytes);
-    Ok(BASE64.encode(signature.to_bytes()))
+    Ok(bytes)
+}
+
+/// Sign a 34-byte Canton multihash (base64-encoded input). Returns base64 signature.
+pub fn sign_multihash(signer: &AgentSigner, base64_input: &str) -> Result<String> {
+    signer.sign_raw_cli(&decode_multihash(base64_input)?)
 }
 
 /// Sign a text message (UTF-8 bytes). Returns base64 signature.
-pub fn sign_message(signing_key: &SigningKey, message: &str) -> String {
-    let signature = signing_key.sign(message.as_bytes());
-    BASE64.encode(signature.to_bytes())
+pub fn sign_message(signer: &AgentSigner, message: &str) -> Result<String> {
+    signer.sign_raw_cli(message.as_bytes())
 }
 
 /// Sign binary data from hex string (with or without 0x prefix). Returns base64 signature.
-pub fn sign_binary(signing_key: &SigningKey, hex_input: &str) -> Result<String> {
+pub fn sign_binary(signer: &AgentSigner, hex_input: &str) -> Result<String> {
     let hex_str = hex_input
         .strip_prefix("0x")
         .or_else(|| hex_input.strip_prefix("0X"))
         .unwrap_or(hex_input);
     let bytes = hex::decode(hex_str).context("Invalid hex encoding")?;
-    let signature = signing_key.sign(&bytes);
-    Ok(BASE64.encode(signature.to_bytes()))
+    signer.sign_raw_cli(&bytes)
 }
 
 /// Generate a new Ed25519 keypair. Returns (private_key_base58, public_key_base58).
@@ -107,7 +105,28 @@ mod tests {
     }
 
     #[test]
+    fn the_sign_helpers_use_the_override_or_the_configured_key() {
+        use ed25519_dalek::Signer;
+        let seed = [11u8; 32];
+        let configured = Secret::seal(&mut { seed }).unwrap();
+        let expected = |msg: &[u8]| BASE64.encode(SigningKey::from_bytes(&seed).sign(msg).to_bytes());
+        let signer = resolve_signer(Some(&configured), None).unwrap();
+        assert_eq!(sign_message(&signer, "hi").unwrap(), expected(b"hi"));
+        assert_eq!(sign_binary(&signer, "0x0102").unwrap(), expected(&[1, 2]));
+        let multihash = BASE64.encode([0x12u8; 34]);
+        assert_eq!(sign_multihash(&signer, &multihash).unwrap(), expected(&[0x12u8; 34]));
+        let err = sign_multihash(&signer, &BASE64.encode([0x12u8; 33])).unwrap_err().to_string();
+        assert!(err.contains("Multihash must be 34 bytes. Got 33 bytes."), "{err}");
+
+        let other = bs58::encode([12u8; 32]).into_string();
+        let overridden = resolve_signer(Some(&configured), Some(&other)).unwrap();
+        assert_eq!(overridden.public_key(), SigningKey::from_bytes(&[12u8; 32]).verifying_key().to_bytes());
+        assert!(resolve_signer(None, None).is_err());
+    }
+
+    #[test]
     fn a_generated_keypair_round_trips() {
+        use crate::config::decode_private_key;
         let (private_b58, public_b58) = generate_keypair().unwrap();
         let seed = decode_private_key(&private_b58).unwrap();
         let derived = SigningKey::from_bytes(&seed).verifying_key();

@@ -302,6 +302,7 @@ pub async fn ensure_receiver_preapproval(
             operator,
         })),
         request_signature: None,
+        controller_command: None,
     };
     // The submit runs in its own task; past its wait the ledger state decides
     let mut submitter = client.clone();
@@ -843,6 +844,7 @@ impl AtomicSwapper {
         let req = PrepareAtomicTransactionRequest {
             params: Some(AtomicParams::AtomicDvpSettle(params)),
             request_signature: None,
+            controller_command: None,
         };
 
         if self.confirm && !self.dry_run {

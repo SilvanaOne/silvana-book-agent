@@ -3,13 +3,15 @@
 //! Generates self-describing Ed25519-signed JWT tokens for authenticating with the orderbook service.
 //! The public key is embedded in the JWT header's `jwk` field per RFC 8037.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use std::time::{SystemTime, UNIX_EPOCH};
+use ed25519_dalek::{SigningKey, Verifier, VerifyingKey};
+
+use crate::secret::Secret;
+use crate::signer::JwtRequest;
 
 /// Generate a self-describing JWT token signed with Ed25519 private key
 ///
@@ -45,59 +47,16 @@ pub fn generate_jwt_with_branch(
     node_name: Option<&str>,
     venue_branch: Option<&str>,
 ) -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("System time error")?
-        .as_secs();
-
-    // Minimal claims for external auth
-    let mut claims = serde_json::json!({
-        "sub": party_id,
-        "exp": now.saturating_add(ttl_secs),
-        "iat": now,
-        "role": role,
-    });
-    if let Some(obj) = claims.as_object_mut() {
-        if let Some(nn) = node_name {
-            obj.insert("node_name".to_string(), serde_json::Value::String(nn.to_string()));
-        }
-        if let Some(branch) = venue_branch.filter(|b| !b.is_empty()) {
-            obj.insert("venue_branch".to_string(), serde_json::Value::String(branch.to_string()));
-        }
-    }
-
-    let signing_key = SigningKey::from_bytes(private_key_bytes);
-    let public_key = signing_key.verifying_key();
-
-    // Create JWT header with embedded JWK (RFC 8037 format)
-    let header = serde_json::json!({
-        "typ": "JWT",
-        "alg": "EdDSA",
-        "jwk": {
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "x": URL_SAFE_NO_PAD.encode(public_key.as_bytes())
-        }
-    });
-
-    // Encode header and claims
-    let header_json = serde_json::to_string(&header).context("Failed to serialize header")?;
-    let claims_json = serde_json::to_string(&claims).context("Failed to serialize claims")?;
-
-    let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
-    let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
-
-    // Create signing input
-    let signing_input = format!("{}.{}", header_b64, claims_b64);
-
-    // Sign with Ed25519
-    let signature = signing_key.sign(signing_input.as_bytes());
-    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-    // Combine into JWT
-    let jwt = format!("{}.{}.{}", header_b64, claims_b64, signature_b64);
-
-    Ok(jwt)
+    // Signed through the signer seam, for callers that hold raw key bytes.
+    let mut seed = *private_key_bytes;
+    let key = Secret::seal(&mut seed)?;
+    crate::signer::resolve(&key)?.sign_jwt(&JwtRequest {
+        sub: party_id,
+        role,
+        ttl_secs,
+        node_name,
+        venue_branch,
+    })
 }
 
 /// Is `s` a valid swap-venue slug (`^[a-z0-9][a-z0-9-]{1,19}$`)?
@@ -165,8 +124,11 @@ pub fn extract_user_id_from_jwt(jwt: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Missing 'sub' claim in JWT"))
 }
 
-/// Sign order data with Ed25519, returning base64-encoded signature
-pub fn sign_order_data(private_key_bytes: &[u8; 32], signed_data: &[u8]) -> String {
+/// Sign order data with Ed25519, returning base64-encoded signature (tests only;
+/// orders are signed through the signer).
+#[cfg(test)]
+pub(crate) fn sign_order_data(private_key_bytes: &[u8; 32], signed_data: &[u8]) -> String {
+    use ed25519_dalek::Signer;
     let signing_key = SigningKey::from_bytes(private_key_bytes);
     let signature = signing_key.sign(signed_data);
     STANDARD.encode(signature.to_bytes())

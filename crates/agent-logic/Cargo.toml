@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 orderbook-proto = { path = "../orderbook-proto" }
 atomic-quote = { path = "../atomic-quote" }
+message-signing = { path = "../message-signing" }
+agent-control = { path = "../agent-control" }
 aes = { workspace = true } # direct dep only to enable aes/zeroize
 aes-gcm = { workspace = true }
 anyhow = { workspace = true }
@@ -33,6 +35,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 uuid = { version = "1", features = ["v7"] }
 zeroize = { workspace = true }
+
+[features]
+# Deterministic control logs for tests of dependent crates.
+testkit = []
 
 [dev-dependencies]
 prost = { workspace = true }

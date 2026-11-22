@@ -8,6 +8,7 @@ members = [
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
+    "crates/agent-control",
     "examples/buy_cc",
 ]
 default-members = [
@@ -18,6 +19,7 @@ default-members = [
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
+    "crates/agent-control",
 ]
 
 [workspace.package]

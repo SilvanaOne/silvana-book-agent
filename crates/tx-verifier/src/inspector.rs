@@ -94,14 +94,7 @@ fn template_matches(id: &Identifier, module_name: &str, entity_name: &str) -> bo
 
 /// Compare two numeric strings for equality (handles "1" vs "1.0000000000")
 fn numeric_eq(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    // Parse as f64 and compare
-    match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(fa), Ok(fb)) => (fa - fb).abs() < 1e-9,
-        _ => false,
-    }
+    crate::decimal::eq_exact(a, b)
 }
 
 // ============================================================================

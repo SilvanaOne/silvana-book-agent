@@ -23,6 +23,7 @@ use cloud_agent::{
     config,
     usdcx::{UsdcxCommands, UsdcxOptions},
 };
+use cloud_agent::control::{ControlCommands, ControllerCommands};
 
 // ============================================================================
 // CLI
@@ -206,6 +207,19 @@ enum Commands {
         #[arg(long = "fee-token")]
         fee_token: Vec<String>,
     },
+    /// Agent control: link controllers, change them, show the control log
+    Control {
+        /// Base directory of the control stores (default: ~/.silvana-agent)
+        #[arg(long, env = "SILVANA_CONTROL_DIR")]
+        control_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        command: ControlCommands,
+    },
+    /// A local Ed25519 controller key: generate it, sign documents with it (no config needed)
+    Controller {
+        #[command(subcommand)]
+        command: ControllerCommands,
+    },
     /// Generate a new Ed25519 private key (no config needed)
     GeneratePrivateKey,
     /// Self-service onboarding: generate keys, register, sign topology, complete ledger setup
@@ -374,6 +388,7 @@ struct Flags {
 enum Job {
     Onboard(Box<OnboardArgs>),
     NetworkInfo { grpc_url: String },
+    Controller(ControllerCommands),
     Command(Box<ConfiguredCommand>),
 }
 
@@ -396,6 +411,8 @@ struct ConfiguredCommand {
     quote_for_atomic: Option<Zeroizing<String>>,
     /// The Ethereum key typed for `usdcx deposit` (never stored).
     eth_key: Option<Zeroizing<String>>,
+    /// The env file in use, where the control marker is recorded.
+    env_file: Option<PathBuf>,
 }
 
 impl Job {
@@ -406,6 +423,7 @@ impl Job {
                 run_onboard(rpc, party, key, invite_code, agent_name, email, env_file, poll_interval).await
             }
             Job::NetworkInfo { grpc_url } => network_info_within(&grpc_url, NETWORK_INFO_BUDGET).await,
+            Job::Controller(command) => cloud_agent::control::run_controller(command).await,
             Job::Command(command) => run_configured(*command).await,
         }
     }
@@ -436,6 +454,9 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
     // Handle commands that don't need config first
     if let Commands::GeneratePrivateKey = &cli.command {
         return run_generate_private_key().map(|()| None);
+    }
+    if let Commands::Controller { command } = cli.command {
+        return Ok(Some(Job::Controller(command)));
     }
 
     if let Commands::Onboard { rpc, party, private_key, invite_code, agent_name, email, poll_interval } = cli.command {
@@ -515,6 +536,10 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
     }
 
     let overrides = resolve_key_overrides(top_party, top_key, top_quote)?;
+    let env_file = match &cli.env_file {
+        Some(path) => Some(path.clone()),
+        None => cloud_agent::env::find_dotenv()?,
+    };
 
     let base_config = if needs_agent_toml {
         if !cli.config.exists() {
@@ -553,6 +578,7 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
         flags,
         quote_for_atomic,
         eth_key,
+        env_file,
     }))))
 }
 
@@ -564,10 +590,16 @@ fn scrub_private_key_env() {
 }
 
 async fn run_configured(job: ConfiguredCommand) -> Result<()> {
-    let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic, eth_key } = job;
+    let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic, eth_key, env_file } = job;
 
     // Checks that need no network fail before any registry wait
     preflight(&base_config, &command)?;
+
+    // A linked agent refuses to run on a missing, stale or forked control log; control
+    // commands open the store themselves (restore must work while it is missing).
+    if let Some(opts) = attach_options(&command, flags) {
+        cloud_agent::control::attach(&base_config, opts).await?;
+    }
 
     // Instrument registry (CC → Amulet + DSO, USDC → registry, …) from orderbook-rpc;
     // `registry_need` decides whether a failure stops the command or is only logged.
@@ -581,7 +613,20 @@ async fn run_configured(job: ConfiguredCommand) -> Result<()> {
     // Idempotent; a no-op for commands that never report.
     agent_logic::error_reporter::init_from_config(&base_config);
 
-    dispatch(base_config, command, flags, quote_for_atomic, eth_key).await
+    dispatch(base_config, command, flags, quote_for_atomic, eth_key, env_file).await
+}
+
+/// How a configured command attaches to the control log; `None` for the control commands.
+fn attach_options(command: &Commands, flags: Flags) -> Option<cloud_agent::control::AttachOptions> {
+    use cloud_agent::control::{AttachOptions, Purpose};
+    match command {
+        Commands::Control { .. } => None,
+        Commands::Agent { no_reject, .. } => {
+            Some(AttachOptions { purpose: Purpose::Agent, force: flags.force, no_reject: *no_reject })
+        }
+        Commands::Sign { .. } => Some(AttachOptions { purpose: Purpose::Sign, force: flags.force, no_reject: false }),
+        _ => Some(AttachOptions { purpose: Purpose::Other, force: flags.force, no_reject: false }),
+    }
 }
 
 /// [`populate_instruments`] bounded by `budget`; an elapsed fetch leaves `config` as it was.
@@ -610,6 +655,8 @@ enum RegistryNeed {
     Required(Duration),
     /// One bounded attempt; an instrument it lacks fails where it is used.
     BestEffort,
+    /// No attempt: the command never reads the registry.
+    Skip,
 }
 
 /// Commands that settle trades or put registry admins on the ledger require the registry.
@@ -642,8 +689,11 @@ fn registry_need(command: &Commands) -> RegistryNeed {
         | Commands::Faucet { .. }
         | Commands::Lock { .. }
         | Commands::Usdcx { .. }
+        | Commands::Controller { .. }
         | Commands::GeneratePrivateKey
         | Commands::Onboard { .. } => RegistryNeed::BestEffort,
+        // `control show --offline` must make no connection
+        Commands::Control { .. } => RegistryNeed::Skip,
     }
 }
 
@@ -663,11 +713,15 @@ async fn load_registry(
     need: RegistryNeed,
     backoff: Backoff,
 ) -> Result<()> {
-    let RegistryNeed::Required(budget) = need else {
-        if let Err(e) = populate_instruments_within(config, INSTRUMENTS_BUDGET).await {
-            tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
+    let budget = match need {
+        RegistryNeed::Required(budget) => budget,
+        RegistryNeed::Skip => return Ok(()),
+        RegistryNeed::BestEffort => {
+            if let Err(e) = populate_instruments_within(config, INSTRUMENTS_BUDGET).await {
+                tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
+            }
+            return Ok(());
         }
-        return Ok(());
     };
     let base = config.clone();
     let loaded = retry_within(
@@ -758,6 +812,7 @@ async fn dispatch(
     flags: Flags,
     quote_for_atomic: Option<Zeroizing<String>>,
     eth_key: Option<Zeroizing<String>>,
+    env_file: Option<PathBuf>,
 ) -> Result<()> {
     let Flags { verbose, dry_run, force, confirm } = flags;
     match command {
@@ -789,7 +844,11 @@ async fn dispatch(
         Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token } => {
             run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token, verbose, dry_run, force, confirm).await
         }
-        Commands::GeneratePrivateKey | Commands::Onboard { .. } => {
+        Commands::Control { control_dir, command } => {
+            let options = cloud_agent::control::ControlOptions { control_dir, env_file };
+            cloud_agent::control::run_control(base_config, options, command).await
+        }
+        Commands::GeneratePrivateKey | Commands::Onboard { .. } | Commands::Controller { .. } => {
             bail!("internal: command dispatched before config load")
         }
     }
@@ -1444,9 +1503,10 @@ mod tests {
             private_key: None,
             poll_interval: 10,
         };
-        for command in [Commands::GeneratePrivateKey, onboard] {
+        let controller = Commands::Controller { command: ControllerCommands::Keygen { dir: PathBuf::from("k") } };
+        for command in [Commands::GeneratePrivateKey, onboard, controller] {
             let config = BaseConfig::test_minimal().unwrap();
-            let err = dispatch(config, command, Flags::default(), None, None).await.unwrap_err();
+            let err = dispatch(config, command, Flags::default(), None, None, None).await.unwrap_err();
             assert!(format!("{err:#}").contains("dispatched before config load"), "{err:#}");
         }
     }
@@ -1475,6 +1535,44 @@ mod tests {
     #[test]
     fn the_cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn control_commands_parse_and_force_never_takes_yes() {
+        let link = parse(&["control", "link", "--code", "LNK-ABC"]).unwrap();
+        assert!(matches!(link.command, Commands::Control { command: ControlCommands::Link { .. }, .. }));
+        assert!(parse(&["control", "remove", "Key 1", "--force", "--yes"]).is_err());
+        assert!(parse(&["control", "capabilities", "Key 1", "read", "--force", "--yes"]).is_err());
+        assert!(parse(&["control", "remove", "Key 1", "--force"]).is_ok());
+        assert!(parse(&["control", "add", "--ed25519", "00"]).is_err(), "--label and --capabilities are required");
+        assert!(parse(&["control", "add", "--code", "LNK-A", "--ed25519", "00", "--label", "x", "--capabilities", "read"]).is_err());
+        for args in [
+            vec!["control", "show", "--json", "--offline"],
+            vec!["control", "policy", "show", "--pending"],
+            vec!["control", "restore"],
+            vec!["control", "sync"],
+            vec!["control", "discard-pending"],
+            vec!["controller", "keygen", "--dir", "/tmp/k"],
+            vec!["controller", "sign", "--key", "k", "--payload", "abc", "--network", "devnet"],
+        ] {
+            assert!(parse(&args).is_ok(), "{args:?}");
+        }
+        assert!(parse(&["controller", "sign", "--key", "k", "--network", "devnet"]).is_err(), "a document is required");
+        let offline = parse(&["control", "show", "--offline"]).unwrap().command;
+        assert_eq!(registry_need(&offline), RegistryNeed::Skip, "no registry connection for control commands");
+    }
+
+    #[test]
+    fn configured_commands_attach_except_the_control_commands() {
+        use cloud_agent::control::Purpose;
+        let flags = Flags { force: true, ..Flags::default() };
+        let control = parse(&["control", "sync"]).unwrap().command;
+        assert!(attach_options(&control, flags).is_none());
+        let agent = parse(&["agent", "--no-reject"]).unwrap().command;
+        let opts = attach_options(&agent, flags).unwrap();
+        assert!(opts.purpose == Purpose::Agent && opts.no_reject && opts.force);
+        let info = parse(&["info", "balance"]).unwrap().command;
+        assert_eq!(attach_options(&info, Flags::default()).unwrap().purpose, Purpose::Other);
     }
 
     fn refused(args: &[&str]) -> bool {

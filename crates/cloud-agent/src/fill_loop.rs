@@ -158,13 +158,7 @@ fn direction_name(direction: FillDirection) -> &'static str {
 
 /// A fresh orderbook-rpc token; the loop can outlive any single one.
 fn rpc_token(config: &BaseConfig) -> Result<String> {
-    agent_logic::auth::generate_jwt(
-        &config.party_id,
-        &config.role,
-        &*config.private_key.expose()?,
-        config.token_ttl_secs,
-        Some(config.node_name.as_str()),
-    )
+    config.jwt()
 }
 
 /// Where the fill state is saved between runs.
@@ -1329,13 +1323,8 @@ async fn monitor_settlement_progress(
         warn!("[round {}] Could not connect RPC for progress monitoring {}", round, proposal_id);
         return;
     };
-    if let Ok(key) = config.private_key.expose() {
-        if let Ok(jwt) = agent_logic::auth::generate_jwt(
-            &config.party_id, &config.role, &key,
-            config.token_ttl_secs, Some(config.node_name.as_str()),
-        ) {
-            rpc.set_jwt(jwt);
-        }
+    if let Ok(jwt) = config.jwt() {
+        rpc.set_jwt(jwt);
     }
 
     let deadline = clock::deadline_after(Duration::from_secs(300));
