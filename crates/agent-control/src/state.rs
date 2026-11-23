@@ -1,6 +1,6 @@
 //! Replay of a verified log: owner, controllers with delayed changes, and the policy timeline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canon::time::UtcTime;
 use crate::canon::values::{Commitment, Hash32, Network, OwnerAccount, sha256};
@@ -19,8 +19,15 @@ use crate::policy::{
     DEFAULT_LINKED_RULES, POLICY_CLOCK_SKEW_SECS, PolicyDocument, Rules, expected_effective_at,
 };
 
-/// Delay before a controller change takes effect, except a withdrawal.
-pub const CONTROLLER_CHANGE_DELAY_SECS: u64 = 86_400;
+/// Delay before a controller change takes effect, except a withdrawal: exactly 1 h on devnet
+/// and 24 h on mainnet. The entry's own network decides it; nothing else can.
+pub const fn controller_change_delay_secs(network: Network) -> u64 {
+    match network {
+        Network::Devnet => 3_600,
+        Network::Mainnet => 86_400,
+    }
+}
+
 /// Most controllers one agent may have, in effect or pending.
 pub const MAX_AGENT_CONTROLLERS: usize = 32;
 
@@ -297,6 +304,8 @@ pub struct ControlState {
     last_created_at: Option<UtcTime>,
     owner_account: Option<OwnerAccount>,
     controllers: BTreeMap<ControllerId, ControllerRecord>,
+    /// Every controller a link or add recorded, including removed ones.
+    recorded: BTreeSet<ControllerId>,
     in_force: Option<AcceptedPolicy>,
     scheduled: Option<AcceptedPolicy>,
 }
@@ -312,6 +321,7 @@ impl ControlState {
             last_created_at: None,
             owner_account: None,
             controllers: BTreeMap::new(),
+            recorded: BTreeSet::new(),
             in_force: None,
             scheduled: None,
         }
@@ -353,6 +363,11 @@ impl ControlState {
     /// Records as of the last entry, ascending by id; ask each one about `now`.
     pub fn controllers(&self) -> impl Iterator<Item = &ControllerRecord> {
         self.controllers.values()
+    }
+
+    /// True when the log ever added `id`: in effect, pending or removed since.
+    pub fn is_recorded_controller(&self, id: &ControllerId) -> bool {
+        self.recorded.contains(id)
     }
 
     /// Controllers holding `capability` in effect at `now`.
@@ -478,6 +493,7 @@ pub(crate) fn is_withdrawal(record: &ControllerRecord, change: &ControllerChange
 
 /// When a change made at `at` takes effect: at once for a withdrawal, else after the delay.
 pub(crate) fn change_effective_at(
+    network: Network,
     record: &ControllerRecord,
     change: &ControllerChange,
     at: UtcTime,
@@ -485,7 +501,7 @@ pub(crate) fn change_effective_at(
     if is_withdrawal(record, change) {
         Some(at)
     } else {
-        add_secs(at, CONTROLLER_CHANGE_DELAY_SECS)
+        add_secs(at, controller_change_delay_secs(network))
     }
 }
 
@@ -605,7 +621,7 @@ fn refuse_agent_key(
 }
 
 fn delayed_effective_at(entry: &LogEntry) -> Result<UtcTime, ReplayErrorKind> {
-    let expected = add_secs(entry.created_at(), CONTROLLER_CHANGE_DELAY_SECS)
+    let expected = add_secs(entry.created_at(), controller_change_delay_secs(entry.network()))
         .ok_or(ReplayErrorKind::TimeOverflow)?;
     if entry.effective_at() != expected {
         return Err(ReplayErrorKind::EffectiveAtMismatch);
@@ -656,6 +672,7 @@ fn apply_link(
     let effective_at = delayed_effective_at(entry)?;
     state.owner_account = Some(body.owner_account);
     for controller in &body.controllers {
+        state.recorded.insert(*controller.id());
         state.controllers.insert(
             *controller.id(),
             ControllerRecord::pending_add(controller.clone(), entry.seq(), effective_at),
@@ -705,6 +722,7 @@ fn apply_add(
         None => {}
     }
     let effective_at = delayed_effective_at(entry)?;
+    state.recorded.insert(id);
     state.controllers.insert(
         id,
         ControllerRecord::pending_add(body.controller.clone(), entry.seq(), effective_at),
@@ -737,8 +755,8 @@ fn check_change(
         return Err(K::ForcedMismatch);
     }
     let withdrawal = is_withdrawal(record, change);
-    let expected =
-        change_effective_at(record, change, entry.created_at()).ok_or(K::TimeOverflow)?;
+    let expected = change_effective_at(entry.network(), record, change, entry.created_at())
+        .ok_or(K::TimeOverflow)?;
     if entry.effective_at() != expected {
         return Err(K::EffectiveAtMismatch);
     }
@@ -788,6 +806,8 @@ fn apply_set_capabilities(
     Ok(())
 }
 
+/// Scope controllers are checked when a policy is submitted and accepted (909), not here:
+/// a scope only restricts, so replay takes any well-formed controller id.
 fn apply_accept(
     state: &mut ControlState,
     entry: &LogEntry,
@@ -868,7 +888,7 @@ mod tests {
     use crate::error::{PolicyError, ProofError, SignatureError};
     use crate::log::verify_log;
     use crate::proof::ControllerProof;
-    use crate::testkit::{self, Chain, DAY, at};
+    use crate::testkit::{self, Chain, DAY, DEVNET_DELAY, MAINNET_DELAY, at};
     use ed25519_dalek::Signer;
 
     fn caps(list: &[Capability]) -> CapabilitySet {
@@ -900,7 +920,7 @@ mod tests {
         chain.push(&pending)
     }
 
-    /// Linked at T0, plus E81 holding policy from 2 days after T0.
+    /// Linked at T0, plus E81 added a day after T0, holding policy one delay later.
     fn with_ed25519_policy() -> Chain {
         let mut chain = Chain::linked();
         add_e81(&mut chain, caps(&[Policy]), at(DAY));
@@ -916,7 +936,7 @@ mod tests {
     ) -> SignedEntry {
         let state = &chain.state;
         let entry = LogEntry {
-            network: Network::Devnet,
+            network: state.network(),
             agent_party: testkit::agent_party(),
             agent_key: *state.agent_key(),
             seq: state.next_seq().unwrap(),
@@ -937,7 +957,7 @@ mod tests {
     ) -> Result<ControlState, ReplayError> {
         let mut entries = chain.entries.clone();
         entries.push(extra);
-        let log = verify_log(Network::Devnet, &testkit::agent_party(), &entries).unwrap();
+        let log = verify_log(chain.state.network(), &testkit::agent_party(), &entries).unwrap();
         replay(&log, docs)
     }
 
@@ -959,37 +979,38 @@ mod tests {
         let chain = Chain::linked();
         let state = &chain.state;
         assert_eq!(state.owner_account(), Some(OwnerAccount::new(42).unwrap()));
-        assert_eq!(chain.entries[0].effective_at(), at(DAY));
+        assert_eq!(chain.entries[0].effective_at(), at(DEVNET_DELAY));
         for capability in Capability::ALL {
-            assert!(state.holders(capability, at(DAY - 1)).is_empty());
+            assert!(state.holders(capability, at(DEVNET_DELAY - 1)).is_empty());
         }
-        assert_eq!(state.holders(Policy, at(DAY)), vec![&passkey()]);
-        assert_eq!(state.holders(Direct, at(DAY)), vec![&passkey()]);
-        assert_eq!(state.holders(Read, at(DAY)), vec![&e21()]);
-        assert_eq!(state.pending_changes(at(DAY - 1)).len(), 2);
-        assert!(state.pending_changes(at(DAY)).is_empty());
+        assert_eq!(state.holders(Policy, at(DEVNET_DELAY)), vec![&passkey()]);
+        assert_eq!(state.holders(Direct, at(DEVNET_DELAY)), vec![&passkey()]);
+        assert_eq!(state.holders(Read, at(DEVNET_DELAY)), vec![&e21()]);
+        assert_eq!(state.pending_changes(at(DEVNET_DELAY - 1)).len(), 2);
+        assert!(state.pending_changes(at(DEVNET_DELAY)).is_empty());
         assert!(
             !state
                 .controller(&passkey())
                 .unwrap()
-                .is_effective_at(at(DAY - 1))
+                .is_effective_at(at(DEVNET_DELAY - 1))
         );
         assert_eq!(chain.replayed(), chain.state);
         assert_eq!(state.rules_at(at(0)), EffectiveRules::Default);
     }
 
     #[test]
-    fn an_add_takes_effect_exactly_one_day_after_its_signature() {
+    fn an_add_takes_effect_exactly_one_delay_after_its_signature() {
         let mut chain = Chain::linked();
         let added = add_e81(&mut chain, caps(&[Policy]), at(2 * DAY));
-        assert_eq!(added.effective_at(), at(3 * DAY));
+        let effective = 2 * DAY + DEVNET_DELAY;
+        assert_eq!(added.effective_at(), at(effective));
         let state = &chain.state;
-        assert_eq!(state.holders(Policy, at(3 * DAY - 1)), vec![&passkey()]);
-        assert_eq!(state.holders(Policy, at(3 * DAY)).len(), 2);
+        assert_eq!(state.holders(Policy, at(effective - 1)), vec![&passkey()]);
+        assert_eq!(state.holders(Policy, at(effective)).len(), 2);
         let pending = state.pending_changes(at(2 * DAY));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, &e81());
-        assert_eq!(pending[0].1.effective_at, at(3 * DAY));
+        assert_eq!(pending[0].1.effective_at, at(effective));
         assert_eq!(chain.replayed(), chain.state);
     }
 
@@ -1001,27 +1022,28 @@ mod tests {
             .builder()
             .remove_controller(&passkey(), false, at(4 * DAY))
             .unwrap();
-        assert_eq!(pending.entry().effective_at(), at(5 * DAY));
+        let removed = 4 * DAY + DEVNET_DELAY;
+        assert_eq!(pending.entry().effective_at(), at(removed));
         chain.push(&pending);
         let state = &chain.state;
         let record = state.controller(&passkey()).unwrap();
         assert_eq!(record.final_capabilities(), None);
         assert_eq!(
-            record.capabilities_at(at(5 * DAY - 1)),
+            record.capabilities_at(at(removed - 1)),
             caps(&[Policy, Direct])
         );
-        assert!(record.capabilities_at(at(5 * DAY)).is_empty());
-        assert!(state.holders(Policy, at(5 * DAY - 1)).contains(&&passkey()));
-        assert!(!state.holders(Policy, at(5 * DAY)).contains(&&passkey()));
+        assert!(record.capabilities_at(at(removed)).is_empty());
+        assert!(state.holders(Policy, at(removed - 1)).contains(&&passkey()));
+        assert!(!state.holders(Policy, at(removed)).contains(&&passkey()));
         // Until then the passkey still signs policies.
-        let doc = testkit::policy_doc(state, 1, at(5 * DAY - 60), DEFAULT_LINKED_RULES);
-        chain.accept_passkey(&doc, at(5 * DAY - 30));
-        let late = testkit::policy_doc(&chain.state, 2, at(5 * DAY), DEFAULT_LINKED_RULES);
+        let doc = testkit::policy_doc(state, 1, at(removed - 60), DEFAULT_LINKED_RULES);
+        chain.accept_passkey(&doc, at(removed - 30));
+        let late = testkit::policy_doc(&chain.state, 2, at(removed), DEFAULT_LINKED_RULES);
         let bytes = late.encode().unwrap();
         let envelope = testkit::passkey_envelope(&bytes);
         let refused = chain
             .builder()
-            .accept_policy(&bytes, &envelope, at(5 * DAY))
+            .accept_policy(&bytes, &envelope, at(removed))
             .unwrap_err();
         assert_eq!(refused, BuildError::Policy(PolicyError::UnknownController));
         assert_eq!(chain.replayed(), chain.state);
@@ -1041,21 +1063,22 @@ mod tests {
         assert_eq!(chain.replayed(), chain.state);
         // The same id can be added again; the delay starts over.
         let again = add_e81(&mut chain, caps(&[Read]), at(2 * DAY + 200));
-        assert_eq!(again.effective_at(), at(3 * DAY + 200));
+        assert_eq!(again.effective_at(), at(2 * DAY + 200 + DEVNET_DELAY));
     }
 
     #[test]
     fn dropping_a_pending_capability_applies_at_once() {
         let mut chain = Chain::linked();
+        let d = DEVNET_DELAY;
         let grant = chain
             .builder()
             .set_capabilities(&e21(), caps(&[Policy, Read]), false, at(2 * DAY))
             .unwrap();
-        assert_eq!(grant.entry().effective_at(), at(3 * DAY));
+        assert_eq!(grant.entry().effective_at(), at(2 * DAY + d));
         chain.push(&grant);
         let record = chain.state.controller(&e21()).unwrap();
-        assert_eq!(record.capabilities_at(at(3 * DAY - 1)), caps(&[Read]));
-        assert_eq!(record.capabilities_at(at(3 * DAY)), caps(&[Policy, Read]));
+        assert_eq!(record.capabilities_at(at(2 * DAY + d - 1)), caps(&[Read]));
+        assert_eq!(record.capabilities_at(at(2 * DAY + d)), caps(&[Policy, Read]));
         let drop = chain
             .builder()
             .set_capabilities(&e21(), caps(&[Read]), false, at(2 * DAY + 10))
@@ -1075,19 +1098,19 @@ mod tests {
         assert_eq!(narrowed.entry().effective_at(), at(2 * DAY + 30));
         chain.push(&narrowed);
         let record = chain.state.controller(&e81()).unwrap();
-        assert_eq!(record.pending().unwrap().effective_at, at(3 * DAY + 20));
-        assert_eq!(record.capabilities_at(at(3 * DAY + 20)), caps(&[Read]));
+        assert_eq!(record.pending().unwrap().effective_at, at(2 * DAY + d + 20));
+        assert_eq!(record.capabilities_at(at(2 * DAY + d + 20)), caps(&[Read]));
         // Granting more is delayed again, and pushes the add back.
         let widened = chain
             .builder()
             .set_capabilities(&e81(), caps(&[Direct, Read]), false, at(2 * DAY + 40))
             .unwrap();
-        assert_eq!(widened.entry().effective_at(), at(3 * DAY + 40));
+        assert_eq!(widened.entry().effective_at(), at(2 * DAY + d + 40));
         chain.push(&widened);
         let record = chain.state.controller(&e81()).unwrap();
-        assert!(record.capabilities_at(at(3 * DAY + 39)).is_empty());
+        assert!(record.capabilities_at(at(2 * DAY + d + 39)).is_empty());
         assert_eq!(
-            record.capabilities_at(at(3 * DAY + 40)),
+            record.capabilities_at(at(2 * DAY + d + 40)),
             caps(&[Direct, Read])
         );
         assert_eq!(chain.replayed(), chain.state);
@@ -1096,24 +1119,25 @@ mod tests {
     #[test]
     fn a_capability_removal_is_delayed() {
         let mut chain = Chain::linked();
+        let effective = 2 * DAY + DEVNET_DELAY;
         let pending = chain
             .builder()
             .set_capabilities(&passkey(), caps(&[Policy]), true, at(2 * DAY))
             .unwrap();
-        assert_eq!(pending.entry().effective_at(), at(3 * DAY));
+        assert_eq!(pending.entry().effective_at(), at(effective));
         chain.push(&pending);
         let record = chain.state.controller(&passkey()).unwrap();
         assert_eq!(
-            record.capabilities_at(at(3 * DAY - 1)),
+            record.capabilities_at(at(effective - 1)),
             caps(&[Policy, Direct])
         );
-        assert_eq!(record.capabilities_at(at(3 * DAY)), caps(&[Policy]));
+        assert_eq!(record.capabilities_at(at(effective)), caps(&[Policy]));
         // Restoring what is still in effect is not a withdrawal of a pending grant.
         let restore = chain
             .builder()
             .set_capabilities(&passkey(), caps(&[Policy, Direct]), false, at(2 * DAY + 5))
             .unwrap();
-        assert_eq!(restore.entry().effective_at(), at(3 * DAY + 5));
+        assert_eq!(restore.entry().effective_at(), at(effective + 5));
     }
 
     #[test]
@@ -1125,7 +1149,7 @@ mod tests {
         );
         let bytes = fresh.encode().unwrap();
         let commitment = fresh.commitment().unwrap();
-        for when in [at(DAY / 2), at(2 * DAY)] {
+        for when in [at(DEVNET_DELAY / 2), at(2 * DAY)] {
             let refused = chain
                 .builder()
                 .link(&bytes, &commitment, &testkit::rp(), false, when);
@@ -1134,7 +1158,8 @@ mod tests {
                 ReplayErrorKind::LinkWhileControlled
             );
         }
-        // A forced full removal, then a re-link once it has taken effect: 48 h in all.
+        // A forced full removal, then a re-link once it has taken effect: two delays in all.
+        let removed = 2 * DAY + DEVNET_DELAY;
         let first = chain
             .builder()
             .remove_controller(&passkey(), true, at(2 * DAY))
@@ -1152,18 +1177,19 @@ mod tests {
         let early =
             chain
                 .builder()
-                .link(&bytes, &commitment, &testkit::rp(), false, at(3 * DAY - 1));
+                .link(&bytes, &commitment, &testkit::rp(), false, at(removed - 1));
         assert_eq!(
             replay_error(early.unwrap_err()),
             ReplayErrorKind::LinkWhileControlled
         );
         let relink = chain
             .builder()
-            .link(&bytes, &commitment, &testkit::rp(), false, at(3 * DAY))
+            .link(&bytes, &commitment, &testkit::rp(), false, at(removed))
             .unwrap();
-        assert_eq!(relink.entry().effective_at(), at(4 * DAY));
+        let relinked = removed + DEVNET_DELAY;
+        assert_eq!(relink.entry().effective_at(), at(relinked));
         chain.push(&relink);
-        assert_eq!(chain.state.holders(Policy, at(4 * DAY)), vec![&e81()]);
+        assert_eq!(chain.state.holders(Policy, at(relinked)), vec![&e81()]);
         assert_eq!(chain.replayed(), chain.state);
         // An invite descriptor is accepted only into an empty log.
         let invite = testkit::invite_descriptor();
@@ -1228,12 +1254,13 @@ mod tests {
     #[test]
     fn a_pending_controller_cannot_sign_a_policy() {
         let chain = Chain::linked();
-        let doc = testkit::policy_doc(&chain.state, 1, at(DAY / 2), DEFAULT_LINKED_RULES);
+        let pending = at(DEVNET_DELAY / 2);
+        let doc = testkit::policy_doc(&chain.state, 1, pending, DEFAULT_LINKED_RULES);
         let bytes = doc.encode().unwrap();
         let envelope = testkit::passkey_envelope(&bytes);
         let refused = chain
             .builder()
-            .accept_policy(&bytes, &envelope, at(DAY / 2))
+            .accept_policy(&bytes, &envelope, pending)
             .unwrap_err();
         assert_eq!(refused, BuildError::Policy(PolicyError::SignerLacksPolicy));
         // The same entry signed by hand is refused by replay.
@@ -1245,7 +1272,7 @@ mod tests {
             signed_by: passkey(),
             proof: envelope.proof().clone(),
         });
-        let forged = forge(&chain, at(DAY / 2), at(DAY / 2), body);
+        let forged = forge(&chain, pending, pending, body);
         let error = replay_with(&chain, forged, &docs).unwrap_err();
         assert_eq!(
             (error.seq, error.kind),
@@ -1474,7 +1501,7 @@ mod tests {
     fn replay_refusals() {
         let chain = Chain::linked();
         let now = at(2 * DAY);
-        let delayed = at(3 * DAY);
+        let delayed = at(2 * DAY + DEVNET_DELAY);
         let reader = testkit::ed25519_controller_from(0x81, caps(&[Read]));
         let add =
             |owner: u64, controller: ControllerDescriptor, descriptor: Option<DescriptorRef>| {
@@ -1520,7 +1547,13 @@ mod tests {
             (
                 "effective_at_mismatch",
                 now,
-                at(3 * DAY - 1),
+                at(2 * DAY + DEVNET_DELAY - 1),
+                add(42, reader.clone(), None),
+            ),
+            (
+                "effective_at_mismatch",
+                now,
+                at(2 * DAY + MAINNET_DELAY),
                 add(42, reader.clone(), None),
             ),
             (
@@ -1539,7 +1572,7 @@ mod tests {
             (
                 "descriptor_expired",
                 at(8 * DAY),
-                at(9 * DAY),
+                at(8 * DAY + DEVNET_DELAY),
                 add(42, passkey_add.controllers()[0].clone(), Some(passkey_ref)),
             ),
             (
@@ -1603,7 +1636,7 @@ mod tests {
             replay(&log, &empty.docs).unwrap_err().code_name(),
             "first_entry_not_link"
         );
-        let backdated = forge(&chain, at(-1), at(DAY - 1), add(42, reader, None));
+        let backdated = forge(&chain, at(-1), at(DEVNET_DELAY - 1), add(42, reader, None));
         let mut entries = chain.entries.clone();
         entries.push(backdated.clone());
         assert_eq!(
@@ -1637,7 +1670,7 @@ mod tests {
             commitment: invite.commitment().unwrap(),
             controllers: invite.controllers().to_vec(),
         });
-        let relink = forge(&chain, at(3 * DAY), at(4 * DAY), body);
+        let relink = forge(&chain, at(3 * DAY), at(3 * DAY + DEVNET_DELAY), body);
         assert_eq!(refusal(&chain, relink), "invite_not_first");
     }
 
@@ -1691,6 +1724,53 @@ mod tests {
                 .code_name(),
             "prev_mismatch"
         );
+    }
+
+    /// `entry` signed again with its effective time `delay` after its signature.
+    fn retimed(entry: &LogEntry, delay: i64) -> SignedEntry {
+        let mut entry = entry.clone();
+        entry.effective_at = entry.created_at().checked_add_secs(delay).unwrap();
+        let bytes = entry.encode().unwrap();
+        let signature = testkit::agent_key().sign(&bytes).to_bytes();
+        SignedEntry::from_parts(entry, bytes, signature)
+    }
+
+    #[test]
+    fn replay_recomputes_the_delay_of_the_entry_network_exactly() {
+        assert_eq!(controller_change_delay_secs(Network::Devnet), 3_600);
+        assert_eq!(controller_change_delay_secs(Network::Mainnet), 86_400);
+        let mismatch = Some("effective_at_mismatch");
+        let cases = [
+            (Network::Mainnet, DEVNET_DELAY, mismatch),
+            (Network::Mainnet, MAINNET_DELAY - 1, mismatch),
+            (Network::Mainnet, MAINNET_DELAY + 1, mismatch),
+            (Network::Mainnet, MAINNET_DELAY, None),
+            (Network::Devnet, MAINNET_DELAY, mismatch),
+            (Network::Devnet, DEVNET_DELAY + 1, mismatch),
+            (Network::Devnet, DEVNET_DELAY, None),
+        ];
+        for (network, delay, expected) in cases {
+            let chain = Chain::linked_on(network);
+            let link = retimed(chain.entries[0].entry(), delay);
+            let log = verify_log(network, &testkit::agent_party(), &[link]).unwrap();
+            let verdict = replay(&log, &PolicyDocuments::new()).err();
+            assert_eq!(verdict.map(|e| e.code_name()), expected, "link {network} {delay}");
+            // An add, and the removal of a controller in effect, carry the same delay.
+            let key = testkit::ed_key(0x81).verifying_key().to_bytes();
+            let add = chain
+                .builder()
+                .add_ed25519(key, label("Backup key"), caps(&[Read]), at(2 * DAY))
+                .unwrap();
+            let removal = chain
+                .builder()
+                .remove_controller(&e21(), true, at(2 * DAY))
+                .unwrap();
+            for (kind, pending) in [("add", add), ("removal", removal)] {
+                let entry = retimed(pending.entry(), delay);
+                let verdict = replay_with(&chain, entry, &chain.docs).err();
+                assert_eq!(verdict.map(|e| e.code_name()), expected, "{kind} {network} {delay}");
+            }
+        }
     }
 }
 

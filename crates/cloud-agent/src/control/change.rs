@@ -10,7 +10,7 @@ use agent_control::{
 use anyhow::{Result, anyhow, bail};
 
 use super::ControlContext;
-use super::link::build_refusal;
+use super::link::{build_refusal, delay_text, write_signed_times};
 use super::prompt::{Prompter, Yes, confirm_typed};
 use super::rpc::ControlRpc;
 use super::sync;
@@ -106,7 +106,8 @@ fn write_freeze_warning(out: &mut dyn Write, state: &ControlState, outcome: &Min
     }
     let _ = writeln!(
         out,
-        "A new controller takes 24 h to take effect, and a new link needs every controller removed first."
+        "A new controller takes {} to take effect, and a new link needs every controller removed first.",
+        delay_text(state.network())
     );
 }
 
@@ -163,7 +164,8 @@ pub async fn run_change(
     } else {
         let _ = writeln!(
             out,
-            "It takes effect at {effective_at} (24 h after the signature); until then the controller keeps what it holds."
+            "It takes effect at about {effective_at} ({} after the signature); until then the controller keeps what it holds.",
+            delay_text(ctx.network)
         );
     }
     let phrase = if forced {
@@ -182,5 +184,7 @@ pub async fn run_change(
     if entry.entry().body() != preview.entry().body() {
         bail!("the change differs from the one confirmed: run the command again");
     }
-    sync::sign_and_upload(ctx, rpc, lock, &entry, out).await
+    let head = sync::sign_and_upload(ctx, rpc, lock, &entry, out).await?;
+    write_signed_times(out, entry.entry());
+    Ok(head)
 }

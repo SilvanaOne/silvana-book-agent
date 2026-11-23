@@ -1,5 +1,6 @@
 //! Plain-language lines describing a rule set, for the CLI and the `--force` warning.
 
+use crate::policy::scopes::{CommandScope, ScopePair};
 use crate::policy::{Allowlist, Limits, PolicyInstrument, Rules, Unlisted};
 
 fn duration(secs: u64) -> String {
@@ -54,6 +55,56 @@ fn switch(enabled: bool) -> &'static str {
     if enabled { "allowed" } else { "disabled" }
 }
 
+fn pair(pair: &ScopePair) -> String {
+    format!(
+        "{} to {}, at least {} bought per unit sold, at most {} sold per command",
+        instrument(&pair.sell),
+        instrument(&pair.buy),
+        pair.min_price,
+        pair.max_sell
+    )
+}
+
+fn scope_lines(scope: &CommandScope) -> [String; 3] {
+    let fingerprint = scope.controller.fingerprint();
+    let commands = if scope.commands.is_empty() {
+        "none".to_owned()
+    } else {
+        let kinds: Vec<&str> = scope.commands.iter().map(|kind| kind.as_str()).collect();
+        kinds.join(", ")
+    };
+    let pairs = if scope.pairs.is_empty() {
+        "any pair, unbounded".to_owned()
+    } else {
+        scope.pairs.iter().map(pair).collect::<Vec<_>>().join("; ")
+    };
+    let lps = if scope.lps.is_empty() {
+        "any".to_owned()
+    } else {
+        scope
+            .lps
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    [
+        format!("Command scope {fingerprint}: {commands}."),
+        format!("Swap pairs {fingerprint}: {pairs}."),
+        format!("Swap LPs {fingerprint}: {lps}."),
+    ]
+}
+
+fn scopes(scopes: &[CommandScope]) -> Vec<String> {
+    if scopes.is_empty() {
+        let line = "Command scopes: none; every direct controller may send every command.";
+        return vec![line.to_owned()];
+    }
+    let mut lines: Vec<String> = scopes.iter().flat_map(scope_lines).collect();
+    lines.push("Direct controllers without a scope: every command.".to_owned());
+    lines
+}
+
 /// One line per rule, in a fixed order; the same rules always give the same lines.
 pub fn describe_rules(rules: &Rules) -> Vec<String> {
     let trading = &rules.trading;
@@ -65,7 +116,7 @@ pub fn describe_rules(rules: &Rules) -> Vec<String> {
     } else {
         "allowed without direction"
     };
-    vec![
+    let mut lines = vec![
         if rules.paused {
             "Paused: only maintenance, fee consents and unwinding run.".to_owned()
         } else {
@@ -88,8 +139,13 @@ pub fn describe_rules(rules: &Rules) -> Vec<String> {
             switch(trading.lp_enabled)
         ),
         format!(
-            "Trading markets: {}.",
-            allowlist(&trading.markets, |m| m.to_string())
+            "Trading markets: {}{}.",
+            allowlist(&trading.markets, |m| m.to_string()),
+            if trading.markets.any {
+                ""
+            } else {
+                "; with a list instead of any, every swap command is refused"
+            }
         ),
         format!(
             "Trading instruments: {}.",
@@ -119,13 +175,20 @@ pub fn describe_rules(rules: &Rules) -> Vec<String> {
             cap(rules.fees.cc_per_consent, "CC"),
             cap(rules.fees.cc_per_day, "CC")
         ),
-    ]
+        format!(
+            "Packages: {}.",
+            allowlist(&rules.packages, ToString::to_string)
+        ),
+    ];
+    lines.extend(scopes(&rules.scopes));
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canon::values::{Amount, InstrumentId, InstrumentRef, MarketId};
+    use crate::canon::values::{Amount, InstrumentId, InstrumentRef, MarketId, PackageId};
+    use crate::command::CommandKind;
     use crate::party::PartyId;
     use crate::policy::{DEFAULT_LINKED_RULES, LimitItem};
 
@@ -150,6 +213,72 @@ mod tests {
                 "Locks and venues: allowed; per lock: unlimited.",
                 "USDCx: allowed.",
                 "Fees: unlimited per consent; unlimited per day.",
+                "Packages: any.",
+                "Command scopes: none; every direct controller may send every command.",
+            ]
+        );
+    }
+
+    #[test]
+    fn packages_and_scopes_are_listed_in_full() {
+        let bank = PartyId::parse(&format!(
+            "Bank::{}",
+            crate::party::namespace_for_key(&[2; 32])
+        ))
+        .unwrap();
+        let lp = PartyId::parse(&format!(
+            "lp-1::{}",
+            crate::party::namespace_for_key(&[7; 32])
+        ))
+        .unwrap();
+        let usdc = PolicyInstrument::Token(InstrumentRef {
+            admin: bank.clone(),
+            id: InstrumentId::parse("USDCx").unwrap(),
+        });
+        let key = crate::controller::ControllerId([0xab; 32]);
+        let stopped = crate::controller::ControllerId([0xcd; 32]);
+        let mut rules = DEFAULT_LINKED_RULES;
+        rules.packages = Allowlist {
+            any: false,
+            items: vec![PackageId([1; 32]), PackageId([2; 32])],
+        };
+        rules.scopes = vec![
+            CommandScope {
+                controller: key,
+                commands: vec![CommandKind::Swap, CommandKind::TransferCc],
+                pairs: vec![ScopePair {
+                    sell: PolicyInstrument::Cc,
+                    buy: usdc,
+                    min_price: Amount::parse("0.15").unwrap(),
+                    max_sell: Amount::parse("1000").unwrap(),
+                }],
+                lps: vec![lp.clone()],
+            },
+            CommandScope {
+                controller: stopped,
+                commands: Vec::new(),
+                pairs: Vec::new(),
+                lps: Vec::new(),
+            },
+        ];
+        let lines = describe_rules(&rules);
+        assert_eq!(
+            lines[16],
+            format!("Packages: {}, {}.", "01".repeat(32), "02".repeat(32))
+        );
+        assert_eq!(
+            &lines[17..],
+            [
+                "Command scope ABAB ABAB ABAB ABAB ABAB: swap, transfer_cc.".to_owned(),
+                format!(
+                    "Swap pairs ABAB ABAB ABAB ABAB ABAB: cc (Canton Coin) to USDCx ({bank}), \
+                     at least 0.15 bought per unit sold, at most 1000 sold per command."
+                ),
+                format!("Swap LPs ABAB ABAB ABAB ABAB ABAB: {lp}."),
+                "Command scope CDCD CDCD CDCD CDCD CDCD: none.".to_owned(),
+                "Swap pairs CDCD CDCD CDCD CDCD CDCD: any pair, unbounded.".to_owned(),
+                "Swap LPs CDCD CDCD CDCD CDCD CDCD: any.".to_owned(),
+                "Direct controllers without a scope: every command.".to_owned(),
             ]
         );
     }
@@ -209,7 +338,10 @@ mod tests {
             "Maintenance: allowed; traffic purchases up to 25.5 CC per day."
         );
         assert_eq!(lines[3], "Trading: allowed; liquidity provision disabled.");
-        assert_eq!(lines[4], "Trading markets: CC/USDCx.");
+        assert_eq!(
+            lines[4],
+            "Trading markets: CC/USDCx; with a list instead of any, every swap command is refused."
+        );
         assert_eq!(lines[5], "Trading instruments: none.");
         assert_eq!(
             lines[6],

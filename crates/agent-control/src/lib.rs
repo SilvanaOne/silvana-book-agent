@@ -23,12 +23,16 @@
     warn(renamed_and_removed_lints)
 )]
 
+pub mod binding;
 pub mod builder;
 pub mod canon;
+pub mod challenge;
 pub mod command;
 pub mod controller;
 pub mod entry;
 pub mod error;
+#[cfg(any(feature = "facts", test))]
+pub mod facts_map;
 pub mod head;
 pub mod json;
 pub mod link;
@@ -47,19 +51,40 @@ pub(crate) mod testkit;
 #[cfg(test)]
 mod vectors;
 
+pub use binding::{
+    BindingError, RootExercise, canton_coin, check_command_id, check_directed_roots,
+};
 pub use builder::{BuildError, EntryBuilder, PendingEntry};
 pub use canon::codes::{format_invite_code, format_link_code, parse_link_code, split_invite_code};
-pub use command::{Command, CommandOp, VerifiedCommand, command_matches, verify_command};
+pub use challenge::{
+    CHALLENGE_CLOCK_SKEW_SECS, CheckedChallenge, ControllerChallenge, ExpectedChallenge,
+    MAX_CHALLENGE_BYTES, MAX_CHALLENGE_SECS, check_challenge, verify_challenge_proof,
+};
+pub use command::{
+    CANTON_COMMAND_PREFIX, Command, CommandKind, CommandOp, SwapRequest, VerifiedCommand,
+    check_swap_bounds, check_swap_lp, command_matches, swap_lp_allowed, swap_request_matches,
+    verify_command,
+};
+#[cfg(feature = "facts")]
+pub use facts_map::{
+    BindingRefusal, DirectedTx, authorize_directed_swap, authorize_directed_transfer,
+    settle_terms, swap_intent, transfer_intent,
+};
+/// The facts reader the binding takes; name its types through here to get the same crate.
+#[cfg(feature = "facts")]
+pub use tx_verifier;
 pub use head::HeadClaim;
 pub use read_session::{
     READ_REQUEST_WINDOW_MS, ReadRequest, ReadSessionRequest, SessionId, VerifiedReadSession,
     verify_read_request, verify_read_session,
 };
-pub use receipt::{CodeSource, Receipt, ReceiptOutcome, ReceiptSubject};
+pub use receipt::{
+    AnyReceipt, CodeSource, Receipt, ReceiptOutcome, ReceiptSubject, SwapReceipt, SwapResult,
+};
 pub use canon::time::UtcTime;
 pub use canon::values::{
     Amount, Commitment, EthAddress, Hash32, InstrumentId, InstrumentRef, Label, MarketId, Network,
-    Nonce16, Origin, OwnerAccount, RpId, Sig64, Text, Token, Uuid7,
+    Nonce16, Origin, OwnerAccount, PackageId, RpId, Sig64, Text, Token, Uuid7,
 };
 pub use controller::{
     BackupPolicy, Capability, CapabilitySet, ControllerDescriptor, ControllerId, ControllerKey,
@@ -67,9 +92,9 @@ pub use controller::{
 };
 pub use entry::{EntryBody, EntryKind, LogEntry, SignedEntry};
 pub use error::{
-    CanonError, CanonErrorKind, CodeError, CommandError, LinkError, LogError, LogErrorKind,
-    PolicyError, ProofError, ReadSessionError, ReplayError, ReplayErrorKind, SignatureError,
-    SignedDocError, ValueError, ValueKind, WebAuthnError,
+    CanonError, CanonErrorKind, ChallengeError, CodeError, CommandError, CommandFailure, LinkError,
+    LogError, LogErrorKind, PolicyError, ProofError, ReadSessionError, ReplayError,
+    ReplayErrorKind, SignatureError, SignedDocError, ValueError, ValueKind, WebAuthnError,
 };
 pub use link::{LinkDescriptor, LinkPurpose, RpPolicy, commitment_of, verify_link_descriptor};
 pub use log::{
@@ -77,12 +102,18 @@ pub use log::{
     compare_logs, decode_entries, verify_extension, verify_log,
 };
 pub use party::{PartyId, namespace_for_key, verify_party_key};
+pub use policy::eval::{
+    DirectedAuthorization, DirectedRefusal, Leg, SettleFee, SettleTerms, authorize_directed,
+};
+pub use policy::widening::required_delay_secs;
 pub use policy::{
-    Coverage, DEFAULT_LINKED_RULES, Decision, EvalContext, Flow, Intent, MAX_POLICY_BYTES,
+    CommandScope, Coverage, DEFAULT_LINKED_RULES, Decision, EvalContext, Flow, Intent,
+    MAX_PACKAGES, MAX_POLICY_BYTES, MAX_SCOPE_COMMANDS, MAX_SCOPE_LPS, MAX_SCOPE_PAIRS, MAX_SCOPES,
     OperationClass, OperationKind, PlatformParties, PolicyDocument, ReasonCode, Recipient, Rules,
-    UsageBucket, UsageDelta, UsageRecord, UsageTotals, VerifiedPolicy, Widening, class_is_limited,
-    describe_rules, evaluate, expected_effective_at, precheck, precheck_intent,
-    required_delay_secs, verify_policy_submission, widening,
+    ScopePair, UsageBucket, UsageDelta, UsageRecord, UsageTotals, VerifiedPolicy, Widening,
+    check_packages, class_is_limited, command_allowed, describe_rules, evaluate,
+    expected_effective_at, precheck, precheck_intent, scope_of, scopes_widen,
+    verify_policy_submission, widening,
 };
 pub use proof::{ControllerProof, ProofEnvelope, ProofOutcome, ProofType, verify_controller_proof};
 pub use sig::ed25519::{parse_ed25519_public_key, verify_ed25519_strict};
@@ -92,9 +123,9 @@ pub use sig::webauthn::{
 };
 pub use signable::{AgentSignable, SignablePurpose, sign_agent};
 pub use state::{
-    AcceptedPolicy, CONTROLLER_CHANGE_DELAY_SECS, ControlState, ControllerChange, ControllerRecord,
-    EffectiveRules, MAX_AGENT_CONTROLLERS, MinimumRuleOutcome, PendingChange, PendingTarget,
-    PolicyDocuments, force_confirmation_phrase, minimum_rule, replay,
+    AcceptedPolicy, ControlState, ControllerChange, ControllerRecord, EffectiveRules,
+    MAX_AGENT_CONTROLLERS, MinimumRuleOutcome, PendingChange, PendingTarget, PolicyDocuments,
+    controller_change_delay_secs, force_confirmation_phrase, minimum_rule, replay,
 };
 
 /// First-line scheme of a control log entry.
@@ -111,10 +142,14 @@ pub const SCHEME_READ_SESSION: &str = "silvana.agent.read-session.v1";
 pub const SCHEME_READ_REQUEST: &str = "silvana.agent.read-request.v1";
 /// First-line scheme of a receipt.
 pub const SCHEME_RECEIPT: &str = "silvana.agent.receipt.v1";
+/// First-line scheme of the receipt of an executed swap: v1 plus its result.
+pub const SCHEME_RECEIPT_V2: &str = "silvana.agent.receipt.v2";
 /// First-line scheme of a head claim.
 pub const SCHEME_HEAD: &str = "silvana.agent.control-head.v1";
 /// First-line scheme of a controller proof envelope.
 pub const SCHEME_PROOF: &str = "silvana.agent.proof.v1";
+/// First-line scheme of a controller sign-in challenge.
+pub const SCHEME_CONTROLLER_CHALLENGE: &str = "silvana.agent.controller-challenge.v1";
 /// Domain prefix hashed in front of a controller's type and key.
 pub const CONTROLLER_ID_DOMAIN: &str = "silvana.agent.controller-id.v1\n";
 

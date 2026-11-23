@@ -369,7 +369,7 @@ mod tests {
     use crate::entry::{EntryKind, LogEntry};
     use crate::policy::DEFAULT_LINKED_RULES;
     use crate::state::replay;
-    use crate::testkit::{self, Chain, DAY, at};
+    use crate::testkit::{self, Chain, DAY, DEVNET_DELAY, at};
     use ed25519_dalek::{Signer, SigningKey};
 
     fn party() -> PartyId {
@@ -410,11 +410,13 @@ mod tests {
             .set_capabilities(&testkit::ed25519_id(0x21), direct_read, false, at(DAY + 20))
             .unwrap();
         chain.push(&pending);
-        let doc = testkit::policy_doc(&chain.state, 1, at(2 * DAY + 10), DEFAULT_LINKED_RULES);
-        chain.accept_ed25519(0x81, &doc, at(2 * DAY + 10));
+        // E81 signs the policy as soon as its add takes effect.
+        let accepted = at(DAY + 10 + DEVNET_DELAY);
+        let doc = testkit::policy_doc(&chain.state, 1, accepted, DEFAULT_LINKED_RULES);
+        chain.accept_ed25519(0x81, &doc, accepted);
         let pending = chain
             .builder()
-            .remove_controller(&passkey_id, false, at(2 * DAY + 20))
+            .remove_controller(&passkey_id, false, at(DAY + 20 + DEVNET_DELAY))
             .unwrap();
         chain.push(&pending);
         chain
@@ -572,7 +574,7 @@ mod tests {
                 key,
                 Label::parse("Other key").unwrap(),
                 read_only(),
-                at(2 * DAY + 15),
+                at(DAY + 15 + DEVNET_DELAY),
             )
             .unwrap();
         let mut forked = chain.entries[..4].to_vec();

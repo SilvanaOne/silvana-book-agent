@@ -19,8 +19,9 @@ use orderbook_proto::{
     },
     pricing::{GetPriceRequest, GetPriceResponse, pricing_service_client::PricingServiceClient},
     rfqv2::{
-        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, RequestQuotesV2Request,
-        RequestQuotesV2Response, RfqConfirmRejectReason, rfq_v2_service_client::RfqV2ServiceClient,
+        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, AtomicLpInfo,
+        GetAtomicLiquidityProvidersRequest, RequestQuotesV2Request, RequestQuotesV2Response,
+        RfqConfirmRejectReason, rfq_v2_service_client::RfqV2ServiceClient,
     },
 };
 use std::future::Future;
@@ -591,6 +592,15 @@ impl OrderbookClient {
             })?;
 
         Ok(response.into_inner())
+    }
+
+    /// The RFQ V2 liquidity providers connected now: name, party and markets.
+    pub async fn get_atomic_liquidity_providers(&mut self) -> Result<Vec<AtomicLpInfo>> {
+        let request = Request::new(GetAtomicLiquidityProvidersRequest {});
+        let response = within(self.deadline, self.rfqv2_client.get_atomic_liquidity_providers(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_atomic_liquidity_providers failed: {}", e.message()))?;
+        Ok(response.into_inner().lps)
     }
 
     /// Get the party ID for this client

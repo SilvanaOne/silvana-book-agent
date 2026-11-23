@@ -603,6 +603,7 @@ pub async fn run_cloud_agent(
     force: bool,
     confirm: bool,
     version_info: Option<&str>,
+    env_file: Option<PathBuf>,
 ) -> Result<()> {
     if dry_run {
         anyhow::bail!(AGENT_DRY_RUN_REFUSAL);
@@ -614,7 +615,8 @@ pub async fn run_cloud_agent(
         "refusing to start: the instrument registry cannot back settlement verification",
     )?;
     // Linked agents refuse to start on a missing, stale or forked control log.
-    control::attach(&config, control::AttachOptions { purpose: control::Purpose::Agent, force, no_reject }).await?;
+    let control_guard =
+        control::attach(&config, control::AttachOptions { purpose: control::Purpose::Agent, force, no_reject }).await?;
     if let Some(v) = version_info {
         info!("Starting Orderbook Cloud Agent (build: {})", v);
     } else {
@@ -696,6 +698,15 @@ pub async fn run_cloud_agent(
     // a clone wakes immediately.
     let lp_shutdown = Shutdown::new();
     control_survey::spawn_summary(lp_shutdown.clone());
+    // Pending policies and direct commands of a linked agent, polled every 60 s.
+    control::poller::spawn(
+        &config,
+        control_guard,
+        env_file,
+        dry_run,
+        lp_shutdown.clone(),
+        Arc::new(control::commands::DaemonExecutor::default()),
+    );
 
     // Issuance forecast poller — keeps the process-global coefficient fresh for
     // the RFQ overload gates and the DvpProposal GC.
@@ -3280,12 +3291,24 @@ pub fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> R
         .context("Failed to write .env file")
 }
 
-/// Write all server config values from GetAgentConfigResponse to .env
+/// Write all server config values from GetAgentConfigResponse to .env; the platform parties
+/// are pinned only where the env sets none. Returns how the pins stand.
 pub fn write_server_config_to_env(
     env_file: &std::path::Path,
     rpc: &str,
     config_resp: &GetAgentConfigResponse,
-) -> Result<()> {
+) -> Result<Vec<(&'static str, control::pins::PinState)>> {
+    write_server_config_with(env_file, rpc, config_resp, &|name| std::env::var_os(name))
+}
+
+fn write_server_config_with(
+    env_file: &std::path::Path,
+    rpc: &str,
+    config_resp: &GetAgentConfigResponse,
+    process: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(&'static str, control::pins::PinState)>> {
+    // Checked before anything is written.
+    let pins = control::pins::template_pins(&config_resp.env)?;
     // Write all KEY=VALUE pairs from the server's .env.agent
     for line in config_resp.env.lines() {
         let line = line.trim();
@@ -3295,7 +3318,7 @@ pub fn write_server_config_to_env(
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim().trim_matches('"');
-            // Don't overwrite agent-specific keys; control settings are never server data
+            // Don't overwrite agent-specific keys; control settings are never server data, and the pins are written below
             if matches!(
                 key,
                 "PARTY_AGENT"
@@ -3314,7 +3337,14 @@ pub fn write_server_config_to_env(
     }
     // Always set the RPC URL from the --rpc flag
     upsert_env_value(env_file, "ORDERBOOK_GRPC_URL", rpc)?;
-    Ok(())
+    control::pins::pin_missing(env_file, &pins, process)
+}
+
+/// The onboarding summary's lines on the platform parties.
+fn print_pins(states: &[(&'static str, control::pins::PinState)]) {
+    let mut out = Vec::new();
+    control::pins::write_states(&mut out, states);
+    println!("Platform parties (pinned once, never replaced):\n{}", String::from_utf8_lossy(&out).trim_end());
 }
 
 /// Save agent.toml from server config if it doesn't already exist locally.
@@ -3387,17 +3417,121 @@ fn record_server_party(
     Ok(party_id)
 }
 
+/// The rpc of mainnet.
+pub const MAINNET_RPC_URL: &str = "https://orderbook-mainnet.silvana.dev:443";
+/// The rpc of devnet.
+pub const DEVNET_RPC_URL: &str = "https://orderbook-devnet.silvana.dev:443";
+/// The notice for `onboard --email`, which is kept for older commands.
+pub const EMAIL_IGNORED: &str =
+    "Note: --email is kept only for an invite code no account owns; otherwise the email comes from the account that owns the invite code.";
+
+/// The rpc of `network`; testnet has none yet.
+pub fn network_rpc_url(network: &str) -> Result<&'static str> {
+    match network {
+        "mainnet" => Ok(MAINNET_RPC_URL),
+        "devnet" => Ok(DEVNET_RPC_URL),
+        "testnet" => anyhow::bail!("testnet has no rpc yet"),
+        other => anyhow::bail!("unknown network {other:?}: give mainnet or devnet"),
+    }
+}
+
+/// Where `onboard` registers, and the network the rpc's agent config must name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnboardTarget {
+    pub rpc: String,
+    /// The `CANTON_CHAIN` expected from the rpc; `None` for an explicit `--rpc`.
+    pub network: Option<String>,
+}
+
+impl OnboardTarget {
+    /// `--network` (default mainnet) or the hidden `--rpc`; testnet is refused here,
+    /// before anything is written.
+    pub fn resolve(network: Option<&str>, rpc: Option<String>) -> Result<Self> {
+        match (network.map(str::trim), rpc) {
+            (Some(_), Some(_)) => anyhow::bail!("give --network or --rpc, not both"),
+            (None, Some(rpc)) => {
+                let rpc = rpc.trim().to_string();
+                anyhow::ensure!(!rpc.is_empty(), "--rpc needs a URL");
+                Ok(Self { rpc, network: None })
+            }
+            (network, None) => {
+                let network = network.unwrap_or("mainnet");
+                Ok(Self { rpc: network_rpc_url(network)?.to_string(), network: Some(network.to_string()) })
+            }
+        }
+    }
+}
+
+/// The `CANTON_CHAIN` an agent config template names, if it names one.
+fn template_chain(config_resp: &GetAgentConfigResponse) -> Option<String> {
+    config_resp.env.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == agent_logic::control_store::CHAIN_ENV)
+            .then(|| value.trim().trim_matches('"').trim().to_string())
+            .filter(|chain| !chain.is_empty())
+    })
+}
+
+/// Refuses an agent config template for another network than the chosen one, before
+/// any of it is written; returns the network the template names.
+fn check_template_network(target: &OnboardTarget, config_resp: &GetAgentConfigResponse) -> Result<Option<String>> {
+    let chain = template_chain(config_resp);
+    if let (Some(network), Some(chain)) = (&target.network, &chain) {
+        anyhow::ensure!(
+            chain.eq_ignore_ascii_case(network),
+            "refusing to onboard: the rpc at {} serves CANTON_CHAIN={chain}, not {network}; nothing from it was \
+             written. Check --network",
+            target.rpc
+        );
+    }
+    Ok(chain)
+}
+
+/// Fetches the agent config template and checks its network before anything of it is written.
+async fn fetch_agent_config(
+    client: &mut DAppProviderServiceClient<tonic::transport::Channel>,
+    target: &OnboardTarget,
+) -> Result<GetAgentConfigResponse> {
+    let config_resp = client
+        .get_agent_config(GetAgentConfigRequest {})
+        .await
+        .context("GetAgentConfig RPC failed")?
+        .into_inner();
+    match (check_template_network(target, &config_resp)?, &target.network) {
+        (Some(chain), _) => println!("Network: {chain}"),
+        (None, Some(network)) => println!(
+            "Warning: the agent config from {} names no CANTON_CHAIN, so it cannot be checked against {network}",
+            target.rpc
+        ),
+        (None, None) => println!("Warning: the agent config from {} names no CANTON_CHAIN", target.rpc),
+    }
+    Ok(config_resp)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_onboard(
-    rpc: String,
+    target: OnboardTarget,
     party: Option<String>,
     private_key: Option<agent_logic::secret::Zeroizing<String>>,
     invite_code: String,
     agent_name: String,
-    email: String,
+    email: Option<String>,
     env_file: PathBuf,
     poll_interval: u64,
 ) -> Result<()> {
     println!("=== Cloud Agent Self-Service Onboarding ===\n");
+    let rpc = target.rpc.clone();
+    // An env file of another network is never mixed with this one's settings.
+    let recorded = read_env_value(&env_file, agent_logic::control_store::CHAIN_ENV).filter(|c| !c.trim().is_empty());
+    if let (Some(network), Some(recorded)) = (&target.network, recorded) {
+        anyhow::ensure!(
+            recorded.trim().eq_ignore_ascii_case(network),
+            "refusing to onboard: {} records CANTON_CHAIN={}, not {network}; give --network {}",
+            env_file.display(),
+            recorded.trim(),
+            recorded.trim()
+        );
+    }
 
     // RegisterAgent gets only AGT-<invite>; a commitment links once the agent is onboarded.
     let (register_code, link_commitment) = split_onboarding_invite(&invite_code)?;
@@ -3424,13 +3558,10 @@ pub async fn run_onboard(
                 let channel = create_raw_channel(&rpc).await?;
                 let mut client = DAppProviderServiceClient::new(channel)
                     .max_decoding_message_size(16 * 1024 * 1024);
-                let config_resp = client
-                    .get_agent_config(GetAgentConfigRequest {})
-                    .await
-                    .context("GetAgentConfig RPC failed")?
-                    .into_inner();
-                write_server_config_to_env(&env_file, &rpc, &config_resp)?;
+                let config_resp = fetch_agent_config(&mut client, &target).await?;
+                let pins = write_server_config_to_env(&env_file, &rpc, &config_resp)?;
                 println!("Server config written to {}", env_file.display());
+                print_pins(&pins);
                 maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
             }
             println!("\nPARTY_AGENT={} — checking ledger onboarding...", party_id);
@@ -3457,14 +3588,11 @@ pub async fn run_onboard(
 
     // Step 3: Fetch server config
     println!("\nFetching server configuration...");
-    let config_resp = client
-        .get_agent_config(GetAgentConfigRequest {})
-        .await
-        .context("GetAgentConfig RPC failed")?
-        .into_inner();
+    let config_resp = fetch_agent_config(&mut client, &target).await?;
 
-    write_server_config_to_env(&env_file, &rpc, &config_resp)?;
+    let pins = write_server_config_to_env(&env_file, &rpc, &config_resp)?;
     println!("Server config written to {}", env_file.display());
+    print_pins(&pins);
     maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
 
     // Step 4: Register on waiting list (idempotent)
@@ -3483,7 +3611,8 @@ pub async fn run_onboard(
         .register_agent(RegisterAgentRequest {
             public_key: public_key_b58.clone(),
             invite_code: Some(register_code.clone()),
-            email: Some(email.clone()),
+            // Kept by the server only for an invite code no account owns.
+            email,
             agent_name: Some(agent_name.clone()),
             request_signature: Some(sig),
         })
@@ -6737,7 +6866,7 @@ mod daemon_tests {
         let mut config = BaseConfig::test_minimal().unwrap();
         config.orderbook_grpc_url = ledger.url.clone();
         let run = run_cloud_agent(
-            config, false, false, true, false, false, false, false, false, None,
+            config, false, false, true, false, false, false, false, false, None, None,
         );
         let err = tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -6765,7 +6894,7 @@ mod daemon_tests {
         let mut config = BaseConfig::test_minimal().unwrap();
         config.orderbook_grpc_url = ledger.url.clone();
         let run = run_cloud_agent(
-            config, false, false, true, false, false, true, false, false, None,
+            config, false, false, true, false, false, true, false, false, None, None,
         );
         let err = tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -7263,9 +7392,9 @@ mod onboard_key_tests {
     async fn onboarding_checks_the_party_flag_and_the_env_party() {
         let (k1, _) = keypair();
         let (_, pub2) = keypair();
-        let rpc = "http://127.0.0.1:1".to_string();
+        let rpc = OnboardTarget::resolve(None, Some("http://127.0.0.1:1".to_string())).unwrap();
         let env = scratch_env(None);
-        let err = run_onboard(rpc.clone(), Some(party_of(&pub2)), Some(k1.clone()), "AGT-x".into(), "n".into(), "e".into(), env.clone(), 1)
+        let err = run_onboard(rpc.clone(), Some(party_of(&pub2)), Some(k1.clone()), "AGT-x".into(), "n".into(), None, env.clone(), 1)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("refusing to record PARTY_AGENT"), "{err:#}");
@@ -7273,11 +7402,76 @@ mod onboard_key_tests {
 
         let content = format!("PARTY_AGENT={}\nPARTY_AGENT_PRIVATE_KEY={}\n", party_of(&pub2), *k1);
         let env = scratch_env(Some(&content));
-        let err = run_onboard(rpc, None, None, "AGT-x".into(), "n".into(), "e".into(), env.clone(), 1)
+        let err = run_onboard(rpc, None, None, "AGT-x".into(), "n".into(), None, env.clone(), 1)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("does not belong to this key"), "{err:#}");
         assert_eq!(read_env_value(&env, "PARTY_AGENT"), Some(party_of(&pub2)), "left as it was");
+    }
+
+    #[test]
+    fn onboarding_refuses_an_agent_config_for_another_network() {
+        let mainnet = OnboardTarget::resolve(None, None).unwrap();
+        assert_eq!(mainnet, OnboardTarget { rpc: MAINNET_RPC_URL.into(), network: Some("mainnet".into()) });
+        let devnet = OnboardTarget::resolve(Some("devnet"), None).unwrap();
+        assert_eq!(devnet.rpc, DEVNET_RPC_URL);
+        assert_eq!(OnboardTarget::resolve(Some("testnet"), None).unwrap_err().to_string(), "testnet has no rpc yet");
+        assert!(OnboardTarget::resolve(Some("local"), None).is_err());
+        let other = OnboardTarget::resolve(None, Some(" http://127.0.0.1:50051 ".into())).unwrap();
+        assert_eq!(other, OnboardTarget { rpc: "http://127.0.0.1:50051".into(), network: None });
+        assert!(OnboardTarget::resolve(None, Some(" ".into())).is_err());
+        assert!(OnboardTarget::resolve(Some("devnet"), Some("http://x".into())).is_err());
+
+        let template = |env: &str| GetAgentConfigResponse { env: env.into(), ..Default::default() };
+        let devnet_env = template("SYNCHRONIZER_ID=s\n# CANTON_CHAIN=mainnet\nCANTON_CHAIN=\"devnet\"\n");
+        assert_eq!(check_template_network(&devnet, &devnet_env).unwrap().as_deref(), Some("devnet"));
+        let err = check_template_network(&mainnet, &devnet_env).unwrap_err().to_string();
+        assert!(err.contains("serves CANTON_CHAIN=devnet, not mainnet"), "{err}");
+        // An explicit --rpc has no network to compare; a template that names none passes.
+        assert_eq!(check_template_network(&other, &devnet_env).unwrap().as_deref(), Some("devnet"));
+        assert_eq!(check_template_network(&mainnet, &template("CANTON_CHAIN=\nNODE_NAME=n\n")).unwrap(), None);
+    }
+
+    #[test]
+    fn onboarding_pins_the_platform_parties_once_and_never_replaces_a_local_one() {
+        use control::pins::PinState;
+        let party = |hint: &str, digit: &str| format!("{hint}::1220{}", digit.repeat(64));
+        let (fee, traffic, other) = (party("fee", "a"), party("traffic", "b"), party("other", "c"));
+        let template = |env: String| GetAgentConfigResponse { env, ..Default::default() };
+        let served = template(format!("SYNCHRONIZER_ID=s\nPARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\n"));
+        let env = scratch_env(Some("PARTY_AGENT=p::1220\n"));
+        let states = write_server_config_with(&env, "http://rpc", &served, &|_| None).unwrap();
+        assert_eq!(
+            states,
+            vec![("PARTY_FEE", PinState::Pinned(fee.clone())), ("PARTY_PREPAID_TRAFFIC", PinState::Pinned(traffic.clone()))]
+        );
+        assert_eq!(read_env_value(&env, "SYNCHRONIZER_ID").as_deref(), Some("s"));
+        // A later agent config naming another fee party never replaces the pin.
+        let moved = template(format!("PARTY_FEE={other}\n"));
+        let states = write_server_config_with(&env, "http://rpc", &moved, &|_| None).unwrap();
+        assert_eq!(states.first(), Some(&("PARTY_FEE", PinState::Kept { local: fee.clone(), offered: Some(other) })));
+        assert_eq!(read_env_value(&env, "PARTY_FEE"), Some(fee));
+        assert_eq!(read_env_value(&env, "PARTY_PREPAID_TRAFFIC"), Some(traffic), "never removed");
+        // A pin that is not a party id is refused before anything is written.
+        let fresh = scratch_env(Some("PARTY_AGENT=p::1220\n"));
+        let before = std::fs::read(&fresh).unwrap();
+        let bad = template("SYNCHRONIZER_ID=s\nPARTY_FEE=fee\n".into());
+        let err = write_server_config_with(&fresh, "http://rpc", &bad, &|_| None).unwrap_err().to_string();
+        assert!(err.contains("refusing to pin PARTY_FEE"), "{err}");
+        assert_eq!(std::fs::read(&fresh).unwrap(), before, "nothing written");
+    }
+
+    // The default moved to mainnet: a re-run in a devnet folder must not mix the two.
+    #[tokio::test]
+    async fn onboarding_refuses_an_env_file_of_another_network_before_anything() {
+        let (k1, pub1) = keypair();
+        let content = format!("CANTON_CHAIN=devnet\nPARTY_AGENT={}\nPARTY_AGENT_PRIVATE_KEY={}\n", party_of(&pub1), *k1);
+        let env = scratch_env(Some(&content));
+        let before = std::fs::read(&env).unwrap();
+        let mainnet = OnboardTarget { rpc: "http://127.0.0.1:1".into(), network: Some("mainnet".into()) };
+        let err = run_onboard(mainnet, None, None, "AGT-x".into(), "n".into(), None, env.clone(), 1).await.unwrap_err();
+        assert!(err.to_string().contains("records CANTON_CHAIN=devnet, not mainnet; give --network devnet"), "{err:#}");
+        assert_eq!(std::fs::read(&env).unwrap(), before, ".env is unchanged");
     }
 
     #[test]

@@ -9,13 +9,14 @@ use crate::controller::{ControllerDescriptor, ControllerKey};
 use crate::entry::{EntryBody, LogEntry, SignedEntry};
 use crate::head::HeadClaim;
 use crate::link::LinkDescriptor;
+use crate::policy::scopes::{CommandScope, ScopePair};
 use crate::policy::{Allowlist, Limits, PolicyDocument, PolicyInstrument, Rules};
 use crate::proof::{ControllerProof, ProofEnvelope};
 use crate::read_session::{ReadRequest, ReadSessionRequest};
-use crate::receipt::Receipt;
+use crate::receipt::{AnyReceipt, Receipt, SwapReceipt, SwapResult};
 use crate::{
     SCHEME_COMMAND, SCHEME_CONTROL, SCHEME_HEAD, SCHEME_LINK, SCHEME_POLICY, SCHEME_PROOF,
-    SCHEME_READ_REQUEST, SCHEME_READ_SESSION, SCHEME_RECEIPT,
+    SCHEME_READ_REQUEST, SCHEME_READ_SESSION, SCHEME_RECEIPT, SCHEME_RECEIPT_V2,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -384,6 +385,48 @@ pub struct FeesJson {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopePairJson {
+    pub sell: InstrumentJson,
+    pub buy: InstrumentJson,
+    pub min_price: String,
+    pub max_sell: String,
+}
+
+impl From<&ScopePair> for ScopePairJson {
+    fn from(p: &ScopePair) -> Self {
+        Self {
+            sell: (&p.sell).into(),
+            buy: (&p.buy).into(),
+            min_price: p.min_price.to_string(),
+            max_sell: p.max_sell.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeJson {
+    pub controller: String,
+    pub fingerprint: String,
+    pub commands: Vec<String>,
+    pub pairs: Vec<ScopePairJson>,
+    pub lps: Vec<String>,
+}
+
+impl From<&CommandScope> for ScopeJson {
+    fn from(s: &CommandScope) -> Self {
+        Self {
+            controller: s.controller.to_string(),
+            fingerprint: s.controller.fingerprint(),
+            commands: s.commands.iter().map(ToString::to_string).collect(),
+            pairs: s.pairs.iter().map(Into::into).collect(),
+            lps: s.lps.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RulesJson {
     pub paused: bool,
     pub delay: DelaysJson,
@@ -393,6 +436,8 @@ pub struct RulesJson {
     pub locks: LocksJson,
     pub usdcx: EnabledJson,
     pub fees: FeesJson,
+    pub packages: AllowlistJson<String>,
+    pub scopes: Vec<ScopeJson>,
 }
 
 fn amount_text(amount: Option<crate::canon::values::Amount>) -> Option<String> {
@@ -439,6 +484,8 @@ impl From<&Rules> for RulesJson {
                 cc_per_consent: amount_text(r.fees.cc_per_consent),
                 cc_per_day: amount_text(r.fees.cc_per_day),
             },
+            packages: allowlist(&r.packages, ToString::to_string),
+            scopes: r.scopes.iter().map(Into::into).collect(),
         }
     }
 }
@@ -497,6 +544,15 @@ pub enum CommandOpJson {
         amount: String,
         destination: String,
     },
+    Swap {
+        sell_instrument_admin: String,
+        sell_instrument_id: String,
+        sell_amount: String,
+        buy_instrument_admin: String,
+        buy_instrument_id: String,
+        min_receive: String,
+        max_fee_cc: String,
+    },
 }
 
 impl From<&CommandOp> for CommandOpJson {
@@ -531,6 +587,21 @@ impl From<&CommandOp> for CommandOpJson {
             } => Self::UsdcxBurn {
                 amount: amount.to_string(),
                 destination: destination.to_string(),
+            },
+            CommandOp::Swap {
+                sell,
+                sell_amount,
+                buy,
+                min_receive,
+                max_fee_cc,
+            } => Self::Swap {
+                sell_instrument_admin: sell.admin.to_string(),
+                sell_instrument_id: sell.id.to_string(),
+                sell_amount: sell_amount.to_string(),
+                buy_instrument_admin: buy.admin.to_string(),
+                buy_instrument_id: buy.id.to_string(),
+                min_receive: min_receive.to_string(),
+                max_fee_cc: max_fee_cc.to_string(),
             },
         }
     }
@@ -642,6 +713,31 @@ pub struct ReceiptJson {
     pub code_source: Option<String>,
     pub log_seq: String,
     pub issued_at: String,
+    /// Only in a v2 receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<SwapResultJson>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapResultJson {
+    pub quote_id: String,
+    pub lp: String,
+    pub sold: String,
+    pub received: String,
+    pub fee_cc: String,
+}
+
+impl From<&SwapResult> for SwapResultJson {
+    fn from(r: &SwapResult) -> Self {
+        Self {
+            quote_id: r.quote_id.to_string(),
+            lp: r.lp.to_string(),
+            sold: r.sold.to_string(),
+            received: r.received.to_string(),
+            fee_cc: r.fee_cc.to_string(),
+        }
+    }
 }
 
 impl From<&Receipt> for ReceiptJson {
@@ -660,6 +756,26 @@ impl From<&Receipt> for ReceiptJson {
             code_source: r.code_source.map(|source| source.as_str().to_owned()),
             log_seq: r.log_seq.to_string(),
             issued_at: r.issued_at.to_string(),
+            result: None,
+        }
+    }
+}
+
+impl From<&SwapReceipt> for ReceiptJson {
+    fn from(r: &SwapReceipt) -> Self {
+        Self {
+            scheme: SCHEME_RECEIPT_V2,
+            result: Some((&r.result).into()),
+            ..(&r.receipt).into()
+        }
+    }
+}
+
+impl From<&AnyReceipt> for ReceiptJson {
+    fn from(r: &AnyReceipt) -> Self {
+        match r {
+            AnyReceipt::V1(receipt) => receipt.into(),
+            AnyReceipt::V2(receipt) => receipt.into(),
         }
     }
 }
@@ -741,7 +857,7 @@ mod tests {
         );
         assert_eq!(
             entry["entryHash"],
-            "9b06b3e8612987e6b36a1946b8d149b3f99356d966f02a14c755ddea8d00635f"
+            "796dd4e8a44a32f21b395c99212cc5f9a5d2e3d37c1c6ff04ce7403ffa3e25f4"
         );
     }
 
@@ -758,6 +874,49 @@ mod tests {
         );
         assert_eq!(view["rules"]["fees"]["ccPerDay"], Value::Null);
         assert_eq!(view["notBefore"], Value::Null);
+        assert_eq!(view["rules"]["packages"], json!({"any": true, "items": []}));
+        assert_eq!(view["rules"]["scopes"], json!([]));
+        let mut scoped = doc.clone();
+        scoped.rules.packages = crate::policy::Allowlist {
+            any: false,
+            items: vec![crate::canon::values::PackageId([0x0f; 32])],
+        };
+        let controller = testkit::ed25519_id(0x21);
+        let lp = testkit::agent_party();
+        scoped.rules.scopes = vec![crate::policy::CommandScope {
+            controller,
+            commands: vec![crate::command::CommandKind::Swap],
+            pairs: vec![crate::policy::ScopePair {
+                sell: PolicyInstrument::Cc,
+                buy: PolicyInstrument::Token(crate::canon::values::InstrumentRef {
+                    admin: lp.clone(),
+                    id: crate::canon::values::InstrumentId::parse("USDCx").unwrap(),
+                }),
+                min_price: crate::canon::values::Amount::parse("0.15").unwrap(),
+                max_sell: crate::canon::values::Amount::parse("1000").unwrap(),
+            }],
+            lps: vec![lp.clone()],
+        }];
+        let rules = &value(&PolicyJson::from(&scoped))["rules"];
+        assert_eq!(
+            rules["packages"],
+            json!({"any": false, "items": ["0f".repeat(32)]})
+        );
+        assert_eq!(
+            rules["scopes"],
+            json!([{
+                "controller": controller.to_string(),
+                "fingerprint": controller.fingerprint(),
+                "commands": ["swap"],
+                "pairs": [{
+                    "sell": {"admin": "cc", "id": "cc"},
+                    "buy": {"admin": lp.to_string(), "id": "USDCx"},
+                    "minPrice": "0.15",
+                    "maxSell": "1000",
+                }],
+                "lps": [lp.to_string()],
+            }])
+        );
         let envelope = testkit::passkey_envelope(b"payload");
         let proof = value(&ProofEnvelopeJson::from(&envelope));
         assert_eq!(proof["proof"]["type"], "webauthn");
@@ -779,5 +938,83 @@ mod tests {
         let head = value(&HeadClaimJson::from(&claim));
         assert_eq!(head["seq"], "1");
         assert!(to_pretty_json(&head).unwrap().contains("\"agentParty\""));
+    }
+
+    #[test]
+    fn a_swap_and_its_receipt_have_flat_views() {
+        use crate::canon::values::{Amount, InstrumentId, InstrumentRef, Token};
+        use crate::receipt::{ReceiptOutcome, ReceiptSubject};
+        let agent = testkit::agent_party();
+        let token = |id: &str| InstrumentRef {
+            admin: agent.clone(),
+            id: InstrumentId::parse(id).unwrap(),
+        };
+        let amount = |s: &str| Amount::parse(s).unwrap();
+        let op = value(&CommandOpJson::from(&CommandOp::Swap {
+            sell: token("Amulet"),
+            sell_amount: amount("1000"),
+            buy: token("USDCx"),
+            min_receive: amount("150"),
+            max_fee_cc: Amount::ZERO,
+        }));
+        assert_eq!(
+            op,
+            json!({
+                "name": "swap",
+                "sellInstrumentAdmin": agent.to_string(),
+                "sellInstrumentId": "Amulet",
+                "sellAmount": "1000",
+                "buyInstrumentAdmin": agent.to_string(),
+                "buyInstrumentId": "USDCx",
+                "minReceive": "150",
+                "maxFeeCc": "0",
+            })
+        );
+        let receipt = Receipt {
+            network: crate::canon::values::Network::Devnet,
+            agent_party: agent.clone(),
+            agent_key: testkit::agent_key().verifying_key().to_bytes(),
+            subject: ReceiptSubject::Command(
+                crate::canon::values::Uuid7::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
+            ),
+            subject_hash: crate::canon::values::Hash32([3; 32]),
+            outcome: ReceiptOutcome::Executed,
+            update_id: Some(Token::parse("update-7").unwrap()),
+            reason_code: None,
+            code_source: None,
+            log_seq: 4,
+            issued_at: at(60),
+        };
+        let v1 = value(&ReceiptJson::from(&receipt));
+        assert_eq!(v1["scheme"], "silvana.agent.receipt.v1");
+        assert!(v1.get("result").is_none());
+        let swap = SwapReceipt {
+            receipt: receipt.clone(),
+            result: SwapResult {
+                quote_id: Token::parse("q-7").unwrap(),
+                lp: agent.clone(),
+                sold: amount("1000"),
+                received: amount("151"),
+                fee_cc: amount("1.5"),
+            },
+        };
+        let v2 = value(&ReceiptJson::from(&swap));
+        assert_eq!(v2["scheme"], "silvana.agent.receipt.v2");
+        assert_eq!(
+            v2["result"],
+            json!({
+                "quoteId": "q-7",
+                "lp": agent.to_string(),
+                "sold": "1000",
+                "received": "151",
+                "feeCc": "1.5",
+            })
+        );
+        let mut without = v2.clone();
+        without.as_object_mut().unwrap().remove("result");
+        without["scheme"] = json!("silvana.agent.receipt.v1");
+        assert_eq!(without, v1);
+        assert_eq!(value(&ReceiptJson::from(&AnyReceipt::V2(swap))), v2);
+        assert_eq!(value(&ReceiptJson::from(&AnyReceipt::V1(receipt))), v1);
     }
 }

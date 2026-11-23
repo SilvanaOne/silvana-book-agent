@@ -1,16 +1,19 @@
-//! Agent-signed receipts (`silvana.agent.receipt.v1`) for commands and policy refusals.
+//! Agent-signed receipts for commands and policy refusals: `silvana.agent.receipt.v1`,
+//! and `silvana.agent.receipt.v2` for an executed swap, which adds the swap's result.
 
-use crate::SCHEME_RECEIPT;
 use crate::canon::time::UtcTime;
-use crate::canon::values::{Hash32, Network, Token, Uuid7, parse_hex_array, parse_u64};
+use crate::canon::values::{Amount, Hash32, Network, Token, Uuid7, parse_hex_array, parse_u64};
 use crate::canon::{Reader, Writer, decode_exact};
 use crate::error::{CanonError, CanonErrorKind, SignedDocError, ValueError, ValueKind};
 use crate::party::{PartyId, verify_party_key};
 use crate::sig::ed25519::verify_ed25519_strict;
 use crate::signable::AgentSignable;
+use crate::{SCHEME_RECEIPT, SCHEME_RECEIPT_V2};
 
 /// Largest receipt, in bytes.
 pub const MAX_RECEIPT_BYTES: usize = 2048;
+/// Largest v2 receipt, in bytes.
+pub const MAX_RECEIPT_V2_BYTES: usize = 3072;
 
 /// What a receipt is about: a command by id, or a policy document by hash.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -119,13 +122,39 @@ fn parse_subject_kind(s: &str) -> Result<&'static str, ValueError> {
         .ok_or(ValueError(ValueKind::ReceiptSubject))
 }
 
-fn outcome_fits_subject(subject: &ReceiptSubject, outcome: ReceiptOutcome) -> bool {
-    !(matches!(subject, ReceiptSubject::Policy(_)) && outcome == ReceiptOutcome::Executed)
+/// A policy is never executed; a v2 receipt is only for an executed command.
+fn outcome_fits_subject(subject: &ReceiptSubject, outcome: ReceiptOutcome, v2: bool) -> bool {
+    match subject {
+        ReceiptSubject::Policy(_) => outcome != ReceiptOutcome::Executed && !v2,
+        ReceiptSubject::Command(_) => outcome == ReceiptOutcome::Executed || !v2,
+    }
+}
+
+/// Checks the party, the key binding and the agent's signature over `bytes`.
+fn check_signed(
+    receipt: &Receipt,
+    bytes: &[u8],
+    signature: &[u8; 64],
+    expected_party: &PartyId,
+) -> Result<(), SignedDocError> {
+    if receipt.agent_party != *expected_party {
+        return Err(SignedDocError::WrongParty);
+    }
+    if !verify_party_key(&receipt.agent_party, &receipt.agent_key) {
+        return Err(SignedDocError::KeyPartyMismatch);
+    }
+    verify_ed25519_strict(&receipt.agent_key, bytes, signature).map_err(SignedDocError::Signature)
 }
 
 impl Receipt {
     pub fn encode(&self) -> Result<Vec<u8>, CanonError> {
         let mut w = Writer::new(SCHEME_RECEIPT, MAX_RECEIPT_BYTES);
+        self.write_fields(&mut w, false);
+        w.finish()
+    }
+
+    /// Every line after the scheme; `v2` allows only an executed command.
+    fn write_fields(&self, w: &mut Writer, v2: bool) {
         w.line("network", self.network.as_str());
         w.line("agent_party", self.agent_party.as_str());
         w.line("agent_key", &hex::encode(self.agent_key));
@@ -133,7 +162,7 @@ impl Receipt {
         w.line("subject_id", &self.subject.id_string());
         w.line("subject_hash", &self.subject_hash.to_string());
         w.line("outcome", self.outcome.as_str());
-        if !outcome_fits_subject(&self.subject, self.outcome) {
+        if !outcome_fits_subject(&self.subject, self.outcome, v2) {
             w.fail(CanonErrorKind::OutcomeMismatch);
         }
         w.opt("update_id", self.update_id.as_ref().map(Token::as_str));
@@ -153,7 +182,6 @@ impl Receipt {
         }
         w.line("log_seq", &self.log_seq.to_string());
         w.line("issued_at", &self.issued_at.to_string());
-        w.finish()
     }
 
     /// Strict decoding: every rule, and the bytes must re-encode identically.
@@ -162,7 +190,7 @@ impl Receipt {
             bytes,
             SCHEME_RECEIPT,
             MAX_RECEIPT_BYTES,
-            Self::read,
+            |r| Self::read_fields(r, false),
             Self::encode,
         )
     }
@@ -179,18 +207,11 @@ impl Receipt {
         expected_party: &PartyId,
     ) -> Result<Self, SignedDocError> {
         let receipt = Self::decode(bytes).map_err(SignedDocError::Canon)?;
-        if receipt.agent_party != *expected_party {
-            return Err(SignedDocError::WrongParty);
-        }
-        if !verify_party_key(&receipt.agent_party, &receipt.agent_key) {
-            return Err(SignedDocError::KeyPartyMismatch);
-        }
-        verify_ed25519_strict(&receipt.agent_key, bytes, signature)
-            .map_err(SignedDocError::Signature)?;
+        check_signed(&receipt, bytes, signature, expected_party)?;
         Ok(receipt)
     }
 
-    fn read(r: &mut Reader<'_>) -> Result<Self, CanonError> {
+    fn read_fields(r: &mut Reader<'_>, v2: bool) -> Result<Self, CanonError> {
         let network = r.value("network", Network::parse)?;
         let agent_party = r.value("agent_party", PartyId::parse)?;
         let agent_key = r.value("agent_key", |s| {
@@ -202,7 +223,7 @@ impl Receipt {
         };
         let subject_hash = r.value("subject_hash", Hash32::parse)?;
         let outcome = r.value("outcome", ReceiptOutcome::parse)?;
-        if !outcome_fits_subject(&subject, outcome) {
+        if !outcome_fits_subject(&subject, outcome, v2) {
             return Err(r.err(CanonErrorKind::OutcomeMismatch));
         }
         let update_id = r.opt_value("update_id", Token::parse)?;
@@ -232,6 +253,163 @@ impl Receipt {
             log_seq,
             issued_at,
         })
+    }
+}
+
+/// What an executed swap settled.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SwapResult {
+    /// The RFQ quote the agent accepted.
+    pub quote_id: Token,
+    /// The LP that settled it.
+    pub lp: PartyId,
+    /// The amount of the sold instrument delivered.
+    pub sold: Amount,
+    /// The amount of the bought instrument received, before any CC fee.
+    pub received: Amount,
+    /// The CC fees paid in total.
+    pub fee_cc: Amount,
+}
+
+/// The v2 receipt of an executed swap: the v1 fields, then `result.*`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SwapReceipt {
+    /// Subject `command` and outcome `executed`; anything else is `outcome_mismatch`.
+    pub receipt: Receipt,
+    pub result: SwapResult,
+}
+
+fn positive_amount(s: &str) -> Result<Amount, ValueError> {
+    Amount::parse(s).and_then(|amount| {
+        if amount.is_zero() {
+            Err(ValueError(ValueKind::Amount))
+        } else {
+            Ok(amount)
+        }
+    })
+}
+
+impl SwapReceipt {
+    pub fn encode(&self) -> Result<Vec<u8>, CanonError> {
+        let mut w = Writer::new(SCHEME_RECEIPT_V2, MAX_RECEIPT_V2_BYTES);
+        self.receipt.write_fields(&mut w, true);
+        let result = &self.result;
+        w.line("result.quote_id", result.quote_id.as_str());
+        w.line("result.lp", result.lp.as_str());
+        for (key, amount) in [
+            ("result.sold", result.sold),
+            ("result.received", result.received),
+        ] {
+            w.line(key, &amount.to_string());
+            if amount.is_zero() {
+                w.fail(CanonErrorKind::InvalidValue(ValueKind::Amount));
+            }
+        }
+        w.line("result.fee_cc", &result.fee_cc.to_string());
+        w.finish()
+    }
+
+    /// Strict decoding: every rule, and the bytes must re-encode identically.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonError> {
+        decode_exact(
+            bytes,
+            SCHEME_RECEIPT_V2,
+            MAX_RECEIPT_V2_BYTES,
+            Self::read,
+            Self::encode,
+        )
+    }
+
+    /// The bytes the agent signs.
+    pub fn signable(&self) -> Result<AgentSignable, CanonError> {
+        self.encode().map(AgentSignable::receipt)
+    }
+
+    /// Decodes and checks the party, the key binding and the agent's signature.
+    pub fn verify(
+        bytes: &[u8],
+        signature: &[u8; 64],
+        expected_party: &PartyId,
+    ) -> Result<Self, SignedDocError> {
+        let receipt = Self::decode(bytes).map_err(SignedDocError::Canon)?;
+        check_signed(&receipt.receipt, bytes, signature, expected_party)?;
+        Ok(receipt)
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, CanonError> {
+        let receipt = Receipt::read_fields(r, true)?;
+        let result = SwapResult {
+            quote_id: r.value("result.quote_id", Token::parse)?,
+            lp: r.value("result.lp", PartyId::parse)?,
+            sold: r.value("result.sold", positive_amount)?,
+            received: r.value("result.received", positive_amount)?,
+            fee_cc: r.value("result.fee_cc", Amount::parse)?,
+        };
+        Ok(Self { receipt, result })
+    }
+}
+
+/// A receipt of either version, told apart by the scheme line.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AnyReceipt {
+    V1(Receipt),
+    V2(SwapReceipt),
+}
+
+impl AnyReceipt {
+    /// Decodes v2 when the scheme line says so, otherwise strictly as v1.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonError> {
+        if bytes.starts_with(format!("scheme={SCHEME_RECEIPT_V2}\n").as_bytes()) {
+            SwapReceipt::decode(bytes).map(Self::V2)
+        } else {
+            Receipt::decode(bytes).map(Self::V1)
+        }
+    }
+
+    /// Decodes either version and checks the party, the key binding and the signature.
+    pub fn verify(
+        bytes: &[u8],
+        signature: &[u8; 64],
+        expected_party: &PartyId,
+    ) -> Result<Self, SignedDocError> {
+        let receipt = Self::decode(bytes).map_err(SignedDocError::Canon)?;
+        check_signed(receipt.receipt(), bytes, signature, expected_party)?;
+        Ok(receipt)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, CanonError> {
+        match self {
+            Self::V1(receipt) => receipt.encode(),
+            Self::V2(receipt) => receipt.encode(),
+        }
+    }
+
+    /// The bytes the agent signs.
+    pub fn signable(&self) -> Result<AgentSignable, CanonError> {
+        self.encode().map(AgentSignable::receipt)
+    }
+
+    /// The fields both versions carry.
+    pub fn receipt(&self) -> &Receipt {
+        match self {
+            Self::V1(receipt) => receipt,
+            Self::V2(swap) => &swap.receipt,
+        }
+    }
+
+    /// The result of an executed swap; `None` for a v1 receipt.
+    pub fn swap_result(&self) -> Option<&SwapResult> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(swap) => Some(&swap.result),
+        }
+    }
+
+    pub fn scheme(&self) -> &'static str {
+        match self {
+            Self::V1(_) => SCHEME_RECEIPT,
+            Self::V2(_) => SCHEME_RECEIPT_V2,
+        }
     }
 }
 
@@ -389,5 +567,181 @@ mod tests {
         failed.reason_code = Some(17);
         failed.code_source = Some(CodeSource::Agent);
         assert_eq!(Receipt::decode(&failed.encode().unwrap()).unwrap(), failed);
+    }
+
+    fn lp() -> PartyId {
+        PartyId::parse(&format!(
+            "lp-1::{}",
+            crate::party::namespace_for_key(&[7; 32])
+        ))
+        .unwrap()
+    }
+
+    fn swapped() -> SwapReceipt {
+        SwapReceipt {
+            receipt: executed(),
+            result: SwapResult {
+                quote_id: Token::parse("q-01890a5d").unwrap(),
+                lp: lp(),
+                sold: Amount::parse("1000").unwrap(),
+                received: Amount::parse("151").unwrap(),
+                fee_cc: Amount::parse("1.5").unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_swap_receipt_is_v1_with_its_result_appended() {
+        let receipt = swapped();
+        let bytes = receipt.encode().unwrap();
+        let v1 = String::from_utf8(executed().encode().unwrap()).unwrap();
+        let expected = format!(
+            "{}result.quote_id=q-01890a5d\nresult.lp={}\nresult.sold=1000\n\
+             result.received=151\nresult.fee_cc=1.5\n",
+            v1.replacen("receipt.v1\n", "receipt.v2\n", 1),
+            lp()
+        );
+        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
+        assert!(bytes.len() <= MAX_RECEIPT_V2_BYTES);
+        assert_eq!(SwapReceipt::decode(&bytes).unwrap(), receipt);
+        assert_eq!(
+            Receipt::decode(&bytes).unwrap_err().code_name(),
+            "wrong_scheme"
+        );
+        assert_eq!(
+            SwapReceipt::decode(v1.as_bytes()).unwrap_err().code_name(),
+            "wrong_scheme"
+        );
+        let signable = receipt.signable().unwrap();
+        assert_eq!(signable.purpose(), SignablePurpose::Receipt);
+        assert_eq!(signable.bytes(), bytes.as_slice());
+        let signature = sign_agent(&testkit::agent_key(), &signable);
+        let party = testkit::agent_party();
+        assert_eq!(
+            SwapReceipt::verify(&bytes, &signature, &party).unwrap(),
+            receipt
+        );
+        let any = AnyReceipt::verify(&bytes, &signature, &party).unwrap();
+        assert_eq!(any, AnyReceipt::V2(receipt.clone()));
+        assert_eq!(any.receipt(), &receipt.receipt);
+        assert_eq!(any.swap_result(), Some(&receipt.result));
+        assert_eq!(any.scheme(), "silvana.agent.receipt.v2");
+        assert_eq!(any.encode().unwrap(), bytes);
+        assert_eq!(any.signable().unwrap(), signable);
+        let refusal = |bytes: &[u8], signature: &[u8; 64], party: &PartyId| {
+            AnyReceipt::verify(bytes, signature, party)
+                .unwrap_err()
+                .code_name()
+        };
+        assert_eq!(refusal(&bytes, &signature, &lp()), "wrong_party");
+        let mut forged = signature;
+        forged[9] ^= 1;
+        assert_eq!(refusal(&bytes, &forged, &party), "bad_signature");
+        // The v1 signature does not cover the v2 bytes, nor the reverse.
+        let v1_signature = sign_agent(&testkit::agent_key(), &executed().signable().unwrap());
+        assert_eq!(refusal(&bytes, &v1_signature, &party), "bad_signature");
+        assert_eq!(refusal(v1.as_bytes(), &signature, &party), "bad_signature");
+        let v1_any = AnyReceipt::verify(v1.as_bytes(), &v1_signature, &party).unwrap();
+        assert_eq!(v1_any, AnyReceipt::V1(executed()));
+        assert_eq!(v1_any.swap_result(), None);
+        assert_eq!(v1_any.scheme(), "silvana.agent.receipt.v1");
+        let mut other_key = receipt.clone();
+        other_key.receipt.agent_key = testkit::ed_key(0x21).verifying_key().to_bytes();
+        let signable = other_key.signable().unwrap();
+        let signature = sign_agent(&testkit::ed_key(0x21), &signable);
+        assert_eq!(
+            SwapReceipt::verify(signable.bytes(), &signature, &party)
+                .unwrap_err()
+                .code_name(),
+            "key_party_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_swap_receipt_is_only_for_an_executed_command() {
+        let mut not_executed = swapped();
+        not_executed.receipt = Receipt {
+            outcome: ReceiptOutcome::Failed,
+            update_id: None,
+            reason_code: Some(1401),
+            code_source: Some(CodeSource::Agent),
+            ..executed()
+        };
+        assert_eq!(
+            not_executed.encode().unwrap_err().code_name(),
+            "outcome_mismatch"
+        );
+        let mut for_policy = swapped();
+        for_policy.receipt = refused();
+        assert_eq!(
+            for_policy.encode().unwrap_err().code_name(),
+            "outcome_mismatch"
+        );
+        let text = String::from_utf8(swapped().encode().unwrap()).unwrap();
+        let quote_and_lp = format!("result.quote_id=q-01890a5d\nresult.lp={}\n", lp());
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "failed",
+                text.replacen(
+                    "outcome=executed\nupdate_id=1220abcd:update-7\nreason_code=\ncode_source=\n",
+                    "outcome=failed\nupdate_id=\nreason_code=1401\ncode_source=agent\n",
+                    1,
+                ),
+                "outcome_mismatch",
+            ),
+            (
+                "zero sold",
+                text.replacen("result.sold=1000", "result.sold=0", 1),
+                "invalid_amount",
+            ),
+            (
+                "zero received",
+                text.replacen("result.received=151", "result.received=0", 1),
+                "invalid_amount",
+            ),
+            (
+                "empty fee",
+                text.replacen("result.fee_cc=1.5", "result.fee_cc=", 1),
+                "empty_value",
+            ),
+            (
+                "bare lp",
+                text.replacen(&format!("result.lp={}", lp()), "result.lp=lp-1", 1),
+                "invalid_party",
+            ),
+            (
+                "quote id",
+                text.replacen("result.quote_id=q-01890a5d", "result.quote_id=q 1", 1),
+                "invalid_token",
+            ),
+            (
+                "no quote or lp",
+                text.replacen(&quote_and_lp, "", 1),
+                "unexpected_key",
+            ),
+            (
+                "result cut short",
+                text.replacen("result.fee_cc=1.5\n", "", 1),
+                "missing_line",
+            ),
+        ];
+        for (name, text, expected) in cases {
+            let err = SwapReceipt::decode(text.as_bytes()).unwrap_err();
+            assert_eq!(err.code_name(), expected, "{name}");
+            let any = AnyReceipt::decode(text.as_bytes()).unwrap_err();
+            assert_eq!(any.code_name(), expected, "{name}");
+        }
+        let feeless = text.replacen("result.fee_cc=1.5", "result.fee_cc=0", 1);
+        let decoded = SwapReceipt::decode(feeless.as_bytes()).unwrap();
+        assert!(decoded.result.fee_cc.is_zero());
+        let v1 = String::from_utf8(executed().encode().unwrap()).unwrap();
+        let with_result = format!("{v1}result.quote_id=q-01890a5d\n");
+        let err = Receipt::decode(with_result.as_bytes()).unwrap_err();
+        assert_eq!(err.code_name(), "trailing_line");
+        let v3 = text.replacen("receipt.v2", "receipt.v3", 1);
+        assert_eq!(
+            AnyReceipt::decode(v3.as_bytes()).unwrap_err().code_name(),
+            "wrong_scheme"
+        );
     }
 }

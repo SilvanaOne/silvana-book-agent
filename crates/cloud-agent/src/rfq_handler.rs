@@ -165,8 +165,8 @@ fn v1_fee_headroom_usd(notional_usd: Option<f64>) -> Option<Decimal> {
         .checked_mul(Decimal::from(4))
 }
 
-/// The requested base as an exact Decimal cut to 10 decimals toward zero, kept
-/// only when it agrees with `priced`, the f64 every check and the quote leg use.
+/// The requested size (base or quote) as an exact Decimal cut to 10 decimals toward
+/// zero, kept only when it agrees with `priced`, the f64 every check uses.
 fn exact_base_quantity(quantity_str: &str, priced: f64) -> Option<Decimal> {
     let s = quantity_str.trim();
     let parsed = match s.split_once(['e', 'E']) {
@@ -866,14 +866,13 @@ impl RfqHandler {
 
         // The exact v1 wire strings; the Decimals mirror them digit-for-digit.
         let price_str = format!("{price:.10}");
-        // A base-sized request signs its own digits; the f64 only prices it.
-        let exact_base = if requested_quote_quantity.is_none() {
-            exact_base_quantity(quantity_str, quantity)
-        } else {
-            None
+        // A sized request signs its own digits, base or quote; the f64 only prices it.
+        let (exact_base, exact_quote) = match requested_quote_quantity {
+            None => (exact_base_quantity(quantity_str, quantity), None),
+            Some(_) => (None, exact_base_quantity(quote_quantity_str, quote_quantity)),
         };
         let quantity_dec_str = exact_base.map_or_else(|| format!("{quantity:.10}"), render_10dp);
-        let quote_quantity_str = format!("{quote_quantity:.10}");
+        let quote_quantity_str = exact_quote.map_or_else(|| format!("{quote_quantity:.10}"), render_10dp);
         let (Ok(price_dec), Ok(quantity_dec), Ok(quote_quantity_dec)) = (
             Decimal::from_str(&price_str),
             Decimal::from_str(&quantity_dec_str),
@@ -2118,6 +2117,23 @@ mod price_rfq_tests {
             .await
             .expect("quote-sized request must quote");
         assert_eq!(priced.quantity_str, format!("{:.10}", 50.0 / MID));
+    }
+
+    // A quote-sized request signs the requested quote digits, not the f64's rendering of them
+    #[tokio::test]
+    async fn a_quote_sized_request_signs_its_own_quote_digits() {
+        let h = handler_at(MID, "1000000000000");
+        for dir in [1, 2] {
+            for req in ["12345678.1234567891", "50", "1234.5678901234", "99.99"] {
+                let priced = h
+                    .price_rfq("t", "EDELx-USDC", dir, "", req, false, None, None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{req} must quote: {:?}", e.reason_detail));
+                assert_eq!(priced.quote_quantity, dec(req), "{req} dir {dir}");
+                assert_eq!(priced.quote_quantity_str, render_10dp(dec(req)), "{req} dir {dir}");
+            }
+        }
+        assert_ne!(format!("{:.10}", f("12345678.1234567891")), "12345678.1234567891");
     }
 
     #[test]

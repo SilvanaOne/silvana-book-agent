@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use agent_control::{
-    AgentSignable, ControlState, HeadClaim, HeadRef, Network, PartyId, Receipt, SCHEME_CONTROL,
-    SCHEME_HEAD, SCHEME_RECEIPT, SignablePurpose, VerifiedLog, replay,
+    AgentSignable, AnyReceipt, ControlState, HeadClaim, HeadRef, Network, PartyId, SCHEME_CONTROL,
+    SCHEME_HEAD, SCHEME_RECEIPT, SCHEME_RECEIPT_V2, SignablePurpose, VerifiedLog, replay,
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine;
@@ -324,15 +324,20 @@ impl ControlGuard {
         }
     }
 
-    /// A receipt of this linked agent, for its own party, network and key.
+    /// A receipt of this linked agent, for its own party, network and key: v1, or v2,
+    /// which only an executed command (a swap) carries.
     fn check_receipt(&self, signable: &AgentSignable) -> Result<()> {
+        let bytes = signable.bytes();
         ensure!(
             signable.purpose() == SignablePurpose::Receipt
-                && signable.bytes().starts_with(format!("scheme={SCHEME_RECEIPT}\n").as_bytes()),
+                && [SCHEME_RECEIPT, SCHEME_RECEIPT_V2]
+                    .iter()
+                    .any(|scheme| bytes.starts_with(format!("scheme={scheme}\n").as_bytes())),
             "signing refused: not a receipt"
         );
-        let receipt =
-            Receipt::decode(signable.bytes()).map_err(|_| anyhow!("signing refused: not a receipt"))?;
+        let any =
+            AnyReceipt::decode(bytes).map_err(|_| anyhow!("signing refused: not a receipt"))?;
+        let receipt = any.receipt();
         let view = self
             .view()
             .ok_or_else(|| anyhow!("signing refused: only a linked agent signs receipts"))?;

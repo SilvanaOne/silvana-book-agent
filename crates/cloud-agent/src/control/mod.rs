@@ -4,9 +4,13 @@
 #![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 
 pub mod change;
-pub mod controller_tool;
+pub mod commands;
+pub mod controller;
 pub mod intent;
 pub mod link;
+pub mod pins;
+pub mod policy_accept;
+pub mod poller;
 pub mod prompt;
 pub mod rpc;
 pub mod show;
@@ -31,7 +35,9 @@ use agent_logic::signer::{AgentSigner, ControlGuard};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tracing::{error, info, warn};
 
-pub use controller_tool::{ControllerCommands, run_controller};
+/// The offline controller commands' earlier module path.
+pub use controller as controller_tool;
+pub use controller::{ControllerCommands, ControllerOptions, run_controller};
 pub use intent::{ContentRefusal, OwnRequest, PlatformParties};
 pub use rpc::{ControlRpc, RemoteLog, RpcError};
 
@@ -388,6 +394,9 @@ pub async fn attach_with(
         if let Some(head) = guard.head() {
             info!("agent control: linked at seq {} ({})", head.seq, head.hash);
         }
+        if let Some(text) = pins::unset_warning(config).filter(|_| opts.purpose == Purpose::Agent) {
+            warn!("agent control: {text}");
+        }
     }
     Ok(guard)
 }
@@ -512,9 +521,33 @@ pub struct ControlContext {
     pub marker: Option<ControlMarker>,
     /// The agent's env file, where the marker is written.
     pub env_file: Option<PathBuf>,
+    /// The pins this context uses: the startup ones, filled in by [`Self::pick_up_pins`].
+    platform: RwLock<PlatformParties>,
 }
 
 impl ControlContext {
+    /// The platform parties this context uses: the startup pins, and any picked up since.
+    pub fn platform(&self) -> PlatformParties {
+        agent_logic::sync::read(&self.platform).clone()
+    }
+
+    /// Fills each unset pin from the env file, here and for the content check; a set pin is
+    /// never replaced. With `linked_now` a pin still unset is warned about.
+    pub fn pick_up_pins(&self, linked_now: bool) {
+        let current = self.platform();
+        let next = match &self.env_file {
+            Some(file) => pins::fill_unset(file, &current, linked_now),
+            None => current.clone(),
+        };
+        if next != current {
+            *agent_logic::sync::write(&self.platform) = next.clone();
+            install_platform_parties(next.clone());
+        }
+        if let Some(text) = pins::unset_warning_of(&next).filter(|_| linked_now) {
+            warn!("agent control: {text}");
+        }
+    }
+
     fn parts(config: &BaseConfig, env: &ControlEnv) -> Result<(Network, PartyId, ControlStore)> {
         let network = match env.network() {
             ChainNetwork::Mapped(network) => network,
@@ -541,7 +574,8 @@ impl ControlContext {
             "PARTY_AGENT={party} does not belong to this agent's key"
         );
         let marker = if env.marker_covers(&signer.public_key()) { env.marker()? } else { None };
-        Ok(Self { config, network, party, store, signer, guard, marker, env_file })
+        let platform = RwLock::new(PlatformParties::from_config(&config));
+        Ok(Self { config, network, party, store, signer, guard, marker, env_file, platform })
     }
 
     /// The context of every control command but `restore`: the attach rules apply.
@@ -551,6 +585,16 @@ impl ControlContext {
         let opts = AttachOptions { purpose: Purpose::Control, force: false, no_reject: false };
         let guard = attach_with(&config, opts, &env, &RpcLogSource).await?;
         Self::assemble(config, &env, env_file, guard)
+    }
+
+    /// The daemon's context over the guard attach installed; `None` when CANTON_CHAIN is
+    /// not a control network or the party is not one control accepts.
+    pub fn for_daemon(config: BaseConfig, guard: Arc<ControlGuard>, env_file: Option<PathBuf>) -> Result<Option<Self>> {
+        let env = control_env(&config, ControlEnv::from_process());
+        if !matches!(env.network(), ChainNetwork::Mapped(_)) || PartyId::parse(&config.party_id).is_err() {
+            return Ok(None);
+        }
+        Self::assemble(config, &env, env_file, guard).map(Some)
     }
 
     /// The context of `restore`: the marker is checked against the rpc's log, not the local store.
@@ -577,7 +621,7 @@ impl ControlContext {
     }
 
     /// Records `head` as the marker, or says what to set when no env file is known.
-    pub fn mark(&self, head: HeadRef, out: &mut dyn Write) -> Result<()> {
+    pub fn mark<W: Write + ?Sized>(&self, head: HeadRef, out: &mut W) -> Result<()> {
         match &self.env_file {
             Some(file) => record_marker(file, self.network, head),
             None => {
@@ -619,7 +663,7 @@ pub enum ControlCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Remove a controller: its capabilities end 24 h after the signature
+    /// Remove a controller: its capabilities end 1 h (devnet) or 24 h (mainnet) after the signature
     Remove {
         /// A unique id prefix (at least 8 hex characters) or the exact label
         controller: String,
@@ -656,6 +700,14 @@ pub enum ControlCommands {
         #[command(subcommand)]
         command: PolicyCommands,
     },
+    /// Execute a pending direct command after the typed confirmation
+    Execute {
+        /// The code from the Agent page: CMD-<command id>
+        #[arg(long)]
+        code: String,
+    },
+    /// List the direct commands waiting for this agent
+    Commands,
     /// Rebuild the local control log from the rpc's verified copy
     Restore,
     /// Compare with the rpc's log, upload what it lacks and settle a pending entry
@@ -675,6 +727,15 @@ pub enum PolicyCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Accept a pending policy after a typed confirmation; an invalid one is refused
+    Accept {
+        /// The policy's hash (64 hex characters); without it, the only pending policy
+        #[arg(long)]
+        hash: Option<String>,
+        /// Do not ask for the typed confirmation (refused when the policy widens anything)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Where a control command runs.
@@ -684,10 +745,23 @@ pub struct ControlOptions {
     pub control_dir: Option<PathBuf>,
     /// The agent's env file, for the marker.
     pub env_file: Option<PathBuf>,
+    /// `--dry-run`: nothing a controller directs is executed.
+    pub dry_run: bool,
+}
+
+/// What `--dry-run` refuses outright: executing a direct command, before anything is
+/// recorded or signed.
+pub fn refuse_dry_run(options: &ControlOptions, command: &ControlCommands) -> Result<()> {
+    ensure!(
+        !(options.dry_run && matches!(command, ControlCommands::Execute { .. })),
+        "--dry-run cannot execute a direct command: nothing was recorded or signed; run it without --dry-run"
+    );
+    Ok(())
 }
 
 /// Runs one `control` command on the terminal.
 pub async fn run_control(config: BaseConfig, options: ControlOptions, command: ControlCommands) -> Result<()> {
+    refuse_dry_run(&options, &command)?;
     let mut env = ControlEnv::from_process();
     if let Some(dir) = &options.control_dir {
         env.control_dir = Some(dir.clone().into_os_string());
@@ -730,6 +804,20 @@ pub async fn run_control_with(
         ControlCommands::Policy { command: PolicyCommands::Show { pending, json } } => {
             let rpc = if pending { Some(connect(&ctx.config).await?) } else { None };
             show::run_policy_show(&ctx, rpc.as_ref(), out, json).await
+        }
+        ControlCommands::Policy { command: PolicyCommands::Accept { hash, yes } } => {
+            let rpc = connect(&ctx.config).await?;
+            policy_accept::run_accept(&ctx, &rpc, prompter, out, hash.as_deref(), yes).await.map(|_| ())
+        }
+        ControlCommands::Execute { code } => {
+            let rpc = connect(&ctx.config).await?;
+            let mut ledger = commands::LazyLedger::new(ctx.config.clone());
+            let handled = commands::run_execute(&ctx, &rpc, &mut ledger, prompter, out, &code).await?;
+            commands::exit_status(&handled)
+        }
+        ControlCommands::Commands => {
+            let rpc = connect(&ctx.config).await?;
+            commands::run_list(&ctx, &rpc, out).await
         }
         ControlCommands::Link { code, yes } => {
             let rpc = connect(&ctx.config).await?;

@@ -2,6 +2,8 @@
 
 pub mod eval;
 pub mod kinds;
+pub mod packages;
+pub mod scopes;
 pub mod summary;
 pub mod widening;
 
@@ -10,8 +12,8 @@ use std::cmp::Ordering;
 use crate::SCHEME_POLICY;
 use crate::canon::time::UtcTime;
 use crate::canon::values::{
-    Amount, EthAddress, Hash32, InstrumentId, InstrumentRef, MarketId, Network, format_bool,
-    parse_bool, parse_u64, sha256,
+    Amount, EthAddress, Hash32, InstrumentId, InstrumentRef, MarketId, Network, PackageId,
+    format_bool, parse_bool, parse_u64, sha256,
 };
 use crate::canon::{Reader, Writer, check_ascending, decode_exact};
 use crate::controller::{Capability, ControllerId};
@@ -26,6 +28,11 @@ pub use eval::{
     precheck_intent,
 };
 pub use kinds::{OperationClass, OperationKind};
+pub use packages::check_packages;
+pub use scopes::{
+    CommandScope, MAX_SCOPE_COMMANDS, MAX_SCOPE_LPS, MAX_SCOPE_PAIRS, MAX_SCOPES, ScopePair,
+    command_allowed, scope_of, scopes_widen,
+};
 pub use summary::describe_rules;
 pub use widening::{Widening, expected_effective_at, required_delay_secs, widening};
 
@@ -44,6 +51,8 @@ pub const MAX_INSTRUMENTS: usize = 32;
 pub const MAX_LIMIT_ITEMS: usize = 32;
 pub const MAX_RECIPIENTS: usize = 100;
 pub const MAX_ETH_DESTINATIONS: usize = 32;
+/// Most package ids a `selected` package rule lists; it lists at least one.
+pub const MAX_PACKAGES: usize = 256;
 
 /// An instrument in a policy: the Canton Coin alias, or an admin party and id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -240,6 +249,10 @@ pub struct Rules {
     pub locks: LockRules,
     pub usdcx: UsdcxRules,
     pub fees: FeeRules,
+    /// The Daml packages a prepared transaction may use: any, or the listed ids.
+    pub packages: Allowlist<PackageId>,
+    /// Strictly ascending by controller; a direct controller without one is unscoped.
+    pub scopes: Vec<CommandScope>,
 }
 
 /// The rules of a linked agent before any `accept_policy`.
@@ -279,6 +292,8 @@ pub const DEFAULT_LINKED_RULES: Rules = Rules {
         cc_per_consent: None,
         cc_per_day: None,
     },
+    packages: Allowlist::ANY,
+    scopes: Vec::new(),
 };
 
 /// A policy a `policy` controller signs and the agent accepts into its log.
@@ -499,6 +514,17 @@ fn write_rules(w: &mut Writer, rules: &Rules) {
         "fees.cc_per_day",
         amount_text(rules.fees.cc_per_day).as_deref(),
     );
+    write_allowlist(
+        w,
+        "packages",
+        &rules.packages,
+        MAX_PACKAGES,
+        |w, key, id| w.line(key, &id.to_string()),
+    );
+    if !rules.packages.any && rules.packages.items.is_empty() {
+        w.fail(CanonErrorKind::CountOutOfRange);
+    }
+    scopes::write_scopes(w, &rules.scopes);
 }
 
 fn read_delay(r: &mut Reader<'_>, key: &str) -> Result<u64, CanonError> {
@@ -569,6 +595,22 @@ fn read_limits(r: &mut Reader<'_>, path: &str) -> Result<Limits, CanonError> {
     Ok(Limits { unlisted, items })
 }
 
+/// `any` lists nothing; a selection lists 1 to `MAX_PACKAGES` ids.
+fn read_packages(r: &mut Reader<'_>) -> Result<Allowlist<PackageId>, CanonError> {
+    let any = r.value("packages.any", parse_bool)?;
+    let (min, max) = if any { (0, 0) } else { (1, MAX_PACKAGES) };
+    let count = r.count("packages", min, max)?;
+    let mut items: Vec<PackageId> = Vec::with_capacity(count);
+    for i in 0..count {
+        let item = r.value(&format!("packages.{i}"), PackageId::parse)?;
+        if let Some(kind) = check_ascending(items.last(), &item) {
+            return Err(r.err(kind));
+        }
+        items.push(item);
+    }
+    Ok(Allowlist { any, items })
+}
+
 fn read_rules(r: &mut Reader<'_>) -> Result<Rules, CanonError> {
     let paused = r.value("paused", parse_bool)?;
     let delays = Delays {
@@ -616,6 +658,8 @@ fn read_rules(r: &mut Reader<'_>) -> Result<Rules, CanonError> {
         cc_per_consent: r.opt_value("fees.cc_per_consent", Amount::parse)?,
         cc_per_day: r.opt_value("fees.cc_per_day", Amount::parse)?,
     };
+    let packages = read_packages(r)?;
+    let scopes = scopes::read_scopes(r)?;
     Ok(Rules {
         paused,
         delays,
@@ -625,6 +669,8 @@ fn read_rules(r: &mut Reader<'_>) -> Result<Rules, CanonError> {
         locks,
         usdcx,
         fees,
+        packages,
+        scopes,
     })
 }
 
@@ -676,9 +722,18 @@ pub fn verify_policy_submission(
         return Err(PolicyError::Expired);
     }
     verify_controller_proof(signer.descriptor(), bytes, envelope).map_err(PolicyError::Proof)?;
+    let unrecorded = document
+        .rules
+        .scopes
+        .iter()
+        .any(|scope| !state.is_recorded_controller(&scope.controller));
+    if unrecorded {
+        return Err(PolicyError::UnknownScopeController);
+    }
     let baseline = state.rules_at(now).rules();
+    let required_delay_secs =
+        widening::required_delay_secs(document.network, baseline, &document.rules);
     let widening = widening(baseline, &document.rules);
-    let required_delay_secs = required_delay_secs(baseline, &document.rules);
     let effective_at =
         expected_effective_at(now, baseline, &document).ok_or(PolicyError::TimeOverflow)?;
     Ok(VerifiedPolicy {
@@ -696,8 +751,10 @@ pub fn verify_policy_submission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canon::values::InstrumentRef;
-    use crate::testkit::{self, Chain, DAY, at};
+    use crate::canon::values::{InstrumentRef, Label};
+    use crate::command::CommandKind;
+    use crate::controller::CapabilitySet;
+    use crate::testkit::{self, Chain, DAY, DEVNET_DELAY, MAINNET_DELAY, at};
 
     fn party(hint: &str, key: u8) -> PartyId {
         PartyId::parse(&format!(
@@ -799,7 +856,39 @@ mod tests {
             cc_per_consent: Some(amount("0.5")),
             cc_per_day: Some(amount("10")),
         };
+        rules.packages = Allowlist {
+            any: false,
+            items: vec![PackageId([0x0a; 32]), PackageId([0x0b; 32])],
+        };
+        let mut pairs = vec![
+            pair(PolicyInstrument::Cc, token(&usdc, "USDCx"), "0.15", "1000"),
+            pair(token(&usdc, "USDCx"), PolicyInstrument::Cc, "6.5", "150.25"),
+        ];
+        pairs.sort_by(|a, b| (&a.sell, &a.buy).cmp(&(&b.sell, &b.buy)));
+        rules.scopes = vec![
+            CommandScope {
+                controller: ControllerId([0xab; 32]),
+                commands: vec![CommandKind::Swap, CommandKind::TransferToken],
+                pairs,
+                lps: vec![party("lp-a", 7), party("lp-b", 8)],
+            },
+            CommandScope {
+                controller: ControllerId([0xcd; 32]),
+                commands: Vec::new(),
+                pairs: Vec::new(),
+                lps: Vec::new(),
+            },
+        ];
         rules
+    }
+
+    fn pair(sell: PolicyInstrument, buy: PolicyInstrument, min: &str, max: &str) -> ScopePair {
+        ScopePair {
+            sell,
+            buy,
+            min_price: amount(min),
+            max_sell: amount(max),
+        }
     }
 
     fn text(doc: &PolicyDocument) -> String {
@@ -829,13 +918,53 @@ mod tests {
              transfers.eth_destinations.count=0\ntransfers.per_transfer.unlisted=unlimited\n\
              transfers.per_transfer.count=0\ntransfers.per_day.unlisted=unlimited\n\
              transfers.per_day.count=0\nlocks.enabled=true\nlocks.per_lock.unlisted=unlimited\n\
-             locks.per_lock.count=0\nusdcx.enabled=true\nfees.cc_per_consent=\nfees.cc_per_day=\n",
+             locks.per_lock.count=0\nusdcx.enabled=true\nfees.cc_per_consent=\nfees.cc_per_day=\n\
+             packages.any=true\npackages.count=0\nscopes.count=0\n",
             testkit::agent_party(),
             "0".repeat(64)
         );
         assert_eq!(text(&doc), expected);
         assert_eq!(PolicyDocument::decode(expected.as_bytes()).unwrap(), doc);
         assert_eq!(doc.hash().unwrap(), Hash32(sha256(expected.as_bytes())));
+    }
+
+    #[test]
+    fn a_scoped_package_selection_encodes_to_the_pinned_text() {
+        let bank = party("Bank", 2);
+        let lp = party("lp-a", 7);
+        let mut rules = DEFAULT_LINKED_RULES;
+        rules.packages = Allowlist {
+            any: false,
+            items: vec![PackageId([0x0a; 32])],
+        };
+        rules.scopes = vec![CommandScope {
+            controller: ControllerId([0x11; 32]),
+            commands: vec![CommandKind::Swap],
+            pairs: vec![pair(
+                PolicyInstrument::Cc,
+                token(&bank, "USDCx"),
+                "0.15",
+                "1000",
+            )],
+            lps: vec![lp.clone()],
+        }];
+        let doc = document(rules);
+        let default = text(&document(DEFAULT_LINKED_RULES));
+        let head = default
+            .strip_suffix("packages.any=true\npackages.count=0\nscopes.count=0\n")
+            .unwrap();
+        let expected = format!(
+            "{head}packages.any=false\npackages.count=1\npackages.0={}\nscopes.count=1\n\
+             scopes.0.controller={}\nscopes.0.commands.count=1\nscopes.0.commands.0=swap\n\
+             scopes.0.pairs.count=1\nscopes.0.pairs.0.sell.admin=cc\nscopes.0.pairs.0.sell.id=cc\n\
+             scopes.0.pairs.0.buy.admin={bank}\nscopes.0.pairs.0.buy.id=USDCx\n\
+             scopes.0.pairs.0.min_price=0.15\nscopes.0.pairs.0.max_sell=1000\n\
+             scopes.0.lps.count=1\nscopes.0.lps.0={lp}\n",
+            "0a".repeat(32),
+            "11".repeat(32),
+        );
+        assert_eq!(text(&doc), expected);
+        assert_eq!(PolicyDocument::decode(expected.as_bytes()).unwrap(), doc);
     }
 
     #[test]
@@ -848,6 +977,22 @@ mod tests {
         assert!(encoded.contains("\ntrading.per_trade.1.admin=cc\ntrading.per_trade.1.id=cc\ntrading.per_trade.1.amount=0\n"));
         assert!(encoded.contains("\nnot_before=2026-11-25T00:00:00Z\n"));
         assert!(encoded.contains("\nfees.cc_per_consent=0.5\nfees.cc_per_day=10\n"));
+        assert!(encoded.contains(&format!(
+            "\nfees.cc_per_day=10\npackages.any=false\npackages.count=2\npackages.0={}\npackages.1={}\nscopes.count=2\n",
+            "0a".repeat(32),
+            "0b".repeat(32)
+        )));
+        assert!(encoded.contains(
+            "\nscopes.0.commands.count=2\nscopes.0.commands.0=swap\nscopes.0.commands.1=transfer_token\nscopes.0.pairs.count=2\n"
+        ));
+        assert!(
+            encoded
+                .contains("\nscopes.0.pairs.0.min_price=6.5\nscopes.0.pairs.0.max_sell=150.25\n")
+        );
+        assert!(encoded.ends_with(&format!(
+            "\nscopes.1.controller={}\nscopes.1.commands.count=0\nscopes.1.pairs.count=0\nscopes.1.lps.count=0\n",
+            "cd".repeat(32)
+        )));
     }
 
     #[test]
@@ -1010,6 +1155,351 @@ mod tests {
     }
 
     #[test]
+    fn package_and_scope_refusals_have_stable_names() {
+        let base = text(&document(full_rules()));
+        let default = text(&document(DEFAULT_LINKED_RULES));
+        let bank = party("Bank", 2).to_string();
+        let (lp_a, lp_b) = (party("lp-a", 7).to_string(), party("lp-b", 8).to_string());
+        let (p0, p1) = ("0a".repeat(32), "0b".repeat(32));
+        let (c0, c1) = ("ab".repeat(32), "cd".repeat(32));
+        let line = |key: &str, value: &str| format!("\n{key}={value}\n");
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "package 63 hex",
+                base.replacen(&line("packages.0", &p0), &line("packages.0", &p0[..63]), 1),
+                "invalid_package_id",
+            ),
+            (
+                "package uppercase",
+                base.replacen(
+                    &line("packages.0", &p0),
+                    &line("packages.0", &p0.to_uppercase()),
+                    1,
+                ),
+                "invalid_package_id",
+            ),
+            (
+                "packages unsorted",
+                base.replacen(&line("packages.0", &p0), &line("packages.0", &p1), 1)
+                    .replacen(&line("packages.1", &p1), &line("packages.1", &p0), 1),
+                "unsorted_list",
+            ),
+            (
+                "packages duplicate",
+                base.replacen(&line("packages.1", &p1), &line("packages.1", &p0), 1),
+                "duplicate_item",
+            ),
+            (
+                "any with packages",
+                base.replacen("\npackages.any=false\n", "\npackages.any=true\n", 1),
+                "count_out_of_range",
+            ),
+            (
+                "selected with none",
+                default.replacen("\npackages.any=true\n", "\npackages.any=false\n", 1),
+                "count_out_of_range",
+            ),
+            (
+                "257 packages",
+                base.replacen("\npackages.count=2\n", "\npackages.count=257\n", 1),
+                "count_out_of_range",
+            ),
+            (
+                "33 scopes",
+                base.replacen("\nscopes.count=2\n", "\nscopes.count=33\n", 1),
+                "count_out_of_range",
+            ),
+            (
+                "controllers unsorted",
+                base.replacen(
+                    &line("scopes.0.controller", &c0),
+                    &line("scopes.0.controller", &c1),
+                    1,
+                )
+                .replacen(
+                    &line("scopes.1.controller", &c1),
+                    &line("scopes.1.controller", &c0),
+                    1,
+                ),
+                "unsorted_list",
+            ),
+            (
+                "controller duplicate",
+                base.replacen(
+                    &line("scopes.1.controller", &c1),
+                    &line("scopes.1.controller", &c0),
+                    1,
+                ),
+                "duplicate_item",
+            ),
+            (
+                "controller uppercase",
+                base.replacen(
+                    &line("scopes.0.controller", &c0),
+                    &line("scopes.0.controller", &c0.to_uppercase()),
+                    1,
+                ),
+                "invalid_hex32",
+            ),
+            (
+                "unknown kind",
+                base.replacen(
+                    "\nscopes.0.commands.0=swap\n",
+                    "\nscopes.0.commands.0=transfer_all\n",
+                    1,
+                ),
+                "invalid_command_op",
+            ),
+            (
+                "5 kinds",
+                base.replacen(
+                    "\nscopes.0.commands.count=2\n",
+                    "\nscopes.0.commands.count=5\n",
+                    1,
+                ),
+                "count_out_of_range",
+            ),
+            (
+                "kinds unsorted",
+                base.replacen(
+                    "\nscopes.0.commands.0=swap\nscopes.0.commands.1=transfer_token\n",
+                    "\nscopes.0.commands.0=transfer_token\nscopes.0.commands.1=swap\n",
+                    1,
+                ),
+                "unsorted_list",
+            ),
+            (
+                "kinds duplicate",
+                base.replacen(
+                    "\nscopes.0.commands.1=transfer_token\n",
+                    "\nscopes.0.commands.1=swap\n",
+                    1,
+                ),
+                "duplicate_item",
+            ),
+            (
+                "17 pairs",
+                base.replacen(
+                    "\nscopes.0.pairs.count=2\n",
+                    "\nscopes.0.pairs.count=17\n",
+                    1,
+                ),
+                "count_out_of_range",
+            ),
+            (
+                "same instrument",
+                base.replacen(
+                    "\nscopes.0.pairs.0.buy.admin=cc\nscopes.0.pairs.0.buy.id=cc\n",
+                    &format!(
+                        "\nscopes.0.pairs.0.buy.admin={bank}\nscopes.0.pairs.0.buy.id=USDCx\n"
+                    ),
+                    1,
+                ),
+                "same_instrument",
+            ),
+            (
+                "pairs unsorted",
+                base.replacen(
+                    &line("scopes.0.pairs.0.sell.admin", &bank),
+                    &line("scopes.0.pairs.0.sell.admin", &lp_a),
+                    1,
+                ),
+                "unsorted_list",
+            ),
+            (
+                "pairs duplicate",
+                base.replacen(
+                    &format!(
+                        "\nscopes.0.pairs.1.sell.admin=cc\nscopes.0.pairs.1.sell.id=cc\n\
+                         scopes.0.pairs.1.buy.admin={bank}\nscopes.0.pairs.1.buy.id=USDCx\n"
+                    ),
+                    &format!(
+                        "\nscopes.0.pairs.1.sell.admin={bank}\nscopes.0.pairs.1.sell.id=USDCx\n\
+                         scopes.0.pairs.1.buy.admin=cc\nscopes.0.pairs.1.buy.id=cc\n"
+                    ),
+                    1,
+                ),
+                "duplicate_item",
+            ),
+            (
+                "pair alias",
+                base.replacen(
+                    "\nscopes.0.pairs.0.buy.id=cc\n",
+                    "\nscopes.0.pairs.0.buy.id=Amulet\n",
+                    1,
+                ),
+                "invalid_cc_alias",
+            ),
+            (
+                "min price",
+                base.replacen(
+                    "\nscopes.0.pairs.0.min_price=6.5\n",
+                    "\nscopes.0.pairs.0.min_price=6.50\n",
+                    1,
+                ),
+                "invalid_amount",
+            ),
+            (
+                "max sell",
+                base.replacen(
+                    "\nscopes.0.pairs.0.max_sell=150.25\n",
+                    "\nscopes.0.pairs.0.max_sell=-1\n",
+                    1,
+                ),
+                "invalid_amount",
+            ),
+            (
+                "17 lps",
+                base.replacen("\nscopes.0.lps.count=2\n", "\nscopes.0.lps.count=17\n", 1),
+                "count_out_of_range",
+            ),
+            (
+                "lps unsorted",
+                base.replacen(
+                    &line("scopes.0.lps.0", &lp_a),
+                    &line("scopes.0.lps.0", &lp_b),
+                    1,
+                )
+                .replacen(
+                    &line("scopes.0.lps.1", &lp_b),
+                    &line("scopes.0.lps.1", &lp_a),
+                    1,
+                ),
+                "unsorted_list",
+            ),
+            (
+                "lps duplicate",
+                base.replacen(
+                    &line("scopes.0.lps.1", &lp_b),
+                    &line("scopes.0.lps.1", &lp_a),
+                    1,
+                ),
+                "duplicate_item",
+            ),
+            (
+                "lp party",
+                base.replacen("\nscopes.0.lps.0=lp-a::", "\nscopes.0.lps.0=lp a::", 1),
+                "invalid_party",
+            ),
+            (
+                "scope keys out of order",
+                base.replacen(
+                    "\nscopes.1.commands.count=0\nscopes.1.pairs.count=0\n",
+                    "\nscopes.1.pairs.count=0\nscopes.1.commands.count=0\n",
+                    1,
+                ),
+                "unexpected_key",
+            ),
+            (
+                "scope keys missing",
+                base.strip_suffix("scopes.1.lps.count=0\n")
+                    .unwrap()
+                    .to_owned(),
+                "missing_line",
+            ),
+            (
+                "scopes before packages",
+                default.replacen(
+                    "packages.any=true\npackages.count=0\nscopes.count=0\n",
+                    "scopes.count=0\npackages.any=true\npackages.count=0\n",
+                    1,
+                ),
+                "unexpected_key",
+            ),
+        ];
+        for (name, t, expected) in cases {
+            assert!(
+                t != base && t != default,
+                "{name}: the replacement did not apply"
+            );
+            assert_eq!(refusal(&t), expected, "{name}");
+        }
+        let codes = |rules: Rules| {
+            let e = document(rules).encode().unwrap_err();
+            (e.code_name(), e.code())
+        };
+        let ids = |n: u16| -> Vec<PackageId> {
+            (0..n)
+                .map(|i| {
+                    let mut bytes = [0u8; 32];
+                    for (byte, value) in bytes.iter_mut().zip(i.to_be_bytes()) {
+                        *byte = value;
+                    }
+                    PackageId(bytes)
+                })
+                .collect()
+        };
+        let mut many = full_rules();
+        many.packages.items = ids(256);
+        let encoded = document(many.clone()).encode().unwrap();
+        assert_eq!(PolicyDocument::decode(&encoded).unwrap().rules, many);
+        many.packages.items = ids(257);
+        assert_eq!(codes(many), ("count_out_of_range", 111));
+        let mut none = full_rules();
+        none.packages.items.clear();
+        assert_eq!(codes(none), ("count_out_of_range", 111));
+        let mut any_listed = full_rules();
+        any_listed.packages.any = true;
+        assert_eq!(codes(any_listed), ("count_out_of_range", 111));
+        let mut unsorted = full_rules();
+        unsorted.packages.items.reverse();
+        assert_eq!(codes(unsorted), ("unsorted_list", 112));
+        let scope = |controller: u8| CommandScope {
+            controller: ControllerId([controller; 32]),
+            commands: Vec::new(),
+            pairs: Vec::new(),
+            lps: Vec::new(),
+        };
+        let mut scopes = DEFAULT_LINKED_RULES;
+        scopes.scopes = (0..32u8).map(scope).collect();
+        assert!(document(scopes.clone()).encode().is_ok());
+        scopes.scopes.push(scope(32));
+        assert_eq!(codes(scopes), ("count_out_of_range", 111));
+        let mut reversed = full_rules();
+        reversed.scopes.reverse();
+        assert_eq!(codes(reversed), ("unsorted_list", 112));
+        let mut kinds = full_rules();
+        kinds.scopes[1].commands = vec![CommandKind::Swap; 5];
+        assert_eq!(codes(kinds), ("count_out_of_range", 111));
+        let mut repeated = full_rules();
+        repeated.scopes[1].commands = vec![CommandKind::UsdcxBurn, CommandKind::UsdcxBurn];
+        assert_eq!(codes(repeated), ("duplicate_item", 113));
+        let mut same = full_rules();
+        same.scopes[0].pairs[0].buy = same.scopes[0].pairs[0].sell.clone();
+        assert_eq!(codes(same), ("same_instrument", 131));
+        let mut pairs = full_rules();
+        pairs.scopes[1].pairs = (0..17u8)
+            .map(|i| {
+                pair(
+                    PolicyInstrument::Cc,
+                    token(&party(&format!("issuer-{i:02}"), i), "X"),
+                    "1",
+                    "1",
+                )
+            })
+            .collect();
+        assert_eq!(codes(pairs.clone()), ("count_out_of_range", 111));
+        pairs.scopes[1].pairs.pop();
+        assert!(document(pairs).encode().is_ok());
+        let mut lps = full_rules();
+        lps.scopes[1].lps = (0..17u8).map(|i| party(&format!("lp-{i:02}"), i)).collect();
+        assert_eq!(codes(lps.clone()), ("count_out_of_range", 111));
+        lps.scopes[1].lps.pop();
+        assert!(document(lps.clone()).encode().is_ok());
+        lps.scopes[1].lps.swap(0, 1);
+        assert_eq!(codes(lps), ("unsorted_list", 112));
+        assert_eq!(
+            PolicyDocument::decode(
+                base.replacen(&line("packages.0", &p0), &line("packages.0", &p0[..63]), 1)
+                    .as_bytes()
+            )
+            .unwrap_err()
+            .code(),
+            188
+        );
+    }
+
+    #[test]
     fn submissions_are_checked_against_the_state() {
         let chain = Chain::linked();
         let state = &chain.state;
@@ -1030,7 +1520,7 @@ mod tests {
             };
         let passkey = |b: &[u8]| testkit::passkey_envelope(b);
         assert_eq!(
-            refuse(&doc, &passkey, at(DAY - 1)),
+            refuse(&doc, &passkey, at(DEVNET_DELAY - 1)),
             PolicyError::SignerLacksPolicy
         );
         assert_eq!(
@@ -1064,5 +1554,160 @@ mod tests {
                 .code_name(),
             "too_short"
         );
+    }
+
+    fn scope_for(controller: ControllerId, commands: &[CommandKind]) -> CommandScope {
+        CommandScope {
+            controller,
+            commands: commands.to_vec(),
+            pairs: Vec::new(),
+            lps: Vec::new(),
+        }
+    }
+
+    fn add_direct_key(chain: &mut Chain, start: u8, when: UtcTime) {
+        let key = testkit::ed_key(start).verifying_key().to_bytes();
+        let label = Label::parse("Swap key").unwrap();
+        let direct = CapabilitySet::of(&[Capability::Direct]);
+        let pending = chain
+            .builder()
+            .add_ed25519(key, label, direct, when)
+            .unwrap();
+        chain.push(&pending);
+    }
+
+    #[test]
+    fn scopes_must_name_controllers_the_log_recorded() {
+        let mut chain = Chain::linked();
+        // 0x82 is added and withdrawn at once; 0x81 is still pending at `now`.
+        add_direct_key(&mut chain, 0x82, at(DAY));
+        let withdrawn = testkit::ed25519_id(0x82);
+        let removal = chain
+            .builder()
+            .remove_controller(&withdrawn, false, at(DAY + 60))
+            .unwrap();
+        chain.push(&removal);
+        let now = at(2 * DAY);
+        add_direct_key(&mut chain, 0x81, at(2 * DAY - 60));
+        let pending = testkit::ed25519_id(0x81);
+        let state = &chain.state;
+        assert!(state.controller(&withdrawn).is_none());
+        assert!(state.is_recorded_controller(&withdrawn));
+        assert!(!state.controller(&pending).unwrap().is_effective_at(now));
+        assert!(!state.is_recorded_controller(&testkit::ed25519_id(0x99)));
+        let submit = |scopes: Vec<CommandScope>| {
+            let mut rules = DEFAULT_LINKED_RULES;
+            rules.scopes = scopes;
+            rules.scopes.sort_by_key(|s| s.controller);
+            let doc = testkit::policy_doc(state, 1, now, rules);
+            let bytes = doc.encode().unwrap();
+            verify_policy_submission(state, &bytes, &testkit::passkey_envelope(&bytes), now)
+        };
+        let unknown = submit(vec![scope_for(
+            testkit::ed25519_id(0x99),
+            &[CommandKind::Swap],
+        )]);
+        let refused = unknown.unwrap_err();
+        assert_eq!(refused, PolicyError::UnknownScopeController);
+        assert_eq!(
+            (refused.code_name(), refused.code()),
+            ("unknown_scope_controller", 909)
+        );
+        let recorded = [
+            pending,
+            withdrawn,
+            testkit::ed25519_id(0x21),
+            testkit::passkey_id(),
+        ];
+        let scopes: Vec<CommandScope> = recorded
+            .iter()
+            .map(|id| scope_for(*id, &[CommandKind::Swap]))
+            .collect();
+        let verified = submit(scopes.clone()).unwrap();
+        assert!(!verified.widening.any());
+        assert_eq!(
+            (verified.required_delay_secs, verified.effective_at),
+            (0, now)
+        );
+        let mut mixed = scopes;
+        mixed.push(scope_for(ControllerId([0x99; 32]), &[]));
+        assert_eq!(
+            submit(mixed).unwrap_err(),
+            PolicyError::UnknownScopeController
+        );
+        // The builder refuses it too, and accepts a scope for a pending controller.
+        let mut rules = DEFAULT_LINKED_RULES;
+        rules.scopes = vec![scope_for(pending, &[CommandKind::Swap])];
+        let doc = testkit::policy_doc(&chain.state, 1, now, rules);
+        let effective = chain.accept_passkey(&doc, now).effective_at();
+        assert_eq!(effective, now);
+        assert_eq!(chain.replayed(), chain.state);
+        assert!(!command_allowed(
+            chain.state.rules_at(now).rules(),
+            &pending,
+            CommandKind::TransferCc
+        ));
+    }
+
+    #[test]
+    fn submissions_report_scope_and_package_widening_per_network() {
+        for (network, delay) in [
+            (Network::Devnet, DEVNET_DELAY),
+            (Network::Mainnet, MAINNET_DELAY),
+        ] {
+            let mut chain = Chain::linked_on(network);
+            let key = testkit::ed25519_id(0x21);
+            let t1 = at(delay + 10);
+            let mut narrow = DEFAULT_LINKED_RULES;
+            narrow.scopes = vec![scope_for(key, &[CommandKind::Swap])];
+            narrow.packages = Allowlist {
+                any: false,
+                items: vec![PackageId([5; 32])],
+            };
+            let v1 = PolicyDocument {
+                network,
+                ..testkit::policy_doc(&chain.state, 1, t1, narrow.clone())
+            };
+            assert_eq!(chain.accept_ed25519(0x21, &v1, t1).effective_at(), t1);
+            let t2 = at(delay + 20);
+            let check = |rules: Rules| {
+                let doc = PolicyDocument {
+                    network,
+                    ..testkit::policy_doc(&chain.state, 2, t2, rules)
+                };
+                let bytes = doc.encode().unwrap();
+                let envelope = testkit::ed25519_envelope(0x21, &bytes);
+                verify_policy_submission(&chain.state, &bytes, &envelope, t2).unwrap()
+            };
+            let later = t2.checked_add_secs(delay).unwrap();
+            let mut more_packages = narrow.clone();
+            more_packages.packages.items.push(PackageId([6; 32]));
+            let mut more_kinds = narrow.clone();
+            more_kinds.scopes[0].commands.push(CommandKind::TransferCc);
+            let mut fewer_kinds = narrow.clone();
+            fewer_kinds.scopes[0].commands.clear();
+            let cases = [
+                (DEFAULT_LINKED_RULES, true, true),
+                (more_packages, true, false),
+                (more_kinds, false, true),
+                (fewer_kinds, false, false),
+            ];
+            for (rules, packages, scopes) in cases {
+                let verified = check(rules);
+                assert_eq!(
+                    (verified.widening.packages, verified.widening.scopes),
+                    (packages, scopes)
+                );
+                let (secs, effective) = if packages || scopes {
+                    (u64::try_from(delay).unwrap(), later)
+                } else {
+                    (0, t2)
+                };
+                assert_eq!(
+                    (verified.required_delay_secs, verified.effective_at),
+                    (secs, effective)
+                );
+            }
+        }
     }
 }

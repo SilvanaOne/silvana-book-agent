@@ -4,9 +4,9 @@
 use std::io::Write;
 
 use agent_control::{
-    BuildError, CapabilitySet, Commitment, ControlState, ControllerDescriptor, ControllerKey,
-    ControllerType, EntryBuilder, HeadRef, Label, LinkDescriptor, LinkPurpose, PartyId, PendingEntry,
-    RpPolicy, UtcTime, controller_id_for, parse_link_code,
+    BuildError, Capability, CapabilitySet, Commitment, ControlState, ControllerDescriptor, ControllerId,
+    ControllerKey, ControllerType, EntryBuilder, HeadRef, Label, LinkDescriptor, LinkPurpose, LogEntry, Network,
+    PartyId, PendingEntry, RpPolicy, UtcTime, controller_id_for, parse_link_code,
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use orderbook_proto::orderbook::ControlLinkStatus;
@@ -67,6 +67,25 @@ pub(crate) fn controlled(state: &ControlState, now: UtcTime) -> usize {
         .count()
 }
 
+/// The controller-change delay of `network` as the CLI prints it, such as "1 h".
+pub(crate) fn delay_text(network: Network) -> String {
+    let secs = agent_control::controller_change_delay_secs(network);
+    match (secs.checked_div(3600), secs.checked_rem(3600)) {
+        (Some(hours), Some(0)) => format!("{hours} h"),
+        _ => format!("{secs} s"),
+    }
+}
+
+/// The times of an entry the rpc accepted, read from the signed entry itself.
+pub(crate) fn write_signed_times(out: &mut dyn Write, entry: &LogEntry) {
+    let (signed, effective) = (entry.created_at(), entry.effective_at());
+    if effective == signed {
+        let _ = writeln!(out, "Signed at {signed}; it applies at once.");
+    } else {
+        let _ = writeln!(out, "Signed at {signed}; it takes effect at {effective}.");
+    }
+}
+
 fn write_controller(out: &mut dyn Write, controller: &ControllerDescriptor, capabilities: CapabilitySet) {
     let _ = writeln!(out, "  - {} \"{}\"", controller.controller_type().as_str(), controller.label().as_str());
     let _ = writeln!(out, "      fingerprint:  {}", controller.id().fingerprint());
@@ -76,6 +95,18 @@ fn write_controller(out: &mut dyn Write, controller: &ControllerDescriptor, capa
         let _ = writeln!(out, "      rp_id:        {}", passkey.rp_id().as_str());
         let _ = writeln!(out, "      origins:      {}", origins.join(", "));
         let _ = writeln!(out, "      backup:       {}", passkey.backup_policy().as_str());
+    }
+}
+
+/// The warning for a controller that may direct commands while no policy scopes it.
+fn write_unscoped(out: &mut dyn Write, state: &ControlState, now: UtcTime, id: &ControllerId, capabilities: CapabilitySet) {
+    if capabilities.contains(Capability::Direct) && agent_control::scope_of(state.rules_at(now).rules(), id).is_none() {
+        let _ = writeln!(
+            out,
+            "Warning: no policy scopes {}: with direct it may send every kind of command (swap, transfer_cc, \
+             transfer_token), for any pair, price and LP, until a policy scopes it.",
+            id.fingerprint()
+        );
     }
 }
 
@@ -93,7 +124,11 @@ fn write_descriptor(out: &mut dyn Write, ctx: &ControlContext, descriptor: &Link
     for controller in descriptor.controllers() {
         write_controller(out, controller, controller.capabilities());
     }
-    let _ = writeln!(out, "They take effect at {effective_at} (24 h after the signature) and can sign nothing before.");
+    let _ = writeln!(
+        out,
+        "They take effect at about {effective_at} ({} after the signature) and can sign nothing before.",
+        delay_text(ctx.network)
+    );
 }
 
 /// The descriptor of `commitment`, refused early when the rpc reports it closed.
@@ -121,6 +156,8 @@ struct Planned<'a> {
     purpose: LinkPurpose,
     allow_invite: bool,
     rp: &'a RpPolicy,
+    /// The platform parties a link pins where the env sets none.
+    pins: Vec<(&'static str, Option<String>)>,
 }
 
 impl Planned<'_> {
@@ -159,13 +196,22 @@ async fn sign_descriptor(
     let preview = planned.build(&prepared.state, now)?;
     let decoded = LinkDescriptor::decode(&planned.bytes).map_err(|e| anyhow!("the descriptor does not decode ({})", e.code_name()))?;
     write_descriptor(out, ctx, &decoded, preview.entry().effective_at());
+    for controller in decoded.controllers() {
+        write_unscoped(out, &prepared.state, now, controller.id(), controller.capabilities());
+    }
+    super::pins::write_offer(out, &planned.pins);
     let (state, _) = prepared.release();
     confirm_typed(prompter, out, phrase, yes).await?;
     let (lock, state) = sync::relock(ctx, state.head()).await?;
     let created_at = rpc.checked_now()?;
     let entry = planned.build(&state, created_at)?;
     ensure!(entry.entry().body() == preview.entry().body(), "the change differs from the one confirmed: run the command again");
-    sync::sign_and_upload(ctx, rpc, lock, &entry, out).await
+    let head = sync::sign_and_upload(ctx, rpc, lock, &entry, out).await?;
+    write_signed_times(out, entry.entry());
+    if let Some(env_file) = ctx.env_file.as_deref() {
+        super::pins::write_after_link(out, env_file, &planned.pins);
+    }
+    Ok(head)
 }
 
 /// `control link --code LNK-…`: the first controllers, from a code naming this agent.
@@ -190,7 +236,8 @@ pub async fn run_link(
         decoded.agent_party().map_or_else(|| "no agent (an invite)".to_string(), ToString::to_string)
     );
     let rp = RpPolicy::for_network(ctx.network);
-    let planned = Planned { commitment, bytes: descriptor.bytes, purpose: LinkPurpose::Link, allow_invite: false, rp: &rp };
+    let pins = super::pins::for_link(ctx.require_env_file()?, &ctx.config.orderbook_grpc_url).await;
+    let planned = Planned { commitment, bytes: descriptor.bytes, purpose: LinkPurpose::Link, allow_invite: false, rp: &rp, pins };
     let head = sign_descriptor(ctx, rpc, prompter, out, planned, "link", yes_of(yes)).await?;
     let _ = writeln!(
         out,
@@ -251,7 +298,7 @@ pub async fn run_add(
             let (descriptor, decoded) = fetch_descriptor(rpc, &commitment).await?;
             ensure!(decoded.purpose() == LinkPurpose::AddController, "this code links an agent: use `cloud-agent control link --code`");
             let rp = RpPolicy::for_network(ctx.network);
-            let planned = Planned { commitment, bytes: descriptor.bytes, purpose: LinkPurpose::AddController, allow_invite: false, rp: &rp };
+            let planned = Planned { commitment, bytes: descriptor.bytes, purpose: LinkPurpose::AddController, allow_invite: false, rp: &rp, pins: Vec::new() };
             let head = sign_descriptor(ctx, rpc, prompter, out, planned, "add", yes_of(yes)).await?;
             let _ = writeln!(out, "Controller added at seq {}.", head.seq);
             Ok(head)
@@ -272,12 +319,19 @@ pub async fn run_add(
             let _ = writeln!(out, "  label:        {}", label.as_str());
             let _ = writeln!(out, "  fingerprint:  {}", id.fingerprint());
             let _ = writeln!(out, "  capabilities: {capabilities}");
-            let _ = writeln!(out, "It takes effect at {} (24 h after the signature).", preview.entry().effective_at());
+            let _ = writeln!(
+                out,
+                "It takes effect at about {} ({} after the signature).",
+                preview.entry().effective_at(),
+                delay_text(ctx.network)
+            );
+            write_unscoped(out, &prepared.state, now, &id, capabilities);
             let (state, _) = prepared.release();
             confirm_typed(prompter, out, "add", yes_of(yes)).await?;
             let (lock, state) = sync::relock(ctx, state.head()).await?;
             let entry = build(&state, rpc.checked_now()?)?;
             let head = sync::sign_and_upload(ctx, rpc, lock, &entry, out).await?;
+            write_signed_times(out, entry.entry());
             let _ = writeln!(out, "Controller {} added at seq {}.", id.fingerprint(), head.seq);
             Ok(head)
         }
@@ -316,7 +370,8 @@ pub async fn run_invite_link(
         ),
     }
     let rp = RpPolicy::for_network(ctx.network);
-    let planned = Planned { commitment, bytes: descriptor.bytes, purpose: LinkPurpose::Link, allow_invite: true, rp: &rp };
+    let pins = super::pins::for_link(ctx.require_env_file()?, &ctx.config.orderbook_grpc_url).await;
+    let planned = Planned { commitment, bytes: descriptor.bytes, purpose: LinkPurpose::Link, allow_invite: true, rp: &rp, pins };
     let _ = writeln!(out, "\nLink this agent to the owner who invited it:");
     let head = sign_descriptor(ctx, rpc, prompter, out, planned, "link", Yes::NotGiven).await?;
     let _ = writeln!(
@@ -345,5 +400,11 @@ mod tests {
         let shown = party_fingerprint(&party);
         assert_eq!(shown.len(), 24);
         assert_eq!(shown.split(' ').collect::<Vec<_>>(), expected.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_delay_text_follows_the_network() {
+        assert_eq!(delay_text(Network::Devnet), "1 h");
+        assert_eq!(delay_text(Network::Mainnet), "24 h");
     }
 }

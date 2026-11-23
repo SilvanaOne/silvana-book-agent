@@ -4,10 +4,17 @@ use std::collections::BTreeMap;
 
 use crate::canon::time::UtcTime;
 use crate::canon::values::{Amount, EthAddress, InstrumentRef, MarketId};
-use crate::command::{VerifiedCommand, command_matches};
+use crate::command::{
+    CommandOp, VerifiedCommand, check_swap_bounds, check_swap_lp, command_matches, swap_lp_allowed,
+    verify_command,
+};
+use crate::error::CommandError;
 use crate::party::PartyId;
 use crate::policy::kinds::{OperationClass, OperationKind};
+use crate::policy::scopes::command_allowed;
 use crate::policy::{Allowlist, CapValue, Limits, PolicyInstrument, Rules, Unlisted};
+use crate::proof::ProofEnvelope;
+use crate::state::ControlState;
 
 /// Most operations inside one multicall.
 pub const MAX_MULTICALL_OPS: usize = 32;
@@ -15,7 +22,7 @@ pub const MAX_MULTICALL_OPS: usize = 32;
 pub const USAGE_WINDOW_SECS: i64 = 86_400;
 
 /// Where a flow goes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Recipient {
     Party(PartyId),
     Eth(EthAddress),
@@ -45,6 +52,51 @@ impl Coverage {
     }
 }
 
+/// An instrument and an amount.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Leg {
+    pub instrument: InstrumentRef,
+    pub amount: Amount,
+}
+
+/// One fee an atomic settle makes the agent pay.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SettleFee {
+    pub receiver: PartyId,
+    pub instrument: InstrumentRef,
+    pub amount: Amount,
+}
+
+/// The terms of an atomic settle for the agent, read from verified content.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SettleTerms {
+    /// The venue's LP, the other side of both legs.
+    pub lp: PartyId,
+    /// What the agent delivers to the LP.
+    pub sent: Leg,
+    /// What the LP delivers to the agent, before any fee.
+    pub received: Leg,
+    /// The agent's holdings of the received instrument created, less those consumed.
+    pub net_received: Amount,
+    /// The fees the agent pays, in order.
+    pub fees: Vec<SettleFee>,
+    /// The quote's expiry, rounded up to the second.
+    pub valid_until: UtcTime,
+}
+
+impl SettleTerms {
+    /// A quote expiry in microseconds since the epoch, rounded up to the second.
+    pub fn expiry_from_micros(micros: i64) -> Option<UtcTime> {
+        let secs = micros.checked_div_euclid(1_000_000)?;
+        let secs = if micros.checked_rem_euclid(1_000_000)? > 0 {
+            secs.checked_add(1)?
+        } else {
+            secs
+        };
+        UtcTime::from_unix_secs(secs)
+    }
+}
+
 /// What one signature would authorize.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Intent {
@@ -55,6 +107,8 @@ pub struct Intent {
     pub fee_total_cc: Option<Amount>,
     pub sub: Vec<Intent>,
     pub coverage: Coverage,
+    /// The settle terms, for an atomic settle; a directed swap needs them.
+    pub settle: Option<SettleTerms>,
 }
 
 impl Intent {
@@ -68,6 +122,7 @@ impl Intent {
             fee_total_cc: None,
             sub: Vec::new(),
             coverage: Coverage::Fields,
+            settle: None,
         }
     }
 }
@@ -209,10 +264,15 @@ pub enum ReasonCode {
     MalformedIntent,
     AmountOverflow,
     ContentUnverifiable,
+    /// A package the transaction uses is outside the policy's package rule.
+    PackageNotAllowed,
+    /// The command's signer may not send it under these rules, or it was verified at
+    /// another clock.
+    CommandOutOfScope,
 }
 
 impl ReasonCode {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 21] = [
         Self::Allowed,
         Self::Paused,
         Self::ClassDisabled,
@@ -232,6 +292,8 @@ impl ReasonCode {
         Self::MalformedIntent,
         Self::AmountOverflow,
         Self::ContentUnverifiable,
+        Self::PackageNotAllowed,
+        Self::CommandOutOfScope,
     ];
 
     pub fn as_u16(self) -> u16 {
@@ -255,6 +317,8 @@ impl ReasonCode {
             Self::MalformedIntent => 16,
             Self::AmountOverflow => 17,
             Self::ContentUnverifiable => 18,
+            Self::PackageNotAllowed => 19,
+            Self::CommandOutOfScope => 20,
         }
     }
 
@@ -283,6 +347,8 @@ impl ReasonCode {
             Self::MalformedIntent => "malformed_intent",
             Self::AmountOverflow => "amount_overflow",
             Self::ContentUnverifiable => "content_unverifiable",
+            Self::PackageNotAllowed => "package_not_allowed",
+            Self::CommandOutOfScope => "command_out_of_scope",
         }
     }
 }
@@ -356,15 +422,16 @@ fn all_fee_flows(part: &Intent, ctx: &EvalContext<'_>) -> bool {
     any
 }
 
-/// The class after the self-transfer, platform-party and unexplained-flow rules.
+/// The class after the self-transfer, platform-party and unexplained-flow rules; a
+/// command's operation decides a directed part.
 fn part_class(
     part: &Intent,
     coverage: Coverage,
     ctx: &EvalContext<'_>,
-    directed: bool,
+    command: Option<&VerifiedCommand>,
 ) -> OperationClass {
-    if directed {
-        return OperationClass::Transfers;
+    if let Some(verified) = command {
+        return verified.command().op.class();
     }
     let base = part.kind.class();
     match base {
@@ -532,9 +599,9 @@ fn gates(
     ctx: &EvalContext<'_>,
     part: &Intent,
     coverage: Coverage,
-    directed: bool,
+    command: Option<&VerifiedCommand>,
 ) -> Result<OperationClass, Refusal> {
-    let class = part_class(part, coverage, ctx, directed);
+    let class = part_class(part, coverage, ctx, command);
     if rules.paused && !passes_pause(class, part.kind) {
         return Err(refuse(ReasonCode::Paused, class));
     }
@@ -556,7 +623,7 @@ fn check_part(
     command: Option<&VerifiedCommand>,
     tally: &mut Tally,
 ) -> Result<OperationClass, Refusal> {
-    let class = gates(rules, ctx, part, coverage, command.is_some())?;
+    let class = gates(rules, ctx, part, coverage, command)?;
     let deny = |reason: ReasonCode| refuse(reason, class);
     if coverage == Coverage::Unverified && (command.is_some() || class_is_limited(rules, class)) {
         return Err(deny(ReasonCode::ContentUnverifiable));
@@ -564,7 +631,8 @@ fn check_part(
     if let Some(fee) = part.fee_total_cc {
         tally.add_fee(fee, class)?;
     }
-    let fees_apply = coverage == Coverage::Fields && command.is_none();
+    let swap = command.is_some_and(|c| matches!(c.command().op, CommandOp::Swap { .. }));
+    let fees_apply = coverage == Coverage::Fields && (command.is_none() || swap);
     match class {
         OperationClass::Identity | OperationClass::Container => {
             return Err(deny(ReasonCode::MalformedIntent));
@@ -589,10 +657,15 @@ fn check_part(
             }
         }
         OperationClass::Trading => {
-            let trading = &rules.trading;
-            if let Some(market) = &part.market
-                && !trading.markets.allows(market)
+            if let Some(verified) = command
+                && !command_matches(verified.command(), part, ctx)
             {
+                return Err(deny(ReasonCode::CommandMismatch));
+            }
+            let trading = &rules.trading;
+            // A directed swap's market is only the venue's own name, so a market list refuses it.
+            let unlisted = |market: &MarketId| !trading.markets.allows(market);
+            if (swap && !trading.markets.any) || part.market.as_ref().is_some_and(unlisted) {
                 return Err(deny(ReasonCode::MarketNotAllowed));
             }
             let listed = |instrument: &InstrumentRef| {
@@ -615,7 +688,7 @@ fn check_part(
         OperationClass::Transfers => {
             let transfers = &rules.transfers;
             match command {
-                Some(verified) if !command_matches(&verified.command.op, part, ctx) => {
+                Some(verified) if !command_matches(verified.command(), part, ctx) => {
                     return Err(deny(ReasonCode::CommandMismatch));
                 }
                 None if transfers.directed_only => return Err(deny(ReasonCode::DirectedOnly)),
@@ -800,12 +873,46 @@ fn identity_shape(intent: &Intent) -> bool {
     intent.outgoing.is_empty() && intent.sub.is_empty() && intent.fee_total_cc.is_none()
 }
 
+/// The signer's scope in `rules` lists the command's kind.
+fn scope_lists(rules: &Rules, verified: &VerifiedCommand) -> bool {
+    command_allowed(rules, verified.controller_id(), verified.command().op.command_kind())
+}
+
+/// The command was verified at this clock, and the signer's scope in `rules` still allows
+/// it: its kind, a swap's signed bounds, and the LP the swap settles with.
+fn in_scope(
+    rules: &Rules,
+    ctx: &EvalContext<'_>,
+    intent: &Intent,
+    verified: &VerifiedCommand,
+) -> bool {
+    let op = &verified.command().op;
+    let signer = verified.controller_id();
+    let lp_allowed = match (op, &intent.settle) {
+        (CommandOp::Swap { .. }, Some(settle)) => swap_lp_allowed(rules, signer, &settle.lp),
+        _ => true,
+    };
+    verified.verified_at() == ctx.now
+        && scope_lists(rules, verified)
+        && check_swap_bounds(rules, signer, op, Some(ctx.cc)).is_ok()
+        && lp_allowed
+}
+
+fn out_of_scope(verified: &VerifiedCommand) -> Refusal {
+    refuse(ReasonCode::CommandOutOfScope, verified.command().op.class())
+}
+
 fn evaluate_inner(
     rules: &Rules,
     ctx: &EvalContext<'_>,
     intent: &Intent,
     command: Option<&VerifiedCommand>,
 ) -> Result<(OperationClass, Vec<UsageDelta>), Refusal> {
+    if let Some(verified) = command
+        && !in_scope(rules, ctx, intent, verified)
+    {
+        return Err(out_of_scope(verified));
+    }
     let static_class = intent.kind.class();
     let deny = |reason: ReasonCode| refuse(reason, static_class);
     match static_class {
@@ -853,7 +960,8 @@ fn evaluate_inner(
     }
 }
 
-/// Evaluates `intent` under `rules`; a verified command directs a transfer.
+/// Evaluates `intent` under `rules`; a verified command directs a transfer or a swap,
+/// and only at the clock it was verified at.
 pub fn evaluate(
     rules: &Rules,
     ctx: &EvalContext<'_>,
@@ -904,16 +1012,25 @@ fn directed_only(
     Ok(class)
 }
 
+/// A market list refuses every swap command, as in `check_part`.
+fn swap_markets(
+    rules: &Rules,
+    class: OperationClass,
+    command: Option<&VerifiedCommand>,
+) -> Result<OperationClass, Refusal> {
+    let swap = command.is_some_and(|c| matches!(c.command().op, CommandOp::Swap { .. }));
+    if swap && !rules.trading.markets.any {
+        return Err(refuse(ReasonCode::MarketNotAllowed, class));
+    }
+    Ok(class)
+}
+
 fn kind_gates(
     rules: &Rules,
     kind: OperationKind,
-    directed: bool,
+    command: Option<&VerifiedCommand>,
 ) -> Result<OperationClass, Refusal> {
-    let class = if directed {
-        OperationClass::Transfers
-    } else {
-        kind.class()
-    };
+    let class = command.map_or(kind.class(), |c| c.command().op.class());
     if rules.paused && !passes_pause(class, kind) {
         return Err(refuse(ReasonCode::Paused, class));
     }
@@ -923,40 +1040,58 @@ fn kind_gates(
     if kind.requires_lp() && !rules.trading.lp_enabled {
         return Err(refuse(ReasonCode::LpDisabled, class));
     }
-    directed_only(rules, class, directed)
+    swap_markets(rules, class, command)?;
+    directed_only(rules, class, command.is_some())
 }
 
-/// The class, pause, switch and directed-only checks of a kind, before content is known.
-pub fn precheck(rules: &Rules, kind: OperationKind, directed: bool) -> Decision {
+/// `command_mismatch` when a command directs another operation kind.
+fn kind_mismatch(kind: OperationKind, command: Option<&VerifiedCommand>) -> Option<Refusal> {
+    command
+        .filter(|c| c.command().op.kind() != kind)
+        .map(|c| refuse(ReasonCode::CommandMismatch, c.command().op.class()))
+}
+
+/// The class, pause, switch and directed-only checks of a kind, before content is known; a
+/// command must direct `kind`, its signer's scope must list it, and a market list refuses a swap.
+pub fn precheck(rules: &Rules, kind: OperationKind, command: Option<&VerifiedCommand>) -> Decision {
+    if let Some(verified) = command
+        && !scope_lists(rules, verified)
+    {
+        return decided(Err(out_of_scope(verified)));
+    }
     let static_class = kind.class();
     let result = match static_class {
-        OperationClass::Identity | OperationClass::Container if directed => {
+        OperationClass::Identity | OperationClass::Container if command.is_some() => {
             Err(refuse(ReasonCode::CommandMismatch, static_class))
         }
         OperationClass::Identity | OperationClass::Container => Ok(static_class),
-        OperationClass::Maintenance
-        | OperationClass::Trading
-        | OperationClass::Transfers
-        | OperationClass::Locks
-        | OperationClass::Usdcx
-        | OperationClass::FeeConsents => kind_gates(rules, kind, directed),
+        _ => match kind_mismatch(kind, command) {
+            Some(refusal) => Err(refusal),
+            None => kind_gates(rules, kind, command),
+        },
     };
     decided(result)
 }
 
-/// As `precheck`, classifying by the flows the request names (taken as given).
+/// As `precheck`, classifying by the flows the request names (taken as given), with the
+/// full scope check of a command at the context's clock.
 pub fn precheck_intent(
     rules: &Rules,
     ctx: &EvalContext<'_>,
     intent: &Intent,
-    directed: bool,
+    command: Option<&VerifiedCommand>,
 ) -> Decision {
+    if let Some(verified) = command
+        && !in_scope(rules, ctx, intent, verified)
+    {
+        return decided(Err(out_of_scope(verified)));
+    }
     let static_class = intent.kind.class();
     let result = match static_class {
         OperationClass::Identity if !identity_shape(intent) => {
             Err(refuse(ReasonCode::MalformedIntent, static_class))
         }
-        OperationClass::Identity | OperationClass::Container if directed => {
+        OperationClass::Identity | OperationClass::Container if command.is_some() => {
             Err(refuse(ReasonCode::CommandMismatch, static_class))
         }
         OperationClass::Identity => Ok(static_class),
@@ -967,7 +1102,7 @@ pub fn precheck_intent(
             .sub
             .iter()
             .try_for_each(|sub| {
-                gates(rules, ctx, sub, Coverage::Fields, false)
+                gates(rules, ctx, sub, Coverage::Fields, None)
                     .and_then(|class| directed_only(rules, class, false))
                     .map(|_| ())
             })
@@ -975,19 +1110,83 @@ pub fn precheck_intent(
         _ if intent.kind.is_multicall_sub() || !intent.sub.is_empty() => {
             Err(refuse(ReasonCode::MalformedIntent, static_class))
         }
-        _ => gates(rules, ctx, intent, Coverage::Fields, directed)
-            .and_then(|class| directed_only(rules, class, directed)),
+        _ => match kind_mismatch(intent.kind, command) {
+            Some(refusal) => Err(refusal),
+            None => gates(rules, ctx, intent, Coverage::Fields, command)
+                .and_then(|class| swap_markets(rules, class, command))
+                .and_then(|class| directed_only(rules, class, command.is_some())),
+        },
     };
     decided(result)
+}
+
+/// A directed signature the rules in force allow: the command, verified at the clock
+/// the rules were read at, and the decision with the usage to record once it succeeded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectedAuthorization {
+    pub command: VerifiedCommand,
+    pub decision: Decision,
+}
+
+/// Why a directed signature was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectedRefusal {
+    /// The command did not verify.
+    Command(CommandError),
+    /// The rules in force refused the intent under the command.
+    Policy(Decision),
+}
+
+impl DirectedRefusal {
+    /// The receipt code: the command error, or the evaluator reason.
+    pub fn code(&self) -> u16 {
+        match self {
+            Self::Command(e) => e.code(),
+            Self::Policy(decision) => decision.reason.as_u16(),
+        }
+    }
+
+    pub fn code_name(&self) -> &'static str {
+        match self {
+            Self::Command(e) => e.code_name(),
+            Self::Policy(decision) => decision.reason.code_name(),
+        }
+    }
+}
+
+/// Verifies a command, checks a swap's LP against the signer's scope (`lp_not_allowed`),
+/// then evaluates `intent` under it, all at `now` with the rules `state` has in force then.
+pub fn authorize_directed(
+    state: &ControlState,
+    now: UtcTime,
+    bytes: &[u8],
+    envelope: &ProofEnvelope,
+    intent: &Intent,
+    ctx: &EvalContext<'_>,
+) -> Result<DirectedAuthorization, DirectedRefusal> {
+    let command = verify_command(state, bytes, envelope, now, Some(ctx.cc))
+        .map_err(DirectedRefusal::Command)?;
+    let rules = state.rules_at(now).rules();
+    if let Some(settle) = &intent.settle {
+        check_swap_lp(rules, command.controller_id(), &command.command().op, &settle.lp)
+            .map_err(DirectedRefusal::Command)?;
+    }
+    let ctx = EvalContext { now, ..*ctx };
+    let decision = evaluate(rules, &ctx, intent, Some(&command));
+    if decision.allowed {
+        Ok(DirectedAuthorization { command, decision })
+    } else {
+        Err(DirectedRefusal::Policy(decision))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canon::values::{InstrumentId, Network};
-    use crate::command::{Command, CommandOp};
+    use crate::canon::values::{InstrumentId, Network, Text, Uuid7};
+    use crate::command::{Command, CommandKind};
     use crate::controller::ControllerId;
-    use crate::policy::{DEFAULT_LINKED_RULES, LimitItem};
+    use crate::policy::{CommandScope, DEFAULT_LINKED_RULES, LimitItem, ScopePair};
     use crate::proof::ProofOutcome;
     use crate::testkit::{self, at};
     use OperationKind as K;
@@ -1087,16 +1286,54 @@ mod tests {
                 summary: crate::canon::values::Text::parse("Pay alice").unwrap(),
             };
             let bytes = command.encode().unwrap();
-            VerifiedCommand {
-                hash: crate::canon::values::Hash32(crate::canon::values::sha256(&bytes)),
-                bytes,
-                command,
-                controller_id: ControllerId([2; 32]),
-                outcome: ProofOutcome {
-                    sign_count: None,
-                    backup_eligible: false,
-                    backup_state: false,
-                },
+            let outcome = ProofOutcome {
+                sign_count: None,
+                backup_eligible: false,
+                backup_state: false,
+            };
+            VerifiedCommand::stub(&bytes, ControllerId([2; 32]), outcome, at(0))
+        }
+
+        /// Sell 1000 CC for at least 150 USDCx, paying at most 2 CC in fees.
+        fn sell_cc(&self) -> CommandOp {
+            CommandOp::Swap {
+                sell: self.cc.clone(),
+                sell_amount: amount("1000"),
+                buy: self.usdc.clone(),
+                min_receive: amount("150"),
+                max_fee_cc: amount("2"),
+            }
+        }
+
+        /// The settle `sell_cc` directs: 151 USDCx from bob, 1.5 CC to the fee party.
+        fn swap_intent(&self) -> Intent {
+            Intent {
+                outgoing: vec![
+                    self.flow(&self.cc, "1000", &self.bob),
+                    self.flow(&self.cc, "1.5", &self.fee),
+                    self.flow(&self.cc, "40", &self.agent),
+                ],
+                instruments: vec![self.cc.clone(), self.usdc.clone()],
+                market: Some(MarketId::parse("CC/USDCx").unwrap()),
+                settle: Some(SettleTerms {
+                    lp: self.bob.clone(),
+                    sent: Leg {
+                        instrument: self.cc.clone(),
+                        amount: amount("1000"),
+                    },
+                    received: Leg {
+                        instrument: self.usdc.clone(),
+                        amount: amount("151"),
+                    },
+                    net_received: amount("151"),
+                    fees: vec![SettleFee {
+                        receiver: self.fee.clone(),
+                        instrument: self.cc.clone(),
+                        amount: amount("1.5"),
+                    }],
+                    valid_until: at(300),
+                }),
+                ..Intent::new(K::AtomicDvpSettle)
             }
         }
     }
@@ -1376,6 +1613,502 @@ mod tests {
             evaluate(&paused, &ctx, &pay("10", &f.alice), Some(&command)).reason,
             R::Paused
         );
+    }
+
+    #[test]
+    fn a_directed_swap_is_judged_as_trading_on_its_sold_leg() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let swap = f.command(f.sell_cc());
+        let intent = f.swap_intent();
+        let rules = DEFAULT_LINKED_RULES;
+        let decision = evaluate(&rules, &ctx, &intent, Some(&swap));
+        assert!(decision.allowed, "{decision:?}");
+        assert_eq!(decision.class, OperationClass::Trading);
+        assert_eq!(
+            decision.usage,
+            vec![
+                UsageDelta {
+                    bucket: UsageBucket::Trading,
+                    instrument: f.cc.clone(),
+                    amount: amount("1000"),
+                },
+                UsageDelta {
+                    bucket: UsageBucket::Fees,
+                    instrument: f.cc.clone(),
+                    amount: amount("1.5"),
+                },
+            ]
+        );
+        // Undirected, the same settle is an ordinary trade.
+        assert!(evaluate(&rules, &ctx, &intent, None).allowed);
+        let mut transfers_off = rules.clone();
+        transfers_off.transfers.enabled = false;
+        assert!(evaluate(&transfers_off, &ctx, &intent, Some(&swap)).allowed);
+        let item = |value: &str| LimitItem {
+            instrument: PolicyInstrument::Cc,
+            amount: amount(value),
+        };
+        let mut paused = rules.clone();
+        paused.paused = true;
+        let mut off = rules.clone();
+        off.trading.enabled = false;
+        let mut markets = rules.clone();
+        markets.trading.markets = Allowlist {
+            any: false,
+            items: vec![MarketId::parse("cETH/USDCx").unwrap()],
+        };
+        let mut instruments = rules.clone();
+        instruments.trading.instruments = Allowlist {
+            any: false,
+            items: vec![PolicyInstrument::Token(f.usdc.clone())],
+        };
+        let mut per_trade = rules.clone();
+        per_trade.trading.per_trade.items = vec![item("999.9999999999")];
+        let mut per_trade_at = rules.clone();
+        per_trade_at.trading.per_trade.items = vec![item("1000")];
+        let mut per_day = rules.clone();
+        per_day.trading.per_day.items = vec![item("1000")];
+        let mut fee_cap = rules.clone();
+        fee_cap.fees.cc_per_consent = Some(amount("1.4999999999"));
+        let cases = [
+            (&paused, R::Paused),
+            (&off, R::ClassDisabled),
+            (&markets, R::MarketNotAllowed),
+            (&instruments, R::InstrumentNotAllowed),
+            (&per_trade, R::PerOperationCap),
+            (&per_trade_at, R::Allowed),
+            (&per_day, R::Allowed),
+            (&fee_cap, R::FeePerConsentCap),
+        ];
+        for (rules, expected) in cases {
+            assert_eq!(evaluate(rules, &ctx, &intent, Some(&swap)).reason, expected);
+        }
+        let mut used = Fixture::new();
+        used.usage.insert(
+            UsageBucket::Trading,
+            &used.cc.clone(),
+            amount("0.0000000001"),
+        );
+        assert_eq!(
+            evaluate(&per_day, &used.ctx(), &intent, Some(&swap)).reason,
+            R::DailyCap
+        );
+        // The binding runs first: content other than the command is a mismatch.
+        let mut wrong = intent.clone();
+        wrong.outgoing[0].amount = amount("1001");
+        assert_eq!(
+            evaluate(&markets, &ctx, &wrong, Some(&swap)).reason,
+            R::CommandMismatch
+        );
+        let transfer = with_flows(K::TransferCc, vec![f.flow(&f.cc, "1000", &f.bob)]);
+        let decision = evaluate(&rules, &ctx, &transfer, Some(&swap));
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::CommandMismatch, OperationClass::Trading)
+        );
+        let unverified = Intent {
+            coverage: Coverage::Unverified,
+            ..intent.clone()
+        };
+        assert_eq!(
+            evaluate(&rules, &ctx, &unverified, Some(&swap)).reason,
+            R::ContentUnverifiable
+        );
+        // A transfer command still cannot direct a settle.
+        let pay = f.command(CommandOp::TransferCc {
+            receiver: f.bob.clone(),
+            amount: amount("1000"),
+            description: None,
+            settlement_proposal_id: None,
+        });
+        let decision = evaluate(&rules, &ctx, &intent, Some(&pay));
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::CommandMismatch, OperationClass::Transfers)
+        );
+    }
+
+    #[test]
+    fn a_market_list_refuses_every_directed_swap() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let swap = f.command(f.sell_cc());
+        let intent = f.swap_intent();
+        let mut listed = DEFAULT_LINKED_RULES;
+        listed.trading.markets = Allowlist {
+            any: false,
+            items: vec![MarketId::parse("CC/USDCx").unwrap()],
+        };
+        // Even the listed name is refused: a directed swap's market is the venue's own.
+        let decision = evaluate(&listed, &ctx, &intent, Some(&swap));
+        assert_eq!(
+            (decision.allowed, decision.reason, decision.class),
+            (false, R::MarketNotAllowed, OperationClass::Trading)
+        );
+        let unnamed = Intent {
+            market: None,
+            ..intent.clone()
+        };
+        assert_eq!(
+            evaluate(&listed, &ctx, &unnamed, Some(&swap)).reason,
+            R::MarketNotAllowed
+        );
+        // Undirected, the listed market is still a trade; with `any`, directed ones pass.
+        assert!(evaluate(&listed, &ctx, &intent, None).allowed);
+        assert!(evaluate(&DEFAULT_LINKED_RULES, &ctx, &intent, Some(&swap)).allowed);
+        assert!(evaluate(&DEFAULT_LINKED_RULES, &ctx, &unnamed, Some(&swap)).allowed);
+        // The binding still runs first.
+        let mut wrong = intent.clone();
+        wrong.outgoing[0].amount = amount("1001");
+        assert_eq!(
+            evaluate(&listed, &ctx, &wrong, Some(&swap)).reason,
+            R::CommandMismatch
+        );
+    }
+
+    #[test]
+    fn a_market_list_refuses_a_swap_command_at_precheck() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let swap = f.command(f.sell_cc());
+        let intent = f.swap_intent();
+        let mut listed = DEFAULT_LINKED_RULES;
+        listed.trading.markets = Allowlist {
+            any: false,
+            items: vec![MarketId::parse("CC/USDCx").unwrap()],
+        };
+        let refused = (false, R::MarketNotAllowed, OperationClass::Trading);
+        let decision = precheck(&listed, K::AtomicDvpSettle, Some(&swap));
+        assert_eq!((decision.allowed, decision.reason, decision.class), refused);
+        let decision = precheck_intent(&listed, &ctx, &intent, Some(&swap));
+        assert_eq!((decision.allowed, decision.reason, decision.class), refused);
+        let mut none = listed.clone();
+        none.trading.markets.items.clear();
+        assert_eq!(
+            precheck(&none, K::AtomicDvpSettle, Some(&swap)).reason,
+            R::MarketNotAllowed
+        );
+        // The earlier gates keep their order, as in `evaluate`.
+        let mut paused = listed.clone();
+        paused.paused = true;
+        let mut off = listed.clone();
+        off.trading.enabled = false;
+        for (rules, expected) in [(&paused, R::Paused), (&off, R::ClassDisabled)] {
+            assert_eq!(
+                precheck(rules, K::AtomicDvpSettle, Some(&swap)).reason,
+                expected
+            );
+            assert_eq!(
+                precheck_intent(rules, &ctx, &intent, Some(&swap)).reason,
+                expected
+            );
+        }
+        // Undirected trades, transfer commands and `any` lists are unchanged.
+        assert!(precheck(&listed, K::AtomicDvpSettle, None).allowed);
+        assert!(precheck_intent(&listed, &ctx, &intent, None).allowed);
+        let pay = f.command(CommandOp::TransferCc {
+            receiver: f.bob.clone(),
+            amount: amount("1"),
+            description: None,
+            settlement_proposal_id: None,
+        });
+        assert!(precheck(&listed, K::TransferCc, Some(&pay)).allowed);
+        assert!(precheck(&DEFAULT_LINKED_RULES, K::AtomicDvpSettle, Some(&swap)).allowed);
+        assert!(precheck_intent(&DEFAULT_LINKED_RULES, &ctx, &intent, Some(&swap)).allowed);
+    }
+
+    #[test]
+    fn the_evaluator_re_checks_the_scope_and_the_clock() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let swap = f.command(f.sell_cc());
+        let intent = f.swap_intent();
+        let scoped = |scope: CommandScope| {
+            let mut rules = DEFAULT_LINKED_RULES;
+            rules.scopes = vec![scope];
+            rules
+        };
+        let scope =
+            |commands: &[CommandKind], pairs: Vec<ScopePair>, lps: Vec<PartyId>| CommandScope {
+                controller: *swap.controller_id(),
+                commands: commands.to_vec(),
+                pairs,
+                lps,
+            };
+        let pair = |min_price: &str, max_sell: &str| ScopePair {
+            sell: PolicyInstrument::Cc,
+            buy: PolicyInstrument::Token(f.usdc.clone()),
+            min_price: amount(min_price),
+            max_sell: amount(max_sell),
+        };
+        let verdict = |rules: &Rules, command: &VerifiedCommand| {
+            let decision = evaluate(rules, &ctx, &intent, Some(command));
+            (decision.reason, decision.class)
+        };
+        let out = (R::CommandOutOfScope, OperationClass::Trading);
+        let allowed = (R::Allowed, OperationClass::Trading);
+        let swaps = scoped(scope(&[CommandKind::Swap], Vec::new(), Vec::new()));
+        assert_eq!(verdict(&swaps, &swap), allowed);
+        let transfers = scoped(scope(&[CommandKind::TransferCc], Vec::new(), Vec::new()));
+        assert_eq!(verdict(&transfers, &swap), out);
+        assert_eq!(
+            verdict(&scoped(scope(&[], Vec::new(), Vec::new())), &swap),
+            out
+        );
+        let bounded = |min_price: &str, max_sell: &str, lps: Vec<PartyId>| {
+            scoped(scope(
+                &[CommandKind::Swap],
+                vec![pair(min_price, max_sell)],
+                lps,
+            ))
+        };
+        assert_eq!(
+            verdict(&bounded("0.15", "1000", vec![f.bob.clone()]), &swap),
+            allowed
+        );
+        assert_eq!(
+            verdict(&bounded("0.1500000001", "1000", Vec::new()), &swap),
+            out
+        );
+        assert_eq!(
+            verdict(&bounded("0.15", "999.9999999999", Vec::new()), &swap),
+            out
+        );
+        assert_eq!(
+            verdict(&bounded("0.15", "1000", vec![f.alice.clone()]), &swap),
+            out
+        );
+        let reversed = scoped(scope(
+            &[CommandKind::Swap],
+            vec![ScopePair {
+                sell: PolicyInstrument::Token(f.usdc.clone()),
+                buy: PolicyInstrument::Cc,
+                min_price: Amount::ZERO,
+                max_sell: amount("1000000"),
+            }],
+            Vec::new(),
+        ));
+        assert_eq!(verdict(&reversed, &swap), out);
+        // Another controller's scope does not bind this signer.
+        let other = scoped(CommandScope {
+            controller: ControllerId([3; 32]),
+            ..scope(&[], Vec::new(), Vec::new())
+        });
+        assert_eq!(verdict(&other, &swap), allowed);
+        // A command verified at another clock is never taken.
+        for secs in [-1, 1] {
+            let stale = swap.verified_again_at(at(secs));
+            assert_eq!(verdict(&DEFAULT_LINKED_RULES, &stale), out);
+        }
+        // Transfers are scoped too.
+        let pay = f.command(CommandOp::TransferCc {
+            receiver: f.alice.clone(),
+            amount: amount("10"),
+            description: None,
+            settlement_proposal_id: None,
+        });
+        let paid = with_flows(K::TransferCc, vec![f.flow(&f.cc, "10", &f.alice)]);
+        let decision = evaluate(&swaps, &ctx, &paid, Some(&pay));
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::CommandOutOfScope, OperationClass::Transfers)
+        );
+        assert!(evaluate(&transfers, &ctx, &paid, Some(&pay)).allowed);
+        // An undirected intent is never judged by a scope.
+        assert!(evaluate(&transfers, &ctx, &intent, None).allowed);
+    }
+
+    #[test]
+    fn authorize_directed_verifies_and_evaluates_at_one_clock() {
+        let f = Fixture::new();
+        let now = at(testkit::DEVNET_DELAY);
+        let signed = |chain: &testkit::Chain, op: CommandOp| {
+            let head = chain.state.head().unwrap();
+            let command = Command {
+                network: Network::Devnet,
+                agent_party: f.agent.clone(),
+                command_id: Uuid7::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
+                log_seq: head.seq,
+                log_head: head.hash,
+                issued_at: now,
+                expires_at: now.checked_add_secs(600).unwrap(),
+                op,
+                summary: Text::parse("Pay alice").unwrap(),
+            };
+            let bytes = command.encode().unwrap();
+            let envelope = testkit::passkey_envelope(&bytes);
+            (bytes, envelope)
+        };
+        let pay = CommandOp::TransferCc {
+            receiver: f.alice.clone(),
+            amount: amount("10"),
+            description: None,
+            settlement_proposal_id: None,
+        };
+        let chain = testkit::Chain::linked();
+        let (bytes, envelope) = signed(&chain, pay.clone());
+        let paid = with_flows(K::TransferCc, vec![f.flow(&f.cc, "10", &f.alice)]);
+        // The context's clock is replaced by `now`, so the command is never stale.
+        let ctx = f.ctx();
+        let done = authorize_directed(&chain.state, now, &bytes, &envelope, &paid, &ctx).unwrap();
+        assert_eq!(done.command.verified_at(), now);
+        assert_eq!(*done.command.controller_id(), testkit::passkey_id());
+        assert_eq!(
+            done.decision.usage,
+            vec![UsageDelta {
+                bucket: UsageBucket::Transfers,
+                instrument: f.cc.clone(),
+                amount: amount("10"),
+            }]
+        );
+        let to_bob = with_flows(K::TransferCc, vec![f.flow(&f.cc, "10", &f.bob)]);
+        let refused =
+            authorize_directed(&chain.state, now, &bytes, &envelope, &to_bob, &ctx).unwrap_err();
+        assert!(matches!(&refused, DirectedRefusal::Policy(d) if !d.allowed));
+        assert_eq!(
+            (refused.code(), refused.code_name()),
+            (5, "command_mismatch")
+        );
+        let late = now.checked_add_secs(601).unwrap();
+        let expired =
+            authorize_directed(&chain.state, late, &bytes, &envelope, &paid, &ctx).unwrap_err();
+        assert_eq!(expired, DirectedRefusal::Command(CommandError::Expired));
+        assert_eq!((expired.code(), expired.code_name()), (1106, "expired"));
+        // A scope accepted at the head refuses the kind before any content is read.
+        let mut scoped = testkit::Chain::linked();
+        let mut rules = DEFAULT_LINKED_RULES;
+        rules.scopes = vec![CommandScope {
+            controller: testkit::passkey_id(),
+            commands: vec![CommandKind::Swap],
+            pairs: Vec::new(),
+            lps: Vec::new(),
+        }];
+        let doc = testkit::policy_doc(&scoped.state, 1, now, rules);
+        scoped.accept_passkey(&doc, now);
+        let (bytes, envelope) = signed(&scoped, pay);
+        let refused =
+            authorize_directed(&scoped.state, now, &bytes, &envelope, &paid, &ctx).unwrap_err();
+        assert_eq!(refused, DirectedRefusal::Command(CommandError::OutOfScope));
+        assert_eq!(
+            (refused.code(), refused.code_name()),
+            (1108, "command_out_of_scope")
+        );
+        // The rules come from the state at `now`: a paused policy refuses the transfer.
+        let mut paused = testkit::Chain::linked();
+        let mut rules = DEFAULT_LINKED_RULES;
+        rules.paused = true;
+        let doc = testkit::policy_doc(&paused.state, 1, now, rules);
+        paused.accept_passkey(&doc, now);
+        let (bytes, envelope) = signed(
+            &paused,
+            CommandOp::TransferCc {
+                receiver: f.alice.clone(),
+                amount: amount("10"),
+                description: None,
+                settlement_proposal_id: None,
+            },
+        );
+        let refused =
+            authorize_directed(&paused.state, now, &bytes, &envelope, &paid, &ctx).unwrap_err();
+        assert_eq!((refused.code(), refused.code_name()), (1, "paused"));
+    }
+
+    #[test]
+    fn authorize_directed_refuses_an_lp_the_scope_does_not_list_with_1112() {
+        let f = Fixture::new();
+        let now = at(testkit::DEVNET_DELAY);
+        let passkey = testkit::passkey_id();
+        let scoped_to = |lps: Vec<PartyId>| {
+            let mut chain = testkit::Chain::linked();
+            let mut rules = DEFAULT_LINKED_RULES;
+            rules.scopes = vec![CommandScope {
+                controller: passkey,
+                commands: vec![CommandKind::Swap],
+                pairs: Vec::new(),
+                lps,
+            }];
+            let doc = testkit::policy_doc(&chain.state, 1, now, rules);
+            chain.accept_passkey(&doc, now);
+            chain
+        };
+        let signed = |chain: &testkit::Chain| {
+            let head = chain.state.head().unwrap();
+            let command = Command {
+                network: Network::Devnet,
+                agent_party: f.agent.clone(),
+                command_id: Uuid7::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
+                log_seq: head.seq,
+                log_head: head.hash,
+                issued_at: now,
+                expires_at: now.checked_add_secs(600).unwrap(),
+                op: f.sell_cc(),
+                summary: Text::parse("Sell 1000 CC").unwrap(),
+            };
+            let bytes = command.encode().unwrap();
+            let envelope = testkit::passkey_envelope(&bytes);
+            (bytes, envelope)
+        };
+        let intent = f.swap_intent();
+        let ctx = f.ctx();
+        for lps in [vec![f.bob.clone()], Vec::new()] {
+            let chain = scoped_to(lps);
+            let (bytes, envelope) = signed(&chain);
+            let done =
+                authorize_directed(&chain.state, now, &bytes, &envelope, &intent, &ctx).unwrap();
+            assert!(done.decision.allowed);
+        }
+        let chain = scoped_to(vec![f.alice.clone()]);
+        let (bytes, envelope) = signed(&chain);
+        let refused =
+            authorize_directed(&chain.state, now, &bytes, &envelope, &intent, &ctx).unwrap_err();
+        assert_eq!(refused, DirectedRefusal::Command(CommandError::LpNotAllowed));
+        assert_eq!(
+            (refused.code(), refused.code_name()),
+            (1112, "lp_not_allowed")
+        );
+        // `evaluate` alone keeps refusing it as out of scope, the backstop.
+        let rules = chain.state.rules_at(now).rules();
+        let verified = verify_command(&chain.state, &bytes, &envelope, now, Some(&f.cc)).unwrap();
+        let at_now = EvalContext { now, ..ctx };
+        assert_eq!(
+            evaluate(rules, &at_now, &intent, Some(&verified)).reason,
+            R::CommandOutOfScope
+        );
+        // Only a swap with an unlisted LP fails, and only under a scope that lists LPs.
+        let swap = f.sell_cc();
+        assert_eq!(
+            check_swap_lp(rules, &passkey, &swap, &f.bob),
+            Err(CommandError::LpNotAllowed)
+        );
+        assert_eq!(check_swap_lp(rules, &passkey, &swap, &f.alice), Ok(()));
+        assert_eq!(check_swap_lp(rules, &ControllerId([9; 32]), &swap, &f.bob), Ok(()));
+        let pay = CommandOp::TransferCc {
+            receiver: f.alice.clone(),
+            amount: amount("10"),
+            description: None,
+            settlement_proposal_id: None,
+        };
+        assert_eq!(check_swap_lp(rules, &passkey, &pay, &f.bob), Ok(()));
+        assert_eq!(
+            check_swap_lp(&DEFAULT_LINKED_RULES, &passkey, &swap, &f.bob),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn settle_expiries_round_up_to_the_second() {
+        let secs = at(0).unix_secs();
+        let micros = |extra: i64| secs * 1_000_000 + extra;
+        assert_eq!(SettleTerms::expiry_from_micros(micros(0)), Some(at(0)));
+        assert_eq!(SettleTerms::expiry_from_micros(micros(1)), Some(at(1)));
+        assert_eq!(
+            SettleTerms::expiry_from_micros(micros(999_999)),
+            Some(at(1))
+        );
+        assert_eq!(SettleTerms::expiry_from_micros(micros(-1)), Some(at(0)));
+        assert_eq!(SettleTerms::expiry_from_micros(-1), None);
+        assert_eq!(SettleTerms::expiry_from_micros(i64::MAX), None);
     }
 
     #[test]
@@ -1905,29 +2638,46 @@ mod tests {
         let f = Fixture::new();
         let ctx = f.ctx();
         let rules = DEFAULT_LINKED_RULES;
+        let pay = f.command(CommandOp::TransferCc {
+            receiver: f.alice.clone(),
+            amount: amount("1"),
+            description: None,
+            settlement_proposal_id: None,
+        });
+        let burn = f.command(CommandOp::UsdcxBurn {
+            amount: amount("1"),
+            destination: EthAddress([1; 20]),
+        });
         let cases = [
-            (K::TransferCc, false, R::DirectedOnly),
-            (K::TransferCc, true, R::Allowed),
-            (K::UsdcxBurn, false, R::DirectedOnly),
-            (K::ProposeDvp, false, R::Allowed),
-            (K::Jwt, false, R::Allowed),
-            (K::Jwt, true, R::CommandMismatch),
-            (K::ExecuteMultiCall, false, R::Allowed),
+            (K::TransferCc, None, R::DirectedOnly),
+            (K::TransferCc, Some(&pay), R::Allowed),
+            (K::UsdcxBurn, None, R::DirectedOnly),
+            (K::UsdcxBurn, Some(&burn), R::Allowed),
+            (K::UsdcxBurn, Some(&pay), R::CommandMismatch),
+            (K::TransferCip56, Some(&pay), R::CommandMismatch),
+            (K::ProposeDvp, None, R::Allowed),
+            (K::Jwt, None, R::Allowed),
+            (K::Jwt, Some(&pay), R::CommandMismatch),
+            (K::ExecuteMultiCall, None, R::Allowed),
+            (K::ExecuteMultiCall, Some(&pay), R::CommandMismatch),
         ];
-        for (kind, directed, expected) in cases {
-            assert_eq!(precheck(&rules, kind, directed).reason, expected, "{kind}");
+        for (kind, command, expected) in cases {
+            assert_eq!(precheck(&rules, kind, command).reason, expected, "{kind}");
         }
         let mut paused = rules.clone();
         paused.paused = true;
-        assert_eq!(precheck(&paused, K::TransferCc, true).reason, R::Paused);
-        assert_eq!(precheck(&paused, K::RetireVenue, false).reason, R::Allowed);
+        assert_eq!(
+            precheck(&paused, K::TransferCc, Some(&pay)).reason,
+            R::Paused
+        );
+        assert_eq!(precheck(&paused, K::RetireVenue, None).reason, R::Allowed);
         let merge = with_flows(K::TransferCip56, vec![f.flow(&f.usdc, "5", &f.agent)]);
         assert_eq!(
-            precheck(&rules, K::TransferCip56, false).reason,
+            precheck(&rules, K::TransferCip56, None).reason,
             R::DirectedOnly
         );
         assert_eq!(
-            precheck_intent(&rules, &ctx, &merge, false).reason,
+            precheck_intent(&rules, &ctx, &merge, None).reason,
             R::Allowed
         );
         let batch = multicall(vec![with_flows(
@@ -1935,25 +2685,108 @@ mod tests {
             vec![f.flow(&f.cc, "1", &f.alice)],
         )]);
         assert_eq!(
-            precheck_intent(&rules, &ctx, &batch, false).reason,
+            precheck_intent(&rules, &ctx, &batch, None).reason,
             R::DirectedOnly
         );
         assert_eq!(
-            precheck_intent(&rules, &ctx, &Intent::new(K::McTransfer), false).reason,
+            precheck_intent(&rules, &ctx, &batch, Some(&pay)).reason,
+            R::CommandMismatch
+        );
+        assert_eq!(
+            precheck_intent(&rules, &ctx, &Intent::new(K::McTransfer), None).reason,
             R::MalformedIntent
         );
         let jwt_with_flow = with_flows(K::Jwt, vec![f.flow(&f.cc, "1", &f.alice)]);
         assert_eq!(
-            precheck_intent(&rules, &ctx, &jwt_with_flow, false).reason,
+            precheck_intent(&rules, &ctx, &jwt_with_flow, None).reason,
             R::MalformedIntent
         );
         assert_eq!(
-            precheck_intent(&rules, &ctx, &Intent::new(K::Jwt), true).reason,
+            precheck_intent(&rules, &ctx, &Intent::new(K::Jwt), Some(&pay)).reason,
             R::CommandMismatch
         );
         assert_eq!(
-            precheck_intent(&rules, &ctx, &Intent::new(K::ExecuteMultiCall), false).reason,
+            precheck_intent(&rules, &ctx, &Intent::new(K::ExecuteMultiCall), None).reason,
             R::MalformedIntent
+        );
+        let cc_pay = with_flows(K::TransferCc, vec![f.flow(&f.cc, "1", &f.alice)]);
+        assert_eq!(
+            precheck_intent(&rules, &ctx, &cc_pay, Some(&pay)).reason,
+            R::Allowed
+        );
+        assert_eq!(
+            precheck_intent(&rules, &ctx, &cc_pay, Some(&burn)).reason,
+            R::CommandMismatch
+        );
+    }
+
+    #[test]
+    fn prechecks_judge_a_swap_as_trading_inside_its_scope() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let swap = f.command(f.sell_cc());
+        let rules = DEFAULT_LINKED_RULES;
+        let decision = precheck(&rules, K::AtomicDvpSettle, Some(&swap));
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Trading)
+        );
+        assert_eq!(
+            precheck(&rules, K::TransferCc, Some(&swap)).reason,
+            R::CommandMismatch
+        );
+        let mut paused = rules.clone();
+        paused.paused = true;
+        assert_eq!(
+            precheck(&paused, K::AtomicDvpSettle, Some(&swap)).reason,
+            R::Paused
+        );
+        let mut off = rules.clone();
+        off.trading.enabled = false;
+        assert_eq!(
+            precheck(&off, K::AtomicDvpSettle, Some(&swap)).reason,
+            R::ClassDisabled
+        );
+        let mut no_transfers = rules.clone();
+        no_transfers.transfers.enabled = false;
+        assert_eq!(
+            precheck(&no_transfers, K::AtomicDvpSettle, Some(&swap)).reason,
+            R::Allowed
+        );
+        let intent = f.swap_intent();
+        assert_eq!(
+            precheck_intent(&rules, &ctx, &intent, Some(&swap)).reason,
+            R::Allowed
+        );
+        // The scope comes first, before any kind or shape rule.
+        let mut scoped = rules.clone();
+        scoped.scopes = vec![CommandScope {
+            controller: *swap.controller_id(),
+            commands: vec![CommandKind::TransferCc],
+            pairs: Vec::new(),
+            lps: Vec::new(),
+        }];
+        for kind in [K::AtomicDvpSettle, K::TransferCc, K::Jwt] {
+            let decision = precheck(&scoped, kind, Some(&swap));
+            assert_eq!(
+                (decision.reason, decision.class),
+                (R::CommandOutOfScope, OperationClass::Trading),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            precheck_intent(&scoped, &ctx, &intent, Some(&swap)).reason,
+            R::CommandOutOfScope
+        );
+        // Only `precheck_intent` knows the clock: a stale command is out of scope there.
+        let stale = swap.verified_again_at(at(1));
+        assert_eq!(
+            precheck(&rules, K::AtomicDvpSettle, Some(&stale)).reason,
+            R::Allowed
+        );
+        assert_eq!(
+            precheck_intent(&rules, &ctx, &intent, Some(&stale)).reason,
+            R::CommandOutOfScope
         );
     }
 
@@ -1965,7 +2798,13 @@ mod tests {
         }
         assert_eq!(R::ContentUnverifiable.as_u16(), 18);
         assert_eq!(R::AmountOverflow.code_name(), "amount_overflow");
-        assert_eq!(ReasonCode::from_u16(19), None);
+        assert_eq!(R::PackageNotAllowed.as_u16(), 19);
+        assert_eq!(R::PackageNotAllowed.code_name(), "package_not_allowed");
+        assert_eq!(R::CommandOutOfScope.as_u16(), 20);
+        assert_eq!(R::CommandOutOfScope.code_name(), "command_out_of_scope");
+        assert_eq!(ReasonCode::from_u16(20), Some(R::CommandOutOfScope));
+        assert_eq!(ReasonCode::from_u16(21), None);
+        assert_eq!(ReasonCode::ALL.len(), 21);
         let names: std::collections::HashSet<&str> =
             ReasonCode::ALL.iter().map(|r| r.code_name()).collect();
         assert_eq!(names.len(), ReasonCode::ALL.len());

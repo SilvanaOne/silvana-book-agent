@@ -313,7 +313,7 @@ async fn upload_missing(
 }
 
 /// Appends the pending entry the rpc holds and moves the marker; the guard reloads later.
-fn accept_pending_locked(ctx: &ControlContext, lock: &ControlLock, pending: &PendingRecord, out: &mut dyn Write) -> Result<HeadRef> {
+fn accept_pending_locked<W: Write + ?Sized>(ctx: &ControlContext, lock: &ControlLock, pending: &PendingRecord, out: &mut W) -> Result<HeadRef> {
     let accepted = head_of(&pending.entry);
     let head = ctx.store.accept_pending(lock, &accepted)?;
     ctx.mark(head, out)?;
@@ -337,12 +337,12 @@ fn pending_refused(ctx: &ControlContext, lock: &ControlLock, error: &RpcError, s
 
 /// Uploads the pending entry; a definite refusal is recorded and never re-signed, and a
 /// transient one is retried with backoff and leaves it pending.
-async fn upload_pending(
+async fn upload_pending<W: Write + ?Sized>(
     ctx: &ControlContext,
     rpc: &ControlRpc,
     lock: &ControlLock,
     pending: &PendingRecord,
-    out: &mut dyn Write,
+    out: &mut W,
 ) -> Result<HeadRef> {
     let documents: Vec<Vec<u8>> = pending.document.iter().cloned().collect();
     let expected = head_of(&pending.entry);
@@ -413,7 +413,7 @@ async fn fetch_verified(ctx: &ControlContext, rpc: &ControlRpc) -> Result<(Remot
 
 /// Compares the logs under the lock: what the rpc lacks or holds broken is uploaded, a
 /// pending entry settled, and a log ahead or forked refuses. Keeps the lock.
-pub async fn prepare_change(ctx: &ControlContext, rpc: &ControlRpc, out: &mut dyn Write) -> Result<Prepared> {
+pub async fn prepare_change<W: Write + ?Sized>(ctx: &ControlContext, rpc: &ControlRpc, out: &mut W) -> Result<Prepared> {
     let (remote_head, uploaded) = {
         let lock = ctx.store.lock().await?;
         let (_, remote_head, uploaded) = settle(ctx, rpc, &lock, out).await?;
@@ -438,11 +438,11 @@ pub async fn prepare_change(ctx: &ControlContext, rpc: &ControlRpc, out: &mut dy
 }
 
 /// The locked part of [`prepare_change`]: (local head moved, remote head, entries uploaded).
-async fn settle(
+async fn settle<W: Write + ?Sized>(
     ctx: &ControlContext,
     rpc: &ControlRpc,
     lock: &ControlLock,
-    out: &mut dyn Write,
+    out: &mut W,
 ) -> Result<(bool, Option<HeadRef>, usize)> {
     let mut stored = ctx.store.load(lock)?;
     let (remote, view) = fetch_verified(ctx, rpc).await?;
@@ -607,7 +607,7 @@ pub async fn sign_and_upload(
 }
 
 /// `control sync`: compare with the rpc, upload what it lacks, resolve a pending entry.
-pub async fn run_sync(ctx: &ControlContext, rpc: &ControlRpc, out: &mut dyn Write) -> Result<()> {
+pub async fn run_sync<W: Write + ?Sized>(ctx: &ControlContext, rpc: &ControlRpc, out: &mut W) -> Result<()> {
     let prepared = prepare_change(ctx, rpc, out).await?;
     let (head, remote, uploaded) = (prepared.head(), prepared.remote_head, prepared.uploaded);
     drop(prepared);

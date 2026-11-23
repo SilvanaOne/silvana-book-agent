@@ -48,10 +48,35 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "p256",
+ "prost",
  "rust_decimal",
  "serde",
  "serde_json",
  "sha2",
+ "tx-verifier",
+]
+
+[[package]]
+name = "agent-controller"
+version = "0.5.3"
+dependencies = [
+ "agent-control",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "orderbook-proto",
+ "prost",
+ "prost-types",
+ "rand 0.8.5",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "zeroize",
 ]
 
 [[package]]
@@ -1560,6 +1585,7 @@ name = "cloud-agent"
 version = "0.5.3"
 dependencies = [
  "agent-control",
+ "agent-controller",
  "agent-logic",
  "alloy",
  "alloy-primitives",

@@ -77,6 +77,10 @@ hex_value!(
     /// 64 bytes as 128 lowercase hex characters.
     Sig64, 64, ValueKind::Hex64
 );
+hex_value!(
+    /// A Daml package id: 32 bytes as 64 lowercase hex characters.
+    PackageId, 32, ValueKind::PackageId
+);
 
 macro_rules! display_from_str {
     ($($t:ty),*) => {
@@ -520,6 +524,28 @@ impl Amount {
             .checked_add(other.0)
             .and_then(|sum| Self::from_decimal(sum).ok())
     }
+
+    /// `None` when `other` is larger, since an amount is never negative.
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        self.0
+            .checked_sub(other.0)
+            .and_then(|difference| Self::from_decimal(difference).ok())
+    }
+
+    /// The amount as a whole number of 10^-10 units; below 10^27, so it fits.
+    fn units(self) -> Option<u128> {
+        let scale = 10u32.checked_sub(self.0.scale())?;
+        let factor = 10u128.checked_pow(scale)?;
+        u128::try_from(self.0.mantissa()).ok()?.checked_mul(factor)
+    }
+
+    /// True when `self / denominator >= floor`, compared exactly with no rounding;
+    /// `None` when `denominator` is zero.
+    pub fn ratio_at_least(self, denominator: Self, floor: Self) -> Option<bool> {
+        let scaled = self.units()?.checked_mul(10u128.checked_pow(10)?)?;
+        let quotient = scaled.checked_div(denominator.units()?)?;
+        Some(quotient >= floor.units()?)
+    }
 }
 
 impl fmt::Display for Amount {
@@ -640,6 +666,20 @@ mod tests {
             &[&h128],
             &[H64, &h128.to_uppercase(), &format!("{h128}0")],
         );
+        table(
+            PackageId::parse,
+            ValueKind::PackageId,
+            &[H64, &"f".repeat(64)],
+            &[
+                &upper,
+                &H64[..63],
+                &format!("{H64}0"),
+                "",
+                &format!("0x{}", &H64[..62]),
+                &format!("{} ", &H64[..63]),
+            ],
+        );
+        assert_eq!(PackageId::parse(&upper).unwrap_err().code(), 188);
     }
 
     #[test]
@@ -736,6 +776,57 @@ mod tests {
         assert_eq!(Amount::from_decimal(scaled).unwrap().to_string(), "2.5");
         assert!(Amount::from_decimal(Decimal::from_str_exact("-2").unwrap()).is_err());
         assert!(Amount::from_decimal(Decimal::from_str_exact("0.00000000001").unwrap()).is_err());
+    }
+
+    #[test]
+    fn subtraction_never_goes_negative() {
+        let amount = |s: &str| Amount::parse(s).unwrap();
+        assert_eq!(
+            amount("10.75").checked_sub(amount("0.5")),
+            Some(amount("10.25"))
+        );
+        assert_eq!(amount("3").checked_sub(amount("3")), Some(Amount::ZERO));
+        assert_eq!(amount("3").checked_sub(amount("3.0000000001")), None);
+        assert_eq!(Amount::ZERO.checked_sub(amount("0.0000000001")), None);
+        let max = amount("99999999999999999.9999999999");
+        assert_eq!(max.checked_sub(max), Some(Amount::ZERO));
+        assert_eq!(
+            max.checked_sub(amount("0.0000000001")).unwrap().to_string(),
+            "99999999999999999.9999999998"
+        );
+    }
+
+    #[test]
+    fn ratios_compare_exactly() {
+        let amount = |s: &str| Amount::parse(s).unwrap();
+        let at_least =
+            |n: &str, d: &str, floor: &str| amount(n).ratio_at_least(amount(d), amount(floor));
+        assert_eq!(at_least("150", "1000", "0.15"), Some(true));
+        assert_eq!(at_least("149.9999999999", "1000", "0.15"), Some(false));
+        assert_eq!(at_least("1", "3", "0.3333333333"), Some(true));
+        assert_eq!(at_least("1", "3", "0.3333333334"), Some(false));
+        assert_eq!(at_least("2", "3", "0.6666666666"), Some(true));
+        assert_eq!(at_least("2", "3", "0.6666666667"), Some(false));
+        assert_eq!(at_least("5", "1", "0"), Some(true));
+        assert_eq!(at_least("0", "1", "0"), Some(true));
+        assert_eq!(at_least("0", "1", "0.0000000001"), Some(false));
+        assert_eq!(at_least("1", "0", "0"), None);
+        // Products far past 28 digits, which a rounding multiply could get wrong.
+        let max = "99999999999999999.9999999999";
+        assert_eq!(at_least(max, max, "1"), Some(true));
+        assert_eq!(at_least(max, max, "1.0000000001"), Some(false));
+        assert_eq!(at_least("0.0000000001", max, "0"), Some(true));
+        assert_eq!(at_least("0.0000000001", max, "0.0000000001"), Some(false));
+        assert_eq!(at_least(max, "0.0000000001", max), Some(true));
+        let (big, small) = ("12345678901234567.1234567891", "0.1234567891");
+        let floor = "99999999928999993.1114099346";
+        assert_eq!(at_least(big, small, floor), Some(true));
+        let above = "99999999928999993.1114099347";
+        assert_eq!(at_least(big, small, above), Some(false));
+        assert_eq!(
+            at_least("1234567.1234567891", big, "0.0000000001"),
+            Some(false)
+        );
     }
 
     #[test]

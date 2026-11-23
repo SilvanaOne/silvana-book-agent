@@ -6,15 +6,15 @@ use agent_control::policy::{LimitItem, Limits, PolicyInstrument};
 use agent_control::sig::p256::P256_SPKI_PREFIX;
 use agent_control::sig::webauthn::{FLAG_BE, FLAG_BS, FLAG_UP, FLAG_UV};
 use agent_control::{
-    Amount, BackupPolicy, CONTROLLER_CHANGE_DELAY_SECS, Capability, CapabilitySet, Command,
-    CommandOp, ControlState, ControllerDescriptor, ControllerId, ControllerKey, ControllerProof,
-    DEFAULT_LINKED_RULES, EntryBuilder, EvalContext, Flow, ForkEvidence, Hash32, HeadCheck,
-    HeadClaim, HeadRef, InstrumentId, InstrumentRef, Intent, Label, LinkDescriptor, LinkPurpose,
-    LogComparison, Network, Nonce16, OperationClass, OperationKind, Origin, OwnerAccount, PartyId,
-    PendingEntry, PlatformParties, PolicyDocument, PolicyDocuments, ProofEnvelope, ReasonCode,
-    Receipt, ReceiptOutcome, ReceiptSubject, Recipient, RpId, RpPolicy, Rules, SignedEntry, Text,
-    Token, UsageBucket, UsageTotals, UtcTime, Uuid7, VerifiedLog, WebAuthnKey, check_head,
-    command_matches, commitment_of, compare_logs, decode_entries, evaluate,
+    Amount, BackupPolicy, Capability, CapabilitySet, Command, CommandOp, ControlState,
+    ControllerDescriptor, ControllerId, ControllerKey, ControllerProof, DEFAULT_LINKED_RULES,
+    EntryBuilder, EvalContext, Flow, ForkEvidence, Hash32, HeadCheck, HeadClaim, HeadRef,
+    InstrumentId, InstrumentRef, Intent, Label, LinkDescriptor, LinkPurpose, LogComparison,
+    Network, Nonce16, OperationClass, OperationKind, Origin, OwnerAccount, PartyId, PendingEntry,
+    PlatformParties, PolicyDocument, PolicyDocuments, ProofEnvelope, ReasonCode, Receipt,
+    ReceiptOutcome, ReceiptSubject, Recipient, RpId, RpPolicy, Rules, SignedEntry, Text, Token,
+    UsageBucket, UsageTotals, UtcTime, Uuid7, VerifiedLog, WebAuthnKey, check_head, command_matches,
+    commitment_of, compare_logs, controller_change_delay_secs, decode_entries, evaluate,
     force_confirmation_phrase, format_link_code, namespace_for_key, parse_link_code, replay,
     sign_agent, verify_command, verify_link_descriptor, verify_log, verify_policy_submission,
     verify_read_session,
@@ -195,8 +195,9 @@ fn cc_cap(value: &str) -> Limits {
 
 #[test]
 fn a_control_lifecycle() {
-    let delay = i64::try_from(CONTROLLER_CHANGE_DELAY_SECS).unwrap();
-    assert_eq!(delay, DAY);
+    let delay = i64::try_from(controller_change_delay_secs(Network::Devnet)).unwrap();
+    assert_eq!(delay, 3600);
+    assert_eq!(controller_change_delay_secs(Network::Mainnet), 86_400);
     let mut agent = Agent::new();
     let passkey = Passkey::new(0x41);
     let recovery_key = SigningKey::from_bytes(&seed(0x21));
@@ -242,34 +243,34 @@ fn a_control_lifecycle() {
     .unwrap_err();
     assert_eq!(refused.code_name(), "commitment_mismatch");
 
-    // 2. The agent alone signs the link; the controllers take effect 24 h later (C18).
+    // 2. The agent alone signs the link; the controllers take effect one delay later (C18).
     let pending = agent
         .builder()
         .link(&bytes, &commitment, &rp, false, t(0))
         .unwrap();
-    assert_eq!(pending.entry().effective_at(), t(DAY));
+    assert_eq!(pending.entry().effective_at(), t(delay));
     agent.append(&pending);
     assert_eq!(replay(&agent.log(), &agent.docs()).unwrap(), agent.state);
     assert_eq!(agent.state.owner_account(), OwnerAccount::new(42).ok());
     for capability in Capability::ALL {
-        assert!(agent.state.holders(capability, t(DAY - 1)).is_empty());
-        assert_eq!(agent.state.holders(capability, t(DAY)).len(), 1);
+        assert!(agent.state.holders(capability, t(delay - 1)).is_empty());
+        assert_eq!(agent.state.holders(capability, t(delay)).len(), 1);
     }
     let early = agent
-        .policy(1, t(3600), DEFAULT_LINKED_RULES)
+        .policy(1, t(delay - 60), DEFAULT_LINKED_RULES)
         .encode()
         .unwrap();
     let refused = verify_policy_submission(
         &agent.state,
         &early,
         &passkey.envelope(passkey_id, &early),
-        t(3600),
+        t(delay - 60),
     )
     .unwrap_err();
     assert_eq!(refused.code_name(), "signer_lacks_policy");
 
     // 3. A widening policy is scheduled for the transfers delay, then in force.
-    let t1 = t(DAY + 3600);
+    let t1 = t(delay + 3600);
     let mut widened = DEFAULT_LINKED_RULES;
     widened.transfers.directed_only = false;
     widened.transfers.per_transfer = cc_cap("100");
@@ -356,10 +357,11 @@ fn a_control_lifecycle() {
         &command_bytes,
         &passkey.envelope(passkey_id, &command_bytes),
         t4,
+        None,
     )
     .unwrap();
     assert_eq!(
-        verified.command.canton_command_id(),
+        verified.command().canton_command_id(),
         "ctl-01890a5d-ac96-774b-bcce-b302099a8057"
     );
     let cc = InstrumentRef {
@@ -384,7 +386,7 @@ fn a_control_lifecycle() {
         now: t4,
         usage: &usage,
     };
-    assert!(command_matches(&verified.command.op, &intent, &ctx));
+    assert!(command_matches(verified.command(), &intent, &ctx));
     let rules = agent.state.rules_at(t4).rules().clone();
     let decision = evaluate(&rules, &ctx, &intent, Some(&verified));
     assert!(decision.allowed, "{decision:?}");
@@ -400,7 +402,7 @@ fn a_control_lifecycle() {
         outgoing: vec![flow(&bob, "10")],
         ..Intent::new(OperationKind::TransferCc)
     };
-    assert!(!command_matches(&verified.command.op, &substituted, &ctx));
+    assert!(!command_matches(verified.command(), &substituted, &ctx));
     assert_eq!(
         evaluate(&rules, &ctx, &substituted, Some(&verified)).reason,
         ReasonCode::CommandMismatch
@@ -410,7 +412,7 @@ fn a_control_lifecycle() {
         agent_party: agent.party.clone(),
         agent_key: agent.key.verifying_key().to_bytes(),
         subject: ReceiptSubject::Command(command.command_id.clone()),
-        subject_hash: verified.hash,
+        subject_hash: *verified.hash(),
         outcome: ReceiptOutcome::Executed,
         update_id: Some(Token::parse("update-0001").unwrap()),
         reason_code: None,
@@ -457,7 +459,7 @@ fn a_control_lifecycle() {
     );
     let fork_base = agent.entries.len();
 
-    // 6. A forced full removal: refused without force, then delayed 24 h, the policy frozen.
+    // 6. A forced full removal: refused without force, then delayed, the policy frozen.
     let t5 = t4.checked_add_secs(3600).unwrap();
     let refused = agent
         .builder()
@@ -474,7 +476,7 @@ fn a_control_lifecycle() {
         .unwrap();
     assert_eq!(
         pending.entry().effective_at(),
-        t5.checked_add_secs(DAY).unwrap()
+        t5.checked_add_secs(delay).unwrap()
     );
     agent.append(&pending);
     let t5b = t5.checked_add_secs(60).unwrap();
@@ -488,18 +490,19 @@ fn a_control_lifecycle() {
         &command_bytes,
         &passkey.envelope(passkey_id, &command_bytes),
         t5b,
+        None,
     )
     .unwrap_err();
     assert_eq!(stale.code_name(), "stale_log_head");
     let record = agent.state.controller(&passkey_id).unwrap();
-    let removed_at = t5.checked_add_secs(DAY).unwrap();
+    let removed_at = t5.checked_add_secs(delay).unwrap();
     assert!(
         record
             .capabilities_at(removed_at.checked_add_secs(-1).unwrap())
             .contains(Capability::Direct)
     );
     assert!(record.capabilities_at(removed_at).is_empty());
-    let all_removed = t5b.checked_add_secs(DAY).unwrap();
+    let all_removed = t5b.checked_add_secs(delay).unwrap();
     assert_eq!(
         version_at(&agent.state, all_removed.checked_add_secs(DAY).unwrap()),
         Some(3)
@@ -551,14 +554,14 @@ fn a_control_lifecycle() {
         .unwrap();
     agent.append(&pending);
     let relinked = agent.state.controller(backup.id()).unwrap();
-    let effective = all_removed.checked_add_secs(DAY).unwrap();
+    let effective = all_removed.checked_add_secs(delay).unwrap();
     assert!(
         relinked
             .capabilities_at(effective.checked_add_secs(-1).unwrap())
             .is_empty()
     );
     assert_eq!(relinked.capabilities_at(effective), CapabilitySet::ALL);
-    assert!(t5.secs_until(effective) >= 2 * DAY);
+    assert!(t5.secs_until(effective) >= 2 * delay);
     assert!(agent.state.controller(&passkey_id).is_none());
     assert_eq!(replay(&agent.log(), &agent.docs()).unwrap(), agent.state);
 
@@ -649,6 +652,7 @@ fn a_control_lifecycle() {
 
 #[test]
 fn a_read_session_spans_agents_that_share_a_reader() {
+    let delay = i64::try_from(controller_change_delay_secs(Network::Devnet)).unwrap();
     let passkey = Passkey::new(0x41);
     let reader = passkey.controller(CapabilitySet::ALL);
     let mut states = Vec::new();
@@ -688,8 +692,8 @@ fn a_read_session_spans_agents_that_share_a_reader() {
         *reader.id(),
         agent_control::parse_p256_spki(&session_key.spki()).unwrap(),
         Nonce16([0x77; 16]),
-        t(DAY),
-        t(DAY + 3600),
+        t(delay),
+        t(delay + 3600),
         states
             .iter()
             .rev()
@@ -699,11 +703,11 @@ fn a_read_session_spans_agents_that_share_a_reader() {
     let bytes = request.encode().unwrap();
     let refs: Vec<&ControlState> = states.iter().collect();
     let envelope = passkey.envelope(*reader.id(), &bytes);
-    let session = verify_read_session(&bytes, &envelope, &refs, t(DAY)).unwrap();
+    let session = verify_read_session(&bytes, &envelope, &refs, t(delay)).unwrap();
     assert_eq!(session.request.agents.len(), 3);
-    let pending = verify_read_session(&bytes, &envelope, &refs, t(DAY - 1)).unwrap_err();
+    let pending = verify_read_session(&bytes, &envelope, &refs, t(delay - 1)).unwrap_err();
     assert_eq!(pending.code_name(), "signer_lacks_read");
-    let issued_at_ms = u64::try_from(t(DAY + 60).unix_secs()).unwrap() * 1000;
+    let issued_at_ms = u64::try_from(t(delay + 60).unix_secs()).unwrap() * 1000;
     let read = agent_control::ReadRequest {
         network: Network::Devnet,
         session_id: session.session_id,

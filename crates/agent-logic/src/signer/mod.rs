@@ -18,7 +18,7 @@ use message_signing::MessageSignatureData;
 use sha2::{Digest, Sha256};
 
 use agent_control::{
-    AgentSignable, HeadClaim, HeadRef, PartyId, PendingEntry, Receipt, SignedEntry,
+    AgentSignable, AnyReceipt, HeadClaim, HeadRef, PartyId, PendingEntry, Receipt, SignedEntry,
     verify_party_key,
 };
 
@@ -572,6 +572,14 @@ impl AgentSigner {
 
     /// Signs a receipt over its canonical bytes; only a linked agent signs receipts.
     pub fn sign_receipt(&self, receipt: &Receipt) -> Result<[u8; 64]> {
+        let signable = receipt
+            .signable()
+            .map_err(|e| anyhow!("signing refused: the receipt does not encode ({})", e.code_name()))?;
+        Ok(self.sign(&SigningIntent::Receipt(&signable))?.to_bytes())
+    }
+
+    /// [`Self::sign_receipt`] for either version; v2 encodes only for an executed command.
+    pub fn sign_any_receipt(&self, receipt: &AnyReceipt) -> Result<[u8; 64]> {
         let signable = receipt
             .signable()
             .map_err(|e| anyhow!("signing refused: the receipt does not encode ({})", e.code_name()))?;
@@ -1609,6 +1617,56 @@ mod tests {
         assert!(unlinked.sign_head_claim(&empty).is_ok());
         let theirs = Receipt { agent_key: public([0x6c; 32]), ..receipt };
         assert!(unlinked.sign_receipt(&theirs).unwrap_err().to_string().contains("only a linked agent"));
+    }
+
+    #[tokio::test]
+    async fn a_v2_receipt_signs_only_for_an_executed_command_of_this_agent() {
+        use agent_control::{
+            Amount, AnyReceipt, Hash32, PartyId, Receipt, ReceiptOutcome, ReceiptSubject, SwapReceipt, SwapResult,
+            Token, UtcTime, Uuid7, verify_ed25519_strict,
+        };
+        let seed = [0x6d; 32];
+        let (signer, _, chain) = linked_signer(seed, 1, "receipt-v2").await;
+        let at = UtcTime::from_unix_secs(1_795_000_600).unwrap();
+        let receipt = Receipt {
+            network: Network::Devnet,
+            agent_party: chain.state.agent_party().clone(),
+            agent_key: public(seed),
+            subject: ReceiptSubject::Command(Uuid7::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap()),
+            subject_hash: Hash32([7; 32]),
+            outcome: ReceiptOutcome::Executed,
+            update_id: Some(Token::parse("1220update").unwrap()),
+            reason_code: None,
+            code_source: None,
+            log_seq: 1,
+            issued_at: at,
+        };
+        let result = SwapResult {
+            quote_id: Token::parse("q-1").unwrap(),
+            lp: PartyId::parse(&format!("lp::1220{}", "ab".repeat(32))).unwrap(),
+            sold: Amount::parse("10").unwrap(),
+            received: Amount::parse("2.5").unwrap(),
+            fee_cc: Amount::parse("0").unwrap(),
+        };
+        let v2 = AnyReceipt::V2(SwapReceipt { receipt: receipt.clone(), result: result.clone() });
+        let signature = signer.sign_any_receipt(&v2).unwrap();
+        verify_ed25519_strict(&public(seed), &v2.encode().unwrap(), &signature).unwrap();
+        // v1 goes through the same path.
+        assert!(signer.sign_any_receipt(&AnyReceipt::V1(receipt.clone())).is_ok());
+        // A v2 receipt of a refusal, or of a policy, does not even encode.
+        let refused = Receipt {
+            outcome: ReceiptOutcome::Refused,
+            update_id: None,
+            reason_code: Some(1106),
+            code_source: Some(agent_control::CodeSource::Agent),
+            ..receipt.clone()
+        };
+        let not_executed = AnyReceipt::V2(SwapReceipt { receipt: refused, result: result.clone() });
+        assert!(signer.sign_any_receipt(&not_executed).unwrap_err().to_string().contains("does not encode"));
+        // Another agent's v2 receipt is refused by the guard.
+        let foreign = SwapReceipt { receipt: Receipt { agent_key: public([0x6e; 32]), ..receipt }, result };
+        let err = signer.sign_any_receipt(&AnyReceipt::V2(foreign)).unwrap_err();
+        assert!(err.to_string().contains("another agent"), "{err}");
     }
 
     #[tokio::test]

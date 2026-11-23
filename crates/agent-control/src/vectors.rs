@@ -1,7 +1,7 @@
 //! Golden vectors: inputs with every derived value and verdict, shared with other verifiers.
 //! `vectors_print` rewrites the fixture; `vectors_match_the_fixture` recomputes it from the file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use ::p256::ecdsa::Signature as P256Signature;
@@ -9,19 +9,23 @@ use ::p256::ecdsa::signature::Signer as _;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::builder::EntryBuilder;
+use crate::builder::{EntryBuilder, PendingEntry};
 use crate::canon::codes::{
     base32_encode, format_invite_code, format_link_code, parse_link_code, split_invite_code,
 };
 use crate::canon::time::UtcTime;
 use crate::canon::values::{
     Amount, Commitment, EthAddress, Hash32, InstrumentId, InstrumentRef, Label, MarketId, Network,
-    Nonce16, Origin, OwnerAccount, RpId, Sig64, Text, Token, Uuid7, decode_b64url, encode_b64url,
-    parse_bool, parse_u64, sha256,
+    Nonce16, Origin, OwnerAccount, PackageId, RpId, Sig64, Text, Token, Uuid7, decode_b64url,
+    encode_b64url, parse_bool, parse_u64, sha256,
+};
+use crate::challenge::{
+    CHALLENGE_CLOCK_SKEW_SECS, ControllerChallenge, ExpectedChallenge, MAX_CHALLENGE_BYTES,
+    MAX_CHALLENGE_SECS, check_challenge, verify_challenge_proof,
 };
 use crate::command::{
-    COMMAND_CLOCK_SKEW_SECS, Command, CommandOp, MAX_COMMAND_BYTES, MAX_COMMAND_VALIDITY_SECS,
-    VerifiedCommand, verify_command,
+    COMMAND_CLOCK_SKEW_SECS, Command, CommandKind, CommandOp, MAX_COMMAND_BYTES,
+    MAX_COMMAND_VALIDITY_SECS, VerifiedCommand, verify_command,
 };
 use crate::controller::{
     BackupPolicy, Capability, CapabilitySet, ControllerDescriptor, ControllerId, ControllerKey,
@@ -32,9 +36,9 @@ use crate::entry::{
     RemoveControllerBody, SetCapabilitiesBody, SignedEntry,
 };
 use crate::error::{
-    CanonError, CodeError, CommandError, LinkError, LogError, PolicyError, ProofError,
-    ReadSessionError, ReplayError, SignatureError, SignedDocError, ValueError, ValueKind,
-    WebAuthnError,
+    CanonError, ChallengeError, CodeError, CommandError, CommandFailure, LinkError, LogError,
+    PolicyError, ProofError, ReadSessionError, ReplayError, SignatureError, SignedDocError,
+    ValueError, ValueKind, WebAuthnError,
 };
 use crate::head::{HeadClaim, MAX_HEAD_CLAIM_BYTES};
 use crate::json::{
@@ -47,12 +51,15 @@ use crate::log::{
     compare_logs, decode_entries, verify_extension, verify_log,
 };
 use crate::party::{PartyId, namespace_for_key};
+use crate::policy::eval::{Leg, SettleFee, SettleTerms};
 use crate::policy::{
-    Allowlist, Coverage, DEFAULT_LINKED_RULES, EvalContext, Flow, Intent, LimitItem, Limits,
-    MAX_DELAY_SECS, MAX_NOT_BEFORE_SECS, MAX_POLICY_BYTES, MAX_POLICY_VALIDITY_SECS, OperationKind,
-    POLICY_CLOCK_SKEW_SECS, PlatformParties, PolicyDocument, PolicyInstrument, Recipient, Rules,
-    Unlisted, UsageBucket, UsageTotals, evaluate, expected_effective_at, required_delay_secs,
-    verify_policy_submission, widening,
+    Allowlist, CommandScope, Coverage, DEFAULT_LINKED_RULES, EvalContext, Flow, Intent, LimitItem,
+    Limits, MAX_DELAY_SECS, MAX_NOT_BEFORE_SECS, MAX_PACKAGES, MAX_POLICY_BYTES,
+    MAX_POLICY_VALIDITY_SECS, MAX_SCOPE_COMMANDS, MAX_SCOPE_LPS, MAX_SCOPE_PAIRS, MAX_SCOPES,
+    OperationKind, POLICY_CLOCK_SKEW_SECS, PlatformParties, PolicyDocument, PolicyInstrument,
+    ReasonCode, Recipient, Rules, ScopePair, Unlisted, UsageBucket, UsageTotals, Widening,
+    check_packages, evaluate, expected_effective_at, required_delay_secs, verify_policy_submission,
+    widening,
 };
 use crate::proof::{
     ControllerProof, ProofEnvelope, ProofOutcome, ProofType, verify_controller_proof,
@@ -62,7 +69,10 @@ use crate::read_session::{
     READ_REQUEST_WINDOW_MS, READ_SESSION_CLOCK_SKEW_SECS, ReadRequest, ReadSessionRequest,
     SessionId, VerifiedReadSession, verify_read_request, verify_read_session,
 };
-use crate::receipt::{CodeSource, MAX_RECEIPT_BYTES, Receipt, ReceiptOutcome, ReceiptSubject};
+use crate::receipt::{
+    AnyReceipt, CodeSource, MAX_RECEIPT_BYTES, MAX_RECEIPT_V2_BYTES, Receipt, ReceiptOutcome,
+    ReceiptSubject, SwapReceipt, SwapResult,
+};
 use crate::sig::ed25519::verify_ed25519_strict;
 use crate::sig::p256::{P256_SPKI_PREFIX, parse_p256_spki, verify_p256_p1363};
 use crate::sig::webauthn::{
@@ -71,11 +81,11 @@ use crate::sig::webauthn::{
 };
 use crate::signable::sign_agent;
 use crate::state::{
-    AcceptedPolicy, CONTROLLER_CHANGE_DELAY_SECS, ControlState, ControllerChange,
-    MAX_AGENT_CONTROLLERS, PendingChange, PendingTarget, PolicyDocuments,
-    force_confirmation_phrase, minimum_rule, replay,
+    AcceptedPolicy, ControlState, ControllerChange, MAX_AGENT_CONTROLLERS, PendingChange,
+    PendingTarget, PolicyDocuments, controller_change_delay_secs, force_confirmation_phrase,
+    minimum_rule, replay,
 };
-use crate::testkit::{self, Chain, DAY, at};
+use crate::testkit::{self, Chain, DAY, DEVNET_DELAY, MAINNET_DELAY, at};
 use crate::{
     CONTROLLER_ID_DOMAIN, MAX_ENTRY_BYTES, MAX_LINK_BYTES, MAX_PROOF_BYTES, MIN_DOCUMENT_BYTES,
 };
@@ -87,18 +97,24 @@ const LOCAL_ORIGIN: &str = "http://localhost:8787";
 const PROOF_PAYLOAD: &[u8] = b"scheme=silvana.agent.policy.v1\nnetwork=devnet\nversion=1\n";
 const SYNCED: u8 = FLAG_UP | FLAG_UV | FLAG_BE | FLAG_BS;
 const DEVICE: u8 = FLAG_UP | FLAG_UV;
+const DEVNET_RPC: &str = "orderbook-devnet.silvana.dev";
+const MAINNET_RPC: &str = "orderbook-mainnet.silvana.dev";
 
-const NOTES: [&str; 11] = [
+const NOTES: [&str; 15] = [
     "Every key here is a deterministic test key; never use one for anything else.",
     "Bytes are UTF-8 text in a field such as `canonical`, or hex in `canonicalHex` when they are not UTF-8.",
     "u64 values and times are strings; `code` is the number of `codeName`; a decoding line is not part of conformance.",
-    "A document's `fields` is its JSON view; a log entry's is the signed-entry view.",
+    "A document's `fields` is its JSON view; a log entry's is the signed-entry view; a receipt is v1 or v2 by its scheme line.",
     "Log cases decode the pool rows, verify them under the case's network and agentParty, then replay them with the listed policy documents stored under keyHex.",
     "`entries`, `base`, `appended`, `local` and `remote` list pool row ids; `stage` is decode, verify, replay, compare, fork or minimum_rule.",
     "A state is reported as of its last entry; each probe, at or after that entry, queries the replayed state at its time.",
+    "The controller-change delay comes from the entry's own network: 3600 s on devnet, 86400 s on mainnet. Devnet logs are timed in units of it.",
+    "A standing probe reports one controller at its time: whether the log ever recorded it, its capabilities in effect, its pending change, and whether it may sign in.",
     "`controller` names an entry of `controllers`; `session` names a case of `readSessions`; `descriptor` names a document.",
+    "A command case's `cc` is Canton Coin as the verifier's own config names it; a case without one verifies with Canton Coin unknown.",
     "Each `expect` holds `ok`; a refusal adds `codeName` and `code`, and log refusals add `stage` and `seq`.",
-    "Decisions exercise the evaluator, which only the agent and the ledger-service run.",
+    "A decision's command counts as verified by `decisionContext.commandSigner` at the case's `verifiedAt`, or at its `now` when absent.",
+    "`decisions`, `packageChecks` and `controllerChallenges` exercise checks that only the agent, the ledger-service and the rpc run.",
     "order-book vendors a verbatim copy at test-vectors/agent-control-vectors.json.",
 ];
 
@@ -141,6 +157,7 @@ named!(
     CommandError,
     ReadSessionError,
     SignedDocError,
+    ChallengeError,
 );
 
 fn st<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -409,6 +426,32 @@ fn flow_from(v: &Value) -> Flow {
     }
 }
 
+fn leg_from(v: &Value) -> Leg {
+    Leg {
+        instrument: instrument_from(v),
+        amount: Amount::parse(st(v, "amount")).unwrap(),
+    }
+}
+
+fn settle_from(v: &Value) -> SettleTerms {
+    let fees = items(v, "fees")
+        .iter()
+        .map(|f| SettleFee {
+            receiver: party_at(f, "receiver"),
+            instrument: instrument_from(f),
+            amount: Amount::parse(st(f, "amount")).unwrap(),
+        })
+        .collect();
+    SettleTerms {
+        lp: party_at(v, "lp"),
+        sent: leg_from(&v["sent"]),
+        received: leg_from(&v["received"]),
+        net_received: Amount::parse(st(v, "netReceived")).unwrap(),
+        fees,
+        valid_until: time(v, "validUntil"),
+    }
+}
+
 fn intent_from(v: &Value) -> Intent {
     Intent {
         kind: OperationKind::parse(st(v, "kind")).unwrap(),
@@ -431,7 +474,19 @@ fn intent_from(v: &Value) -> Intent {
         } else {
             Coverage::Fields
         },
+        settle: v.get("settle").map(settle_from),
     }
+}
+
+fn widening_view(w: &Widening) -> Value {
+    json!({
+        "transfers": w.transfers,
+        "trading": w.trading,
+        "other": w.other,
+        "packages": w.packages,
+        "scopes": w.scopes,
+        "any": w.any(),
+    })
 }
 
 fn decode_kind(kind: &str, bytes: &[u8]) -> Result<(), CanonError> {
@@ -443,7 +498,7 @@ fn decode_kind(kind: &str, bytes: &[u8]) -> Result<(), CanonError> {
         "command" => Command::decode(bytes).map(drop),
         "read_session" => ReadSessionRequest::decode(bytes).map(drop),
         "read_request" => ReadRequest::decode(bytes).map(drop),
-        "receipt" => Receipt::decode(bytes).map(drop),
+        "receipt" => AnyReceipt::decode(bytes).map(drop),
         "head_claim" => HeadClaim::decode(bytes).map(drop),
         other => panic!("unknown document kind {other}"),
     }
@@ -583,6 +638,9 @@ const SECTIONS: &[(&str, Run)] = &[
     ("kinds/table", run_kind),
     ("kinds/fromTransactionOperation", run_tx_op),
     ("decisions", run_decision),
+    ("controllerStanding", run_standing),
+    ("packageChecks", run_package_check),
+    ("controllerChallenges", run_challenge),
 ];
 
 fn plain<T, E: Named>(r: Result<T, E>) -> Value {
@@ -634,6 +692,8 @@ fn run_value(c: &Value, _: &Ctx) -> Obj {
         "unlisted" => plain(Unlisted::parse(input)),
         "receipt_outcome" => plain(ReceiptOutcome::parse(input)),
         "code_source" => plain(CodeSource::parse(input)),
+        "package_id" => plain(PackageId::parse(input)),
+        "command_kind" => plain(CommandKind::parse(input)),
         other => panic!("unknown value type {other}"),
     };
     expect(v)
@@ -758,8 +818,9 @@ fn run_document(c: &Value, ctx: &Ctx) -> Obj {
             view(&ReadRequestJson::from(&request))
         }
         "receipt" => {
-            let receipt = Receipt::decode(&bytes).unwrap();
-            let verdict = Receipt::verify(&bytes, &sig_at(c, "signatureHex"), &receipt.agent_party);
+            let receipt = AnyReceipt::decode(&bytes).unwrap();
+            let party = receipt.receipt().agent_party.clone();
+            let verdict = AnyReceipt::verify(&bytes, &sig_at(c, "signatureHex"), &party);
             out.insert("signature".into(), plain(verdict));
             view(&ReceiptJson::from(&receipt))
         }
@@ -1021,14 +1082,16 @@ fn run_minimum(c: &Value, ctx: &Ctx) -> Obj {
     expect(either(minimum(c, ctx)))
 }
 
+/// The delay is the next document's network's: a widening waits on the network it is for.
 fn run_widening(c: &Value, ctx: &Ctx) -> Obj {
     let base = PolicyDocument::decode(ctx.doc(st(c, "baseline"))).unwrap();
     let next = PolicyDocument::decode(ctx.doc(st(c, "next"))).unwrap();
     let w = widening(&base.rules, &next.rules);
     let effective = expected_effective_at(time(c, "acceptedAt"), &base.rules, &next);
+    let delay = required_delay_secs(next.network, &base.rules, &next.rules);
     fields(json!({
-        "widens": {"transfers": w.transfers, "trading": w.trading, "other": w.other, "any": w.any()},
-        "requiredDelaySecs": required_delay_secs(&base.rules, &next.rules).to_string(),
+        "widens": widening_view(&w),
+        "requiredDelaySecs": delay.to_string(),
         "effectiveAt": effective.map(|t| t.to_string()),
     }))
 }
@@ -1039,12 +1102,11 @@ fn submission(c: &Value, ctx: &Ctx) -> Result<Value, Value> {
     let verified =
         verify_policy_submission(&state, ctx.doc(st(c, "policy")), &envelope, time(c, "now"))
             .map_err(|e| refused(&e))?;
-    let w = verified.widening;
     Ok(ok(json!({
         "hash": verified.hash.to_string(),
         "version": verified.document.version.to_string(),
         "signer": verified.signer.to_string(),
-        "widens": {"transfers": w.transfers, "trading": w.trading, "other": w.other, "any": w.any()},
+        "widens": widening_view(&verified.widening),
         "requiredDelaySecs": verified.required_delay_secs.to_string(),
         "effectiveAt": verified.effective_at.to_string(),
     })))
@@ -1057,14 +1119,21 @@ fn run_submission(c: &Value, ctx: &Ctx) -> Obj {
 fn command_case(c: &Value, ctx: &Ctx) -> Result<Value, Value> {
     let state = ctx.state(c)?;
     let envelope = ProofEnvelope::decode(&bytes_in(c, "envelope")).unwrap();
-    let verified = verify_command(&state, &bytes_in(c, "command"), &envelope, time(c, "now"))
-        .map_err(|e| refused(&e))?;
+    let cc = c.get("cc").map(instrument_from);
+    let verified = verify_command(
+        &state,
+        &bytes_in(c, "command"),
+        &envelope,
+        time(c, "now"),
+        cc.as_ref(),
+    )
+    .map_err(|e| refused(&e))?;
     Ok(ok(json!({
-        "hash": verified.hash.to_string(),
-        "controllerId": verified.controller_id.to_string(),
-        "op": verified.command.op.name(),
-        "cantonCommandId": verified.command.canton_command_id(),
-        "signCount": verified.outcome.sign_count,
+        "hash": verified.hash().to_string(),
+        "controllerId": verified.controller_id().to_string(),
+        "op": verified.command().op.name(),
+        "cantonCommandId": verified.command().canton_command_id(),
+        "signCount": verified.outcome().sign_count,
     })))
 }
 
@@ -1098,13 +1167,16 @@ fn run_read_request(c: &Value, ctx: &Ctx) -> Obj {
 }
 
 fn run_receipt(c: &Value, _: &Ctx) -> Obj {
-    let verdict = Receipt::verify(
+    let verdict = AnyReceipt::verify(
         &bytes_in(c, "canonical"),
         &sig_at(c, "signatureHex"),
         &party_at(c, "expectedParty"),
     );
     expect(match verdict {
-        Ok(receipt) => ok(json!({"outcome": receipt.outcome.as_str()})),
+        Ok(receipt) => ok(json!({
+            "scheme": receipt.scheme(),
+            "outcome": receipt.receipt().outcome.as_str(),
+        })),
         Err(e) => refused(&e),
     })
 }
@@ -1142,17 +1214,19 @@ fn run_tx_op(c: &Value, _: &Ctx) -> Obj {
     )
 }
 
-fn verified_stub(bytes: &[u8]) -> VerifiedCommand {
-    VerifiedCommand {
-        command: Command::decode(bytes).unwrap(),
-        bytes: bytes.to_vec(),
-        hash: Hash32(sha256(bytes)),
-        controller_id: ControllerId([2; 32]),
-        outcome: ProofOutcome {
-            sign_count: None,
-            backup_eligible: false,
-            backup_state: false,
-        },
+fn verified_stub(bytes: &[u8], signer: ControllerId, verified_at: UtcTime) -> VerifiedCommand {
+    let outcome = ProofOutcome {
+        sign_count: None,
+        backup_eligible: false,
+        backup_state: false,
+    };
+    VerifiedCommand::stub(bytes, signer, outcome, verified_at)
+}
+
+fn rules_of(c: &Value, ctx: &Ctx) -> Rules {
+    match st(c, "rules") {
+        "default" => DEFAULT_LINKED_RULES,
+        id => PolicyDocument::decode(ctx.doc(id)).unwrap().rules,
     }
 }
 
@@ -1160,6 +1234,7 @@ fn run_decision(c: &Value, ctx: &Ctx) -> Obj {
     let h = &ctx.decision;
     let agent = party_at(h, "agentParty");
     let cc = instrument_from(&h["cc"]);
+    let signer = ControllerId::parse(st(h, "commandSigner")).unwrap();
     let platform = match st(c, "platform") {
         "pinned" => PlatformParties {
             fee: Some(party_at(h, "feeParty")),
@@ -1175,21 +1250,20 @@ fn run_decision(c: &Value, ctx: &Ctx) -> Obj {
             Amount::parse(st(u, "amount")).unwrap(),
         );
     }
-    let rules = match st(c, "rules") {
-        "default" => DEFAULT_LINKED_RULES,
-        id => PolicyDocument::decode(ctx.doc(id)).unwrap().rules,
-    };
+    let rules = rules_of(c, ctx);
+    let now = time(c, "now");
     let eval = EvalContext {
         agent_party: &agent,
         cc: &cc,
         platform: &platform,
-        now: time(c, "now"),
+        now,
         usage: &usage,
     };
+    let verified_at = c.get("verifiedAt").map_or(now, |_| time(c, "verifiedAt"));
     let command = c
         .get("command")
         .and_then(Value::as_str)
-        .map(|text| verified_stub(text.as_bytes()));
+        .map(|text| verified_stub(text.as_bytes(), signer, verified_at));
     let decision = evaluate(&rules, &eval, &intent_from(&c["intent"]), command.as_ref());
     let deltas: Vec<Value> = decision
         .usage
@@ -1210,6 +1284,88 @@ fn run_decision(c: &Value, ctx: &Ctx) -> Obj {
         "class": decision.class.as_str(),
         "usage": deltas,
     }))
+}
+
+/// One controller at `now`; it signs in only while it holds a capability in effect.
+fn standing(state: &ControlState, id: &ControllerId, now: UtcTime) -> Value {
+    let record = state.controller(id);
+    let capabilities = record.map_or(CapabilitySet::EMPTY, |r| r.capabilities_at(now));
+    json!({
+        "at": now.to_string(),
+        "recorded": state.is_recorded_controller(id),
+        "capabilities": caps_view(capabilities),
+        "pending": record.and_then(|r| r.pending_at(now)).map_or(Value::Null, pending_view),
+        "signsIn": !capabilities.is_empty(),
+    })
+}
+
+fn run_standing(c: &Value, ctx: &Ctx) -> Obj {
+    let id = ControllerId::parse(st(c, "controllerId")).unwrap();
+    expect(either(ctx.state(c).map(|state| {
+        let probes: Vec<Value> = items(c, "probeTimes")
+            .iter()
+            .map(|t| standing(&state, &id, UtcTime::parse(t.as_str().unwrap()).unwrap()))
+            .collect();
+        ok(json!({"standing": probes}))
+    })))
+}
+
+fn run_package_check(c: &Value, ctx: &Ctx) -> Obj {
+    let rules = rules_of(c, ctx);
+    let used: BTreeSet<PackageId> = items(c, "packages")
+        .iter()
+        .map(|p| PackageId::parse(p.as_str().unwrap()).unwrap())
+        .collect();
+    let (refused, reason) = match check_packages(&rules, &used) {
+        Ok(()) => (None, ReasonCode::Allowed),
+        Err(id) => (Some(id.to_string()), ReasonCode::PackageNotAllowed),
+    };
+    expect(json!({
+        "allowed": refused.is_none(),
+        "refused": refused,
+        "reason": reason.code_name(),
+        "reasonCode": reason.as_u16(),
+    }))
+}
+
+fn challenge_view(c: &ControllerChallenge) -> Value {
+    json!({
+        "network": c.network.as_str(),
+        "rpc": c.rpc.as_str(),
+        "controllerId": c.controller_id.to_string(),
+        "agentParty": c.agent_party.to_string(),
+        "nonce": c.nonce.to_string(),
+        "issuedAt": c.issued_at.to_string(),
+        "expiresAt": c.expires_at.to_string(),
+    })
+}
+
+fn run_challenge(c: &Value, _: &Ctx) -> Obj {
+    let bytes = bytes_in(c, "canonical");
+    let verdict = match st(c, "function") {
+        "decode" => ControllerChallenge::decode(&bytes).map_err(ChallengeError::Canon),
+        "check_challenge" => {
+            let e = &c["expected"];
+            let expected = ExpectedChallenge {
+                network: network(e),
+                rpc: RpId::parse(st(e, "rpc")).unwrap(),
+                controller_id: ControllerId::parse(st(e, "controllerId")).unwrap(),
+                agent_party: party_at(e, "agentParty"),
+            };
+            check_challenge(&bytes, &expected, time(c, "now"))
+                .map(|checked| checked.challenge().clone())
+        }
+        "verify_challenge_proof" => {
+            let envelope = ProofEnvelope::decode(&bytes_in(c, "envelope")).unwrap();
+            let key: [u8; 32] = hex_at(c, "publicKeyHex").try_into().unwrap();
+            verify_challenge_proof(&bytes, &envelope, &key)
+        }
+        other => panic!("unknown challenge function {other}"),
+    };
+    expect(match verdict {
+        Ok(challenge) => ok(json!({"challenge": challenge_view(&challenge)})),
+        Err(e) => refused(&e),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,6 +1512,18 @@ fn alice() -> PartyId {
 
 fn bob() -> PartyId {
     named_party("bob", 4)
+}
+
+fn lp_a() -> PartyId {
+    named_party("lp-a", 5)
+}
+
+fn lp_b() -> PartyId {
+    named_party("lp-b", 6)
+}
+
+fn fee_party() -> PartyId {
+    named_party("fee", 7)
 }
 
 fn cc_ref() -> InstrumentRef {
@@ -1654,6 +1822,41 @@ fn default_document() -> PolicyDocument {
     }
 }
 
+/// A selection of three packages.
+fn packages_example() -> PolicyDocument {
+    let mut rules = DEFAULT_LINKED_RULES;
+    rules.packages = selected(&["splice-amulet", "atomic-dvp", "registry"]);
+    PolicyDocument {
+        expires_at: at(DAY),
+        ..rules_doc(rules)
+    }
+}
+
+/// Two scopes: 0x84 with swaps in both directions and transfers, bounded per pair and to
+/// two LPs; 0x82 with no command at all.
+fn scopes_example() -> PolicyDocument {
+    let usdc_for_cc = pair(
+        PolicyInstrument::Token(usdc_ref()),
+        PolicyInstrument::Cc,
+        "6",
+        "150",
+    );
+    let mut rules = DEFAULT_LINKED_RULES;
+    rules.scopes = scopes(vec![
+        scope(
+            testkit::ed25519_id(0x84),
+            &[CommandKind::Swap, CommandKind::TransferCc],
+            vec![cc_for_usdc(), usdc_for_cc],
+            vec![lp_a(), lp_b()],
+        ),
+        scope(testkit::ed25519_id(0x82), &[], vec![], vec![]),
+    ]);
+    PolicyDocument {
+        expires_at: at(DAY),
+        ..rules_doc(rules)
+    }
+}
+
 fn command_at(
     head: HeadRef,
     party: &PartyId,
@@ -1705,7 +1908,37 @@ fn burn() -> CommandOp {
     }
 }
 
-/// The twelve-entry log covering every kind, with the state after each entry.
+const SWAP_CMD_ID: &str = "01890a5d-ac96-774b-bcce-b302099a805a";
+const SWAP_BUY_CMD_ID: &str = "01890a5d-ac96-774b-bcce-b302099a805b";
+
+fn swap(
+    sell: InstrumentRef,
+    sold: &str,
+    buy: InstrumentRef,
+    minimum: &str,
+    fee_cap: &str,
+) -> CommandOp {
+    CommandOp::Swap {
+        sell,
+        sell_amount: amount(sold),
+        buy,
+        min_receive: amount(minimum),
+        max_fee_cc: amount(fee_cap),
+    }
+}
+
+/// Sell 1000 CC for at least 150 USDCx, at most 2 CC in fees.
+fn sell_cc() -> CommandOp {
+    swap(cc_ref(), "1000", usdc_ref(), "150", "2")
+}
+
+/// Sell 150 USDCx for at least 990 CC net of fees, at most 2 CC in fees.
+fn buy_cc() -> CommandOp {
+    swap(usdc_ref(), "150", cc_ref(), "990", "2")
+}
+
+/// The twelve-entry log covering every kind, with the state after each entry. It is timed in
+/// units of the devnet delay `D`: linked at T0, in effect at D, changes at D+ and 2D+.
 struct Main {
     chain: Chain,
     states: Vec<ControlState>,
@@ -1720,14 +1953,17 @@ impl Main {
     }
 }
 
+/// Pushes `pending` and records the state after it.
+fn step(chain: &mut Chain, states: &mut Vec<ControlState>, pending: &PendingEntry) {
+    chain.push(pending);
+    states.push(chain.state.clone());
+}
+
 fn main_chain() -> Main {
     use Capability::{Direct, Policy, Read};
+    let d = DEVNET_DELAY;
     let mut chain = Chain::linked();
     let mut states = vec![chain.state.clone()];
-    let mut step = |chain: &mut Chain, pending: &crate::builder::PendingEntry| {
-        chain.push(pending);
-        states.push(chain.state.clone());
-    };
     let add = add_local_descriptor();
     let pending = chain
         .builder()
@@ -1735,108 +1971,104 @@ fn main_chain() -> Main {
             &add.encode().unwrap(),
             &add.commitment().unwrap(),
             &testkit::rp(),
-            at(DAY),
+            at(d),
         )
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
         .add_ed25519(
             ed_public(0x81),
             label("Backup key"),
             caps(&[Policy]),
-            at(DAY + 10),
+            at(d + 10),
         )
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
         .set_capabilities(
             &testkit::ed25519_id(0x21),
             caps(&[Direct, Read]),
             false,
-            at(DAY + 20),
+            at(d + 20),
         )
         .unwrap();
-    step(&mut chain, &pending);
-    let v1 = testkit::policy_doc(&chain.state, 1, at(DAY + 30), DEFAULT_LINKED_RULES);
+    step(&mut chain, &mut states, &pending);
+    let v1 = testkit::policy_doc(&chain.state, 1, at(d + 30), DEFAULT_LINKED_RULES);
     let v1_pending = chain
         .builder()
         .accept_policy(
             &v1.encode().unwrap(),
             &testkit::passkey_envelope(&v1.encode().unwrap()),
-            at(DAY + 30),
+            at(d + 30),
         )
         .unwrap();
-    step(&mut chain, &v1_pending);
-    let v2 = testkit::policy_doc(
-        &chain.state,
-        2,
-        at(2 * DAY + 10),
-        testkit::undirected_rules(),
-    );
+    step(&mut chain, &mut states, &v1_pending);
+    // 0x81 signs the moment its add takes effect.
+    let v2 = testkit::policy_doc(&chain.state, 2, at(2 * d + 10), testkit::undirected_rules());
     let v2_bytes = v2.encode().unwrap();
     let pending = chain
         .builder()
         .accept_policy(
             &v2_bytes,
             &testkit::ed25519_envelope(0x81, &v2_bytes),
-            at(2 * DAY + 10),
+            at(2 * d + 10),
         )
         .unwrap();
-    step(&mut chain, &pending);
-    let v3 = testkit::policy_doc(&chain.state, 3, at(2 * DAY + 20), DEFAULT_LINKED_RULES);
+    step(&mut chain, &mut states, &pending);
+    let v3 = testkit::policy_doc(&chain.state, 3, at(2 * d + 20), DEFAULT_LINKED_RULES);
     let v3_bytes = v3.encode().unwrap();
     let pending = chain
         .builder()
         .accept_policy(
             &v3_bytes,
             &testkit::passkey_envelope(&v3_bytes),
-            at(2 * DAY + 20),
+            at(2 * d + 20),
         )
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let local_id = *local_passkey(CapabilitySet::ALL).id();
     let pending = chain
         .builder()
-        .remove_controller(&local_id, false, at(2 * DAY + 30))
+        .remove_controller(&local_id, false, at(2 * d + 30))
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
         .add_ed25519(
             ed_public(0x82),
             label("Spare key"),
             caps(&[Read]),
-            at(2 * DAY + 40),
+            at(2 * d + 40),
         )
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
-        .remove_controller(&testkit::ed25519_id(0x82), false, at(2 * DAY + 50))
+        .remove_controller(&testkit::ed25519_id(0x82), false, at(2 * d + 50))
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
         .add_ed25519(
             ed_public(0x83),
             label("Second key"),
             caps(&[Policy, Read]),
-            at(2 * DAY + 60),
+            at(2 * d + 60),
         )
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
         .set_capabilities(
             &testkit::ed25519_id(0x83),
             caps(&[Read]),
             false,
-            at(2 * DAY + 70),
+            at(2 * d + 70),
         )
         .unwrap();
-    step(&mut chain, &pending);
+    step(&mut chain, &mut states, &pending);
     Main {
         chain,
         states,
@@ -1848,20 +2080,19 @@ fn main_chain() -> Main {
 
 /// Linked, both controllers removed by force, then linked again once the removals apply.
 fn relink_chain() -> (Chain, Vec<ControlState>) {
+    let d = DEVNET_DELAY;
     let mut chain = Chain::linked();
     let mut states = vec![chain.state.clone()];
     let pending = chain
         .builder()
-        .remove_controller(&testkit::passkey_id(), true, at(DAY + 10))
+        .remove_controller(&testkit::passkey_id(), true, at(d + 10))
         .unwrap();
-    chain.push(&pending);
-    states.push(chain.state.clone());
+    step(&mut chain, &mut states, &pending);
     let pending = chain
         .builder()
-        .remove_controller(&testkit::ed25519_id(0x21), true, at(DAY + 20))
+        .remove_controller(&testkit::ed25519_id(0x21), true, at(d + 20))
         .unwrap();
-    chain.push(&pending);
-    states.push(chain.state.clone());
+    step(&mut chain, &mut states, &pending);
     let relink = relink_descriptor();
     let pending = chain
         .builder()
@@ -1870,12 +2101,263 @@ fn relink_chain() -> (Chain, Vec<ControlState>) {
             &relink.commitment().unwrap(),
             &testkit::rp(),
             false,
-            at(2 * DAY + 20),
+            at(2 * d + 20),
         )
         .unwrap();
-    chain.push(&pending);
-    states.push(chain.state.clone());
+    step(&mut chain, &mut states, &pending);
     (chain, states)
+}
+
+/// A policy for `state`'s agent on `state`'s network that chains onto its latest one.
+fn policy_on(
+    state: &ControlState,
+    version: u64,
+    issued_at: UtcTime,
+    rules: Rules,
+) -> PolicyDocument {
+    PolicyDocument {
+        network: state.network(),
+        ..testkit::policy_doc(state, version, issued_at, rules)
+    }
+}
+
+/// Accepts `doc` at its `issued_at`, signed by Ed25519 `signer` or, for 0, by the passkey.
+fn accept_doc(
+    chain: &mut Chain,
+    states: &mut Vec<ControlState>,
+    signer: u8,
+    doc: &PolicyDocument,
+) -> Vec<u8> {
+    let bytes = doc.encode().unwrap();
+    let envelope = match signer {
+        0 => testkit::passkey_envelope(&bytes),
+        start => testkit::ed25519_envelope(start, &bytes),
+    };
+    let pending = chain
+        .builder()
+        .accept_policy(&bytes, &envelope, doc.issued_at)
+        .unwrap();
+    step(chain, states, &pending);
+    bytes
+}
+
+/// A mainnet log timed by the mainnet delay `M`: an add, a withdrawn add, a narrowing, a
+/// removal and a package widening, with the state after each entry and both policies.
+fn mainnet_chain() -> (Chain, Vec<ControlState>, Vec<Vec<u8>>) {
+    use Capability::{Direct, Policy, Read};
+    let m = MAINNET_DELAY;
+    let mut chain = Chain::linked_on(Network::Mainnet);
+    let mut states = vec![chain.state.clone()];
+    let pending = chain
+        .builder()
+        .add_ed25519(
+            ed_public(0x81),
+            label("Backup key"),
+            caps(&[Policy, Direct]),
+            at(m + 10),
+        )
+        .unwrap();
+    step(&mut chain, &mut states, &pending);
+    let pending = chain
+        .builder()
+        .add_ed25519(
+            ed_public(0x82),
+            label("Spare key"),
+            caps(&[Read]),
+            at(m + 20),
+        )
+        .unwrap();
+    step(&mut chain, &mut states, &pending);
+    let pending = chain
+        .builder()
+        .remove_controller(&testkit::ed25519_id(0x82), false, at(m + 30))
+        .unwrap();
+    step(&mut chain, &mut states, &pending);
+    let v1 = policy_on(&chain.state, 1, at(2 * m + 20), mainnet_narrow_rules());
+    let v1 = accept_doc(&mut chain, &mut states, 0x21, &v1);
+    let pending = chain
+        .builder()
+        .remove_controller(&testkit::ed25519_id(0x81), false, at(2 * m + 30))
+        .unwrap();
+    step(&mut chain, &mut states, &pending);
+    let v2 = policy_on(&chain.state, 2, at(2 * m + 40), mainnet_wide_packages());
+    let v2 = accept_doc(&mut chain, &mut states, 0x21, &v2);
+    (chain, states, vec![v1, v2])
+}
+
+/// The mainnet narrowing: two packages selected, and 0x81 scoped to swaps.
+fn mainnet_narrow_rules() -> Rules {
+    let mut rules = DEFAULT_LINKED_RULES;
+    rules.packages = selected(&["splice-amulet", "atomic-dvp"]);
+    rules.scopes = vec![scope(
+        testkit::ed25519_id(0x81),
+        &[CommandKind::Swap],
+        vec![],
+        vec![],
+    )];
+    rules
+}
+
+/// The mainnet narrowing with every package allowed again: a packages widening only.
+fn mainnet_wide_packages() -> Rules {
+    let mut rules = mainnet_narrow_rules();
+    rules.packages = Allowlist::ANY;
+    rules
+}
+
+/// The mainnet narrowing with 0x81's scope dropped: a scopes widening only.
+fn mainnet_wide_scopes() -> Rules {
+    let mut rules = mainnet_narrow_rules();
+    rules.scopes = Vec::new();
+    rules
+}
+
+/// A package id, deterministic per name.
+fn package(name: &str) -> PackageId {
+    PackageId(sha256(name.as_bytes()))
+}
+
+/// A package selection of the named packages, in ascending order.
+fn selected(names: &[&str]) -> Allowlist<PackageId> {
+    let mut items: Vec<PackageId> = names.iter().map(|name| package(name)).collect();
+    items.sort();
+    Allowlist { any: false, items }
+}
+
+fn scope(
+    controller: ControllerId,
+    commands: &[CommandKind],
+    mut pairs: Vec<ScopePair>,
+    mut lps: Vec<PartyId>,
+) -> CommandScope {
+    pairs.sort_by(|a, b| (&a.sell, &a.buy).cmp(&(&b.sell, &b.buy)));
+    lps.sort();
+    CommandScope {
+        controller,
+        commands: commands.to_vec(),
+        pairs,
+        lps,
+    }
+}
+
+/// Scopes in the controller order a policy lists them in.
+fn scopes(mut list: Vec<CommandScope>) -> Vec<CommandScope> {
+    list.sort_by_key(|s| s.controller);
+    list
+}
+
+fn pair(
+    sell: PolicyInstrument,
+    buy: PolicyInstrument,
+    min_price: &str,
+    max_sell: &str,
+) -> ScopePair {
+    ScopePair {
+        sell,
+        buy,
+        min_price: amount(min_price),
+        max_sell: amount(max_sell),
+    }
+}
+
+/// The scoped pair: CC sold for USDCx at 0.15 or better, at most 1000 CC a command.
+fn cc_for_usdc() -> ScopePair {
+    pair(
+        PolicyInstrument::Cc,
+        PolicyInstrument::Token(usdc_ref()),
+        "0.15",
+        "1000",
+    )
+}
+
+/// Devnet: Ed25519 0x84 added with `direct`, scoped to one swap pair and LP, then widened and
+/// emptied; `not_before` holds the same narrowing for 2D+600 instead.
+struct ScopedChain {
+    chain: Chain,
+    states: Vec<ControlState>,
+    docs: Vec<Vec<u8>>,
+    not_before: (SignedEntry, ControlState, Vec<u8>),
+}
+
+fn scoped_rules(commands: &[CommandKind]) -> Rules {
+    let mut rules = DEFAULT_LINKED_RULES;
+    rules.scopes = vec![scope(
+        testkit::ed25519_id(0x84),
+        commands,
+        vec![cc_for_usdc()],
+        vec![lp_a()],
+    )];
+    rules
+}
+
+fn scoped_chain() -> ScopedChain {
+    let d = DEVNET_DELAY;
+    let mut chain = Chain::linked();
+    let mut states = vec![chain.state.clone()];
+    let pending = chain
+        .builder()
+        .add_ed25519(
+            ed_public(0x84),
+            label("Swap key"),
+            caps(&[Capability::Direct]),
+            at(d),
+        )
+        .unwrap();
+    step(&mut chain, &mut states, &pending);
+    let v1 = policy_on(
+        &chain.state,
+        1,
+        at(d + 10),
+        scoped_rules(&[CommandKind::Swap]),
+    );
+    let v1 = accept_doc(&mut chain, &mut states, 0, &v1);
+    let after_v1 = chain.state.clone();
+    let wider = scoped_rules(&[CommandKind::Swap, CommandKind::TransferCc]);
+    let v2 = policy_on(&chain.state, 2, at(d + 20), wider);
+    let v2 = accept_doc(&mut chain, &mut states, 0, &v2);
+    let v3 = policy_on(&chain.state, 3, at(d + 30), scoped_rules(&[]));
+    let v3 = accept_doc(&mut chain, &mut states, 0, &v3);
+    let later = PolicyDocument {
+        not_before: Some(at(2 * d + 600)),
+        ..policy_on(&after_v1, 2, at(d + 20), scoped_rules(&[]))
+    };
+    let bytes = later.encode().unwrap();
+    let pending = EntryBuilder::new(&after_v1)
+        .accept_policy(&bytes, &testkit::passkey_envelope(&bytes), at(d + 20))
+        .unwrap();
+    let not_before = (
+        testkit::sign_pending(&pending),
+        pending.state_after().clone(),
+        bytes,
+    );
+    ScopedChain {
+        chain,
+        states,
+        docs: vec![v1, v2, v3],
+        not_before,
+    }
+}
+
+/// Devnet: two packages selected at D+100, any package at D+200 (due at 2D+200), and one
+/// package at D+300, which cancels that widening.
+fn packages_chain() -> (Chain, Vec<ControlState>, Vec<Vec<u8>>) {
+    let d = DEVNET_DELAY;
+    let mut chain = Chain::linked();
+    let mut states = vec![chain.state.clone()];
+    let mut docs = Vec::new();
+    let rules = |packages: Allowlist<PackageId>| Rules {
+        packages,
+        ..DEFAULT_LINKED_RULES
+    };
+    for (version, issued, packages) in [
+        (1, at(d + 100), selected(&["splice-amulet", "atomic-dvp"])),
+        (2, at(d + 200), Allowlist::ANY),
+        (3, at(d + 300), selected(&["splice-amulet"])),
+    ] {
+        let doc = policy_on(&chain.state, version, issued, rules(packages));
+        docs.push(accept_doc(&mut chain, &mut states, 0, &doc));
+    }
+    (chain, states, docs)
 }
 
 /// An agent linked at T0 with the given controllers, as one signed entry.
@@ -1987,6 +2469,14 @@ impl Pool {
     fn rules(&mut self, id: &str, rules: Rules) -> String {
         self.doc(id, &rules_doc(rules).encode().unwrap())
     }
+
+    fn rules_on(&mut self, id: &str, network: Network, rules: Rules) -> String {
+        let doc = PolicyDocument {
+            network,
+            ..rules_doc(rules)
+        };
+        self.doc(id, &doc.encode().unwrap())
+    }
 }
 
 fn ids(prefix: &str, n: usize) -> Vec<String> {
@@ -2012,6 +2502,72 @@ fn log_case(name: &str, entries: &[String], documents: &[&str], probes: &[UtcTim
         "documents": documents,
         "probeTimes": probes,
     })
+}
+
+fn on_mainnet(mut c: Value) -> Value {
+    put(&mut c, "network", "mainnet");
+    c
+}
+
+/// Every chain the cases draw on, with the state after each of its entries.
+struct Chains {
+    main: Main,
+    relink: Vec<ControlState>,
+    mainnet: Vec<ControlState>,
+    mainnet_docs: Vec<Vec<u8>>,
+    scoped: ScopedChain,
+    packages: Vec<ControlState>,
+    package_docs: Vec<Vec<u8>>,
+}
+
+/// Puts each chain's rows and policy documents in the pool; the rows every devnet chain
+/// shares with `main` (its link at T0) are listed once, as `main.1`.
+fn chains(pool: &mut Pool) -> Chains {
+    let main = main_chain();
+    let (relink, relink_states) = relink_chain();
+    let (mainnet, mainnet_states, mainnet_docs) = mainnet_chain();
+    let scoped = scoped_chain();
+    let (packages, package_states, package_docs) = packages_chain();
+    for (i, entry) in main.chain.entries.iter().enumerate() {
+        pool.entry(&format!("main.{}", i + 1), entry);
+    }
+    for (prefix, chain) in [
+        ("relink", &relink),
+        ("scoped", &scoped.chain),
+        ("pk", &packages),
+    ] {
+        assert_eq!(chain.entries[0], main.chain.entries[0]);
+        for (i, entry) in chain.entries.iter().enumerate().skip(1) {
+            pool.entry(&format!("{prefix}.{}", i + 1), entry);
+        }
+    }
+    for (i, entry) in mainnet.entries.iter().enumerate() {
+        pool.entry(&format!("mainnet.{}", i + 1), entry);
+    }
+    pool.entry("scoped_nb.4", &scoped.not_before.0);
+    pool.doc("main.v1", &main.v1);
+    pool.doc("main.v2", &main.v2);
+    pool.doc("main.v3", &main.v3);
+    let docs = [
+        ("mainnet", &mainnet_docs),
+        ("scoped", &scoped.docs),
+        ("pk", &package_docs),
+    ];
+    for (prefix, list) in docs {
+        for (i, bytes) in list.iter().enumerate() {
+            pool.doc(&format!("{prefix}.v{}", i + 1), bytes);
+        }
+    }
+    pool.doc("scoped_nb.v2", &scoped.not_before.2);
+    Chains {
+        main,
+        relink: relink_states,
+        mainnet: mainnet_states,
+        mainnet_docs,
+        scoped,
+        packages: package_states,
+        package_docs,
+    }
 }
 
 fn mutate(base: &str, from: &str, to: &str) -> String {
@@ -2061,19 +2617,10 @@ fn set_line(text: &str, key: &str, value: &str) -> String {
 // Inputs
 
 fn inputs() -> Value {
-    let main = main_chain();
-    let (relink, relink_states) = relink_chain();
     let mut pool = Pool::default();
-    for (i, entry) in main.chain.entries.iter().enumerate() {
-        pool.entry(&format!("main.{}", i + 1), entry);
-    }
-    for (i, entry) in relink.entries.iter().enumerate().skip(1) {
-        pool.entry(&format!("relink.{}", i + 1), entry);
-    }
-    pool.doc("main.v1", &main.v1);
-    pool.doc("main.v2", &main.v2);
-    pool.doc("main.v3", &main.v3);
-    let documents = documents(&main);
+    let all = chains(&mut pool);
+    let main = &all.main;
+    let documents = documents(main);
     let mut root = Map::new();
     let mut set = |key: &str, value: Value| {
         root.insert(key.to_owned(), value);
@@ -2082,6 +2629,7 @@ fn inputs() -> Value {
     set("regenerate", REGENERATE.into());
     set("notes", json!(NOTES));
     set("constants", constants());
+    set("errorCodes", error_codes());
     set("keys", key_list());
     set("values", values_cases().into());
     set("originRpId", origin_cases().into());
@@ -2096,32 +2644,36 @@ fn inputs() -> Value {
     set("signCount", sign_count_cases().into());
     set("proofs", proof_cases().into());
     set("links", link_cases().into());
-    set("logs", log_cases(&mut pool, &main).into());
-    set("timeline", timeline_cases(&mut pool, &main).into());
-    set(
-        "controllerDelay",
-        controller_delay_cases(&mut pool, &main, &relink_states).into(),
-    );
+    set("logs", log_cases(&mut pool, main).into());
+    let mut timeline = timeline_cases(&mut pool, main);
+    timeline.extend(rule_timeline_cases(&mut pool, &all));
+    set("timeline", timeline.into());
+    let mut delays = controller_delay_cases(&mut pool, main, &all.relink);
+    delays.extend(network_delay_cases(&mut pool, &all));
+    set("controllerDelay", delays.into());
+    set("controllerStanding", standing_cases(&all).into());
     set("extensions", extension_cases().into());
-    set("comparisons", comparison_cases(&mut pool, &main).into());
+    set("comparisons", comparison_cases(&mut pool, main).into());
     set("forkEvidence", fork_cases().into());
-    set("headChecks", head_check_cases(&main).into());
+    set("headChecks", head_check_cases(main).into());
     set("jwtClaims", jwt_cases().into());
     set("minimumRule", minimum_cases().into());
     set("widening", widening_cases(&mut pool).into());
     set(
         "policySubmissions",
-        submission_cases(&mut pool, &main).into(),
+        submission_cases(&mut pool, &all).into(),
     );
-    set("commands", command_cases(&main, &relink_states).into());
+    set("commands", command_cases(&all).into());
     let (sessions, requests) = read_cases(&mut pool);
     set("readSessions", sessions.into());
     set("readRequests", requests.into());
-    set("receipts", receipt_cases(&main).into());
-    set("headClaims", head_claim_cases(&main).into());
+    set("receipts", receipt_cases(main).into());
+    set("headClaims", head_claim_cases(main).into());
     set("kinds", kind_cases());
     set("decisionContext", decision_context());
     set("decisions", decision_cases(&mut pool).into());
+    set("packageChecks", package_check_cases(&mut pool).into());
+    set("controllerChallenges", challenge_cases().into());
     set(
         "logPool",
         json!({"entries": pool.entries, "policyDocuments": pool.docs}),
@@ -2129,7 +2681,39 @@ fn inputs() -> Value {
     Value::Object(root)
 }
 
+/// Every stable number a verifier reports beside the ones the cases produce.
+fn error_codes() -> Value {
+    let reasons: Vec<Value> = ReasonCode::ALL
+        .into_iter()
+        .map(|r| json!({"name": r.code_name(), "code": r.as_u16()}))
+        .collect();
+    let failures: Vec<Value> = CommandFailure::ALL
+        .into_iter()
+        .map(|f| json!({"name": f.code_name(), "code": f.code()}))
+        .collect();
+    let commands: Vec<Value> = [
+        CommandError::WrongNetwork,
+        CommandError::WrongParty,
+        CommandError::UnknownController,
+        CommandError::SignerLacksDirect,
+        CommandError::StaleLogHead,
+        CommandError::IssuedInFuture,
+        CommandError::Expired,
+        CommandError::TimeOverflow,
+        CommandError::OutOfScope,
+        CommandError::SwapPairNotAllowed,
+        CommandError::SwapBelowMinPrice,
+        CommandError::SwapAboveMaxSell,
+        CommandError::LpNotAllowed,
+    ]
+    .iter()
+    .map(|e| json!({"name": e.code_name(), "code": e.code()}))
+    .collect();
+    json!({"reasons": reasons, "commandFailures": failures, "commands": commands})
+}
+
 fn constants() -> Value {
+    let delay = |network: Network| controller_change_delay_secs(network);
     json!({
         "minDocumentBytes": MIN_DOCUMENT_BYTES,
         "maxBytes": {
@@ -2141,11 +2725,24 @@ fn constants() -> Value {
             "readSession": MAX_READ_SESSION_BYTES,
             "readRequest": MAX_READ_REQUEST_BYTES,
             "receipt": MAX_RECEIPT_BYTES,
+            "receiptV2": MAX_RECEIPT_V2_BYTES,
             "controlHead": MAX_HEAD_CLAIM_BYTES,
+            "controllerChallenge": MAX_CHALLENGE_BYTES,
         },
         "maxLogEntries": MAX_LOG_ENTRIES,
         "maxAgentControllers": MAX_AGENT_CONTROLLERS,
-        "controllerChangeDelaySecs": CONTROLLER_CHANGE_DELAY_SECS,
+        "controllerChangeDelaySecs": {
+            "devnet": delay(Network::Devnet),
+            "mainnet": delay(Network::Mainnet),
+        },
+        "maxPackages": MAX_PACKAGES,
+        "maxScopes": MAX_SCOPES,
+        "maxScopeCommands": MAX_SCOPE_COMMANDS,
+        "maxScopePairs": MAX_SCOPE_PAIRS,
+        "maxScopeLps": MAX_SCOPE_LPS,
+        "commandKinds": CommandKind::ALL.map(CommandKind::as_str),
+        "maxChallengeSecs": MAX_CHALLENGE_SECS,
+        "challengeClockSkewSecs": CHALLENGE_CLOCK_SKEW_SECS,
         "maxPolicyValiditySecs": MAX_POLICY_VALIDITY_SECS,
         "maxNotBeforeSecs": MAX_NOT_BEFORE_SECS,
         "maxDelaySecs": MAX_DELAY_SECS,
@@ -2521,6 +3118,33 @@ fn values_cases() -> Vec<Value> {
             strs(&["executed", "refused", "failed", "expired", "ok"]),
         ),
         ("code_source", strs(&["agent", "ledger", "rpc"])),
+        (
+            "package_id",
+            vec![
+                hex32.clone(),
+                "f".repeat(64),
+                hex32.to_uppercase(),
+                hex32[..63].to_owned(),
+                format!("{hex32}0"),
+                format!("0x{}", &hex32[..62]),
+                format!("{} ", &hex32[..63]),
+                String::new(),
+            ],
+        ),
+        (
+            "command_kind",
+            strs(&[
+                "swap",
+                "transfer_cc",
+                "transfer_token",
+                "usdcx_burn",
+                "Swap",
+                "transfer",
+                "swap ",
+                "usdcx-burn",
+                "",
+            ]),
+        ),
     ];
     table
         .into_iter()
@@ -2715,14 +3339,65 @@ fn signed_by_agent(name: &str, kind: &str, bytes: &[u8], key: &ed25519_dalek::Si
     d
 }
 
+/// When the main log's commands are issued, after its last entry.
+fn main_command_time() -> UtcTime {
+    at(2 * DEVNET_DELAY + 100)
+}
+
+/// When the main log's receipts and head claim are issued.
+fn main_receipt_time() -> UtcTime {
+    at(2 * DEVNET_DELAY + 200)
+}
+
+/// The swap of `sell_cc` at the main head, as the documents and receipts name it.
+fn main_swap(main: &Main) -> Command {
+    command_at(
+        main.head(12),
+        &testkit::agent_party(),
+        SWAP_CMD_ID,
+        main_command_time(),
+        600,
+        sell_cc(),
+        "Swap 1000 CC for USDCx",
+    )
+}
+
+/// The v2 receipt of the main swap, settled with LP a: 1000 CC for 151 USDCx, 1.5 CC fees.
+fn swap_receipt(main: &Main) -> SwapReceipt {
+    let command = main_swap(main);
+    SwapReceipt {
+        receipt: Receipt {
+            network: Network::Devnet,
+            agent_party: testkit::agent_party(),
+            agent_key: ed_public(1),
+            subject: ReceiptSubject::Command(command.command_id.clone()),
+            subject_hash: command.hash().unwrap(),
+            outcome: ReceiptOutcome::Executed,
+            update_id: Some(Token::parse("update-0002").unwrap()),
+            reason_code: None,
+            code_source: None,
+            log_seq: main.head(12).seq,
+            issued_at: main_receipt_time(),
+        },
+        result: SwapResult {
+            quote_id: Token::parse("quote-7f3a").unwrap(),
+            lp: lp_a(),
+            sold: amount("1000"),
+            received: amount("151"),
+            fee_cc: amount("1.5"),
+        },
+    }
+}
+
 fn receipts(main: &Main) -> Vec<(&'static str, Receipt)> {
     let head = main.head(12);
     let party = testkit::agent_party();
+    let issued = main_command_time();
     let command = command_at(
         head,
         &party,
         CMD_ID,
-        at(2 * DAY + 100),
+        issued,
         600,
         pay_alice("10"),
         "Pay alice 10 CC",
@@ -2731,7 +3406,7 @@ fn receipts(main: &Main) -> Vec<(&'static str, Receipt)> {
         head,
         &party,
         TOKEN_CMD_ID,
-        at(2 * DAY + 100),
+        issued,
         600,
         send_bob_usdc(),
         "Send bob 2.25 USDCx",
@@ -2740,11 +3415,12 @@ fn receipts(main: &Main) -> Vec<(&'static str, Receipt)> {
         head,
         &party,
         BURN_CMD_ID,
-        at(2 * DAY + 100),
+        issued,
         600,
         burn(),
         "Burn 100 USDCx",
     );
+    let swap_command = main_swap(main);
     let policy_hash = policy_example().hash().unwrap();
     let receipt = |subject: ReceiptSubject,
                    subject_hash: Hash32,
@@ -2761,7 +3437,7 @@ fn receipts(main: &Main) -> Vec<(&'static str, Receipt)> {
         reason_code: reason.map(|(code, _)| code),
         code_source: reason.map(|(_, source)| source),
         log_seq: head.seq,
-        issued_at: at(2 * DAY + 200),
+        issued_at: main_receipt_time(),
     };
     let subject = |c: &Command| ReceiptSubject::Command(c.command_id.clone());
     vec![
@@ -2813,6 +3489,32 @@ fn receipts(main: &Main) -> Vec<(&'static str, Receipt)> {
                 ReceiptOutcome::Refused,
                 None,
                 Some((18, CodeSource::Agent)),
+            ),
+        ),
+        (
+            "receipt.swap_failed",
+            receipt(
+                subject(&swap_command),
+                swap_command.hash().unwrap(),
+                ReceiptOutcome::Failed,
+                None,
+                Some((
+                    u64::from(CommandFailure::BelowMinimum.code()),
+                    CodeSource::Agent,
+                )),
+            ),
+        ),
+        (
+            "receipt.swap_out_of_scope",
+            receipt(
+                subject(&swap_command),
+                swap_command.hash().unwrap(),
+                ReceiptOutcome::Refused,
+                None,
+                Some((
+                    u64::from(CommandError::OutOfScope.code()),
+                    CodeSource::Agent,
+                )),
             ),
         ),
     ]
@@ -2892,11 +3594,35 @@ fn documents(main: &Main) -> Vec<Value> {
         policy_example().encode().unwrap(),
         &["laptop", "recovery"],
     ));
+    out.push(signed(
+        "policy.packages",
+        "policy",
+        packages_example().encode().unwrap(),
+        &["laptop"],
+    ));
+    out.push(signed(
+        "policy.scopes",
+        "policy",
+        scopes_example().encode().unwrap(),
+        &["laptop"],
+    ));
     let command = |id: &str, op: CommandOp, summary: &str| {
-        command_at(head, &party, id, at(2 * DAY + 100), 600, op, summary)
+        command_at(head, &party, id, main_command_time(), 600, op, summary)
             .encode()
             .unwrap()
     };
+    out.push(signed(
+        "command.swap",
+        "command",
+        main_swap(main).encode().unwrap(),
+        &["laptop"],
+    ));
+    out.push(signed(
+        "command.swap_buy",
+        "command",
+        command(SWAP_BUY_CMD_ID, buy_cc(), "Swap 150 USDCx for CC"),
+        &["laptop"],
+    ));
     out.push(signed(
         "command.example",
         "command",
@@ -2943,6 +3669,12 @@ fn documents(main: &Main) -> Vec<Value> {
             &testkit::agent_key(),
         ));
     }
+    out.push(signed_by_agent(
+        "receipt.swap_executed",
+        "receipt",
+        &swap_receipt(main).encode().unwrap(),
+        &testkit::agent_key(),
+    ));
     let empty = HeadClaim::for_state(&testkit::empty_state(), at(0));
     out.push(signed_by_agent(
         "head_claim.empty",
@@ -2950,7 +3682,7 @@ fn documents(main: &Main) -> Vec<Value> {
         &empty.encode().unwrap(),
         &testkit::agent_key(),
     ));
-    let linked = HeadClaim::for_state(&main.chain.state, at(2 * DAY + 200));
+    let linked = HeadClaim::for_state(&main.chain.state, main_receipt_time());
     out.push(signed_by_agent(
         "head_claim.linked",
         "head_claim",
@@ -2993,6 +3725,10 @@ fn negative_cases(documents: &[Value]) -> Vec<Value> {
     let rc = base("receipt.executed");
     let rr = base("receipt.refused_agent");
     let rp = base("receipt.policy_refused");
+    let pp = base("policy.packages");
+    let ps = base("policy.scopes");
+    let cs = base("command.swap");
+    let rv = base("receipt.swap_executed");
     let head_value = line_value(&h, "head").to_owned();
     let party_line = line_value(&h, "agent_party").to_owned();
     let (hint, namespace) = party_line.split_once("::").unwrap();
@@ -3531,10 +4267,15 @@ fn negative_cases(documents: &[Value]) -> Vec<Value> {
         ck,
         set_line(&c, "op", "transfer_all").into_bytes(),
     );
+    let too_late = UtcTime::parse(line_value(&c, "issued_at"))
+        .unwrap()
+        .checked_add_secs(901)
+        .unwrap()
+        .to_string();
     add(
         "invalid_validity: over 900 s",
         ck,
-        set_line(&c, "expires_at", "2026-11-24T12:16:41Z").into_bytes(),
+        set_line(&c, "expires_at", &too_late).into_bytes(),
     );
     add(
         "invalid_validity: expires at issue",
@@ -3695,6 +4436,291 @@ fn negative_cases(documents: &[Value]) -> Vec<Value> {
         "invalid_hex32: policy subject id",
         xk,
         set_line(&rp, "subject_id", CMD_ID).into_bytes(),
+    );
+    // The package rule: any, or 1 to 256 ascending ids.
+    let first_package = line_value(&pp, "packages.0").to_owned();
+    add(
+        "invalid_package_id: 63 hex characters",
+        qk,
+        set_line(&pp, "packages.0", &first_package[..63]).into_bytes(),
+    );
+    add(
+        "invalid_package_id: uppercase",
+        qk,
+        set_line(&pp, "packages.0", &first_package.to_uppercase()).into_bytes(),
+    );
+    add(
+        "unsorted_list: packages",
+        qk,
+        reorder(&pp, "packages.", &[1, 0, 2]).into_bytes(),
+    );
+    add(
+        "duplicate_item: packages",
+        qk,
+        reorder(&pp, "packages.", &[0, 0, 2]).into_bytes(),
+    );
+    add(
+        "count_out_of_range: 257 packages",
+        qk,
+        set_line(&pp, "packages.count", "257").into_bytes(),
+    );
+    add(
+        "count_out_of_range: a selection of none",
+        qk,
+        set_line(&pp, "packages.count", "0").into_bytes(),
+    );
+    add(
+        "count_out_of_range: any with packages",
+        qk,
+        set_line(&pp, "packages.any", "true").into_bytes(),
+    );
+    add(
+        "invalid_bool: packages.any",
+        qk,
+        set_line(&pp, "packages.any", "yes").into_bytes(),
+    );
+    // Command scopes; `rich` is the scope with two kinds, pairs and LPs.
+    let rich = if line_value(&ps, "scopes.0.commands.count") == "2" {
+        0
+    } else {
+        1
+    };
+    let empty_scope = 1 - rich;
+    let s = |key: &str| format!("scopes.{rich}.{key}");
+    let cc_pair = if line_value(&ps, &s("pairs.0.sell.admin")) == "cc" {
+        0
+    } else {
+        1
+    };
+    add(
+        "count_out_of_range: 33 scopes",
+        qk,
+        set_line(&ps, "scopes.count", "33").into_bytes(),
+    );
+    add(
+        "unsorted_list: scopes",
+        qk,
+        reorder(&ps, "scopes.", &[1, 0]).into_bytes(),
+    );
+    add(
+        "duplicate_item: scopes",
+        qk,
+        reorder(&ps, "scopes.", &[0, 0]).into_bytes(),
+    );
+    let scope_controller = line_value(&ps, "scopes.0.controller").to_owned();
+    add(
+        "invalid_hex32: uppercase scope controller",
+        qk,
+        set_line(&ps, "scopes.0.controller", &scope_controller.to_uppercase()).into_bytes(),
+    );
+    add(
+        "invalid_command_op: an unknown scope kind",
+        qk,
+        set_line(&ps, &s("commands.0"), "transfer").into_bytes(),
+    );
+    add(
+        "invalid_command_op: an uppercase scope kind",
+        qk,
+        set_line(&ps, &s("commands.0"), "Swap").into_bytes(),
+    );
+    add(
+        "count_out_of_range: five scope kinds",
+        qk,
+        set_line(&ps, &s("commands.count"), "5").into_bytes(),
+    );
+    add(
+        "unsorted_list: scope kinds",
+        qk,
+        reorder(&ps, &s("commands."), &[1, 0]).into_bytes(),
+    );
+    add(
+        "duplicate_item: scope kinds",
+        qk,
+        reorder(&ps, &s("commands."), &[0, 0]).into_bytes(),
+    );
+    add(
+        "count_out_of_range: 17 scope pairs",
+        qk,
+        set_line(&ps, &s("pairs.count"), "17").into_bytes(),
+    );
+    add(
+        "unsorted_list: scope pairs",
+        qk,
+        reorder(&ps, &s("pairs."), &[1, 0]).into_bytes(),
+    );
+    add(
+        "duplicate_item: scope pairs",
+        qk,
+        reorder(&ps, &s("pairs."), &[0, 0]).into_bytes(),
+    );
+    let sold_admin = line_value(&ps, &s("pairs.0.sell.admin")).to_owned();
+    let sold_id = line_value(&ps, &s("pairs.0.sell.id")).to_owned();
+    let same_pair = set_line(
+        &set_line(&ps, &s("pairs.0.buy.admin"), &sold_admin),
+        &s("pairs.0.buy.id"),
+        &sold_id,
+    );
+    add("same_instrument: a scope pair", qk, same_pair.into_bytes());
+    add(
+        "invalid_cc_alias: a scope pair",
+        qk,
+        set_line(&ps, &s(&format!("pairs.{cc_pair}.sell.id")), "Amulet").into_bytes(),
+    );
+    add(
+        "invalid_amount: a min_price with a leading zero",
+        qk,
+        set_line(&ps, &s("pairs.0.min_price"), "06").into_bytes(),
+    );
+    add(
+        "invalid_amount: a max_sell that is not minimal",
+        qk,
+        set_line(&ps, &s("pairs.0.max_sell"), "150.0").into_bytes(),
+    );
+    add(
+        "count_out_of_range: 17 scope lps",
+        qk,
+        set_line(&ps, &s("lps.count"), "17").into_bytes(),
+    );
+    add(
+        "unsorted_list: scope lps",
+        qk,
+        reorder(&ps, &s("lps."), &[1, 0]).into_bytes(),
+    );
+    add(
+        "duplicate_item: scope lps",
+        qk,
+        reorder(&ps, &s("lps."), &[0, 0]).into_bytes(),
+    );
+    add(
+        "invalid_party: a scope lp",
+        qk,
+        set_line(&ps, &s("lps.0"), "lp-a").into_bytes(),
+    );
+    add(
+        "unexpected_key: a scope without its pairs count",
+        qk,
+        mutate(
+            &ps,
+            &format!("\nscopes.{empty_scope}.pairs.count=0\n"),
+            "\n",
+        )
+        .into_bytes(),
+    );
+    // The swap command.
+    let sell_admin = line_value(&cs, "op.sell_instrument_admin").to_owned();
+    let sell_id = line_value(&cs, "op.sell_instrument_id").to_owned();
+    let same_swap = set_line(
+        &set_line(&cs, "op.buy_instrument_admin", &sell_admin),
+        "op.buy_instrument_id",
+        &sell_id,
+    );
+    add("same_instrument: a swap", ck, same_swap.into_bytes());
+    add(
+        "invalid_amount: a swap selling zero",
+        ck,
+        set_line(&cs, "op.sell_amount", "0").into_bytes(),
+    );
+    add(
+        "invalid_amount: a swap with a zero minimum",
+        ck,
+        set_line(&cs, "op.min_receive", "0").into_bytes(),
+    );
+    add(
+        "invalid_amount: a fee cap that is not minimal",
+        ck,
+        set_line(&cs, "op.max_fee_cc", "2.0").into_bytes(),
+    );
+    add(
+        "empty_value: a swap without a fee cap",
+        ck,
+        set_line(&cs, "op.max_fee_cc", "").into_bytes(),
+    );
+    add(
+        "invalid_party: a bare sell admin",
+        ck,
+        set_line(&cs, "op.sell_instrument_admin", "DSO").into_bytes(),
+    );
+    add(
+        "invalid_instrument_id: a buy id with a space",
+        ck,
+        set_line(&cs, "op.buy_instrument_id", "USD Cx").into_bytes(),
+    );
+    add(
+        "unexpected_key: swap fields under transfer_cc",
+        ck,
+        set_line(&cs, "op", "transfer_cc").into_bytes(),
+    );
+    add(
+        "unexpected_key: transfer fields under swap",
+        ck,
+        set_line(&c, "op", "swap").into_bytes(),
+    );
+    // The v2 receipt of an executed swap.
+    add(
+        "outcome_mismatch: a v2 receipt that failed",
+        xk,
+        set_line(&rv, "outcome", "failed").into_bytes(),
+    );
+    let swap_hash = line_value(&rv, "subject_hash").to_owned();
+    add(
+        "outcome_mismatch: a v2 receipt for a policy",
+        xk,
+        set_line(
+            &set_line(&rv, "subject", "policy"),
+            "subject_id",
+            &swap_hash,
+        )
+        .into_bytes(),
+    );
+    add(
+        "invalid_amount: a v2 receipt that sold nothing",
+        xk,
+        set_line(&rv, "result.sold", "0").into_bytes(),
+    );
+    add(
+        "invalid_amount: a v2 receipt that received nothing",
+        xk,
+        set_line(&rv, "result.received", "0").into_bytes(),
+    );
+    add(
+        "invalid_amount: a v2 fee that is not minimal",
+        xk,
+        set_line(&rv, "result.fee_cc", "1.50").into_bytes(),
+    );
+    add(
+        "invalid_token: a quote id with a space",
+        xk,
+        set_line(&rv, "result.quote_id", "quote 7").into_bytes(),
+    );
+    add(
+        "invalid_party: a bare lp",
+        xk,
+        set_line(&rv, "result.lp", "lp-a").into_bytes(),
+    );
+    let unsettled: String = rv
+        .lines()
+        .filter(|line| !line.starts_with("result."))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    add(
+        "missing_line: a v2 receipt without its result",
+        xk,
+        unsettled.into_bytes(),
+    );
+    add(
+        "trailing_line: a v1 receipt with a result",
+        xk,
+        mutate(&rv, "receipt.v2", "receipt.v1").into_bytes(),
+    );
+    add(
+        "wrong_scheme: a v3 receipt",
+        xk,
+        mutate(&rv, "receipt.v2", "receipt.v3").into_bytes(),
+    );
+    add(
+        "too_large: a v2 receipt",
+        xk,
+        format!("{rv}{}", "x".repeat(3100)).into_bytes(),
     );
     out.into_iter()
         .map(|(name, kind, bytes)| {
@@ -4370,6 +5396,7 @@ fn link_cases() -> Vec<Value> {
 
 fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     use Capability::{Direct, Read};
+    let d = DEVNET_DELAY;
     let linked = &main.states[0];
     let s4 = &main.states[3];
     let s5 = &main.states[4];
@@ -4400,8 +5427,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     pool.row("v.sig.3", main.chain.entries[2].bytes(), &signature);
     let tampered = mutate(
         &text(main.chain.entries[3].bytes()),
-        "created_at=2026-11-23T12:00:20Z",
-        "created_at=2026-11-23T12:00:21Z",
+        &format!("created_at={}", at(d + 20)),
+        &format!("created_at={}", at(d + 21)),
     );
     pool.row(
         "v.tamper.4",
@@ -4417,7 +5444,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         &forge(
             linked,
             at(-1),
-            at(DAY - 1),
+            at(d - 1),
             add_body(42, reader.clone(), None),
         ),
     );
@@ -4432,7 +5459,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         seq: 1,
         prev: Hash32([0; 32]),
         created_at: at(0),
-        effective_at: at(DAY),
+        effective_at: at(d),
         body: link_body(&invite, true, invite.commitment().unwrap()),
     };
     pool.row("w.1", &weak.encode().unwrap(), &[0; 64]);
@@ -4443,19 +5470,14 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     let invite_commitment = invite.commitment().unwrap();
     pool.entry(
         "f.first_not_link.1",
-        &forge(
-            &empty,
-            at(DAY),
-            at(2 * DAY),
-            add_body(42, reader.clone(), None),
-        ),
+        &forge(&empty, at(d), at(2 * d), add_body(42, reader.clone(), None)),
     );
     pool.entry(
         "f.link_commitment.1",
         &forge(
             &empty,
             at(0),
-            at(DAY),
+            at(d),
             link_body(&invite, true, Commitment([0; 16])),
         ),
     );
@@ -4464,7 +5486,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         &forge(
             &empty,
             at(8 * DAY),
-            at(9 * DAY),
+            at(8 * DAY + d),
             link_body(&invite, true, invite_commitment),
         ),
     );
@@ -4473,7 +5495,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         &forge(
             &empty,
             at(0),
-            at(DAY - 1),
+            at(d - 1),
             link_body(&invite, true, invite_commitment),
         ),
     );
@@ -4481,8 +5503,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.link_controlled.2",
         &forge(
             linked,
-            at(DAY + 5),
-            at(2 * DAY + 5),
+            at(d + 5),
+            at(2 * d + 5),
             link_body(&relink, false, relink_commitment),
         ),
     );
@@ -4490,8 +5512,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.owner.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             add_body(7, reader.clone(), None),
         ),
     );
@@ -4499,8 +5521,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.duplicate.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             add_body(42, testkit::ed25519_controller(caps(&[Read])), None),
         ),
     );
@@ -4509,8 +5531,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.agent_key.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             add_body(42, agent_as_controller, None),
         ),
     );
@@ -4519,8 +5541,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.commitment_required.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             add_body(42, local.clone(), None),
         ),
     );
@@ -4528,8 +5550,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.add_effective.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY - 1),
+            at(2 * d),
+            at(3 * d - 1),
             add_body(42, reader.clone(), None),
         ),
     );
@@ -4543,8 +5565,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.add_commitment.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             add_body(
                 42,
                 local.clone(),
@@ -4560,7 +5582,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         &forge(
             linked,
             at(8 * DAY),
-            at(9 * DAY),
+            at(8 * DAY + d),
             add_body(42, local, Some(add_ref)),
         ),
     );
@@ -4574,8 +5596,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.forced.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             remove(testkit::ed25519_id(0x21), false),
         ),
     );
@@ -4590,8 +5612,8 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.no_change.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             set(testkit::ed25519_id(0x21), caps(&[Read])),
         ),
     );
@@ -4599,32 +5621,27 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         "f.unknown.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             remove(testkit::ed25519_id(0x81), false),
         ),
     );
     let local_id = *local_passkey(CapabilitySet::ALL).id();
     pool.entry(
         "f.remove_again.9",
-        &forge(
-            s8,
-            at(2 * DAY + 35),
-            at(3 * DAY + 35),
-            remove(local_id, false),
-        ),
+        &forge(s8, at(2 * d + 35), at(3 * d + 35), remove(local_id, false)),
     );
     pool.entry(
         "f.set_direct.2",
         &forge(
             linked,
-            at(2 * DAY),
-            at(3 * DAY),
+            at(2 * d),
+            at(3 * d),
             set(testkit::passkey_id(), caps(&[Direct])),
         ),
     );
     // accept_policy refusals, signed at D+30 after main.4.
-    let now = at(DAY + 30);
+    let now = at(d + 30);
     let v1_hash = Hash32(sha256(&main.v1));
     let passkey = testkit::passkey_id();
     let webauthn = |bytes: &[u8]| ControllerProof::WebAuthn(testkit::assertion_over(bytes));
@@ -4712,7 +5729,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         &forge(
             s4,
             now,
-            at(DAY + 31),
+            at(d + 31),
             accept_body(v1_hash, 1, passkey, webauthn(&main.v1)),
         ),
     );
@@ -4721,16 +5738,16 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         (
             "f.expired_doc",
             PolicyDocument {
-                issued_at: at(DAY - 60),
-                expires_at: at(DAY + 29),
+                issued_at: at(d - 60),
+                expires_at: at(d + 29),
                 ..base.clone()
             },
         ),
         (
             "f.future_doc",
             PolicyDocument {
-                issued_at: at(DAY + 331),
-                expires_at: at(DAY + 3600),
+                issued_at: at(d + 331),
+                expires_at: at(d + 3600),
                 ..base.clone()
             },
         ),
@@ -4765,7 +5782,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         );
         forged_docs.push((row, id));
     }
-    let later = at(DAY + 40);
+    let later = at(d + 40);
     let again = testkit::policy_doc(s5, 1, later, DEFAULT_LINKED_RULES);
     let mut unchained = testkit::policy_doc(s5, 2, later, DEFAULT_LINKED_RULES);
     unchained.prev_policy_hash = Hash32([0; 32]);
@@ -4787,7 +5804,7 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
             ),
         );
     }
-    let probes = [at(2 * DAY + 70), at(3 * DAY + 30), at(3 * DAY + 60)];
+    let probes = [at(2 * d + 70), at(3 * d + 30), at(3 * d + 60)];
     let v123 = ["main.v1", "main.v2", "main.v3"];
     let m = main_ids;
     let mut out = vec![
@@ -5004,7 +6021,9 @@ fn log_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     out
 }
 
+/// Policy timing on devnet; the transfers delay of the default rules is a day.
 fn timeline_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
+    let d = DEVNET_DELAY;
     let linked = &main.states[0];
     let mut narrow = DEFAULT_LINKED_RULES;
     narrow.transfers.enabled = false;
@@ -5019,7 +6038,7 @@ fn timeline_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
             bytes,
         )
     };
-    let t = at(DAY + 100);
+    let t = at(d + 100);
     let (entry, _, bytes) = accept(linked, &testkit::policy_doc(linked, 1, t, narrow), t);
     pool.entry("tl.narrow.2", &entry);
     pool.doc("tl.narrow", &bytes);
@@ -5038,15 +6057,15 @@ fn timeline_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     };
     let (entry, s3, bytes) = accept(
         &s2,
-        &testkit::policy_doc(&s2, 2, at(DAY + 200), second.clone()),
-        at(DAY + 200),
+        &testkit::policy_doc(&s2, 2, at(d + 200), second.clone()),
+        at(d + 200),
     );
     pool.entry("tl.3", &entry);
     pool.doc("tl.v2", &bytes);
     let (entry, _, bytes) = accept(
         &s3,
-        &testkit::policy_doc(&s3, 3, at(2 * DAY + 300), second),
-        at(2 * DAY + 300),
+        &testkit::policy_doc(&s3, 3, at(d + DAY + 300), second),
+        at(d + DAY + 300),
     );
     pool.entry("tl.4", &entry);
     pool.doc("tl.v3", &bytes);
@@ -5076,37 +6095,41 @@ fn timeline_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
             "a widening waits for the transfers delay",
             &m(6),
             &["main.v1", "main.v2"],
-            &[at(3 * DAY + 9), at(3 * DAY + 10)],
+            &[at(2 * d + DAY + 9), at(2 * d + DAY + 10)],
         ),
         log_case(
             "a narrowing during the delay cancels the widening",
             &m(7),
             &["main.v1", "main.v2", "main.v3"],
-            &[at(3 * DAY + 10)],
+            &[at(2 * d + DAY + 10)],
         ),
         log_case(
             "a second widening replaces the first",
             &plus(m(1), &["tl.2", "tl.3"]),
             &["tl.v1", "tl.v2"],
-            &[at(2 * DAY + 100), at(2 * DAY + 199), at(2 * DAY + 200)],
+            &[at(d + DAY + 100), at(d + DAY + 199), at(d + DAY + 200)],
         ),
         log_case(
             "a due widening is promoted before the next accept",
             &plus(m(1), &["tl.2", "tl.3", "tl.4"]),
             &["tl.v1", "tl.v2", "tl.v3"],
-            &[at(2 * DAY + 300)],
+            &[at(d + DAY + 300)],
         ),
         log_case(
             "not_before holds back a narrowing",
             &plus(m(1), &["nb.2"]),
             &["nb.doc"],
-            &[at(DAY + 3699), at(DAY + 3700)],
+            &[at(d + 3699), at(d + 3700)],
         ),
         log_case(
             "not_before later than the delay wins",
             &plus(m(1), &["nbw.2"]),
             &["nbw.doc"],
-            &[at(2 * DAY + 100), at(3 * DAY + 99), at(3 * DAY + 100)],
+            &[
+                at(d + DAY + 100),
+                at(d + 2 * DAY + 99),
+                at(d + 2 * DAY + 100),
+            ],
         ),
         log_case(
             "accepted policies never expire",
@@ -5117,14 +6140,16 @@ fn timeline_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     ]
 }
 
+/// The controller-change delay on devnet, `D` = 3600 s.
 fn controller_delay_cases(pool: &mut Pool, main: &Main, relink: &[ControlState]) -> Vec<Value> {
+    let d = DEVNET_DELAY;
     let linked = &main.states[0];
     let pending = EntryBuilder::new(linked)
         .set_capabilities(
             &testkit::passkey_id(),
             caps(&[Capability::Policy]),
             true,
-            at(DAY + 10),
+            at(d + 10),
         )
         .unwrap();
     pool.entry("cd.2", &testkit::sign_pending(&pending));
@@ -5133,8 +6158,8 @@ fn controller_delay_cases(pool: &mut Pool, main: &Main, relink: &[ControlState])
         "f.relink_early.4",
         &forge(
             &relink[2],
-            at(2 * DAY + 19),
-            at(3 * DAY + 19),
+            at(2 * d + 19),
+            at(3 * d + 19),
             link_body(&early, false, early.commitment().unwrap()),
         ),
     );
@@ -5143,8 +6168,8 @@ fn controller_delay_cases(pool: &mut Pool, main: &Main, relink: &[ControlState])
         "f.invite_again.4",
         &forge(
             &relink[2],
-            at(2 * DAY + 30),
-            at(3 * DAY + 30),
+            at(2 * d + 30),
+            at(3 * d + 30),
             link_body(&invite, true, invite.commitment().unwrap()),
         ),
     );
@@ -5152,57 +6177,57 @@ fn controller_delay_cases(pool: &mut Pool, main: &Main, relink: &[ControlState])
     let relinked = plus(m(1), &["relink.2", "relink.3", "relink.4"]);
     vec![
         log_case(
-            "link: controllers wait a day",
+            "link: controllers wait the delay",
             &m(1),
             &[],
-            &[at(DAY - 1), at(DAY)],
+            &[at(d - 1), at(d)],
         ),
         log_case(
-            "add: effective a day after its signature",
+            "add: effective one delay after its signature",
             &m(2),
             &[],
-            &[at(2 * DAY - 1), at(2 * DAY)],
+            &[at(2 * d - 1), at(2 * d)],
         ),
         log_case(
             "a removal keeps capabilities until it takes effect",
             &m(8),
             &["main.v1", "main.v2", "main.v3"],
-            &[at(3 * DAY + 29), at(3 * DAY + 30)],
+            &[at(3 * d + 29), at(3 * d + 30)],
         ),
         log_case(
             "withdrawing a pending add applies at once",
             &m(10),
             &["main.v1", "main.v2", "main.v3"],
-            &[at(2 * DAY + 50)],
+            &[at(2 * d + 50)],
         ),
         log_case(
             "dropping a capability a pending change would grant applies at once",
             &m(12),
             &["main.v1", "main.v2", "main.v3"],
-            &[at(3 * DAY + 59), at(3 * DAY + 60)],
+            &[at(3 * d + 59), at(3 * d + 60)],
         ),
         log_case(
             "a capability removal is delayed",
             &plus(m(1), &["cd.2"]),
             &[],
-            &[at(2 * DAY + 9), at(2 * DAY + 10)],
+            &[at(2 * d + 9), at(2 * d + 10)],
         ),
         log_case(
             "a forced full removal keeps capabilities until each removal applies",
             &plus(m(1), &["relink.2", "relink.3"]),
             &[],
             &[
-                at(2 * DAY + 9),
-                at(2 * DAY + 10),
-                at(2 * DAY + 19),
-                at(2 * DAY + 20),
+                at(2 * d + 9),
+                at(2 * d + 10),
+                at(2 * d + 19),
+                at(2 * d + 20),
             ],
         ),
         log_case(
             "a re-link once the removals apply",
             &relinked,
             &[],
-            &[at(2 * DAY + 20), at(3 * DAY + 19), at(3 * DAY + 20)],
+            &[at(2 * d + 20), at(3 * d + 19), at(3 * d + 20)],
         ),
         log_case(
             "link_while_controlled: a re-link before the removals apply",
@@ -5222,6 +6247,494 @@ fn controller_delay_cases(pool: &mut Pool, main: &Main, relink: &[ControlState])
             &["main.v1"],
             &[],
         ),
+    ]
+}
+
+/// The mainnet delay, `M` = 86400 s, and entries timed by the other network's delay.
+fn network_delay_cases(pool: &mut Pool, all: &Chains) -> Vec<Value> {
+    let (d, m) = (DEVNET_DELAY, MAINNET_DELAY);
+    let mainnet = &all.mainnet;
+    let controllers = vec![testkit::ed25519_controller(CapabilitySet::ALL)];
+    let mainnet_link = testkit::link_descriptor_on(Network::Mainnet, controllers, 0x44);
+    let devnet_link = relink_descriptor();
+    let link = |descriptor: &LinkDescriptor| {
+        link_body(descriptor, false, descriptor.commitment().unwrap())
+    };
+    let reader = ed_controller(0x83, "Second key", caps(&[Capability::Read]));
+    let remove = |id: ControllerId| {
+        EntryBody::RemoveController(RemoveControllerBody {
+            controller_id: id,
+            forced: false,
+        })
+    };
+    let empty_mainnet = testkit::empty_state_on(Network::Mainnet);
+    let empty_devnet = testkit::empty_state();
+    let backup = testkit::ed25519_id(0x81);
+    let rows = [
+        (
+            "x.mainnet_link_3600.1",
+            &empty_mainnet,
+            0,
+            d,
+            link(&mainnet_link),
+        ),
+        (
+            "x.mainnet_link_86399.1",
+            &empty_mainnet,
+            0,
+            m - 1,
+            link(&mainnet_link),
+        ),
+        (
+            "x.devnet_link_86400.1",
+            &empty_devnet,
+            0,
+            m,
+            link(&devnet_link),
+        ),
+        (
+            "x.mainnet_add_3600.2",
+            &mainnet[0],
+            m + 10,
+            d,
+            add_body(42, reader.clone(), None),
+        ),
+        (
+            "x.mainnet_add_86399.2",
+            &mainnet[0],
+            m + 10,
+            m - 1,
+            add_body(42, reader.clone(), None),
+        ),
+        (
+            "x.devnet_add_86400.2",
+            &all.main.states[0],
+            d + 10,
+            m,
+            add_body(42, reader, None),
+        ),
+        (
+            "x.mainnet_remove_3600.6",
+            &mainnet[4],
+            2 * m + 30,
+            d,
+            remove(backup),
+        ),
+        (
+            "x.mainnet_remove_86399.6",
+            &mainnet[4],
+            2 * m + 30,
+            m - 1,
+            remove(backup),
+        ),
+        (
+            "x.devnet_remove_86400.9",
+            &all.main.states[7],
+            2 * d + 35,
+            m,
+            remove(backup),
+        ),
+    ];
+    for (id, state, created, delay, body) in rows {
+        let entry = forge(state, at(created), at(created + delay), body);
+        pool.entry(id, &entry);
+    }
+    let mn = |n: usize| ids("mainnet", n);
+    let v123 = ["main.v1", "main.v2", "main.v3"];
+    let mismatch =
+        |name: &str, entries: Vec<String>, docs: &[&str]| log_case(name, &entries, docs, &[]);
+    vec![
+        on_mainnet(log_case(
+            "mainnet link: controllers wait the mainnet delay",
+            &mn(1),
+            &[],
+            &[at(m - 1), at(m)],
+        )),
+        on_mainnet(log_case(
+            "mainnet add: effective one mainnet delay after its signature",
+            &mn(2),
+            &[],
+            &[at(2 * m + 9), at(2 * m + 10)],
+        )),
+        on_mainnet(log_case(
+            "mainnet withdrawal: a pending add withdrawn applies at once",
+            &mn(4),
+            &[],
+            &[at(m + 30)],
+        )),
+        on_mainnet(log_case(
+            "mainnet removal: capabilities kept until it takes effect",
+            &mn(6),
+            &["mainnet.v1"],
+            &[at(3 * m + 29), at(3 * m + 30)],
+        )),
+        on_mainnet(log_case(
+            "mainnet: the whole log once every change applied",
+            &mn(7),
+            &["mainnet.v1", "mainnet.v2"],
+            &[at(3 * m + 40)],
+        )),
+        log_case(
+            "wrong_network: a mainnet log read as devnet",
+            &mn(2),
+            &[],
+            &[],
+        ),
+        on_mainnet(mismatch(
+            "effective_at_mismatch: a mainnet link on the devnet delay",
+            strs(&["x.mainnet_link_3600.1"]),
+            &[],
+        )),
+        on_mainnet(mismatch(
+            "effective_at_mismatch: a mainnet link one second early",
+            strs(&["x.mainnet_link_86399.1"]),
+            &[],
+        )),
+        mismatch(
+            "effective_at_mismatch: a devnet link on the mainnet delay",
+            strs(&["x.devnet_link_86400.1"]),
+            &[],
+        ),
+        on_mainnet(mismatch(
+            "effective_at_mismatch: a mainnet add on the devnet delay",
+            plus(mn(1), &["x.mainnet_add_3600.2"]),
+            &[],
+        )),
+        on_mainnet(mismatch(
+            "effective_at_mismatch: a mainnet add one second early",
+            plus(mn(1), &["x.mainnet_add_86399.2"]),
+            &[],
+        )),
+        mismatch(
+            "effective_at_mismatch: a devnet add on the mainnet delay",
+            plus(main_ids(1), &["x.devnet_add_86400.2"]),
+            &[],
+        ),
+        on_mainnet(mismatch(
+            "effective_at_mismatch: a mainnet removal on the devnet delay",
+            plus(mn(5), &["x.mainnet_remove_3600.6"]),
+            &["mainnet.v1"],
+        )),
+        on_mainnet(mismatch(
+            "effective_at_mismatch: a mainnet removal one second early",
+            plus(mn(5), &["x.mainnet_remove_86399.6"]),
+            &["mainnet.v1"],
+        )),
+        mismatch(
+            "effective_at_mismatch: a devnet removal on the mainnet delay",
+            plus(main_ids(8), &["x.devnet_remove_86400.9"]),
+            &v123,
+        ),
+    ]
+}
+
+/// Packages and scopes over time on both networks: a narrowing applies at acceptance, a
+/// widening waits the network's controller delay, and an accept on another delay is refused.
+fn rule_timeline_cases(pool: &mut Pool, all: &Chains) -> Vec<Value> {
+    let (d, m) = (DEVNET_DELAY, MAINNET_DELAY);
+    let mainnet = &all.mainnet;
+    let passkey = testkit::passkey_id();
+    let recovery = testkit::ed25519_id(0x21);
+    let webauthn = |bytes: &[u8]| ControllerProof::WebAuthn(testkit::assertion_over(bytes));
+    let wide_scopes = policy_on(&mainnet[5], 2, at(2 * m + 40), mainnet_wide_scopes());
+    let wide_scopes = wide_scopes.encode().unwrap();
+    pool.doc("mainnet.v2s", &wide_scopes);
+    let pending = EntryBuilder::new(&mainnet[5])
+        .accept_policy(
+            &wide_scopes,
+            &testkit::ed25519_envelope(0x21, &wide_scopes),
+            at(2 * m + 40),
+        )
+        .unwrap();
+    pool.entry("mainnet.scopes.7", &testkit::sign_pending(&pending));
+    let mainnet_wide = &all.mainnet_docs[1];
+    let package_wide = &all.package_docs[1];
+    let scope_wide = &all.scoped.docs[1];
+    let rows = [
+        (
+            "x.mainnet_packages_3600.7",
+            &mainnet[5],
+            2 * m + 40,
+            d,
+            accept_body(
+                Hash32(sha256(mainnet_wide)),
+                2,
+                recovery,
+                ed_proof(0x21, mainnet_wide),
+            ),
+        ),
+        (
+            "x.mainnet_packages_86399.7",
+            &mainnet[5],
+            2 * m + 40,
+            m - 1,
+            accept_body(
+                Hash32(sha256(mainnet_wide)),
+                2,
+                recovery,
+                ed_proof(0x21, mainnet_wide),
+            ),
+        ),
+        (
+            "x.mainnet_scopes_3600.7",
+            &mainnet[5],
+            2 * m + 40,
+            d,
+            accept_body(
+                Hash32(sha256(&wide_scopes)),
+                2,
+                recovery,
+                ed_proof(0x21, &wide_scopes),
+            ),
+        ),
+        (
+            "x.mainnet_scopes_86399.7",
+            &mainnet[5],
+            2 * m + 40,
+            m - 1,
+            accept_body(
+                Hash32(sha256(&wide_scopes)),
+                2,
+                recovery,
+                ed_proof(0x21, &wide_scopes),
+            ),
+        ),
+        (
+            "x.devnet_packages_86400.3",
+            &all.packages[1],
+            d + 200,
+            m,
+            accept_body(
+                Hash32(sha256(package_wide)),
+                2,
+                passkey,
+                webauthn(package_wide),
+            ),
+        ),
+        (
+            "x.devnet_scopes_86400.4",
+            &all.scoped.states[2],
+            d + 20,
+            m,
+            accept_body(Hash32(sha256(scope_wide)), 2, passkey, webauthn(scope_wide)),
+        ),
+    ];
+    for (id, state, created, delay, body) in rows {
+        let entry = forge(state, at(created), at(created + delay), body);
+        pool.entry(id, &entry);
+    }
+    let m1 = main_ids(1);
+    let after_link = |n: &[&str]| plus(m1.clone(), n);
+    let mn = |n: usize| ids("mainnet", n);
+    vec![
+        log_case(
+            "packages: a narrowing applies at once",
+            &after_link(&["pk.2"]),
+            &["pk.v1"],
+            &[at(d + 100)],
+        ),
+        log_case(
+            "packages: a widening waits the devnet delay, not the policy's",
+            &after_link(&["pk.2", "pk.3"]),
+            &["pk.v1", "pk.v2"],
+            &[at(2 * d + 199), at(2 * d + 200)],
+        ),
+        log_case(
+            "packages: a narrowing cancels a scheduled widening",
+            &after_link(&["pk.2", "pk.3", "pk.4"]),
+            &["pk.v1", "pk.v2", "pk.v3"],
+            &[at(d + 300), at(2 * d + 200)],
+        ),
+        log_case(
+            "effective_at_mismatch: a devnet package widening on the mainnet delay",
+            &after_link(&["pk.2", "x.devnet_packages_86400.3"]),
+            &["pk.v1", "pk.v2"],
+            &[],
+        ),
+        log_case(
+            "scopes: scoping a pending controller is a narrowing and applies at once",
+            &after_link(&["scoped.2", "scoped.3"]),
+            &["scoped.v1"],
+            &[at(d + 10)],
+        ),
+        log_case(
+            "scopes: a kind added waits the devnet delay",
+            &after_link(&["scoped.2", "scoped.3", "scoped.4"]),
+            &["scoped.v1", "scoped.v2"],
+            &[at(2 * d + 19), at(2 * d + 20)],
+        ),
+        log_case(
+            "scopes: emptying the kinds cancels a scheduled widening",
+            &after_link(&["scoped.2", "scoped.3", "scoped.4", "scoped.5"]),
+            &["scoped.v1", "scoped.v2", "scoped.v3"],
+            &[at(d + 30), at(2 * d + 20)],
+        ),
+        log_case(
+            "scopes: not_before holds back a narrowing",
+            &after_link(&["scoped.2", "scoped.3", "scoped_nb.4"]),
+            &["scoped.v1", "scoped_nb.v2"],
+            &[at(2 * d + 599), at(2 * d + 600)],
+        ),
+        log_case(
+            "effective_at_mismatch: a devnet scope widening on the mainnet delay",
+            &after_link(&["scoped.2", "scoped.3", "x.devnet_scopes_86400.4"]),
+            &["scoped.v1", "scoped.v2"],
+            &[],
+        ),
+        on_mainnet(log_case(
+            "mainnet packages: a narrowing applies at once",
+            &mn(5),
+            &["mainnet.v1"],
+            &[at(2 * m + 20)],
+        )),
+        on_mainnet(log_case(
+            "mainnet packages: a widening waits the mainnet delay",
+            &mn(7),
+            &["mainnet.v1", "mainnet.v2"],
+            &[at(3 * m + 39), at(3 * m + 40)],
+        )),
+        on_mainnet(log_case(
+            "mainnet scopes: dropping a scope waits the mainnet delay",
+            &plus(mn(6), &["mainnet.scopes.7"]),
+            &["mainnet.v1", "mainnet.v2s"],
+            &[at(3 * m + 39), at(3 * m + 40)],
+        )),
+        on_mainnet(log_case(
+            "effective_at_mismatch: a mainnet package widening on the devnet delay",
+            &plus(mn(6), &["x.mainnet_packages_3600.7"]),
+            &["mainnet.v1", "mainnet.v2"],
+            &[],
+        )),
+        on_mainnet(log_case(
+            "effective_at_mismatch: a mainnet package widening one second early",
+            &plus(mn(6), &["x.mainnet_packages_86399.7"]),
+            &["mainnet.v1", "mainnet.v2"],
+            &[],
+        )),
+        on_mainnet(log_case(
+            "effective_at_mismatch: a mainnet scope widening on the devnet delay",
+            &plus(mn(6), &["x.mainnet_scopes_3600.7"]),
+            &["mainnet.v1", "mainnet.v2s"],
+            &[],
+        )),
+        on_mainnet(log_case(
+            "effective_at_mismatch: a mainnet scope widening one second early",
+            &plus(mn(6), &["x.mainnet_scopes_86399.7"]),
+            &["mainnet.v1", "mainnet.v2s"],
+            &[],
+        )),
+    ]
+}
+
+/// One controller just before and at each change's `effective_at`, on both networks; a
+/// withdrawal applies at its own entry, so its "before" comes from the log without it.
+fn standing_cases(all: &Chains) -> Vec<Value> {
+    let (d, m) = (DEVNET_DELAY, MAINNET_DELAY);
+    let case =
+        |name: &str, entries: Vec<String>, docs: &[&str], id: ControllerId, probes: &[UtcTime]| {
+            let mut c = log_case(name, &entries, docs, probes);
+            put(&mut c, "controllerId", id.to_string());
+            c
+        };
+    assert!(all.relink.len() == 4 && all.scoped.states.len() == 5);
+    let main = main_ids;
+    let mn = |n: usize| ids("mainnet", n);
+    let relinked = plus(main(1), &["relink.2", "relink.3"]);
+    let swap_key = plus(main(1), &["scoped.2", "scoped.3"]);
+    let id = testkit::ed25519_id;
+    let v123 = ["main.v1", "main.v2", "main.v3"];
+    vec![
+        case(
+            "devnet link: pending until one delay after the link",
+            main(1),
+            &[],
+            id(0x21),
+            &[at(d - 1), at(d)],
+        ),
+        case(
+            "devnet add: refused one second before effective_at, signs in at it",
+            main(3),
+            &[],
+            id(0x81),
+            &[at(2 * d + 9), at(2 * d + 10)],
+        ),
+        case(
+            "devnet add: a scoped direct key",
+            swap_key,
+            &["scoped.v1"],
+            id(0x84),
+            &[at(2 * d - 1), at(2 * d)],
+        ),
+        case(
+            "devnet removal: signs in until effective_at",
+            relinked,
+            &[],
+            id(0x21),
+            &[at(2 * d + 19), at(2 * d + 20)],
+        ),
+        case(
+            "devnet withdrawal: pending one second before",
+            main(9),
+            &v123,
+            id(0x82),
+            &[at(2 * d + 49)],
+        ),
+        case(
+            "devnet withdrawal: gone at its own entry",
+            main(10),
+            &v123,
+            id(0x82),
+            &[at(2 * d + 50)],
+        ),
+        case(
+            "devnet capability withdrawal: the pending grant shrinks at once",
+            main(12),
+            &v123,
+            id(0x83),
+            &[at(2 * d + 70), at(3 * d + 60)],
+        ),
+        case(
+            "an unknown controller is never recorded",
+            main(12),
+            &v123,
+            id(0x99),
+            &[at(3 * d)],
+        ),
+        on_mainnet(case(
+            "mainnet link: pending until one delay after the link",
+            mn(1),
+            &[],
+            id(0x21),
+            &[at(m - 1), at(m)],
+        )),
+        on_mainnet(case(
+            "mainnet add: refused one second before effective_at, signs in at it",
+            mn(2),
+            &[],
+            id(0x81),
+            &[at(2 * m + 9), at(2 * m + 10)],
+        )),
+        on_mainnet(case(
+            "mainnet withdrawal: pending one second before",
+            mn(3),
+            &[],
+            id(0x82),
+            &[at(m + 29)],
+        )),
+        on_mainnet(case(
+            "mainnet withdrawal: gone at its own entry",
+            mn(4),
+            &[],
+            id(0x82),
+            &[at(m + 30)],
+        )),
+        on_mainnet(case(
+            "mainnet removal: signs in until effective_at",
+            mn(6),
+            &["mainnet.v1"],
+            id(0x81),
+            &[at(3 * m + 29), at(3 * m + 30)],
+        )),
     ]
 }
 
@@ -5253,7 +6766,7 @@ fn comparison_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
             ed_public(0x84),
             label("Other key"),
             caps(&[Capability::Read]),
-            at(2 * DAY + 45),
+            at(2 * DEVNET_DELAY + 45),
         )
         .unwrap();
     pool.entry("fork.9", &testkit::sign_pending(&pending));
@@ -5433,8 +6946,15 @@ fn minimum_cases() -> Vec<Value> {
     ]
 }
 
+/// Each case's documents are on `network`, which sets the package and scope delay.
 fn widening_cases(pool: &mut Pool) -> Vec<Value> {
     let default_id = pool.rules("rules.default", DEFAULT_LINKED_RULES);
+    let mainnet_default_id = pool.rules_on(
+        "rules.default.mainnet",
+        Network::Mainnet,
+        DEFAULT_LINKED_RULES,
+    );
+    let network = std::cell::Cell::new(Network::Devnet);
     let mut cases = Vec::new();
     let mut n = 0;
     let mut add = |pool: &mut Pool,
@@ -5443,11 +6963,14 @@ fn widening_cases(pool: &mut Pool) -> Vec<Value> {
                    next: Rules,
                    not_before: Option<i64>| {
         n += 1;
-        let baseline_id = match baseline {
-            Some(rules) => pool.rules(&format!("widen.{n}.base"), rules),
-            None => default_id.clone(),
+        let net = network.get();
+        let baseline_id = match (baseline, net) {
+            (Some(rules), _) => pool.rules_on(&format!("widen.{n}.base"), net, rules),
+            (None, Network::Devnet) => default_id.clone(),
+            (None, Network::Mainnet) => mainnet_default_id.clone(),
         };
         let next_doc = PolicyDocument {
+            network: net,
             not_before: not_before.map(at),
             ..rules_doc(next)
         };
@@ -5755,14 +7278,346 @@ fn widening_cases(pool: &mut Pool) -> Vec<Value> {
         }),
         None,
     );
+    // Packages and scopes wait the controller delay of the document's network.
+    let (a, b) = ("splice-amulet", "atomic-dvp");
+    let with_packages = |names: &[&str]| Rules {
+        packages: selected(names),
+        ..DEFAULT_LINKED_RULES
+    };
+    let no_delays = |mut rules: Rules| {
+        rules.delays.transfers_secs = 0;
+        rules.delays.trading_secs = 0;
+        rules.delays.other_secs = 0;
+        rules
+    };
+    let (k84, k82) = (testkit::ed25519_id(0x84), testkit::ed25519_id(0x82));
+    let with_scopes = |list: Vec<CommandScope>| Rules {
+        scopes: scopes(list),
+        ..DEFAULT_LINKED_RULES
+    };
+    let kinds = |id: ControllerId, kinds: &[CommandKind]| scope(id, kinds, vec![], vec![]);
+    let swaps = |pairs: Vec<ScopePair>, lps: Vec<PartyId>| {
+        with_scopes(vec![scope(k84, &[CommandKind::Swap], pairs, lps)])
+    };
+    let usdc_for_cc = || {
+        pair(
+            PolicyInstrument::Token(usdc_ref()),
+            PolicyInstrument::Cc,
+            "6",
+            "150",
+        )
+    };
+    let priced = |min: &str, max: &str| {
+        pair(
+            PolicyInstrument::Cc,
+            PolicyInstrument::Token(usdc_ref()),
+            min,
+            max,
+        )
+    };
+    use CommandKind::{Swap, TransferCc, TransferToken};
+    add(
+        pool,
+        "packages: a selection (narrowing)",
+        None,
+        with_packages(&[a]),
+        None,
+    );
+    add(
+        pool,
+        "packages: a selection opened to any",
+        Some(with_packages(&[a])),
+        r(),
+        None,
+    );
+    add(
+        pool,
+        "packages: an id added",
+        Some(with_packages(&[a])),
+        with_packages(&[a, b]),
+        None,
+    );
+    add(
+        pool,
+        "packages: an id removed (narrowing)",
+        Some(with_packages(&[a, b])),
+        with_packages(&[a]),
+        None,
+    );
+    add(
+        pool,
+        "packages: an id replaced",
+        Some(with_packages(&[a])),
+        with_packages(&[b]),
+        None,
+    );
+    add(
+        pool,
+        "packages: policy delays of 0 do not shorten it",
+        Some(no_delays(with_packages(&[a]))),
+        no_delays(r()),
+        None,
+    );
+    add(
+        pool,
+        "packages: a longer other delay does not lengthen it",
+        Some(edit(&|x| {
+            x.packages = selected(&[a]);
+            x.delays.other_secs = 7200;
+        })),
+        edit(&|x| x.delays.other_secs = 7200),
+        None,
+    );
+    add(
+        pool,
+        "packages and transfers: the longest delay",
+        Some(with_packages(&[a])),
+        testkit::undirected_rules(),
+        None,
+    );
+    add(
+        pool,
+        "packages: not_before later than the delay wins",
+        Some(with_packages(&[a])),
+        r(),
+        Some(2 * DAY),
+    );
+    add(
+        pool,
+        "scopes: an entry added (narrowing)",
+        None,
+        with_scopes(vec![kinds(k84, &[Swap])]),
+        None,
+    );
+    add(
+        pool,
+        "scopes: a kind dropped (narrowing)",
+        Some(with_scopes(vec![kinds(k84, &[Swap, TransferCc])])),
+        with_scopes(vec![kinds(k84, &[Swap])]),
+        None,
+    );
+    add(
+        pool,
+        "scopes: the kinds emptied (narrowing)",
+        Some(with_scopes(vec![kinds(k84, &[Swap])])),
+        with_scopes(vec![kinds(k84, &[])]),
+        None,
+    );
+    add(
+        pool,
+        "scopes: a kind added",
+        Some(with_scopes(vec![kinds(k84, &[Swap])])),
+        with_scopes(vec![kinds(k84, &[Swap, TransferCc])]),
+        None,
+    );
+    add(
+        pool,
+        "scopes: an entry removed",
+        Some(with_scopes(vec![kinds(k84, &[Swap])])),
+        r(),
+        None,
+    );
+    add(
+        pool,
+        "scopes: an entry listing every kind removed",
+        Some(with_scopes(vec![kinds(k84, &CommandKind::ALL)])),
+        r(),
+        None,
+    );
+    add(
+        pool,
+        "scopes: narrowing one controller while widening another widens",
+        Some(with_scopes(vec![
+            kinds(k84, &[Swap]),
+            kinds(k82, &[TransferCc, TransferToken]),
+        ])),
+        with_scopes(vec![kinds(k84, &[]), kinds(k82, &CommandKind::ALL)]),
+        None,
+    );
+    add(
+        pool,
+        "scopes: narrowing two controllers narrows",
+        Some(with_scopes(vec![
+            kinds(k84, &[Swap]),
+            kinds(k82, &[TransferCc, TransferToken]),
+        ])),
+        with_scopes(vec![kinds(k84, &[]), kinds(k82, &[TransferCc])]),
+        None,
+    );
+    add(
+        pool,
+        "scopes: policy delays of 0 do not shorten it",
+        Some(no_delays(with_scopes(vec![kinds(k84, &[Swap])]))),
+        no_delays(with_scopes(vec![kinds(k84, &[Swap, TransferCc])])),
+        None,
+    );
+    add(
+        pool,
+        "pairs: a pair added",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![priced("0.15", "1000"), usdc_for_cc()], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: min_price lowered",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![priced("0.1499999999", "1000")], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: max_sell raised",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![priced("0.15", "1000.0000000001")], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: every pair removed",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: min_price raised (narrowing)",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![priced("0.2", "1000")], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: max_sell lowered (narrowing)",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![priced("0.15", "10")], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: listed after every pair (narrowing)",
+        Some(swaps(vec![], vec![])),
+        swaps(vec![priced("0.15", "1000")], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "pairs: dropped while swaps are not allowed (narrowing)",
+        Some(with_scopes(vec![scope(
+            k84,
+            &[TransferCc],
+            vec![priced("0.15", "1000")],
+            vec![],
+        )])),
+        with_scopes(vec![kinds(k84, &[TransferCc])]),
+        None,
+    );
+    add(
+        pool,
+        "lps: an LP added",
+        Some(swaps(vec![], vec![lp_a()])),
+        swaps(vec![], vec![lp_a(), lp_b()]),
+        None,
+    );
+    add(
+        pool,
+        "lps: the list removed",
+        Some(swaps(vec![], vec![lp_a()])),
+        swaps(vec![], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "lps: an LP dropped (narrowing)",
+        Some(swaps(vec![], vec![lp_a(), lp_b()])),
+        swaps(vec![], vec![lp_a()]),
+        None,
+    );
+    add(
+        pool,
+        "lps: listed after every LP (narrowing)",
+        Some(swaps(vec![], vec![])),
+        swaps(vec![], vec![lp_a()]),
+        None,
+    );
+    network.set(Network::Mainnet);
+    add(
+        pool,
+        "mainnet packages: a selection (narrowing)",
+        None,
+        with_packages(&[a]),
+        None,
+    );
+    add(
+        pool,
+        "mainnet packages: a selection opened to any waits a day",
+        Some(with_packages(&[a])),
+        r(),
+        None,
+    );
+    add(
+        pool,
+        "mainnet packages: an id added waits a day",
+        Some(with_packages(&[a])),
+        with_packages(&[a, b]),
+        None,
+    );
+    add(
+        pool,
+        "mainnet packages: policy delays of 0 do not shorten it",
+        Some(no_delays(with_packages(&[a]))),
+        no_delays(r()),
+        None,
+    );
+    add(
+        pool,
+        "mainnet scopes: a kind added waits a day",
+        Some(with_scopes(vec![kinds(k84, &[Swap])])),
+        with_scopes(vec![kinds(k84, &[Swap, TransferCc])]),
+        None,
+    );
+    add(
+        pool,
+        "mainnet scopes: the kinds emptied (narrowing)",
+        Some(with_scopes(vec![kinds(k84, &[Swap])])),
+        with_scopes(vec![kinds(k84, &[])]),
+        None,
+    );
+    add(
+        pool,
+        "mainnet pairs: min_price lowered waits a day",
+        Some(swaps(vec![priced("0.15", "1000")], vec![])),
+        swaps(vec![priced("0.1499999999", "1000")], vec![]),
+        None,
+    );
+    add(
+        pool,
+        "mainnet lps: an LP added waits a day",
+        Some(swaps(vec![], vec![lp_a()])),
+        swaps(vec![], vec![lp_a(), lp_b()]),
+        None,
+    );
+    add(
+        pool,
+        "mainnet transfers: the policy's own delay still applies",
+        Some(edit(&|x| x.delays.transfers_secs = 3600)),
+        edit(&|x| {
+            x.delays.transfers_secs = 3600;
+            x.transfers.directed_only = false;
+        }),
+        None,
+    );
     cases
 }
 
-fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
+fn submission_cases(pool: &mut Pool, all: &Chains) -> Vec<Value> {
+    let d = DEVNET_DELAY;
+    let main = &all.main;
     let s4 = &main.states[3];
     let s5 = &main.states[4];
     let s7 = &main.states[6];
-    let now = at(DAY + 30);
+    let s12 = &main.states[11];
+    let now = at(d + 30);
     let mut docs = Vec::new();
     let mut doc = |pool: &mut Pool, id: &str, d: &PolicyDocument| {
         let bytes = d.encode().unwrap();
@@ -5770,6 +7625,38 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         docs.push((id.to_owned(), bytes));
     };
     let base = testkit::policy_doc(s4, 1, now, DEFAULT_LINKED_RULES);
+    let scoped = |id: ControllerId| Rules {
+        scopes: vec![scope(id, &[CommandKind::Swap], vec![], vec![])],
+        ..DEFAULT_LINKED_RULES
+    };
+    doc(
+        pool,
+        "submit.unknown_scope",
+        &testkit::policy_doc(s4, 1, now, scoped(testkit::ed25519_id(0x99))),
+    );
+    doc(
+        pool,
+        "submit.pending_scope",
+        &testkit::policy_doc(s4, 1, now, scoped(testkit::ed25519_id(0x81))),
+    );
+    doc(
+        pool,
+        "submit.packages",
+        &testkit::policy_doc(
+            s4,
+            1,
+            now,
+            Rules {
+                packages: selected(&["splice-amulet"]),
+                ..DEFAULT_LINKED_RULES
+            },
+        ),
+    );
+    doc(
+        pool,
+        "submit.withdrawn_scope",
+        &testkit::policy_doc(s12, 4, at(2 * d + 80), scoped(testkit::ed25519_id(0x82))),
+    );
     doc(
         pool,
         "submit.undirected",
@@ -5795,8 +7682,8 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         pool,
         "submit.future",
         &PolicyDocument {
-            issued_at: at(DAY + 331),
-            expires_at: at(DAY + 3600),
+            issued_at: at(d + 331),
+            expires_at: at(d + 3600),
             ..base.clone()
         },
     );
@@ -5804,8 +7691,8 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         pool,
         "submit.skew",
         &PolicyDocument {
-            issued_at: at(DAY + 330),
-            expires_at: at(DAY + 3600),
+            issued_at: at(d + 330),
+            expires_at: at(d + 3600),
             ..base.clone()
         },
     );
@@ -5813,23 +7700,23 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
         pool,
         "submit.expired",
         &PolicyDocument {
-            issued_at: at(DAY - 3600),
-            expires_at: at(DAY + 29),
+            issued_at: at(d - 3600),
+            expires_at: at(d + 29),
             ..base.clone()
         },
     );
     doc(
         pool,
         "submit.again",
-        &testkit::policy_doc(s5, 1, at(DAY + 40), DEFAULT_LINKED_RULES),
+        &testkit::policy_doc(s5, 1, at(d + 40), DEFAULT_LINKED_RULES),
     );
-    let mut unchained = testkit::policy_doc(s5, 2, at(DAY + 40), DEFAULT_LINKED_RULES);
+    let mut unchained = testkit::policy_doc(s5, 2, at(d + 40), DEFAULT_LINKED_RULES);
     unchained.prev_policy_hash = Hash32([0; 32]);
     doc(pool, "submit.unchained", &unchained);
     doc(
         pool,
         "submit.v4",
-        &testkit::policy_doc(s7, 4, at(2 * DAY + 25), DEFAULT_LINKED_RULES),
+        &testkit::policy_doc(s7, 4, at(2 * d + 25), DEFAULT_LINKED_RULES),
     );
     let bytes_of = |id: &str| {
         docs.iter()
@@ -5859,6 +7746,20 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     let ed = |start: u8, bytes: &[u8]| testkit::ed25519_envelope(start, bytes);
     let undirected = bytes_of("submit.undirected");
     let v4 = bytes_of("submit.v4");
+    let general = |name: &str,
+                   network: &str,
+                   entries: Vec<String>,
+                   docs: &[&str],
+                   policy: &str,
+                   envelope: ProofEnvelope,
+                   now: UtcTime| {
+        let mut c = log_case(name, &entries, docs, &[]);
+        c.as_object_mut().unwrap().remove("probeTimes");
+        put(&mut c, "network", network);
+        put(&mut c, "policy", policy);
+        put(&mut c, "now", now.to_string());
+        with_bytes(c, "envelope", &envelope.encode().unwrap())
+    };
     vec![
         case("accepted: no widening", 4, "main.v1", passkey(v1), now),
         case(
@@ -5937,21 +7838,21 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
             5,
             "submit.again",
             passkey(&bytes_of("submit.again")),
-            at(DAY + 40),
+            at(d + 40),
         ),
         case(
             "prev_mismatch",
             5,
             "submit.unchained",
             passkey(&bytes_of("submit.unchained")),
-            at(DAY + 40),
+            at(d + 40),
         ),
         case(
             "accepted: an ed25519 signer",
             7,
             "submit.v4",
             ed(0x81, &v4),
-            at(2 * DAY + 25),
+            at(2 * d + 25),
         ),
         case(
             "bad_signature",
@@ -5962,7 +7863,62 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
                 &v4,
                 ed_proof(0x81, b"other bytes"),
             ),
-            at(2 * DAY + 25),
+            at(2 * d + 25),
+        ),
+        case(
+            "unknown_scope_controller",
+            4,
+            "submit.unknown_scope",
+            passkey(&bytes_of("submit.unknown_scope")),
+            now,
+        ),
+        case(
+            "accepted: a scope for a pending controller narrows at once",
+            4,
+            "submit.pending_scope",
+            passkey(&bytes_of("submit.pending_scope")),
+            now,
+        ),
+        case(
+            "accepted: a scope for a withdrawn controller",
+            12,
+            "submit.withdrawn_scope",
+            passkey(&bytes_of("submit.withdrawn_scope")),
+            at(2 * d + 80),
+        ),
+        case(
+            "accepted: a package selection narrows at once",
+            4,
+            "submit.packages",
+            passkey(&bytes_of("submit.packages")),
+            now,
+        ),
+        general(
+            "accepted: a scope widening waits the devnet delay",
+            "devnet",
+            plus(main_ids(1), &["scoped.2", "scoped.3"]),
+            &["scoped.v1"],
+            "scoped.v2",
+            passkey(&all.scoped.docs[1]),
+            at(d + 20),
+        ),
+        general(
+            "accepted: a package widening waits the mainnet delay",
+            "mainnet",
+            ids("mainnet", 6),
+            &["mainnet.v1"],
+            "mainnet.v2",
+            ed(0x21, &all.mainnet_docs[1]),
+            at(2 * MAINNET_DELAY + 40),
+        ),
+        general(
+            "wrong_network: a devnet policy for a mainnet log",
+            "mainnet",
+            ids("mainnet", 6),
+            &["mainnet.v1"],
+            "submit.undirected",
+            ed(0x21, &undirected),
+            at(2 * MAINNET_DELAY + 40),
         ),
         case(
             "invalid_version: decoding",
@@ -5974,10 +7930,13 @@ fn submission_cases(pool: &mut Pool, main: &Main) -> Vec<Value> {
     ]
 }
 
-fn command_cases(main: &Main, relink: &[ControlState]) -> Vec<Value> {
+fn command_cases(chains: &Chains) -> Vec<Value> {
+    let d = DEVNET_DELAY;
+    let main = &chains.main;
+    let relink = &chains.relink;
     let party = testkit::agent_party();
     let head = main.head(12);
-    let now = at(2 * DAY + 100);
+    let now = main_command_time();
     let make = |head: HeadRef, party: &PartyId, issued: UtcTime, op: CommandOp| {
         command_at(head, party, CMD_ID, issued, 600, op, "Pay alice 10 CC")
             .encode()
@@ -6031,16 +7990,17 @@ fn command_cases(main: &Main, relink: &[ControlState]) -> Vec<Value> {
     let wrong_network = wrong_network.encode().unwrap();
     let wrong_party = make(head, &agent(2), now, pay_alice("10"));
     let stale = make(main.head(11), &party, now, pay_alice("10"));
-    let future = make(head, &party, at(2 * DAY + 221), pay_alice("10"));
-    let skew = make(head, &party, at(2 * DAY + 220), pay_alice("10"));
+    let future = make(head, &party, at(2 * d + 221), pay_alice("10"));
+    let skew = make(head, &party, at(2 * d + 220), pay_alice("10"));
     let zero = set_line(&text(&example), "op.amount", "0").into_bytes();
     let relinked = plus(main_ids(1), &["relink.2"]);
     let pending_removal = make(
         relink[1].head().unwrap(),
         &party,
-        at(2 * DAY + 9),
+        at(2 * d + 9),
         pay_alice("10"),
     );
+    let swap_bytes = main_swap(main).encode().unwrap();
     vec![
         case(
             "accepted: a passkey",
@@ -6068,14 +8028,14 @@ fn command_cases(main: &Main, relink: &[ControlState]) -> Vec<Value> {
             all.clone(),
             &example,
             passkey(&example),
-            at(2 * DAY + 700),
+            at(2 * d + 700),
         ),
         case(
             "expired",
             all.clone(),
             &example,
             passkey(&example),
-            at(2 * DAY + 701),
+            at(2 * d + 701),
         ),
         case(
             "issued_in_future",
@@ -6161,14 +8121,223 @@ fn command_cases(main: &Main, relink: &[ControlState]) -> Vec<Value> {
             relinked.clone(),
             &pending_removal,
             passkey(&pending_removal),
-            at(2 * DAY + 9),
+            at(2 * d + 9),
         ),
         case(
             "signer_lacks_direct: the removal took effect",
             relinked,
             &pending_removal,
             passkey(&pending_removal),
-            at(2 * DAY + 10),
+            at(2 * d + 10),
+        ),
+        with_cc(case(
+            "accepted: a swap by an unscoped passkey",
+            all.clone(),
+            &swap_bytes,
+            passkey(&swap_bytes),
+            now,
+        )),
+        case(
+            "accepted: an unscoped swap needs no Canton Coin config",
+            all,
+            &swap_bytes,
+            passkey(&swap_bytes),
+            now,
+        ),
+    ]
+    .into_iter()
+    .chain(scoped_command_cases(&chains.scoped))
+    .collect()
+}
+
+fn instrument_json(i: &InstrumentRef) -> Value {
+    json!({"admin": i.admin.to_string(), "id": i.id.as_str()})
+}
+
+/// The case with Canton Coin named as the verifier's config names it.
+fn with_cc(mut c: Value) -> Value {
+    put(&mut c, "cc", instrument_json(&cc_ref()));
+    c
+}
+
+/// Command scopes: the unscoped passkey sends anything, the swap-scoped Ed25519 key 0x84
+/// only swaps of CC for USDCx within its bounds, and only once its add applies at 2D.
+fn scoped_command_cases(scoped: &ScopedChain) -> Vec<Value> {
+    let d = DEVNET_DELAY;
+    let party = testkit::agent_party();
+    let scoped_entries = plus(main_ids(1), &["scoped.2", "scoped.3"]);
+    let emptied_entries = plus(
+        main_ids(1),
+        &["scoped.2", "scoped.3", "scoped.4", "scoped.5"],
+    );
+    let later_entries = plus(main_ids(1), &["scoped.2", "scoped.3", "scoped_nb.4"]);
+    let scoped_head = scoped.states[2].head().unwrap();
+    let emptied_head = scoped.states[4].head().unwrap();
+    let later_head = scoped.not_before.1.head().unwrap();
+    let t = at(2 * d + 100);
+    let command = |head: HeadRef, id: &str, issued: UtcTime, op: CommandOp, summary: &str| {
+        command_at(head, &party, id, issued, 600, op, summary)
+            .encode()
+            .unwrap()
+    };
+    let swap_at = |head: HeadRef, issued: UtcTime, op: CommandOp| {
+        command(head, SWAP_CMD_ID, issued, op, "Swap CC for USDCx")
+    };
+    let case =
+        |name: &str, entries: &[String], docs: &[&str], bytes: &[u8], signer: u8, now: UtcTime| {
+            let mut c = log_case(name, entries, docs, &[]);
+            c.as_object_mut().unwrap().remove("probeTimes");
+            put(&mut c, "now", now.to_string());
+            let envelope = match signer {
+                0 => testkit::passkey_envelope(bytes),
+                start => testkit::ed25519_envelope(start, bytes),
+            };
+            let c = with_bytes(c, "command", bytes);
+            with_cc(with_bytes(c, "envelope", &envelope.encode().unwrap()))
+        };
+    let scoped_docs = ["scoped.v1"];
+    let emptied_docs = ["scoped.v1", "scoped.v2", "scoped.v3"];
+    let later_docs = ["scoped.v1", "scoped_nb.v2"];
+    let sell = swap_at(scoped_head, t, sell_cc());
+    let pay = command(scoped_head, CMD_ID, t, pay_alice("10"), "Pay alice 10 CC");
+    let early = swap_at(scoped_head, at(2 * d - 60), sell_cc());
+    let reverse = swap_at(scoped_head, t, buy_cc());
+    let below = swap_at(
+        scoped_head,
+        t,
+        swap(cc_ref(), "1000", usdc_ref(), "149.9999999999", "2"),
+    );
+    let at_floor = swap_at(scoped_head, t, swap(cc_ref(), "1", usdc_ref(), "0.15", "0"));
+    let above = swap_at(
+        scoped_head,
+        t,
+        swap(cc_ref(), "1000.0000000001", usdc_ref(), "200", "2"),
+    );
+    let emptied_swap = swap_at(emptied_head, t, sell_cc());
+    let emptied_pay = command(emptied_head, CMD_ID, t, pay_alice("10"), "Pay alice 10 CC");
+    let fresh = swap_at(later_head, at(2 * d + 500), sell_cc());
+    let mut unknown_cc = case(
+        "swap_pair_not_allowed: Canton Coin unknown to the verifier",
+        &scoped_entries,
+        &scoped_docs,
+        &sell,
+        0x84,
+        t,
+    );
+    unknown_cc.as_object_mut().unwrap().remove("cc");
+    vec![
+        case(
+            "scopes: the unscoped passkey swaps",
+            &scoped_entries,
+            &scoped_docs,
+            &sell,
+            0,
+            t,
+        ),
+        case(
+            "scopes: the unscoped passkey sends transfer_cc",
+            &scoped_entries,
+            &scoped_docs,
+            &pay,
+            0,
+            t,
+        ),
+        case(
+            "scopes: the swap-scoped key swaps",
+            &scoped_entries,
+            &scoped_docs,
+            &sell,
+            0x84,
+            t,
+        ),
+        case(
+            "command_out_of_scope: the swap-scoped key sends transfer_cc",
+            &scoped_entries,
+            &scoped_docs,
+            &pay,
+            0x84,
+            t,
+        ),
+        case(
+            "signer_lacks_direct: a pending key one second before its add applies",
+            &scoped_entries,
+            &scoped_docs,
+            &early,
+            0x84,
+            at(2 * d - 1),
+        ),
+        case(
+            "scopes: the same key at the second its add applies",
+            &scoped_entries,
+            &scoped_docs,
+            &early,
+            0x84,
+            at(2 * d),
+        ),
+        case(
+            "swap_pair_not_allowed: the other direction",
+            &scoped_entries,
+            &scoped_docs,
+            &reverse,
+            0x84,
+            t,
+        ),
+        unknown_cc,
+        case(
+            "swap_below_min_price: one unit under the floor",
+            &scoped_entries,
+            &scoped_docs,
+            &below,
+            0x84,
+            t,
+        ),
+        case(
+            "accepted: exactly at the floor price",
+            &scoped_entries,
+            &scoped_docs,
+            &at_floor,
+            0x84,
+            t,
+        ),
+        case(
+            "swap_above_max_sell: one unit over the cap",
+            &scoped_entries,
+            &scoped_docs,
+            &above,
+            0x84,
+            t,
+        ),
+        case(
+            "command_out_of_scope: an empty scope refuses everything",
+            &emptied_entries,
+            &emptied_docs,
+            &emptied_swap,
+            0x84,
+            t,
+        ),
+        case(
+            "scopes: the unscoped passkey still sends transfers",
+            &emptied_entries,
+            &emptied_docs,
+            &emptied_pay,
+            0,
+            t,
+        ),
+        case(
+            "scopes: verified one second before a scheduled narrowing",
+            &later_entries,
+            &later_docs,
+            &fresh,
+            0x84,
+            at(2 * d + 599),
+        ),
+        case(
+            "command_out_of_scope: the same swap once the narrowing applies",
+            &later_entries,
+            &later_docs,
+            &fresh,
+            0x84,
+            at(2 * d + 600),
         ),
     ]
 }
@@ -6201,7 +8370,7 @@ fn read_cases(pool: &mut Pool) -> (Vec<Value>, Vec<Value>) {
     let bytes = example.encode().unwrap();
     let envelope = testkit::passkey_envelope(&bytes);
     let with_four = session_request(&[1, 2, 4], now, 3600).encode().unwrap();
-    let early = session_request(&[1, 2, 3], at(DAY - 100), 3600)
+    let early = session_request(&[1, 2, 3], at(DEVNET_DELAY - 100), 3600)
         .encode()
         .unwrap();
     let future = session_request(&[1, 2, 3], at(DAY + 221), 3600)
@@ -6230,7 +8399,7 @@ fn read_cases(pool: &mut Pool) -> (Vec<Value>, Vec<Value>) {
             &[1, 2, 3],
             &early,
             &passkey(&early),
-            at(DAY - 100),
+            at(DEVNET_DELAY - 100),
         ),
         session_case(
             "unknown_controller",
@@ -6416,6 +8585,35 @@ fn receipt_cases(main: &Main) -> Vec<Value> {
         agent_key.sign(&refused_bytes).to_bytes(),
         &agent1,
     ));
+    let swap = swap_receipt(main);
+    let swapped = swap.encode().unwrap();
+    out.push(case(
+        "receipt.swap_executed",
+        &swapped,
+        agent_key.sign(&swapped).to_bytes(),
+        &agent1,
+    ));
+    out.push(case(
+        "wrong_party: a v2 receipt",
+        &swapped,
+        agent_key.sign(&swapped).to_bytes(),
+        &agent(2).to_string(),
+    ));
+    let mut foreign_swap = swap.clone();
+    foreign_swap.receipt.agent_key = intruder.verifying_key().to_bytes();
+    let foreign_swap = foreign_swap.encode().unwrap();
+    out.push(case(
+        "key_party_mismatch: a v2 receipt",
+        &foreign_swap,
+        intruder.sign(&foreign_swap).to_bytes(),
+        &agent1,
+    ));
+    out.push(case(
+        "bad_signature: a v1 signature over a v2 receipt",
+        &swapped,
+        agent_key.sign(&executed).to_bytes(),
+        &agent1,
+    ));
     out
 }
 
@@ -6436,7 +8634,7 @@ fn head_claim_cases(main: &Main) -> Vec<Value> {
         )
     };
     let empty = HeadClaim::for_state(&testkit::empty_state(), at(0));
-    let linked = HeadClaim::for_state(&main.chain.state, at(2 * DAY + 200));
+    let linked = HeadClaim::for_state(&main.chain.state, main_receipt_time());
     let intruder = testkit::ed_key(0x77);
     let foreign = HeadClaim {
         agent_key: intruder.verifying_key().to_bytes(),
@@ -6482,13 +8680,18 @@ fn kind_cases() -> Value {
 // ---------------------------------------------------------------------------
 // Evaluator decisions
 
+/// The controller a decision's command counts as verified for.
+fn command_signer() -> ControllerId {
+    ControllerId([2; 32])
+}
+
 fn decision_context() -> Value {
-    let cc = cc_ref();
     json!({
         "agentParty": testkit::agent_party().to_string(),
-        "cc": {"admin": cc.admin.to_string(), "id": cc.id.as_str()},
-        "feeParty": named_party("fee", 7).to_string(),
+        "cc": instrument_json(&cc_ref()),
+        "feeParty": fee_party().to_string(),
         "prepaidTrafficParty": named_party("prepaid", 8).to_string(),
+        "commandSigner": command_signer().to_string(),
     })
 }
 
@@ -6638,6 +8841,17 @@ fn decision_cases(pool: &mut Pool) -> Vec<Value> {
             }),
         ),
         ("rules.locks_off", edit(&|x| x.locks.enabled = false)),
+        (
+            "rules.swap_scope",
+            edit(&|x| {
+                x.scopes = vec![scope(
+                    command_signer(),
+                    &[CommandKind::Swap],
+                    vec![cc_for_usdc()],
+                    vec![lp_a()],
+                )]
+            }),
+        ),
     ];
     for (id, r) in rules {
         pool.rules(id, r);
@@ -6657,6 +8871,7 @@ fn decision_cases(pool: &mut Pool) -> Vec<Value> {
     .encode()
     .unwrap();
     let command = text(&command);
+    let pay_text = command.clone();
     let case = |name: &str, rules: &str, platform: &str, intent: Value| json!({"name": name, "rules": rules, "platform": platform, "now": at(0).to_string(), "intent": intent});
     let with = |mut c: Value, key: &str, value: Value| {
         put(&mut c, key, value);
@@ -7078,5 +9293,737 @@ fn decision_cases(pool: &mut Pool) -> Vec<Value> {
             "pinned",
             unverified(trade("1")),
         ),
+    ]
+    .into_iter()
+    .chain(swap_decision_cases(&pay_text))
+    .collect()
+}
+
+/// The swap binding: exactly the command's swap, CC fees to the pinned party within the cap,
+/// the minimum met net of them; then the trading rules, fee caps and the signer's scope.
+fn swap_decision_cases(pay_text: &str) -> Vec<Value> {
+    let (cc, usdc) = (cc_ref(), usdc_ref());
+    let agent1 = testkit::agent_party();
+    let (fee, lp, other_lp) = (fee_party(), lp_a(), lp_b());
+    let head = HeadRef {
+        seq: 1,
+        hash: Hash32([1; 32]),
+    };
+    let swap_text = |id: &str, op: CommandOp, summary: &str| {
+        text(
+            &command_at(head, &agent1, id, at(0), 600, op, summary)
+                .encode()
+                .unwrap(),
+        )
+    };
+    let sell_text = swap_text(SWAP_CMD_ID, sell_cc(), "Swap 1000 CC for USDCx");
+    let buy_text = swap_text(SWAP_BUY_CMD_ID, buy_cc(), "Swap 150 USDCx for CC");
+    let leg = |i: &InstrumentRef, value: &str| json!({"admin": i.admin.to_string(), "id": i.id.as_str(), "amount": value});
+    let fee_leg = |to: &PartyId, i: &InstrumentRef, value: &str| json!({"receiver": to.to_string(), "admin": i.admin.to_string(), "id": i.id.as_str(), "amount": value});
+    let terms =
+        |lp: &PartyId, sent: Value, received: Value, net: &str, fees: Vec<Value>, until: i64| {
+            json!({
+                "lp": lp.to_string(),
+                "sent": sent,
+                "received": received,
+                "netReceived": net,
+                "fees": fees,
+                "validUntil": at(until).to_string(),
+            })
+        };
+    let settle = |flows: Vec<Value>, settle: Option<Value>| {
+        let mut i = json!({
+            "kind": "atomic_dvp_settle",
+            "outgoing": flows,
+            "instruments": [instrument_json(&cc), instrument_json(&usdc)],
+        });
+        if let Some(s) = settle {
+            put(&mut i, "settle", s);
+        }
+        i
+    };
+    // 1000 CC for 151 USDCx with a 1.5 CC fee and 48.5 CC change.
+    let sell_flows = |lp: &PartyId| {
+        vec![
+            flow(&cc, "1000", lp),
+            flow(&cc, "1.5", &fee),
+            flow(&cc, "48.5", &agent1),
+        ]
+    };
+    let sell_terms = |lp: &PartyId| {
+        terms(
+            lp,
+            leg(&cc, "1000"),
+            leg(&usdc, "151"),
+            "151",
+            vec![fee_leg(&fee, &cc, "1.5")],
+            300,
+        )
+    };
+    let selling = || settle(sell_flows(&lp), Some(sell_terms(&lp)));
+    let edited = |edit: &dyn Fn(&mut Value)| {
+        let mut i = selling();
+        edit(&mut i);
+        i
+    };
+    // 150 USDCx for `received` CC with a 1.5 CC fee, `net` CC net of it.
+    let buying = |received: &str, net: &str| {
+        settle(
+            vec![flow(&usdc, "150", &lp), flow(&cc, "1.5", &fee)],
+            Some(terms(
+                &lp,
+                leg(&usdc, "150"),
+                leg(&cc, received),
+                net,
+                vec![fee_leg(&fee, &cc, "1.5")],
+                300,
+            )),
+        )
+    };
+    let case = |name: &str, rules: &str, platform: &str, command: &str, intent: Value| {
+        json!({
+            "name": name,
+            "rules": rules,
+            "platform": platform,
+            "now": at(0).to_string(),
+            "intent": intent,
+            "command": command,
+        })
+    };
+    let sell = sell_text.as_str();
+    let buy = buy_text.as_str();
+    let mut stale = case(
+        "command_out_of_scope: verified at another clock",
+        "default",
+        "pinned",
+        sell,
+        selling(),
+    );
+    put(&mut stale, "verifiedAt", at(1).to_string());
+    let mut daily = case(
+        "fee_daily_cap: a swap's fee counts",
+        "rules.fees",
+        "pinned",
+        sell,
+        selling(),
+    );
+    put(
+        &mut daily,
+        "usage",
+        json!([{"bucket": "fees", "admin": cc.admin.to_string(), "id": cc.id.as_str(), "amount": "9"}]),
+    );
+    let feeless = settle(
+        vec![flow(&cc, "1000", &lp), flow(&cc, "50", &agent1)],
+        Some(terms(
+            &lp,
+            leg(&cc, "1000"),
+            leg(&usdc, "151"),
+            "151",
+            vec![],
+            300,
+        )),
+    );
+    let elsewhere = settle(sell_flows(&other_lp), Some(sell_terms(&other_lp)));
+    let transfer = intent("transfer_cc", vec![flow(&cc, "10", &alice())]);
+    vec![
+        case("swap: selling CC", "default", "pinned", sell, selling()),
+        case(
+            "swap: buying CC, the minimum met net of the fee",
+            "default",
+            "pinned",
+            buy,
+            buying("991.5", "990"),
+        ),
+        case(
+            "command_mismatch: buying CC, one unit short net of the fee",
+            "default",
+            "pinned",
+            buy,
+            buying("991.4999999999", "989.9999999999"),
+        ),
+        case(
+            "command_mismatch: the net received the content shows is short",
+            "default",
+            "pinned",
+            buy,
+            buying("991.5", "989.9999999999"),
+        ),
+        case(
+            "command_mismatch: a sold amount one unit too large",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| {
+                i["settle"]["sent"]["amount"] = json!("1000.0000000001");
+                i["outgoing"][0]["amount"] = json!("1000.0000000001");
+            }),
+        ),
+        case(
+            "command_mismatch: an extra outflow",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| {
+                let extra = flow(&usdc, "1", &bob());
+                i["outgoing"].as_array_mut().unwrap().push(extra);
+            }),
+        ),
+        case(
+            "command_mismatch: a fee to the LP",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| {
+                i["settle"]["fees"] = json!([fee_leg(&lp, &cc, "1.5")]);
+                i["outgoing"][1] = flow(&cc, "1.5", &lp);
+            }),
+        ),
+        case(
+            "command_mismatch: a fee in another instrument",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| {
+                i["settle"]["fees"] = json!([fee_leg(&fee, &usdc, "1.5")]);
+                i["outgoing"][1] = flow(&usdc, "1.5", &fee);
+            }),
+        ),
+        case(
+            "command_mismatch: fees over the cap",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| {
+                let fees = [
+                    fee_leg(&fee, &cc, "1.5"),
+                    fee_leg(&fee, &cc, "0.5000000001"),
+                ];
+                i["settle"]["fees"] = json!(fees);
+                i["outgoing"][2] = flow(&cc, "0.5000000001", &fee);
+            }),
+        ),
+        case(
+            "command_mismatch: LP change in the outflows",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| {
+                let change = flow(&usdc, "849", &lp);
+                i["outgoing"].as_array_mut().unwrap().push(change);
+            }),
+        ),
+        case(
+            "command_mismatch: no settle terms",
+            "default",
+            "pinned",
+            sell,
+            settle(sell_flows(&lp), None),
+        ),
+        case(
+            "command_mismatch: a quote that outlives the command",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| i["settle"]["validUntil"] = json!(at(601).to_string())),
+        ),
+        case(
+            "swap: a quote valid until the command expires",
+            "default",
+            "pinned",
+            sell,
+            edited(&|i| i["settle"]["validUntil"] = json!(at(600).to_string())),
+        ),
+        case(
+            "command_mismatch: a fee with no fee party pinned",
+            "default",
+            "none",
+            sell,
+            selling(),
+        ),
+        case(
+            "swap: a fee-less quote with no fee party pinned",
+            "default",
+            "none",
+            sell,
+            feeless,
+        ),
+        case(
+            "command_mismatch: a swap command on a transfer",
+            "default",
+            "pinned",
+            sell,
+            intent("transfer_cc", vec![flow(&cc, "1000", &lp)]),
+        ),
+        case("paused: a swap", "rules.paused", "pinned", sell, selling()),
+        case(
+            "class_disabled: a swap",
+            "rules.trading_off",
+            "pinned",
+            sell,
+            selling(),
+        ),
+        case(
+            "per_operation_cap: a swap's sold leg",
+            "rules.cc_cap_10",
+            "pinned",
+            sell,
+            selling(),
+        ),
+        case(
+            "instrument_not_allowed: a swap",
+            "rules.instruments_usdc",
+            "pinned",
+            sell,
+            selling(),
+        ),
+        daily,
+        case(
+            "swap: within its scope's pair and LP",
+            "rules.swap_scope",
+            "pinned",
+            sell,
+            selling(),
+        ),
+        case(
+            "command_out_of_scope: an LP the scope does not list",
+            "rules.swap_scope",
+            "pinned",
+            sell,
+            elsewhere,
+        ),
+        case(
+            "command_out_of_scope: a pair the scope does not list",
+            "rules.swap_scope",
+            "pinned",
+            buy,
+            buying("991.5", "990"),
+        ),
+        case(
+            "command_out_of_scope: a kind the scope does not list",
+            "rules.swap_scope",
+            "pinned",
+            pay_text,
+            transfer,
+        ),
+        stale,
+    ]
+}
+
+/// The package rule against the package ids of a transaction, given in any order.
+fn package_check_cases(pool: &mut Pool) -> Vec<Value> {
+    let with_packages = |names: &[&str]| Rules {
+        packages: selected(names),
+        ..DEFAULT_LINKED_RULES
+    };
+    let cc_only = pool.rules(
+        "rules.packages_cc",
+        with_packages(&["splice-amulet", "splice-wallet"]),
+    );
+    let swaps = pool.rules(
+        "rules.packages_swaps",
+        with_packages(&["splice-amulet", "atomic-dvp", "registry"]),
+    );
+    let ids = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| package(name).to_string()).collect()
+    };
+    let case = |name: &str, rules: &str, used: Vec<String>| json!({"name": name, "rules": rules, "packages": used});
+    let mut refused = ids(&["registry", "atomic-dvp", "splice-amulet"]);
+    refused.sort();
+    refused.reverse();
+    vec![
+        case(
+            "any allows every package",
+            "default",
+            ids(&["splice-amulet", "atomic-dvp", "registry", "cip56-token"]),
+        ),
+        case(
+            "any allows a transaction without packages",
+            "default",
+            vec![],
+        ),
+        case(
+            "a selection allows its own ids",
+            &cc_only,
+            ids(&["splice-amulet"]),
+        ),
+        case(
+            "a selection allows all of them together",
+            &cc_only,
+            ids(&["splice-wallet", "splice-amulet"]),
+        ),
+        case(
+            "a selection allows a transaction without packages",
+            &cc_only,
+            vec![],
+        ),
+        case(
+            "package_not_allowed: a swap under a CC-only selection",
+            &cc_only,
+            ids(&["splice-amulet", "atomic-dvp"]),
+        ),
+        case(
+            "package_not_allowed: the first refused id in ascending order",
+            &cc_only,
+            refused,
+        ),
+        case(
+            "a swap with the AtomicDVP and registry packages selected",
+            &swaps,
+            ids(&["registry", "atomic-dvp", "splice-amulet"]),
+        ),
+        case(
+            "package_not_allowed: a CIP-56 transfer outside the selection",
+            &swaps,
+            ids(&["splice-amulet", "cip56-token"]),
+        ),
+        case(
+            "package_not_allowed: a selected id with one hex digit changed",
+            &swaps,
+            vec![{
+                let mut id = package("registry").0;
+                id[31] ^= 1;
+                PackageId(id).to_string()
+            }],
+        ),
+    ]
+}
+
+/// Controller sign-in challenges: the exact layout, what the signer checks, and the rpc's
+/// check of the Ed25519 proof over them.
+fn challenge_cases() -> Vec<Value> {
+    let issued = at(DAY);
+    let sample = ControllerChallenge {
+        network: Network::Devnet,
+        rpc: RpId::parse(DEVNET_RPC).unwrap(),
+        controller_id: testkit::ed25519_id(0x81),
+        agent_party: testkit::agent_party(),
+        nonce: Nonce16([0x5c; 16]),
+        issued_at: issued,
+        expires_at: issued.checked_add_secs(60).unwrap(),
+    };
+    let mainnet = ControllerChallenge {
+        network: Network::Mainnet,
+        rpc: RpId::parse(MAINNET_RPC).unwrap(),
+        ..sample.clone()
+    };
+    let bytes = sample.encode().unwrap();
+    let text_of = |c: &ControllerChallenge| text(&c.encode().unwrap());
+    let base = text_of(&sample);
+    let expected = |c: &ControllerChallenge| {
+        json!({
+            "network": c.network.as_str(),
+            "rpc": c.rpc.as_str(),
+            "controllerId": c.controller_id.to_string(),
+            "agentParty": c.agent_party.to_string(),
+        })
+    };
+    let decode = |name: &str, bytes: &[u8]| {
+        with_bytes(
+            json!({"name": name, "function": "decode"}),
+            "canonical",
+            bytes,
+        )
+    };
+    let check = |name: &str, bytes: &[u8], wanted: Value, now: UtcTime| {
+        let c = json!({"name": name, "function": "check_challenge", "expected": wanted, "now": now.to_string()});
+        with_bytes(c, "canonical", bytes)
+    };
+    let proof = |name: &str, bytes: &[u8], envelope: &ProofEnvelope, key: &[u8; 32]| {
+        let c = json!({"name": name, "function": "verify_challenge_proof", "publicKeyHex": hex::encode(key)});
+        let c = with_bytes(c, "canonical", bytes);
+        with_bytes(c, "envelope", &envelope.encode().unwrap())
+    };
+    let later = |secs: i64| issued.checked_add_secs(secs).unwrap();
+    let valid_for = |secs: i64| ControllerChallenge {
+        expires_at: later(secs),
+        ..sample.clone()
+    };
+    let label = |c: &str| c.repeat(63);
+    let longest = ControllerChallenge {
+        rpc: RpId::parse(&format!(
+            "{}.{}.{}.{}",
+            label("a"),
+            label("b"),
+            label("c"),
+            "d".repeat(61)
+        ))
+        .unwrap(),
+        agent_party: PartyId::parse(&format!(
+            "{}::{}",
+            "h".repeat(185),
+            namespace_for_key(&[7; 32])
+        ))
+        .unwrap(),
+        ..mainnet.clone()
+    };
+    let local = ControllerChallenge {
+        rpc: RpId::parse("localhost").unwrap(),
+        ..sample.clone()
+    };
+    let invalid_validity = |secs: i64| {
+        let expires = format!("expires_at={}", later(60));
+        mutate(&base, &expires, &format!("expires_at={}", later(secs)))
+    };
+    let id = sample.controller_id.to_string();
+    let swapped = mutate(
+        &base,
+        &format!("rpc={DEVNET_RPC}\ncontroller_id={id}\n"),
+        &format!("controller_id={id}\nrpc={DEVNET_RPC}\n"),
+    );
+    let nonce_line = format!("nonce={}\n", sample.nonce);
+    let other_party = named_party("agent-2", 9);
+    let key = ed_public(0x81);
+    let other_key = ed_public(0x82);
+    let envelope = testkit::ed25519_envelope(0x81, &bytes);
+    let theirs = testkit::ed25519_envelope(0x82, &bytes);
+    let misnamed = ProofEnvelope::new(testkit::ed25519_id(0x82), &bytes, ed_proof(0x81, &bytes));
+    let renewed = ControllerChallenge {
+        nonce: Nonce16([0x11; 16]),
+        ..sample.clone()
+    }
+    .encode()
+    .unwrap();
+    let passkey = ProofEnvelope::new(
+        sample.controller_id,
+        &bytes,
+        ControllerProof::WebAuthn(testkit::assertion_over(&bytes)),
+    );
+    let mut flipped = testkit::ed_key(0x81).sign(&bytes).to_bytes();
+    flipped[7] ^= 1;
+    let flipped = ProofEnvelope::new(
+        sample.controller_id,
+        &bytes,
+        ControllerProof::Ed25519 { signature: flipped },
+    );
+    let elsewhere = ProofEnvelope::new(
+        sample.controller_id,
+        &bytes,
+        ed_proof(0x81, b"another document"),
+    );
+    let mut weak = [0u8; 32];
+    weak[0] = 1;
+    let weak_id = controller_id_for(ControllerType::Ed25519, &weak);
+    let weak_bytes = ControllerChallenge {
+        controller_id: weak_id,
+        ..sample.clone()
+    }
+    .encode()
+    .unwrap();
+    let forged = ProofEnvelope::new(
+        weak_id,
+        &weak_bytes,
+        ControllerProof::Ed25519 { signature: [0; 64] },
+    );
+    let mainnet_bytes = mainnet.encode().unwrap();
+    let mainnet_envelope = testkit::ed25519_envelope(0x81, &mainnet_bytes);
+    let wanted = expected(&sample);
+    let with = |mut v: Value, key: &str, value: Value| {
+        put(&mut v, key, value);
+        v
+    };
+    vec![
+        decode("decode: devnet", &bytes),
+        decode("decode: mainnet", &mainnet_bytes),
+        decode(
+            "decode: valid for one second",
+            &valid_for(1).encode().unwrap(),
+        ),
+        decode("decode: the longest fields fit", &longest.encode().unwrap()),
+        decode("decode: a localhost rpc", &local.encode().unwrap()),
+        decode(
+            "wrong_scheme: v2",
+            mutate(&base, "controller-challenge.v1", "controller-challenge.v2").as_bytes(),
+        ),
+        decode(
+            "wrong_scheme: a read session scheme",
+            mutate(&base, "controller-challenge.v1", "read-session.v1").as_bytes(),
+        ),
+        decode(
+            "invalid_network: testnet",
+            mutate(&base, "network=devnet", "network=testnet").as_bytes(),
+        ),
+        decode(
+            "invalid_rp_id: an uppercase rpc",
+            mutate(&base, DEVNET_RPC, "Orderbook-devnet.silvana.dev").as_bytes(),
+        ),
+        decode(
+            "invalid_rp_id: an rpc with a port",
+            mutate(&base, DEVNET_RPC, "orderbook-devnet.silvana.dev:443").as_bytes(),
+        ),
+        decode(
+            "invalid_rp_id: an rpc URL",
+            mutate(&base, DEVNET_RPC, "https://orderbook-devnet.silvana.dev").as_bytes(),
+        ),
+        decode(
+            "invalid_rp_id: an IP address",
+            mutate(&base, DEVNET_RPC, "192.0.2.1").as_bytes(),
+        ),
+        decode(
+            "invalid_hex32: an uppercase controller id",
+            mutate(&base, &id, &id.to_uppercase()).as_bytes(),
+        ),
+        decode(
+            "invalid_party: a space in the hint",
+            mutate(&base, "agent_party=agent-1::", "agent_party=agent 1::").as_bytes(),
+        ),
+        decode(
+            "invalid_hex16: a short nonce",
+            mutate(&base, "nonce=5c5c", "nonce=5c").as_bytes(),
+        ),
+        decode(
+            "invalid_time: no seconds",
+            mutate(
+                &base,
+                &format!("issued_at={issued}"),
+                &format!("issued_at={}", &issued.to_string()[..16]),
+            )
+            .as_bytes(),
+        ),
+        decode("unexpected_key: swapped lines", swapped.as_bytes()),
+        decode(
+            "unexpected_key: no nonce",
+            mutate(&base, &nonce_line, "").as_bytes(),
+        ),
+        decode("trailing_line", format!("{base}extra=1\n").as_bytes()),
+        decode("invalid_byte: CRLF", base.replace('\n', "\r\n").as_bytes()),
+        decode(
+            "too_large",
+            format!("{base}{}", "x".repeat(1024)).as_bytes(),
+        ),
+        decode(
+            "invalid_validity: zero seconds",
+            invalid_validity(0).as_bytes(),
+        ),
+        decode(
+            "invalid_validity: 61 seconds",
+            invalid_validity(61).as_bytes(),
+        ),
+        decode(
+            "invalid_validity: expires before issue",
+            invalid_validity(-1).as_bytes(),
+        ),
+        decode("too_short", b"junk"),
+        check("check: at issued_at", &bytes, wanted.clone(), issued),
+        check(
+            "check: 120 s before issued_at",
+            &bytes,
+            wanted.clone(),
+            later(-120),
+        ),
+        check(
+            "check: 120 s after issued_at",
+            &bytes,
+            wanted.clone(),
+            later(120),
+        ),
+        check(
+            "outside_window: 121 s before issued_at",
+            &bytes,
+            wanted.clone(),
+            later(-121),
+        ),
+        check(
+            "outside_window: 121 s after issued_at",
+            &bytes,
+            wanted.clone(),
+            later(121),
+        ),
+        check(
+            "check: a mainnet challenge on mainnet",
+            &mainnet_bytes,
+            expected(&mainnet),
+            issued,
+        ),
+        check(
+            "wrong_network: a devnet challenge for a mainnet signer",
+            &bytes,
+            with(wanted.clone(), "network", "mainnet".into()),
+            issued,
+        ),
+        check(
+            "wrong_network: a mainnet challenge for a devnet signer",
+            &mainnet_bytes,
+            with(expected(&mainnet), "network", "devnet".into()),
+            issued,
+        ),
+        check(
+            "wrong_rpc: the other network's rpc",
+            &bytes,
+            with(wanted.clone(), "rpc", MAINNET_RPC.into()),
+            issued,
+        ),
+        check(
+            "wrong_controller",
+            &bytes,
+            with(
+                wanted.clone(),
+                "controllerId",
+                testkit::ed25519_id(0x82).to_string().into(),
+            ),
+            issued,
+        ),
+        check(
+            "wrong_party",
+            &bytes,
+            with(wanted.clone(), "agentParty", other_party.to_string().into()),
+            issued,
+        ),
+        check(
+            "trailing_line: a padded challenge",
+            format!("{base}extra=1\n").as_bytes(),
+            wanted.clone(),
+            issued,
+        ),
+        check("too_short: junk", b"junk", wanted, issued),
+        proof(
+            "proof: an Ed25519 proof by the named key",
+            &bytes,
+            &envelope,
+            &key,
+        ),
+        proof(
+            "proof: a mainnet challenge",
+            &mainnet_bytes,
+            &mainnet_envelope,
+            &key,
+        ),
+        proof(
+            "wrong_controller: another key's own valid proof",
+            &bytes,
+            &theirs,
+            &other_key,
+        ),
+        proof(
+            "controller_mismatch: the envelope names another controller",
+            &bytes,
+            &misnamed,
+            &key,
+        ),
+        proof(
+            "payload_mismatch: a proof over another challenge",
+            &renewed,
+            &envelope,
+            &key,
+        ),
+        proof(
+            "proof_type_mismatch: a passkey proof",
+            &bytes,
+            &passkey,
+            &key,
+        ),
+        proof("bad_signature: one flipped bit", &bytes, &flipped, &key),
+        proof(
+            "bad_signature: a signature over another document",
+            &bytes,
+            &elsewhere,
+            &key,
+        ),
+        proof(
+            "weak_public_key: a small-order key named everywhere",
+            &weak_bytes,
+            &forged,
+            &weak,
+        ),
+        proof("too_short: junk", b"junk", &envelope, &key),
     ]
 }

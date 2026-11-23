@@ -44,6 +44,7 @@ pub enum ValueKind {
     ReceiptSubject,
     Outcome,
     CodeSource,
+    PackageId,
 }
 
 impl ValueKind {
@@ -88,10 +89,11 @@ impl ValueKind {
             Self::ReceiptSubject => "invalid_receipt_subject",
             Self::Outcome => "invalid_outcome",
             Self::CodeSource => "invalid_code_source",
+            Self::PackageId => "invalid_package_id",
         }
     }
 
-    /// Stable numeric code (150-187).
+    /// Stable numeric code (150-188).
     pub fn code(self) -> u16 {
         match self {
             Self::Hex16 => 150,
@@ -132,6 +134,7 @@ impl ValueKind {
             Self::ReceiptSubject => 185,
             Self::Outcome => 186,
             Self::CodeSource => 187,
+            Self::PackageId => 188,
         }
     }
 }
@@ -193,6 +196,7 @@ pub enum CanonErrorKind {
     InvalidRange,
     OutcomeMismatch,
     InvalidHead,
+    SameInstrument,
 }
 
 impl CanonErrorKind {
@@ -231,10 +235,11 @@ impl CanonErrorKind {
             Self::InvalidRange => "invalid_range",
             Self::OutcomeMismatch => "outcome_mismatch",
             Self::InvalidHead => "invalid_head",
+            Self::SameInstrument => "same_instrument",
         }
     }
 
-    /// Stable numeric code (100-130, or the value kind code).
+    /// Stable numeric code (100-131, or the value kind code).
     pub fn code(self) -> u16 {
         match self {
             Self::TooShort => 100,
@@ -269,6 +274,7 @@ impl CanonErrorKind {
             Self::InvalidRange => 128,
             Self::OutcomeMismatch => 129,
             Self::InvalidHead => 130,
+            Self::SameInstrument => 131,
         }
     }
 }
@@ -779,6 +785,7 @@ pub enum PolicyError {
     Expired,
     Proof(ProofError),
     TimeOverflow,
+    UnknownScopeController,
 }
 
 impl PolicyError {
@@ -796,10 +803,11 @@ impl PolicyError {
             Self::Expired => "expired",
             Self::Proof(e) => e.code_name(),
             Self::TimeOverflow => "time_overflow",
+            Self::UnknownScopeController => "unknown_scope_controller",
         }
     }
 
-    /// Stable numeric code (900-908, or the wrapped code).
+    /// Stable numeric code (900-909, or the wrapped code).
     pub fn code(&self) -> u16 {
         match self {
             Self::Canon(e) => e.code(),
@@ -813,6 +821,7 @@ impl PolicyError {
             Self::Expired => 907,
             Self::Proof(e) => e.code(),
             Self::TimeOverflow => 908,
+            Self::UnknownScopeController => 909,
         }
     }
 }
@@ -831,6 +840,16 @@ pub enum CommandError {
     Expired,
     Proof(ProofError),
     TimeOverflow,
+    /// The signer's command scope does not list this kind.
+    OutOfScope,
+    /// The signer's scope lists swap pairs and none is this one.
+    SwapPairNotAllowed,
+    /// `min_receive / sell_amount` is below the pair's `min_price`.
+    SwapBelowMinPrice,
+    /// `sell_amount` is above the pair's `max_sell`.
+    SwapAboveMaxSell,
+    /// The signer's scope lists LPs and the settling LP is not one of them.
+    LpNotAllowed,
 }
 
 impl CommandError {
@@ -847,10 +866,15 @@ impl CommandError {
             Self::Expired => "expired",
             Self::Proof(e) => e.code_name(),
             Self::TimeOverflow => "time_overflow",
+            Self::OutOfScope => "command_out_of_scope",
+            Self::SwapPairNotAllowed => "swap_pair_not_allowed",
+            Self::SwapBelowMinPrice => "swap_below_min_price",
+            Self::SwapAboveMaxSell => "swap_above_max_sell",
+            Self::LpNotAllowed => "lp_not_allowed",
         }
     }
 
-    /// Stable numeric code (1100-1107, or the wrapped code).
+    /// Stable numeric code (1100-1112, or the wrapped code).
     pub fn code(&self) -> u16 {
         match self {
             Self::Canon(e) => e.code(),
@@ -863,7 +887,89 @@ impl CommandError {
             Self::Expired => 1106,
             Self::Proof(e) => e.code(),
             Self::TimeOverflow => 1107,
+            Self::OutOfScope => 1108,
+            Self::SwapPairNotAllowed => 1109,
+            Self::SwapBelowMinPrice => 1110,
+            Self::SwapAboveMaxSell => 1111,
+            Self::LpNotAllowed => 1112,
         }
+    }
+}
+
+/// Why the agent could not carry out a verified command; a receipt carries the code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CommandFailure {
+    NoAcceptableQuote,
+    BelowMinimum,
+    FeeAboveCap,
+    InexactSize,
+    LpRejected,
+    InsufficientHoldings,
+    PreapprovalUnavailable,
+    ContentRefused,
+    WindowClosed,
+    SubmitFailed,
+    NoReferencePrice,
+    PriceDeviation,
+}
+
+impl CommandFailure {
+    pub const ALL: [Self; 12] = [
+        Self::NoAcceptableQuote,
+        Self::BelowMinimum,
+        Self::FeeAboveCap,
+        Self::InexactSize,
+        Self::LpRejected,
+        Self::InsufficientHoldings,
+        Self::PreapprovalUnavailable,
+        Self::ContentRefused,
+        Self::WindowClosed,
+        Self::SubmitFailed,
+        Self::NoReferencePrice,
+        Self::PriceDeviation,
+    ];
+
+    /// Stable name of the failure.
+    pub fn code_name(self) -> &'static str {
+        match self {
+            Self::NoAcceptableQuote => "no_acceptable_quote",
+            Self::BelowMinimum => "below_minimum",
+            Self::FeeAboveCap => "fee_above_cap",
+            Self::InexactSize => "inexact_size",
+            Self::LpRejected => "lp_rejected",
+            Self::InsufficientHoldings => "insufficient_holdings",
+            Self::PreapprovalUnavailable => "preapproval_unavailable",
+            Self::ContentRefused => "content_refused",
+            Self::WindowClosed => "window_closed",
+            Self::SubmitFailed => "submit_failed",
+            Self::NoReferencePrice => "no_reference_price",
+            Self::PriceDeviation => "price_deviation",
+        }
+    }
+
+    /// Stable numeric code (1400-1411).
+    pub fn code(self) -> u16 {
+        match self {
+            Self::NoAcceptableQuote => 1400,
+            Self::BelowMinimum => 1401,
+            Self::FeeAboveCap => 1402,
+            Self::InexactSize => 1403,
+            Self::LpRejected => 1404,
+            Self::InsufficientHoldings => 1405,
+            Self::PreapprovalUnavailable => 1406,
+            Self::ContentRefused => 1407,
+            Self::WindowClosed => 1408,
+            Self::SubmitFailed => 1409,
+            Self::NoReferencePrice => 1410,
+            Self::PriceDeviation => 1411,
+        }
+    }
+
+    pub fn from_code(code: u64) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|failure| u64::from(failure.code()) == code)
     }
 }
 
@@ -961,6 +1067,47 @@ impl SignedDocError {
     }
 }
 
+/// Why a controller sign-in challenge, or the proof over one, was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChallengeError {
+    Canon(CanonError),
+    WrongNetwork,
+    WrongRpc,
+    WrongController,
+    WrongParty,
+    OutsideWindow,
+    Proof(ProofError),
+}
+
+impl ChallengeError {
+    /// Stable name of the refusal; wrapped errors keep their own names.
+    pub fn code_name(&self) -> &'static str {
+        match self {
+            Self::Canon(e) => e.code_name(),
+            Self::WrongNetwork => "wrong_network",
+            Self::WrongRpc => "wrong_rpc",
+            Self::WrongController => "wrong_controller",
+            Self::WrongParty => "wrong_party",
+            Self::OutsideWindow => "outside_window",
+            Self::Proof(e) => e.code_name(),
+        }
+    }
+
+    /// Stable numeric code (1500-1504, or the wrapped code).
+    pub fn code(&self) -> u16 {
+        match self {
+            Self::Canon(e) => e.code(),
+            Self::WrongNetwork => 1500,
+            Self::WrongRpc => 1501,
+            Self::WrongController => 1502,
+            Self::WrongParty => 1503,
+            Self::OutsideWindow => 1504,
+            Self::Proof(e) => e.code(),
+        }
+    }
+}
+
 impl fmt::Display for CanonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} at line {}", self.code_name(), self.line)
@@ -1000,13 +1147,17 @@ display_by_name!(
     ProofError,
     PolicyError,
     CommandError,
+    CommandFailure,
     ReadSessionError,
-    SignedDocError
+    SignedDocError,
+    ChallengeError
 );
 
 impl std::error::Error for CommandError {}
+impl std::error::Error for CommandFailure {}
 impl std::error::Error for ReadSessionError {}
 impl std::error::Error for SignedDocError {}
+impl std::error::Error for ChallengeError {}
 impl std::error::Error for LogError {}
 impl std::error::Error for ReplayError {}
 impl std::error::Error for PolicyError {}
@@ -1057,6 +1208,7 @@ mod tests {
             CanonErrorKind::InvalidRange,
             CanonErrorKind::OutcomeMismatch,
             CanonErrorKind::InvalidHead,
+            CanonErrorKind::SameInstrument,
         ];
         let values = [
             ValueKind::Hex16,
@@ -1097,7 +1249,11 @@ mod tests {
             ValueKind::ReceiptSubject,
             ValueKind::Outcome,
             ValueKind::CodeSource,
+            ValueKind::PackageId,
         ];
+        assert_eq!(CanonErrorKind::SameInstrument.code(), 131);
+        assert_eq!(ValueKind::PackageId.code(), 188);
+        assert_eq!(ValueKind::PackageId.code_name(), "invalid_package_id");
         let all: Vec<CanonErrorKind> = canon
             .into_iter()
             .chain(values.into_iter().map(CanonErrorKind::InvalidValue))
@@ -1194,7 +1350,9 @@ mod tests {
             PolicyError::IssuedInFuture,
             PolicyError::Expired,
             PolicyError::TimeOverflow,
+            PolicyError::UnknownScopeController,
         ];
+        assert_eq!(PolicyError::UnknownScopeController.code(), 909);
         fn unique(pairs: &[(&'static str, u16)]) -> bool {
             let names: HashSet<&str> = pairs.iter().map(|p| p.0).collect();
             let codes: HashSet<u16> = pairs.iter().map(|p| p.1).collect();
@@ -1232,6 +1390,26 @@ mod tests {
         let pairs: Vec<_> = command.iter().map(|e| (e.code_name(), e.code())).collect();
         assert!(unique(&pairs));
         assert!(pairs.iter().all(|p| (1100..=1107).contains(&p.1)));
+        let scoped = [
+            CommandError::OutOfScope,
+            CommandError::SwapPairNotAllowed,
+            CommandError::SwapBelowMinPrice,
+            CommandError::SwapAboveMaxSell,
+            CommandError::LpNotAllowed,
+        ];
+        let named: Vec<_> = scoped.iter().map(|e| (e.code_name(), e.code())).collect();
+        assert_eq!(
+            named,
+            [
+                ("command_out_of_scope", 1108),
+                ("swap_pair_not_allowed", 1109),
+                ("swap_below_min_price", 1110),
+                ("swap_above_max_sell", 1111),
+                ("lp_not_allowed", 1112),
+            ]
+        );
+        let all: Vec<_> = pairs.iter().chain(named.iter()).copied().collect();
+        assert!(unique(&all));
         let session = [
             ReadSessionError::WrongNetwork,
             ReadSessionError::UnknownAgent,
@@ -1260,6 +1438,62 @@ mod tests {
         let wrapped = ReadSessionError::Signature(SignatureError::BadSignature);
         assert_eq!(wrapped.code_name(), "bad_signature");
         assert_eq!(CommandError::StaleLogHead.to_string(), "stale_log_head");
+    }
+
+    #[test]
+    fn challenge_names_and_codes_are_unique_and_in_their_range() {
+        let challenge = [
+            ChallengeError::WrongNetwork,
+            ChallengeError::WrongRpc,
+            ChallengeError::WrongController,
+            ChallengeError::WrongParty,
+            ChallengeError::OutsideWindow,
+        ];
+        let names: HashSet<&str> = challenge.iter().map(|e| e.code_name()).collect();
+        let codes: HashSet<u16> = challenge.iter().map(|e| e.code()).collect();
+        assert_eq!(names.len(), challenge.len());
+        assert_eq!(codes.len(), challenge.len());
+        assert!(codes.iter().all(|code| (1500..=1504).contains(code)));
+        let canon = CanonError::new(4, CanonErrorKind::InvalidValidity);
+        assert_eq!(ChallengeError::Canon(canon).code(), 125);
+        let proof = ChallengeError::Proof(ProofError::ProofTypeMismatch);
+        assert_eq!((proof.code_name(), proof.code()), ("proof_type_mismatch", 602));
+        assert_eq!(ChallengeError::WrongRpc.to_string(), "wrong_rpc");
+    }
+
+    #[test]
+    fn command_failures_are_numbered_1400_to_1411_in_order() {
+        let named: Vec<(&str, u16)> = CommandFailure::ALL
+            .iter()
+            .map(|f| (f.code_name(), f.code()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("no_acceptable_quote", 1400),
+                ("below_minimum", 1401),
+                ("fee_above_cap", 1402),
+                ("inexact_size", 1403),
+                ("lp_rejected", 1404),
+                ("insufficient_holdings", 1405),
+                ("preapproval_unavailable", 1406),
+                ("content_refused", 1407),
+                ("window_closed", 1408),
+                ("submit_failed", 1409),
+                ("no_reference_price", 1410),
+                ("price_deviation", 1411),
+            ]
+        );
+        for failure in CommandFailure::ALL {
+            assert_eq!(
+                CommandFailure::from_code(u64::from(failure.code())),
+                Some(failure)
+            );
+        }
+        assert_eq!(CommandFailure::from_code(1399), None);
+        assert_eq!(CommandFailure::from_code(1412), None);
+        assert_eq!(CommandFailure::from_code(1108), None);
+        assert_eq!(CommandFailure::WindowClosed.to_string(), "window_closed");
     }
 
     #[test]

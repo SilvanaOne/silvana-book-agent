@@ -464,6 +464,23 @@ pub struct PreSignContext<'a> {
     pub command_id: &'a str,
     pub transaction_id: &'a str,
     pub verification: &'a tx_verifier::VerificationResult,
+    /// The facts read from the same bytes.
+    pub facts: &'a Result<TxFacts, String>,
+    /// The prepared transaction bytes the hash was computed over.
+    pub prepared_transaction: &'a [u8],
+}
+
+/// What a ledger scan found for one Canton command id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandSearch {
+    /// Committed, in this update.
+    Found(String),
+    /// Not in the whole range scanned.
+    NotFound,
+    /// The scan did not cover the range: absence proves nothing.
+    Unknown(String),
+    /// Not in the range up to `scanned_to`, which is all the scan covered.
+    Partial { scanned_to: i64, why: String },
 }
 
 /// A hook run before each signature; an error aborts that attempt unsigned.
@@ -984,9 +1001,51 @@ impl DAppProviderClient {
     ) -> Result<ExecuteTransactionResponse> {
         let mut uncertain = None;
         let attempts = opts.max_retries.max(1);
-        self.submit_attempts(req, expectation, verbose, dry_run, force, attempts, opts.pre_sign, &mut uncertain)
+        self.submit_attempts(req, expectation, verbose, dry_run, force, attempts, opts.pre_sign, None, &mut uncertain)
             .await
             .map_err(|e| mark_uncertain(e, uncertain.as_deref()))
+    }
+
+    /// One attempt of a transaction `command` directs: the content check takes its
+    /// command id, and `bind` runs right before the one signature.
+    pub async fn submit_directed(
+        &mut self,
+        req: PrepareTransactionRequest,
+        expectation: &OperationExpectation,
+        command: &agent_control::Command,
+        bind: PreSign<'_>,
+    ) -> Result<ExecuteTransactionResponse> {
+        let mut uncertain = None;
+        self.submit_attempts(req, expectation, false, false, false, 1, Some(bind), Some(command), &mut uncertain)
+            .await
+            .map_err(|e| mark_uncertain(e, uncertain.as_deref()))
+    }
+
+    /// Scans the updates after `start_offset` for a transaction with `command_id`; a scan cut
+    /// short says how far it got, so the next one resumes there.
+    pub async fn find_command(&mut self, command_id: &str, start_offset: i64) -> CommandSearch {
+        if start_offset <= 0 {
+            return CommandSearch::Unknown("no ledger offset was recorded".into());
+        }
+        let current_end = match self.get_ledger_end().await {
+            Ok(end) => end,
+            Err(e) => return CommandSearch::Unknown(format!("ledger end unavailable: {e:#}")),
+        };
+        if current_end <= start_offset {
+            return CommandSearch::NotFound;
+        }
+        let (updates, complete) = match self.get_updates(start_offset, Some(current_end), &[]).await {
+            Ok(scanned) => scanned,
+            Err(e) => return CommandSearch::Unknown(format!("updates scan failed: {e:#}")),
+        };
+        match scan_updates(&updates, complete, command_id) {
+            UpdateScan::Found(found) => CommandSearch::Found(found.update_id),
+            UpdateScan::NotFound => CommandSearch::NotFound,
+            UpdateScan::Unknown(why) => match last_offset(&updates).filter(|last| *last > start_offset) {
+                Some(scanned_to) => CommandSearch::Partial { scanned_to, why },
+                None => CommandSearch::Unknown(why),
+            },
+        }
     }
 
     async fn submit_with_retries(
@@ -999,7 +1058,7 @@ impl DAppProviderClient {
         max_retries: u32,
     ) -> Result<ExecuteTransactionResponse> {
         let mut uncertain = None;
-        self.submit_attempts(req, expectation, verbose, dry_run, force, max_retries, None, &mut uncertain)
+        self.submit_attempts(req, expectation, verbose, dry_run, force, max_retries, None, None, &mut uncertain)
             .await
             .map_err(|e| mark_uncertain(e, uncertain.as_deref()))
     }
@@ -1015,8 +1074,13 @@ impl DAppProviderClient {
         force: bool,
         max_retries: u32,
         mut pre_sign: Option<PreSign<'_>>,
+        directed: Option<&agent_control::Command>,
         uncertain: &mut Option<String>,
     ) -> Result<ExecuteTransactionResponse> {
+        // A directed transaction is only ever signed by a linked agent, once, through its hook.
+        if directed.is_some() && !(self.signer.guard().strict() && !dry_run && !force && pre_sign.is_some()) {
+            bail!("a directed transaction is signed only by a linked agent, once, through its binding");
+        }
         // A linked agent hashes strictly, never forces, and checks the content first.
         let mut strict = self.signer.guard().strict();
         if strict && force {
@@ -1089,9 +1153,10 @@ impl DAppProviderClient {
             );
 
             // 2. Verify transaction and compute hash, reading its facts alongside
-            //    (the bytes are not needed afterwards)
+            //    (the bytes stay for the pre-sign hook)
+            let prepared_bytes: Arc<[u8]> = std::mem::take(&mut prepared.prepared_transaction).into();
             let (verification, facts) = verify_with_facts(
-                std::mem::take(&mut prepared.prepared_transaction),
+                Arc::clone(&prepared_bytes),
                 prepared.prepared_transaction_hash.clone(),
                 prepared.hashing_scheme_version.clone(),
                 expectation.clone(),
@@ -1168,14 +1233,14 @@ impl DAppProviderClient {
                         expectation,
                         req.operation,
                         attempt_no,
-                        &format!("Transaction verification REJECTED: {reason}"),
+                        &format!("{VERIFICATION_REJECTED}: {reason}"),
                     );
-                    anyhow::bail!("Transaction verification REJECTED: {}", reason);
+                    anyhow::bail!("{VERIFICATION_REJECTED}: {}", reason);
                 }
             }
 
             if expectation.requires_hash_match() && verification.computed_hash == [0u8; 32] {
-                anyhow::bail!("Transaction verification gave no hash to sign for a strict operation");
+                anyhow::bail!("{NO_HASH_TO_SIGN}");
             }
             // Read again: a link may have landed since the prepare, and the guard moves only forward.
             strict = self.signer.guard().strict();
@@ -1189,17 +1254,22 @@ impl DAppProviderClient {
                     crate::control::OwnRequest::Ledger(req.params.as_ref()),
                     &verification,
                     &facts,
+                    directed,
                     &prepared.command_id,
                     req.operation,
                     attempt_no,
                     "ledger_client.content",
                 )?;
+            } else if directed.is_some() {
+                bail!("a directed transaction is signed only by a linked agent; nothing was signed");
             }
             if let Some(hook) = pre_sign.as_mut() {
                 hook(&PreSignContext {
                     command_id: &prepared.command_id,
                     transaction_id: &prepared.transaction_id,
                     verification: &verification,
+                    facts: &facts,
+                    prepared_transaction: &prepared_bytes,
                 })
                 .context("refused before signing")?;
             }
@@ -1219,7 +1289,8 @@ impl DAppProviderClient {
                 bail!("the control state changed before signing; nothing was signed: retry");
             }
             let signature = self.signer.sign_transaction(&authorization, &hash_to_sign)?;
-            crate::control_survey::record_signed(expectation, &self.party_id, &verification.hash_check, &facts);
+            let request = crate::control::OwnRequest::Ledger(req.params.as_ref());
+            crate::control_survey::record_signed_observed(expectation, &self.party_id, request, &verification, &facts, strict);
 
             // 4. Execute (catch gRPC errors for update-based recovery).
             //    Echo back the server's fees_json verbatim — the server
@@ -1763,6 +1834,19 @@ enum ExecuteRecovery {
     Stop(anyhow::Error),
 }
 
+/// The highest offset among `updates`: the stream is in offset order, so everything up to it
+/// was delivered.
+fn last_offset(updates: &[GetUpdatesResponse]) -> Option<i64> {
+    updates
+        .iter()
+        .filter_map(|u| match &u.update {
+            Some(get_updates_response::Update::Transaction(tx)) => Some(tx.offset),
+            Some(get_updates_response::Update::OffsetCheckpoint(checkpoint)) => Some(checkpoint.offset),
+            None => None,
+        })
+        .max()
+}
+
 /// Look for `command_id` in `updates`; a miss in an incomplete scan is `Unknown`.
 fn scan_updates(updates: &[GetUpdatesResponse], complete: bool, command_id: &str) -> UpdateScan {
     for update_resp in updates {
@@ -1852,7 +1936,7 @@ where
 /// [`verify_bounded`] and [`facts_bounded`] over the same bytes, run concurrently.
 #[allow(clippy::too_many_arguments)]
 async fn verify_with_facts(
-    prepared_transaction: Vec<u8>,
+    bytes: Arc<[u8]>,
     server_hash_base64: String,
     hashing_scheme_version: String,
     expectation: OperationExpectation,
@@ -1860,7 +1944,6 @@ async fn verify_with_facts(
     verbose: bool,
     party: String,
 ) -> (Result<tx_verifier::VerificationResult>, Result<TxFacts, String>) {
-    let bytes: Arc<[u8]> = prepared_transaction.into();
     tokio::join!(
         verify_bounded(Arc::clone(&bytes), server_hash_base64, hashing_scheme_version, expectation, mode, verbose),
         facts_bounded(bytes, party),
@@ -1870,6 +1953,15 @@ async fn verify_with_facts(
 /// The refusal of `--force` for a linked agent.
 pub const FORCE_REFUSED_WHEN_LINKED: &str = "--force is refused for a linked agent";
 
+/// The local verifier refused the prepared transaction; nothing was signed.
+pub const VERIFICATION_REJECTED: &str = "Transaction verification REJECTED";
+
+/// [`VERIFICATION_REJECTED`] on the atomic path.
+pub const ATOMIC_VERIFICATION_REJECTED: &str = "Atomic transaction verification REJECTED";
+
+/// A strict operation whose hash was not computed locally; nothing was signed.
+pub const NO_HASH_TO_SIGN: &str = "Transaction verification gave no hash to sign for a strict operation";
+
 /// The content check of a linked agent before a signature; a refusal is reported and returned.
 #[allow(clippy::too_many_arguments)]
 fn check_linked_content(
@@ -1878,15 +1970,21 @@ fn check_linked_content(
     request: crate::control::OwnRequest<'_>,
     verification: &tx_verifier::VerificationResult,
     facts: &Result<TxFacts, String>,
+    directed: Option<&agent_control::Command>,
     command_id: &str,
     operation: i32,
     attempt_no: u32,
     source: &str,
 ) -> Result<()> {
+    use crate::control::intent::{check_before_signing, check_before_signing_directed};
     let platform = crate::control::platform_parties()?;
-    if let Err(refusal) =
-        crate::control::intent::check_before_signing(party_id, &platform, expectation, request, verification, facts)
-    {
+    let checked = match directed {
+        Some(command) => {
+            check_before_signing_directed(party_id, &platform, expectation, request, verification, facts, command)
+        }
+        None => check_before_signing(party_id, &platform, expectation, request, verification, facts),
+    };
+    if let Err(refusal) = checked {
         report_submit_error(
             "CONTENT_REFUSED",
             "critical",
@@ -2300,6 +2398,13 @@ impl AtomicProviderClient {
         })
     }
 
+    /// A client of `party_id` on `channel` with short bounds, for a fake ledger-service.
+    #[cfg(test)]
+    pub(crate) fn for_tests(channel: Channel, party_id: &str, private_key: &Secret<32>, ledger_service_public_key: &[u8; 32]) -> Result<Self> {
+        let bounds = CallBounds::for_request_secs(Some(5));
+        Self::with_channel(channel, party_id, "agent", private_key, 3600, None, ledger_service_public_key, bounds)
+    }
+
     fn verify_server_key(&self, public_key_b64url: &str) -> Result<()> {
         let key = parse_public_key(public_key_b64url)
             .context("Failed to parse ledger service public key from response")?;
@@ -2466,6 +2571,19 @@ impl AtomicProviderClient {
             .await
     }
 
+    /// One attempt of an atomic transaction `command` directs: the content check takes
+    /// its command id, and `bind` runs right before the one signature.
+    pub async fn submit_atomic_directed(
+        &mut self,
+        req: PrepareAtomicTransactionRequest,
+        expectation: &OperationExpectation,
+        command: &agent_control::Command,
+        bind: PreSign<'_>,
+    ) -> Result<AtomicExecuteResponse> {
+        self.submit_atomic_attempts(req, expectation, false, false, false, 1, Some(bind), Some(command))
+            .await
+    }
+
     async fn submit_atomic_with_retries(
         &mut self,
         req: PrepareAtomicTransactionRequest,
@@ -2475,6 +2593,27 @@ impl AtomicProviderClient {
         force: bool,
         max_retries: u32,
     ) -> Result<AtomicExecuteResponse> {
+        self.submit_atomic_attempts(req, expectation, verbose, dry_run, force, max_retries, None, None)
+            .await
+    }
+
+    /// The atomic attempt loop; a directed one runs its hook right before the signature.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_atomic_attempts(
+        &mut self,
+        req: PrepareAtomicTransactionRequest,
+        expectation: &OperationExpectation,
+        verbose: bool,
+        dry_run: bool,
+        force: bool,
+        max_retries: u32,
+        mut pre_sign: Option<PreSign<'_>>,
+        directed: Option<&agent_control::Command>,
+    ) -> Result<AtomicExecuteResponse> {
+        // A directed transaction is only ever signed by a linked agent, once, through its hook.
+        if directed.is_some() && !(self.signer.guard().strict() && !dry_run && !force && pre_sign.is_some()) {
+            bail!("a directed transaction is signed only by a linked agent, once, through its binding");
+        }
         // A linked agent hashes strictly, never forces, and checks the content first.
         let mut strict = self.signer.guard().strict();
         if strict && force {
@@ -2548,9 +2687,10 @@ impl AtomicProviderClient {
             );
 
             // 2. Verify transaction and compute hash, reading its facts alongside
-            //    (the bytes are not needed afterwards)
+            //    (the bytes stay for the pre-sign hook)
+            let prepared_bytes: Arc<[u8]> = std::mem::take(&mut prepared.prepared_transaction).into();
             let (verification, facts) = verify_with_facts(
-                std::mem::take(&mut prepared.prepared_transaction),
+                Arc::clone(&prepared_bytes),
                 prepared.prepared_transaction_hash.clone(),
                 prepared.hashing_scheme_version.clone(),
                 expectation.clone(),
@@ -2599,9 +2739,9 @@ impl AtomicProviderClient {
                         expectation,
                         0,
                         attempt_no,
-                        &format!("Atomic transaction verification REJECTED: {reason}"),
+                        &format!("{ATOMIC_VERIFICATION_REJECTED}: {reason}"),
                     );
-                    anyhow::bail!("Atomic transaction verification REJECTED: {}", reason);
+                    anyhow::bail!("{ATOMIC_VERIFICATION_REJECTED}: {}", reason);
                 }
             }
 
@@ -2617,11 +2757,24 @@ impl AtomicProviderClient {
                     crate::control::OwnRequest::Atomic(req.params.as_ref()),
                     &verification,
                     &facts,
+                    directed,
                     &prepared.command_id,
                     0,
                     attempt_no,
                     "ledger_client.atomic_content",
                 )?;
+            } else if directed.is_some() {
+                bail!("a directed transaction is signed only by a linked agent; nothing was signed");
+            }
+            if let Some(hook) = pre_sign.as_mut() {
+                hook(&PreSignContext {
+                    command_id: &prepared.command_id,
+                    transaction_id: &prepared.transaction_id,
+                    verification: &verification,
+                    facts: &facts,
+                    prepared_transaction: &prepared_bytes,
+                })
+                .context("refused before signing")?;
             }
 
             // 3. Hash selection (server hash unless it matched; 32 non-zero bytes either way)
@@ -2638,7 +2791,8 @@ impl AtomicProviderClient {
                 bail!("the control state changed before signing; nothing was signed: retry");
             }
             let signature = self.signer.sign_transaction(&authorization, &hash_to_sign)?;
-            crate::control_survey::record_signed(expectation, &self.party_id, &verification.hash_check, &facts);
+            let request = crate::control::OwnRequest::Atomic(req.params.as_ref());
+            crate::control_survey::record_signed_observed(expectation, &self.party_id, request, &verification, &facts, strict);
 
             // 4. Execute — echo fees_json verbatim
             let result = match self
@@ -3176,6 +3330,25 @@ mod bounded_io_tests {
         };
         assert!(why.contains("incomplete after 1 update(s)"), "{why}");
         assert!(matches!(scan_updates(&[], false, "cmd"), UpdateScan::Unknown(_)));
+    }
+
+    #[test]
+    fn a_cut_scan_reaches_the_highest_offset_it_was_given() {
+        let at = |offset: i64| GetUpdatesResponse {
+            update: Some(get_updates_response::Update::Transaction(LedgerTransaction {
+                offset,
+                ..Default::default()
+            })),
+        };
+        let checkpoint = GetUpdatesResponse {
+            update: Some(get_updates_response::Update::OffsetCheckpoint(
+                orderbook_proto::ledger::LedgerOffsetCheckpoint { offset: 90 },
+            )),
+        };
+        assert_eq!(last_offset(&[at(41), at(57), checkpoint.clone()]), Some(90));
+        assert_eq!(last_offset(&[at(41), at(57)]), Some(57));
+        assert_eq!(last_offset(&[GetUpdatesResponse { update: None }]), None);
+        assert_eq!(last_offset(&[]), None);
     }
 
     #[test]
@@ -3846,7 +4019,7 @@ mod bounded_io_tests {
         let expectation = OperationExpectation::IssueTickets { lp_party: "lp".into(), ticket_count: 1 };
         let direct = tx_verifier::verify_and_hash(&[], "", "", &expectation, false);
         let (with_facts, facts) =
-            verify_with_facts(Vec::new(), String::new(), String::new(), expectation, VerifyMode::default(), false, "party".into()).await;
+            verify_with_facts(Vec::new().into(), String::new(), String::new(), expectation, VerifyMode::default(), false, "party".into()).await;
         match (direct, with_facts) {
             (Ok(d), Ok(b)) => assert_eq!(
                 (d.accepted, d.computed_hash, d.summary, d.hash_check),
@@ -4458,6 +4631,120 @@ mod bounded_io_tests {
             assert_eq!(second["ctl_seq"].as_u64(), Some(2));
             assert_eq!(second["ctl_head"].as_str(), Some(signed.hash().to_string().as_str()));
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ---- directed transactions: the command's own id, and the binding before the signature ----
+
+        use crate::control::commands::tests::{fixture, signed_command};
+
+        /// A signed 10 CC transfer command for `party`, its request and its expectation.
+        fn directed_transfer(party: &str) -> (agent_control::Command, PrepareTransactionRequest, OperationExpectation) {
+            let party_id = agent_control::PartyId::parse(party).unwrap();
+            let op = agent_control::CommandOp::TransferCc {
+                receiver: agent_control::PartyId::parse(&fixture::bob()).unwrap(),
+                amount: agent_control::Amount::parse("10").unwrap(),
+                description: None,
+                settlement_proposal_id: None,
+            };
+            let now = agent_control::UtcTime::from_unix_secs(clock::now_secs_i64()).unwrap();
+            let head = HeadRef { seq: 1, hash: agent_control::Hash32([1; 32]) };
+            let item = signed_command(&party_id, op, now, 600, head);
+            let command = agent_control::Command::decode(&item.command).unwrap();
+            let canton_id = command.canton_command_id();
+            let req = PrepareTransactionRequest {
+                operation: 0,
+                params: Some(Params::TransferCc(TransferCcParams {
+                    receiver_party: fixture::bob(),
+                    amount: "10".into(),
+                    command_id: canton_id.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let expectation = OperationExpectation::TransferCc {
+                sender_party: party.into(),
+                receiver_party: fixture::bob(),
+                amount: "10".into(),
+                command_id: canton_id,
+            };
+            (command, req, expectation)
+        }
+
+        fn transfer_bytes(party: &str, command_id: &str) -> Vec<u8> {
+            fixture::cc_transfer(&fixture::Shape {
+                agent: party.into(),
+                paid: fixture::bob(),
+                declared: fixture::bob(),
+                amount: "10".into(),
+                input: "100".into(),
+                change: "90".into(),
+                extra: None,
+                second_root: false,
+                command_id: command_id.into(),
+            })
+        }
+
+        /// One directed submission on the counting ledger; `bind` answers for the signature.
+        async fn submit_directed_once(seed: [u8; 32], bytes_for: impl FnOnce(&str, &str) -> Vec<u8>, refuse: bool) -> (Result<ExecuteTransactionResponse>, u32, Vec<String>) {
+            let (key, party) = link(seed).await;
+            let (command, req, expectation) = directed_transfer(&party);
+            let body = bytes_for(&party, &command.canton_command_id());
+            let executes = Arc::new(AtomicU32::new(0));
+            let ledger = Counting {
+                inner: SigningLedger {
+                    prepare: signed_prepare_of(&party, &body, false),
+                    execute: Ok(signed_failure("Transaction failed: rejected", 4)),
+                },
+                executes: Arc::clone(&executes),
+            };
+            let (url, server) = serve(tonic::service::Routes::new(ledger)).await;
+            let mut c = DAppProviderClient::from_channel(lazy_channel(&url), &party, "agent", &key, 3600, None, &server_key())
+                .unwrap()
+                .with_bounds(short_bounds());
+            let mut seen = Vec::new();
+            let mut bind = |pc: &PreSignContext<'_>| -> Result<()> {
+                let facts = pc.facts.as_ref().map_err(|e| anyhow!("{e}"))?;
+                seen.push(facts.command_id.clone());
+                assert!(!pc.prepared_transaction.is_empty());
+                if refuse {
+                    bail!("the binding refused");
+                }
+                Ok(())
+            };
+            let submit = c.submit_directed(req, &expectation, &command, &mut bind);
+            let result = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded");
+            server.abort();
+            (result, executes.load(AtomicOrdering::SeqCst), seen)
+        }
+
+        #[tokio::test]
+        async fn a_directed_submission_signs_once_after_its_binding_saw_the_hashed_bytes() {
+            let (result, executes, seen) = submit_directed_once([0xd1; 32], transfer_bytes, false).await;
+            let text = format!("{:#}", result.unwrap_err());
+            assert!(text.contains("Transaction failed: rejected"), "{text}");
+            assert_eq!(executes, 1, "signed and executed once: {text}");
+            assert_eq!(seen.len(), 1);
+            assert!(seen.first().is_some_and(|id| id.starts_with("ctl-")), "{seen:?}");
+            // A refusing binding stops it unsigned.
+            let (result, executes, seen) = submit_directed_once([0xd2; 32], transfer_bytes, true).await;
+            let text = format!("{:#}", result.unwrap_err());
+            assert!(text.contains("the binding refused"), "{text}");
+            assert_eq!((executes, seen.len()), (0, 1), "{text}");
+        }
+
+        #[tokio::test]
+        async fn drill_a_directed_command_id_is_exact_and_never_on_an_undirected_transaction() {
+            // Directed, but the ledger-service chose another command id: refused before the binding.
+            let (result, executes, seen) = submit_directed_once([0xd3; 32], |party, _| transfer_bytes(party, "send-transfer-1"), false).await;
+            let text = format!("{:#}", result.unwrap_err());
+            assert!(text.contains("command_id_mismatch"), "{text}");
+            assert_eq!((executes, seen.len()), (0, 0), "{text}");
+            // Undirected, with a directed id: the content check refuses it.
+            let seed = [0xd4; 32];
+            let (_, me) = link(seed).await;
+            let (_, req, expectation) = directed_transfer(&me);
+            let o = submit_linked(seed, req, expectation, |party| transfer_bytes(party, "ctl-01890a5d-ac96-774b-bcce-b302099a8057"), false, false).await;
+            refused_before_signing(&o, "reserved_command_id");
         }
     }
 }

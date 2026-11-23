@@ -52,6 +52,11 @@ pub const MAX_COUNTER_ENTRIES: usize = 65_536;
 pub const MAX_COMMAND_RECORDS: usize = 65_536;
 /// Largest control file read (32 MiB).
 const MAX_FILE_BYTES: u64 = 33_554_432;
+/// commands.json stays below this: past it, records that can no longer run go first, and a
+/// new record is refused.
+const COMMANDS_BUDGET_BYTES: usize = 16_777_216;
+/// How long past its expiry a record may go early to keep commands.json in its budget.
+const EARLY_PRUNE_SECS: i64 = 3_600;
 
 /// The base directory: `SILVANA_CONTROL_DIR`, else `$HOME/.silvana-agent`.
 pub fn base_dir(control_dir: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
@@ -425,16 +430,124 @@ struct PolicyFile {
     document_b64: String,
 }
 
-/// One controller command this agent saw, by id.
+/// Where one controller command stands in this agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandStatus {
+    /// Seen and kept; nothing was signed for it.
+    Received,
+    /// Its one attempt is recorded; once `signing` is set a signature may exist.
     Executing,
-    Done,
+    Executed,
     Refused,
     Failed,
 }
 
+impl CommandStatus {
+    /// Executed, refused or failed: settled for good.
+    pub fn is_final(self) -> bool {
+        matches!(self, Self::Executed | Self::Refused | Self::Failed)
+    }
+}
+
+/// One use to count against the daily caps once the command executed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandUsage {
+    pub bucket: String,
+    pub instrument_admin: String,
+    pub instrument_id: String,
+    /// Exact decimal.
+    pub amount: String,
+}
+
+/// The answer kept for a signed attempt whose transaction is never found.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandVerdict {
+    /// `Refused` or `Failed`.
+    pub status: CommandStatus,
+    pub code: u16,
+    /// Whether the ledger-service gave the code.
+    pub from_ledger: bool,
+}
+
+/// The quote a swap attempt settles, recorded before its signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapAttempt {
+    pub quote_id: String,
+    pub lp: String,
+    /// Exact decimals: the sold amount, the amount received before any fee, the CC fees.
+    pub sold: String,
+    pub received: String,
+    pub fee_cc: String,
+    /// The agent's own input holdings.
+    pub inputs: Vec<String>,
+    /// The quote's signed expiry, unix seconds.
+    pub valid_until: i64,
+}
+
+/// The one attempt of a command: what recovery needs after a crash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandAttempt {
+    /// The Canton command id, `ctl-<command_id>`.
+    pub canton_command_id: String,
+    /// The ledger end read before the attempt; recovery scans from here, and moves it past
+    /// what a cut scan covered.
+    pub ledger_offset: i64,
+    pub started_at: i64,
+    /// Set durably right before the signature.
+    #[serde(default)]
+    pub signing: bool,
+    #[serde(default)]
+    pub usage: Vec<CommandUsage>,
+    #[serde(default)]
+    pub verdict: Option<CommandVerdict>,
+    /// A swap's quote, set before its signature.
+    #[serde(default)]
+    pub swap: Option<SwapAttempt>,
+}
+
+/// The agent's signed receipt, kept so that a repost is byte-identical.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredReceipt {
+    pub bytes_b64: String,
+    /// 64 bytes as lowercase hex.
+    pub signature_hex: String,
+}
+
+impl StoredReceipt {
+    pub fn new(bytes: &[u8], signature: &[u8; 64]) -> Self {
+        Self {
+            bytes_b64: BASE64.encode(bytes),
+            signature_hex: hex::encode(signature),
+        }
+    }
+
+    /// The receipt bytes and the signature.
+    pub fn decode(&self) -> Result<(Vec<u8>, [u8; 64])> {
+        let bytes = BASE64
+            .decode(&self.bytes_b64)
+            .context("a stored receipt is not base64")?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(&self.signature_hex, &mut signature)
+            .context("a stored receipt signature is not 64 hex bytes")?;
+        Ok((bytes, signature))
+    }
+}
+
+/// How a command settled; the receipt is signed before the record is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandEnd {
+    Executed { update_id: String },
+    Refused { code: u16 },
+    Failed { code: u16 },
+}
+
+/// One controller command this agent saw, by id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRecord {
@@ -443,13 +556,35 @@ pub struct CommandRecord {
     /// Unix seconds.
     pub expires_at: i64,
     pub updated_at: i64,
+    /// The signed command, base64.
+    #[serde(default)]
+    pub canonical_b64: String,
+    #[serde(default)]
+    pub attempt: Option<CommandAttempt>,
     #[serde(default)]
     pub update_id: Option<String>,
+    #[serde(default)]
+    pub reason_code: Option<u16>,
+    #[serde(default)]
+    pub receipt: Option<StoredReceipt>,
     #[serde(default)]
     pub receipt_posted: bool,
 }
 
-/// The command ids this agent has used; each is used once.
+impl CommandRecord {
+    /// Whether a signature for it may exist.
+    pub fn may_be_signed(&self) -> bool {
+        self.attempt.as_ref().is_some_and(|a| a.signing)
+    }
+
+    /// Settled and delivered, or never begun, an hour past its expiry: it can no longer run.
+    fn prunable_early(&self, now: i64) -> bool {
+        let done = (self.status.is_final() && self.receipt_posted) || self.status == CommandStatus::Received;
+        done && self.expires_at.saturating_add(EARLY_PRUNE_SECS) < now
+    }
+}
+
+/// The commands this agent has seen; each runs at most one signed attempt.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandBook {
@@ -465,59 +600,260 @@ impl CommandBook {
         &self.commands
     }
 
-    /// Records `command_id` as executing; a known id is refused (single use).
-    pub fn begin(&mut self, command_id: &str, expires_at: i64, now: i64) -> Result<()> {
-        ensure!(
-            self.get(command_id).is_none(),
-            "command {command_id} was already used"
-        );
+    fn get_mut(&mut self, command_id: &str) -> Result<&mut CommandRecord> {
+        self.commands
+            .iter_mut()
+            .find(|c| c.command_id == command_id)
+            .ok_or_else(|| anyhow!("command {command_id} is not recorded"))
+    }
+
+    /// Keeps `command_id` with its signed bytes, once; the same id with other bytes is refused.
+    pub fn receive(
+        &mut self,
+        command_id: &str,
+        canonical: &[u8],
+        expires_at: i64,
+        now: i64,
+    ) -> Result<&CommandRecord> {
+        let encoded = BASE64.encode(canonical);
+        if let Some(at) = self.commands.iter().position(|c| c.command_id == command_id) {
+            let known = self
+                .commands
+                .get(at)
+                .ok_or_else(|| anyhow!("command {command_id} is not recorded"))?;
+            ensure!(
+                known.canonical_b64 == encoded,
+                "command {command_id} was already used for other bytes"
+            );
+            return Ok(known);
+        }
         ensure!(
             self.commands.len() < MAX_COMMAND_RECORDS,
             "too many command records"
         );
         self.commands.push(CommandRecord {
             command_id: command_id.to_string(),
-            status: CommandStatus::Executing,
+            status: CommandStatus::Received,
             expires_at,
             updated_at: now,
+            canonical_b64: encoded,
+            attempt: None,
             update_id: None,
+            reason_code: None,
+            receipt: None,
             receipt_posted: false,
         });
+        self.commands
+            .last()
+            .ok_or_else(|| anyhow!("command {command_id} is not recorded"))
+    }
+
+    /// Starts the one attempt of a received command (single use).
+    pub fn begin(&mut self, command_id: &str, attempt: CommandAttempt, now: i64) -> Result<()> {
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            record.status == CommandStatus::Received && record.attempt.is_none(),
+            "command {command_id} was already used"
+        );
+        record.status = CommandStatus::Executing;
+        record.attempt = Some(attempt);
+        record.updated_at = now;
         Ok(())
     }
 
+    /// Marks the attempt as signing, with the uses to count once it executed.
+    pub fn mark_signing(
+        &mut self,
+        command_id: &str,
+        usage: Vec<CommandUsage>,
+        now: i64,
+    ) -> Result<()> {
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            record.status == CommandStatus::Executing,
+            "command {command_id} is not executing"
+        );
+        let attempt = record
+            .attempt
+            .as_mut()
+            .ok_or_else(|| anyhow!("command {command_id} has no attempt"))?;
+        ensure!(!attempt.signing, "command {command_id} was signed already");
+        attempt.signing = true;
+        attempt.usage = usage;
+        record.updated_at = now;
+        Ok(())
+    }
+
+    /// Records the quote an executing swap is about to sign; never after its signature.
+    pub fn set_swap(&mut self, command_id: &str, swap: SwapAttempt, now: i64) -> Result<()> {
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            record.status == CommandStatus::Executing,
+            "command {command_id} is not executing"
+        );
+        let attempt = record
+            .attempt
+            .as_mut()
+            .ok_or_else(|| anyhow!("command {command_id} has no attempt"))?;
+        ensure!(!attempt.signing, "command {command_id} was signed already");
+        attempt.swap = Some(swap);
+        record.updated_at = now;
+        Ok(())
+    }
+
+    /// Keeps the answer to sign if the signed attempt is never found on the ledger.
+    pub fn set_verdict(&mut self, command_id: &str, verdict: CommandVerdict, now: i64) -> Result<()> {
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            record.status == CommandStatus::Executing,
+            "command {command_id} is not executing"
+        );
+        ensure!(
+            matches!(verdict.status, CommandStatus::Refused | CommandStatus::Failed),
+            "a verdict refuses or fails"
+        );
+        let attempt = record
+            .attempt
+            .as_mut()
+            .ok_or_else(|| anyhow!("command {command_id} has no attempt"))?;
+        attempt.verdict = Some(verdict);
+        record.updated_at = now;
+        Ok(())
+    }
+
+    /// Moves a signed attempt's scan start past what a scan covered without finding it.
+    pub fn advance_scan(&mut self, command_id: &str, offset: i64, now: i64) -> Result<()> {
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            record.status == CommandStatus::Executing && record.may_be_signed(),
+            "command {command_id} is not a signed attempt"
+        );
+        let attempt = record
+            .attempt
+            .as_mut()
+            .ok_or_else(|| anyhow!("command {command_id} has no attempt"))?;
+        if offset > attempt.ledger_offset {
+            attempt.ledger_offset = offset;
+            record.updated_at = now;
+        }
+        Ok(())
+    }
+
+    /// Ends an attempt that never reached its signature; the command is received again.
+    pub fn release(&mut self, command_id: &str, now: i64) -> Result<()> {
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            record.status == CommandStatus::Executing,
+            "command {command_id} is not executing"
+        );
+        ensure!(
+            !record.may_be_signed(),
+            "command {command_id} may be signed: it is only reconciled"
+        );
+        record.status = CommandStatus::Received;
+        record.attempt = None;
+        record.updated_at = now;
+        Ok(())
+    }
+
+    /// Settles a command with its signed receipt; a settled one never changes, and only
+    /// an attempt that may have been signed can have executed.
     pub fn finish(
         &mut self,
         command_id: &str,
-        status: CommandStatus,
-        update_id: Option<&str>,
+        end: &CommandEnd,
+        receipt: StoredReceipt,
         now: i64,
     ) -> Result<()> {
-        let record = self
-            .commands
-            .iter_mut()
-            .find(|c| c.command_id == command_id)
-            .ok_or_else(|| anyhow!("command {command_id} is not recorded"))?;
-        record.status = status;
-        record.update_id = update_id.map(str::to_string);
+        let record = self.get_mut(command_id)?;
+        ensure!(
+            !record.status.is_final(),
+            "command {command_id} is settled already"
+        );
+        match end {
+            CommandEnd::Executed { update_id } => {
+                ensure!(
+                    record.status == CommandStatus::Executing && record.may_be_signed(),
+                    "command {command_id} was never signed"
+                );
+                record.status = CommandStatus::Executed;
+                record.update_id = Some(update_id.clone());
+            }
+            CommandEnd::Refused { code } => {
+                record.status = CommandStatus::Refused;
+                record.reason_code = Some(*code);
+            }
+            CommandEnd::Failed { code } => {
+                record.status = CommandStatus::Failed;
+                record.reason_code = Some(*code);
+            }
+        }
+        record.receipt = Some(receipt);
         record.updated_at = now;
         Ok(())
     }
 
     pub fn mark_receipt_posted(&mut self, command_id: &str, now: i64) -> Result<()> {
-        let record = self
-            .commands
-            .iter_mut()
-            .find(|c| c.command_id == command_id)
-            .ok_or_else(|| anyhow!("command {command_id} is not recorded"))?;
+        let record = self.get_mut(command_id)?;
+        ensure!(record.receipt.is_some(), "command {command_id} has no receipt");
         record.receipt_posted = true;
         record.updated_at = now;
         Ok(())
     }
 
-    fn prune(&mut self, now: i64) {
+    /// Records whose attempt is in flight or must be reconciled.
+    pub fn executing(&self) -> impl Iterator<Item = &CommandRecord> {
         self.commands
-            .retain(|c| c.expires_at.saturating_add(COMMAND_RETENTION_SECS) > now);
+            .iter()
+            .filter(|c| c.status == CommandStatus::Executing)
+    }
+
+    /// Settled records whose receipt the rpc has not taken yet.
+    pub fn unposted(&self) -> impl Iterator<Item = &CommandRecord> {
+        self.commands
+            .iter()
+            .filter(|c| c.status.is_final() && !c.receipt_posted)
+    }
+
+    /// Drops records a week past expiry; one still executing is kept until it settles.
+    fn prune(&mut self, now: i64) {
+        self.commands.retain(|c| {
+            c.status == CommandStatus::Executing
+                || c.expires_at.saturating_add(COMMAND_RETENTION_SECS) > now
+        });
+    }
+
+    /// The book as JSON; past `budget`, records that can no longer run go first, oldest first.
+    fn encode_within(&mut self, now: i64, budget: usize) -> Result<Vec<u8>> {
+        let json = serde_json::to_vec_pretty(self)?;
+        let mut over = json.len().saturating_sub(budget);
+        if over == 0 {
+            return Ok(json);
+        }
+        let mut candidates: Vec<(i64, usize, usize)> = Vec::new();
+        for (at, record) in self.commands.iter().enumerate() {
+            if record.prunable_early(now) {
+                let alone = serde_json::to_vec_pretty(record)?;
+                // Nested in the book, each line is indented four more spaces.
+                let lines = alone.iter().filter(|b| **b == b'\n').count().saturating_add(1);
+                let size = alone.len().saturating_add(lines.saturating_mul(4)).saturating_add(2);
+                candidates.push((record.updated_at, at, size));
+            }
+        }
+        candidates.sort_unstable();
+        let mut dropped = vec![false; self.commands.len()];
+        for (_, at, size) in candidates {
+            if over == 0 {
+                break;
+            }
+            if let Some(flag) = dropped.get_mut(at) {
+                *flag = true;
+            }
+            over = over.saturating_sub(size);
+        }
+        let mut flags = dropped.into_iter();
+        self.commands.retain(|_| !flags.next().unwrap_or(false));
+        Ok(serde_json::to_vec_pretty(self)?)
     }
 }
 
@@ -1075,6 +1411,12 @@ impl ControlStore {
         Ok(signed)
     }
 
+    /// Reads commands.json under the lock.
+    pub fn commands(&self, lock: &ControlLock) -> Result<CommandBook> {
+        self.check_lock(lock)?;
+        Ok(read_json(&self.path(COMMANDS_FILE))?.unwrap_or_default())
+    }
+
     /// Reads and updates commands.json under the lock, pruning old records.
     pub fn update_commands<T>(
         &self,
@@ -1082,12 +1424,32 @@ impl ControlStore {
         now: i64,
         f: impl FnOnce(&mut CommandBook) -> Result<T>,
     ) -> Result<T> {
+        self.update_commands_within(lock, now, COMMANDS_BUDGET_BYTES, f)
+    }
+
+    /// [`Self::update_commands`] with commands.json kept within `budget` bytes, as far as
+    /// records that can no longer run allow; past it a new record is refused.
+    fn update_commands_within<T>(
+        &self,
+        lock: &ControlLock,
+        now: i64,
+        budget: usize,
+        f: impl FnOnce(&mut CommandBook) -> Result<T>,
+    ) -> Result<T> {
         self.check_lock(lock)?;
         let path = self.path(COMMANDS_FILE);
         let mut book: CommandBook = read_json(&path)?.unwrap_or_default();
         book.prune(now);
+        let before = book.commands.len();
         let out = f(&mut book)?;
-        save_json(&path, &book)?;
+        let added = book.commands.len() > before;
+        let json = book.encode_within(now, budget)?;
+        ensure!(
+            !added || json.len() <= budget,
+            "{} is full: no new command is kept until older ones expire",
+            path.display()
+        );
+        save_bytes(&path, &json)?;
         Ok(out)
     }
 
@@ -1201,13 +1563,23 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 
 /// Writes `value` to `path` atomically and durably, mode 0600 in a 0700 directory.
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let json = serde_json::to_vec_pretty(value)?;
+    save_bytes(path, &json)
+}
+
+/// [`save_json`] of encoded bytes; what could not be read back is never written.
+fn save_bytes(path: &Path, json: &[u8]) -> Result<()> {
+    ensure!(
+        u64::try_from(json.len()).is_ok_and(|n| n <= MAX_FILE_BYTES),
+        "{} would be too large to read back; nothing was written",
+        path.display()
+    );
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     create_private_dir(dir)?;
-    let json = serde_json::to_vec_pretty(value)?;
-    replace_file(path, &json, FileMode::Exactly(0o600))
+    replace_file(path, json, FileMode::Exactly(0o600))
 }
 
 /// Replaces `path` with `bytes` atomically and durably (temp file, fsync, rename, directory
@@ -1500,9 +1872,8 @@ pub mod testing {
             use ed25519_dalek::Signer;
             let mut now = self.tick();
             if !self.state.controllers().any(|c| c.is_effective_at(now)) {
-                now = now
-                    .checked_add_secs(i64::try_from(agent_control::CONTROLLER_CHANGE_DELAY_SECS)?)
-                    .context("time")?;
+                let delay = agent_control::controller_change_delay_secs(self.state.network());
+                now = now.checked_add_secs(i64::try_from(delay)?).context("time")?;
                 self.created_at = now;
             }
             let latest = self.state.latest_policy();
@@ -1744,27 +2115,116 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    fn attempt(offset: i64) -> CommandAttempt {
+        CommandAttempt {
+            canton_command_id: "ctl-c1".into(),
+            ledger_offset: offset,
+            started_at: 100,
+            signing: false,
+            usage: Vec::new(),
+            verdict: None,
+            swap: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_swap_quote_is_kept_only_before_the_signature() {
+        let base = temp_dir("swap-attempt");
+        let store = store(&base);
+        let lock = store.lock().await.unwrap();
+        let swap = |quote: &str| SwapAttempt {
+            quote_id: quote.into(),
+            lp: "lp::1220aa".into(),
+            sold: "10".into(),
+            received: "2.5".into(),
+            fee_cc: "0".into(),
+            inputs: vec!["h1".into()],
+            valid_until: 900,
+        };
+        store.update_commands(&lock, 100, |b| b.receive("c1", b"cmd", 1000, 100).map(|_| ())).unwrap();
+        assert!(store.update_commands(&lock, 100, |b| b.set_swap("c1", swap("q0"), 100)).is_err(), "not executing");
+        store.update_commands(&lock, 101, |b| b.begin("c1", attempt(7), 101)).unwrap();
+        store.update_commands(&lock, 101, |b| b.set_swap("c1", swap("q1"), 101)).unwrap();
+        // A re-quote before the signature replaces it; a release drops it with the attempt.
+        store.update_commands(&lock, 102, |b| b.set_swap("c1", swap("q2"), 102)).unwrap();
+        store.update_commands(&lock, 103, |b| b.mark_signing("c1", Vec::new(), 103)).unwrap();
+        let err = store.update_commands(&lock, 104, |b| b.set_swap("c1", swap("q3"), 104)).unwrap_err();
+        assert!(err.to_string().contains("signed already"), "{err}");
+        let record = store.commands(&lock).unwrap().get("c1").cloned().unwrap();
+        assert_eq!(record.attempt.and_then(|a| a.swap).map(|s| s.quote_id), Some("q2".to_string()));
+        // An attempt written before swaps were recorded still reads.
+        let old = r#"{"canton_command_id":"ctl-c1","ledger_offset":7,"started_at":100,"signing":true}"#;
+        assert_eq!(serde_json::from_str::<CommandAttempt>(old).unwrap().swap, None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn command_ids_single_use() {
         let base = temp_dir("commands");
         let store = store(&base);
         let lock = store.lock().await.unwrap();
-        store.update_commands(&lock, 100, |b| b.begin("c1", 1000, 100)).unwrap();
-        let err = store.update_commands(&lock, 101, |b| b.begin("c1", 1000, 101)).unwrap_err();
+        store.update_commands(&lock, 100, |b| b.receive("c1", b"cmd", 1000, 100).map(|_| ())).unwrap();
+        let err = store.update_commands(&lock, 100, |b| b.receive("c1", b"other", 1000, 100).map(|_| ())).unwrap_err();
+        assert!(err.to_string().contains("other bytes"), "{err}");
+        store.update_commands(&lock, 101, |b| b.begin("c1", attempt(7), 101)).unwrap();
+        let err = store.update_commands(&lock, 101, |b| b.begin("c1", attempt(8), 101)).unwrap_err();
         assert!(err.to_string().contains("already used"), "{err}");
-        store
-            .update_commands(&lock, 102, |b| b.finish("c1", CommandStatus::Done, Some("u1"), 102))
-            .unwrap();
-        store.update_commands(&lock, 103, |b| b.mark_receipt_posted("c1", 103)).unwrap();
-        let record = store
-            .update_commands(&lock, 104, |b| Ok(b.get("c1").cloned()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.status, CommandStatus::Done);
-        assert!(record.receipt_posted);
+        // An attempt that never reached its signature is received again; a signing one is not.
+        store.update_commands(&lock, 102, |b| b.release("c1", 102)).unwrap();
+        store.update_commands(&lock, 102, |b| b.begin("c1", attempt(9), 102)).unwrap();
+        let usage = vec![CommandUsage {
+            bucket: "transfers".into(),
+            instrument_admin: "dso::1220aa".into(),
+            instrument_id: "Amulet".into(),
+            amount: "10".into(),
+        }];
+        store.update_commands(&lock, 103, |b| b.mark_signing("c1", usage.clone(), 103)).unwrap();
+        let err = store.update_commands(&lock, 103, |b| b.release("c1", 103)).unwrap_err();
+        assert!(err.to_string().contains("only reconciled"), "{err}");
+        assert!(store.update_commands(&lock, 103, |b| b.mark_signing("c1", Vec::new(), 103)).is_err());
+        let receipt = StoredReceipt::new(b"receipt", &[5u8; 64]);
+        let executed = CommandEnd::Executed { update_id: "u1".into() };
+        store.update_commands(&lock, 104, |b| b.finish("c1", &executed, receipt.clone(), 104)).unwrap();
+        let failed = CommandEnd::Failed { code: 1409 };
+        let err = store.update_commands(&lock, 105, |b| b.finish("c1", &failed, receipt.clone(), 105)).unwrap_err();
+        assert!(err.to_string().contains("settled already"), "{err}");
+        let book = store.commands(&lock).unwrap();
+        assert_eq!(book.unposted().count(), 1);
+        store.update_commands(&lock, 106, |b| b.mark_receipt_posted("c1", 106)).unwrap();
+        let record = store.commands(&lock).unwrap().get("c1").cloned().unwrap();
+        assert_eq!(record.status, CommandStatus::Executed);
+        assert_eq!(record.update_id.as_deref(), Some("u1"));
+        assert_eq!(record.attempt.as_ref().map(|a| (a.ledger_offset, a.usage.clone())), Some((9, usage)));
+        assert!(record.receipt_posted && record.may_be_signed());
+        assert_eq!(record.receipt.unwrap().decode().unwrap(), (b"receipt".to_vec(), [5u8; 64]));
         // Seven days after expiry the record is pruned.
         let later = 1000 + COMMAND_RETENTION_SECS;
         assert!(store.update_commands(&lock, later, |b| Ok(b.get("c1").is_none())).unwrap());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn only_a_signed_attempt_executes_and_an_executing_one_is_never_pruned() {
+        let base = temp_dir("commands-exec");
+        let store = store(&base);
+        let lock = store.lock().await.unwrap();
+        let receipt = StoredReceipt::new(b"r", &[1u8; 64]);
+        let executed = CommandEnd::Executed { update_id: "u".into() };
+        store.update_commands(&lock, 100, |b| b.receive("c1", b"cmd", 1000, 100).map(|_| ())).unwrap();
+        let err = store.update_commands(&lock, 100, |b| b.finish("c1", &executed, receipt.clone(), 100)).unwrap_err();
+        assert!(err.to_string().contains("never signed"), "{err}");
+        store.update_commands(&lock, 101, |b| b.begin("c1", attempt(1), 101)).unwrap();
+        let verdict = CommandVerdict { status: CommandStatus::Refused, code: 4124, from_ledger: true };
+        store.update_commands(&lock, 101, |b| b.set_verdict("c1", verdict.clone(), 101)).unwrap();
+        let executed_verdict = CommandVerdict { status: CommandStatus::Executed, ..verdict };
+        assert!(store.update_commands(&lock, 101, |b| b.set_verdict("c1", executed_verdict, 101)).is_err());
+        let later = 1000 + COMMAND_RETENTION_SECS;
+        let kept = store.update_commands(&lock, later, |b| Ok(b.executing().count())).unwrap();
+        assert_eq!(kept, 1);
+        // A refusal settles from either open state.
+        store.update_commands(&lock, later, |b| b.finish("c1", &CommandEnd::Refused { code: 1106 }, receipt, later)).unwrap();
+        let record = store.commands(&lock).unwrap().get("c1").cloned().unwrap();
+        assert_eq!((record.status, record.reason_code), (CommandStatus::Refused, Some(1106)));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -2027,5 +2487,56 @@ mod tests {
         let churn = TestChain::churn(SEED, &party, Network::Devnet, 40).unwrap();
         assert_eq!(churn.entries.len(), 81, "past the controller cap: every grant is withdrawn");
         assert!(agent_control::verify_log(Network::Devnet, &party, &churn.entries).is_ok());
+    }
+
+    #[tokio::test]
+    async fn commands_json_stays_within_its_budget_and_readable() {
+        let base = temp_dir("commands-budget");
+        let store = store(&base);
+        let lock = store.lock().await.unwrap();
+        let (big, budget) = (vec![7u8; 3000], 64 * 1024);
+        let receipt = StoredReceipt::new(&[1u8; 2000], &[2u8; 64]);
+        let refused = CommandEnd::Refused { code: 1104 };
+        // Settled, delivered and expired an hour ago: they go first, oldest first.
+        for i in 0..40i64 {
+            let id = format!("old{i:02}");
+            store
+                .update_commands_within(&lock, 10_000, budget, |b| {
+                    b.receive(&id, &big, 1_000, 1_000 + i)?;
+                    b.finish(&id, &refused, receipt.clone(), 1_000 + i)?;
+                    b.mark_receipt_posted(&id, 1_000 + i)
+                })
+                .unwrap();
+        }
+        let size = || fs::metadata(store.path(COMMANDS_FILE)).unwrap().len();
+        let book = store.commands(&lock).unwrap();
+        assert!(book.get("old39").is_some() && book.get("old00").is_none(), "the oldest went first");
+        assert!(size() <= budget as u64, "{}", size());
+        // A record that may still run is never dropped: past the budget a new one is refused,
+        // nothing is written, and the book stays readable and settles.
+        let mut full = None;
+        for i in 0..40 {
+            let id = format!("live{i:02}");
+            let kept = store.update_commands_within(&lock, 10_000, budget, |b| b.receive(&id, &big, 20_000, 10_000).map(|_| ()));
+            if let Err(e) = kept {
+                full = Some((id, e.to_string()));
+                break;
+            }
+        }
+        let (id, err) = full.expect("a new record is refused past the budget");
+        assert!(err.contains("is full"), "{err}");
+        let book = store.commands(&lock).unwrap();
+        assert!(book.get(&id).is_none() && book.get("live00").is_some());
+        assert!(book.records().iter().all(|r| r.command_id.starts_with("live")), "every settled one made room first");
+        store
+            .update_commands_within(&lock, 10_001, budget, |b| b.finish("live00", &refused, receipt.clone(), 10_001))
+            .unwrap();
+        assert_eq!(store.commands(&lock).unwrap().get("live00").map(|r| r.status), Some(CommandStatus::Refused));
+        // What could not be read back is never written.
+        let huge = vec![b' '; usize::try_from(MAX_FILE_BYTES).unwrap() + 1];
+        assert!(save_bytes(&store.path(COUNTERS_FILE), &huge).is_err());
+        assert!(!store.path(COUNTERS_FILE).exists());
+        drop(lock);
+        let _ = fs::remove_dir_all(&base);
     }
 }

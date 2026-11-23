@@ -358,7 +358,7 @@ mod tests {
     use crate::controller::{CapabilitySet, ControllerDescriptor};
     use crate::link::{LinkDescriptor, LinkPurpose};
     use crate::party::namespace_for_key;
-    use crate::testkit::{self, DAY, at};
+    use crate::testkit::{self, DAY, DEVNET_DELAY, at};
     use ::p256::ecdsa::signature::Signer as _;
     use ::p256::ecdsa::{Signature, SigningKey};
 
@@ -484,8 +484,9 @@ mod tests {
             name(&f.request(&[0, 3], now, 600), now),
             "signer_lacks_read"
         );
+        let pending = at(DEVNET_DELAY - 1);
         assert_eq!(
-            name(&f.request(&[0], now, 600), at(DAY - 1)),
+            name(&f.request(&[0], pending, 600), pending),
             "signer_lacks_read"
         );
         let mut stranger = f.request(&[0], now, 600);

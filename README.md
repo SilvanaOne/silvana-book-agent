@@ -43,12 +43,12 @@ Check the starter `agent.toml` before running `agent`: a `[liquidity_provider]` 
 
 ```bash
 cloud-agent onboard \
+  --network devnet \
   --agent-name my-agent \
-  --email me@example.com \
   --invite-code INVITE1
 ```
 
-Default RPC is `https://orderbook-devnet.silvana.dev:443` — override with `--rpc`.
+`--network` picks the rpc: `mainnet` (the default) is `https://orderbook-mainnet.silvana.dev:443`, `devnet` is `https://orderbook-devnet.silvana.dev:443`. `testnet` is refused before anything is written, because it has no rpc yet. Onboarding also refuses an rpc whose agent configuration names another `CANTON_CHAIN` than the chosen network. No email is sent: it comes from the account that owns the invite code, and an older command that still passes `--email` works, with a notice that the flag is ignored.
 
 ### Faucet (devnet top-up)
 
@@ -437,7 +437,7 @@ The `onboard` command performs 11 steps automatically:
 
 1. Load an Ed25519 key (from `--private-key`, a prompt, or `.env`) or generate one; only a generated key is written to `.env` as `PARTY_AGENT_PRIVATE_KEY`.
 2. Connect to the orderbook RPC (raw gRPC, no auth yet).
-3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`.
+3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`; `PARTY_FEE` and `PARTY_PREPAID_TRAFFIC` are written only where none is set, and never replaced.
 4. Register on the waiting list (`RegisterAgent`, signed).
 5. Poll for `SIGNATURE_REQUIRED` status.
 6. Fetch and sign the Canton topology multihash.
@@ -451,9 +451,8 @@ Flags:
 
 | Flag                     | Description                                      |
 | ------------------------ | ------------------------------------------------ |
-| `--rpc <URL>`            | Orderbook gRPC endpoint (default devnet)         |
+| `--network <NETWORK>`    | `mainnet` (default) or `devnet`; `testnet` is refused, it has no rpc yet |
 | `--agent-name <NAME>`    | Display name (required)                          |
-| `--email <EMAIL>`        | Contact email (required)                         |
 | `--invite-code <CODE>`   | Waiting list invite code (required)              |
 | `--party <ID>`           | Skip the waiting list; prompts for the private key when none is configured |
 | `--private-key <B58>`    | Base58 Ed25519 private key for `--party` (optional in a terminal — prompted, input hidden) |
@@ -503,6 +502,8 @@ cloud-agent --quote-private-key <HEX> agent
 | `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
 | `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
 | `PARTY_ORDERBOOK_FEE`            | Orderbook fee collection party                                         |         yes          |
+| `PARTY_FEE`                      | Platform fee party: once linked, the agent pays fees, a swap quote's fee included, only to this party, and refuses them while it is unset (see [docs/control.md](docs/control.md#platform-parties)) | once, when unset |
+| `PARTY_PREPAID_TRAFFIC`          | Prepaid traffic party: once linked, the agent tops up prepaid traffic only to this party, and refuses top-ups while it is unset | once, when unset |
 | `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`; a finite number)        |          no          |
 | `MERGE_THRESHOLD`                | Merge worker triggers when selectable amulets exceed this count        |         yes          |
 | `MERGE_MAX_AMULETS`              | Max amulets merged per round (default: `100`)                          |         yes          |
@@ -610,6 +611,23 @@ settle_before_secs = 1800
 - No grid/limit orders are placed; `[[markets.bid_levels]]`/`[[markets.offer_levels]]` are ignored (keep them in the file for easy rollback). The startup cancel-all still runs, so flipping the switch on and restarting clears any resting orders.
 - The mid-price poller, balance refresh, and the settlement subscription keep running. **V1 transition behavior:** an in-flight V1 DVP that still needs *this agent's* fee or allocation steps is **actively cancelled server-side on encounter** — reservations released and the counterparty notified within one poll cycle, instead of stranding until deadline expiry (without live V1-stream registration the server's fee gate would classify the agent as a regular user and the DVP could never complete). One this agent has already allocated for is left alone and can still settle via the operator. Leftover on-chain DvpProposals are reaped by the DvpProposal GC; the counterparty's already-paid fees are not refunded — still prefer flipping during a quiet V1 window.
 - Startup fails loudly unless `[liquidity_provider.rfq_v2].enabled = true` and at least one enabled market has `[markets.rfq.v2].enabled = true`; a failed RFQ V2 setup is also fatal in this mode (nothing left to quote). `--orders-only` conflicts with it.
+
+**`[control]` and `[vetted_packages]`** apply to an agent linked to controllers (see [docs/control.md](docs/control.md)). Both are optional. They are read strictly: an unknown key or a value out of range stops startup with a message naming the section and the key. The running agent logs both at startup and reads them only then, so restart it after a change; each `control` command reads them when it runs.
+
+```toml
+[control]
+auto_execute_commands = false   # run pending direct commands without a prompt (default false)
+auto_accept_policies = true     # accept valid pending policies without a prompt (default true)
+swap_max_deviation_bps = 100    # largest gap between a swap's price and the reference mid; 0 turns it off; at most 10000
+
+[vetted_packages]
+mode = "selected"               # or "all", with no packages key (the default)
+packages = [
+  "<64 lowercase hex package id>", # name version
+]
+```
+
+`selected` takes 1 to 256 different package ids. The Agent page's Packages tab copies this section for you. The agent does not enforce this section yet. What binds is the packages rule of the agent's signed policy: the agent checks it before it signs the transaction of a direct command, and the ledger service can refuse a transaction that uses a package outside it.
 
 ### Grid Orders
 
@@ -723,6 +741,17 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `sign message --input <TEXT>`                                                                 | Sign a UTF-8 text message                               |
 | `sign binary --input <HEX>`                                                                   | Sign hex-encoded binary data                            |
 | `usdcx status` / `usdcx onboard` / `usdcx deposit` / `usdcx mint` / `usdcx burn` / `usdcx track` | USDCx bridge (see below)                             |
+| `control link --code <LNK-…>` / `control add` / `control remove` / `control capabilities`     | Link the agent with a link code, and change its controllers. The Agent page makes no link code for an existing agent yet: a new agent links during `onboard` with an `AGT-<invite>-<link>` code |
+| `control show [--offline] [--json]`                                                           | Controllers, pending changes, policy, log head, marker  |
+| `control policy show [--pending]` / `control policy accept [--hash <H>]`                      | Show the policy; accept a pending one                   |
+| `control commands` / `control execute --code CMD-<id>`                                        | List the pending direct commands; run one               |
+| `control sync` / `control restore` / `control discard-pending`                                | Keep the local control log and the rpc's copy in step   |
+| `controller keygen --dir <DIR>` / `controller sign --key <FILE> --network <NET> …`            | Ed25519 controller key: create it, sign a document (offline) |
+| `controller status` / `log` / `holdings` / `traffic` / `activity` / `ledger` / `packages` / `commands` | Read a linked agent with an Ed25519 controller key |
+| `controller policy show [--rules]` / `controller policy set …`                                | Show or sign the agent's policy                         |
+| `controller command transfer-cc` / `transfer-token` / `swap` / `show --code CMD-<id>`         | Sign a direct command, or follow one to its receipt     |
+
+The `control` and `controller` commands are described in [docs/control.md](docs/control.md).
 
 ### USDCx bridge (Ethereum USDC ⇄ Canton USDCx)
 

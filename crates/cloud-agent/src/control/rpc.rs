@@ -12,11 +12,12 @@ use agent_logic::control_store::{ControlLock, ControlStore};
 use anyhow::{Result, anyhow, bail};
 use orderbook_proto::orderbook::agent_control_agent_service_client::AgentControlAgentServiceClient;
 use orderbook_proto::orderbook::{
-    AppendControlEntriesRequest, AppendControlEntriesResponse, ControlHead, ControlHeartbeat,
-    ControlLinkPurpose, ControlLinkStatus, ControlLogEntry, ControlPolicyDocument,
-    ControlVerification, GetAgentControlLogRequest, GetAgentControlLogResponse,
-    GetControlDescriptorRequest, GetControlDescriptorResponse, ListPendingControlRequest,
-    ListPendingControlResponse,
+    AckPolicyRequest, AckPolicyResponse, AppendControlEntriesRequest, AppendControlEntriesResponse,
+    ControlHead, ControlHeartbeat, ControlLinkPurpose, ControlLinkStatus, ControlLogEntry,
+    ControlPolicyDocument, ControlPolicyView, ControlVerification, GetAgentControlLogRequest,
+    GetAgentControlLogResponse, GetControlDescriptorRequest, GetControlDescriptorResponse,
+    GetPolicyRequest, GetPolicyResponse, ListPendingControlRequest, ListPendingControlResponse,
+    PostReceiptRequest, PostReceiptResponse,
 };
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
@@ -74,6 +75,27 @@ impl ServerTime for AppendControlEntriesResponse {
 impl ServerTime for ListPendingControlResponse {
     fn server_time(&self) -> Option<&prost_types::Timestamp> {
         self.server_time.as_ref()
+    }
+}
+
+/// No time field: the `date` header is read instead.
+impl ServerTime for GetPolicyResponse {
+    fn server_time(&self) -> Option<&prost_types::Timestamp> {
+        None
+    }
+}
+
+/// No time field: the `date` header is read instead.
+impl ServerTime for AckPolicyResponse {
+    fn server_time(&self) -> Option<&prost_types::Timestamp> {
+        None
+    }
+}
+
+/// No time field: the `date` header is read instead.
+impl ServerTime for PostReceiptResponse {
+    fn server_time(&self) -> Option<&prost_types::Timestamp> {
+        None
     }
 }
 
@@ -570,6 +592,47 @@ impl ControlRpc {
         let request = self.request(ListPendingControlRequest {})?;
         let mut client = self.client();
         self.call(client.list_pending_control(request)).await
+    }
+
+    /// The policy stored under `policy_hash`; only its document and proof are trusted,
+    /// after re-hashing.
+    pub async fn policy(&self, policy_hash: &Hash32) -> Result<ControlPolicyView, RpcError> {
+        let request = self.request(GetPolicyRequest { policy_hash: policy_hash.to_string() })?;
+        let mut client = self.client();
+        let response = self.call(client.get_policy(request)).await?;
+        let view = response
+            .policy
+            .ok_or_else(|| RpcError::Refused { code: None, status: "the rpc returned no policy".into() })?;
+        if document_hash(&view.document) != *policy_hash {
+            return Err(RpcError::Refused {
+                code: None,
+                status: format!("the policy the rpc returned does not hash to {policy_hash}"),
+            });
+        }
+        Ok(view)
+    }
+
+    /// Answers a pending policy with the agent's signed refusal receipt.
+    pub async fn ack_policy(
+        &self,
+        policy_hash: &Hash32,
+        receipt: Vec<u8>,
+        signature: [u8; 64],
+    ) -> Result<AckPolicyResponse, RpcError> {
+        let request = self.request(AckPolicyRequest {
+            policy_hash: policy_hash.to_string(),
+            receipt,
+            signature: signature.to_vec(),
+        })?;
+        let mut client = self.client();
+        self.call(client.ack_policy(request)).await
+    }
+
+    /// Delivers the agent's signed receipt for a command.
+    pub async fn post_receipt(&self, receipt: Vec<u8>, signature: [u8; 64]) -> Result<PostReceiptResponse, RpcError> {
+        let request = self.request(PostReceiptRequest { receipt, signature: signature.to_vec() })?;
+        let mut client = self.client();
+        self.call(client.post_receipt(request)).await
     }
 }
 

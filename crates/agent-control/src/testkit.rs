@@ -170,6 +170,10 @@ pub(crate) fn invite_descriptor() -> LinkDescriptor {
 
 pub(crate) const T0: &str = "2026-11-22T12:00:00Z";
 pub(crate) const DAY: i64 = 86_400;
+/// The controller-change delay of the devnet test chains.
+pub(crate) const DEVNET_DELAY: i64 = 3_600;
+/// The controller-change delay on mainnet.
+pub(crate) const MAINNET_DELAY: i64 = 86_400;
 
 pub(crate) fn t(s: &str) -> UtcTime {
     UtcTime::parse(s).unwrap()
@@ -185,11 +189,11 @@ pub(crate) fn rp() -> RpPolicy {
 }
 
 pub(crate) fn empty_state() -> ControlState {
-    ControlState::empty(
-        Network::Devnet,
-        agent_party(),
-        agent_key().verifying_key().to_bytes(),
-    )
+    empty_state_on(Network::Devnet)
+}
+
+pub(crate) fn empty_state_on(network: Network) -> ControlState {
+    ControlState::empty(network, agent_party(), agent_key().verifying_key().to_bytes())
 }
 
 pub(crate) fn ed25519_id(start: u8) -> ControllerId {
@@ -205,8 +209,16 @@ pub(crate) fn passkey_id() -> ControllerId {
 
 /// A `link` descriptor for this agent, expiring a week after `T0`.
 pub(crate) fn link_descriptor(controllers: Vec<ControllerDescriptor>, nonce: u8) -> LinkDescriptor {
+    link_descriptor_on(Network::Devnet, controllers, nonce)
+}
+
+pub(crate) fn link_descriptor_on(
+    network: Network,
+    controllers: Vec<ControllerDescriptor>,
+    nonce: u8,
+) -> LinkDescriptor {
     LinkDescriptor::new(
-        Network::Devnet,
+        network,
         LinkPurpose::Link,
         OwnerAccount::new(42).unwrap(),
         Some(agent_party()),
@@ -290,11 +302,31 @@ pub(crate) struct Chain {
 
 impl Chain {
     pub(crate) fn new() -> Self {
+        Self::new_on(Network::Devnet)
+    }
+
+    pub(crate) fn new_on(network: Network) -> Self {
         Self {
-            state: empty_state(),
+            state: empty_state_on(network),
             entries: Vec::new(),
             docs: PolicyDocuments::new(),
         }
+    }
+
+    /// Linked at `T0` on `network`, by Ed25519 0x21 holding every capability.
+    pub(crate) fn linked_on(network: Network) -> Self {
+        let mut chain = Self::new_on(network);
+        let controllers = vec![ed25519_controller(CapabilitySet::ALL)];
+        let descriptor = link_descriptor_on(network, controllers, 0x44);
+        let bytes = descriptor.encode().unwrap();
+        let commitment = descriptor.commitment().unwrap();
+        let rp = RpPolicy::for_network(network);
+        let pending = chain
+            .builder()
+            .link(&bytes, &commitment, &rp, false, at(0))
+            .unwrap();
+        chain.push(&pending);
+        chain
     }
 
     /// Onboarded from the invite at `T0`: passkey (policy, direct) and Ed25519 0x21 (read).
@@ -326,7 +358,7 @@ impl Chain {
     }
 
     pub(crate) fn log(&self) -> VerifiedLog {
-        verify_log(Network::Devnet, &agent_party(), &self.entries).unwrap()
+        verify_log(self.state.network(), &agent_party(), &self.entries).unwrap()
     }
 
     pub(crate) fn replayed(&self) -> ControlState {

@@ -17,10 +17,11 @@ use agent_logic::control_store::{ControlEnv, ControlMarker, ControlStore, MARKER
 use agent_logic::control_store::testing::{TestChain, party_for};
 use agent_logic::secret::Secret;
 use orderbook_proto::orderbook::{
-    AppendControlEntriesRequest, AppendControlEntriesResponse, ControlHead, ControlLinkPurpose,
-    ControlLinkStatus, ControlLogEntry, ControlVerification, GetAgentControlLogRequest,
-    GetAgentControlLogResponse, GetControlDescriptorRequest, GetControlDescriptorResponse,
-    ListPendingControlRequest, ListPendingControlResponse,
+    AckPolicyRequest, AckPolicyResponse, AppendControlEntriesRequest, AppendControlEntriesResponse,
+    ControlHead, ControlLinkPurpose, ControlLinkStatus, ControlLogEntry, ControlPolicyStatus,
+    ControlVerification, GetAgentControlLogRequest, GetAgentControlLogResponse,
+    GetControlDescriptorRequest, GetControlDescriptorResponse, ListPendingControlRequest,
+    ListPendingControlResponse, PostReceiptRequest, PostReceiptResponse,
 };
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::http;
@@ -175,6 +176,20 @@ impl<Q: Send + 'static, R: Send + 'static> tonic::server::UnaryService<Q> for Un
     }
 }
 
+/// A unary call that needs no token, such as GetAgentConfig.
+struct Open<R> {
+    reply: Result<R, Status>,
+}
+
+impl<Q: Send + 'static, R: Send + 'static> tonic::server::UnaryService<Q> for Open<R> {
+    type Response = R;
+    type Future = tonic::codegen::BoxFuture<Response<R>, Status>;
+    fn call(&mut self, _request: tonic::Request<Q>) -> Self::Future {
+        let reply = std::mem::replace(&mut self.reply, Err(Status::internal("answered")));
+        Box::pin(async move { reply.map(Response::new) })
+    }
+}
+
 // ---- the fake rpc ----
 
 /// What the fake holds and how it answers.
@@ -211,6 +226,16 @@ pub(crate) struct FakeState {
     pub calls: Vec<String>,
     /// Each handled call's method and the head its token claimed.
     pub claims: Vec<(String, Option<HeadRef>)>,
+    /// Pending policies by hash, with the party each belongs to.
+    pub policies: BTreeMap<String, PartyId>,
+    /// Commands by id: the party and the command bytes.
+    pub commands: BTreeMap<String, (PartyId, Vec<u8>)>,
+    /// The refusal receipts AckPolicy took, by policy hash.
+    pub acks: Vec<(String, Vec<u8>)>,
+    /// The receipts PostReceipt took, by command id.
+    pub receipts: Vec<(String, Vec<u8>)>,
+    /// The env GetAgentConfig answers with; none answers Unimplemented.
+    pub agent_env: Option<String>,
 }
 
 pub(crate) type Shared = Arc<Mutex<FakeState>>;
@@ -220,6 +245,32 @@ struct FakeService(Shared);
 
 impl tonic::server::NamedService for FakeService {
     const NAME: &'static str = "silvana.orderbook.v1.AgentControlAgentService";
+}
+
+/// The same fake under the ledger-service's name, for GetAgentConfig.
+#[derive(Clone)]
+struct FakeDapp(FakeService);
+
+impl tonic::server::NamedService for FakeDapp {
+    const NAME: &'static str = "silvana.ledger.v1.DAppProviderService";
+}
+
+impl<B> tonic::codegen::Service<http::Request<B>> for FakeDapp
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Infallible>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        self.0.call(req)
+    }
 }
 
 fn http_date(offset: i64) -> String {
@@ -524,6 +575,55 @@ fn append(state: &mut FakeState, caller: Caller, request: AppendControlEntriesRe
     })
 }
 
+/// AckPolicy as the rpc checks it: a policy of the caller, and a v1 refusal receipt with the
+/// policy as its subject, signed by the caller's key.
+fn ack_policy(state: &mut FakeState, caller: Caller, request: AckPolicyRequest) -> Result<AckPolicyResponse, Status> {
+    use agent_control::{Hash32, Receipt, ReceiptSubject};
+    note_claim(state, "AckPolicy", caller.claim);
+    let hash = Hash32::parse(&request.policy_hash).map_err(|_| refused(4084))?;
+    match state.policies.get(&request.policy_hash) {
+        Some(owner) if *owner == caller.party => {}
+        Some(_) => return Err(refused(4082)),
+        None => return Err(refused(4094)),
+    }
+    if request.receipt.is_empty() && request.signature.is_empty() {
+        return Ok(AckPolicyResponse { status: ControlPolicyStatus::Pending as i32 });
+    }
+    let signature: [u8; 64] = request.signature.as_slice().try_into().map_err(|_| refused(4084))?;
+    let decoded = Receipt::decode(&request.receipt).map_err(|_| refused(4084))?;
+    if decoded.network != Network::Devnet || decoded.subject != ReceiptSubject::Policy(hash) || decoded.subject_hash != hash {
+        return Err(refused(4084));
+    }
+    Receipt::verify(&request.receipt, &signature, &caller.party).map_err(|_| refused(4085))?;
+    state.acks.push((request.policy_hash, request.receipt));
+    Ok(AckPolicyResponse { status: ControlPolicyStatus::Refused as i32 })
+}
+
+/// PostReceipt as the rpc checks it: the caller's signed receipt for a command of its own,
+/// whose subject hash is the command's, v2 only for a swap.
+fn post_receipt(state: &mut FakeState, caller: Caller, request: PostReceiptRequest) -> Result<PostReceiptResponse, Status> {
+    use agent_control::{AnyReceipt, Command, CommandOp, ReceiptSubject};
+    note_claim(state, "PostReceipt", caller.claim);
+    let signature: [u8; 64] = request.signature.as_slice().try_into().map_err(|_| refused(4084))?;
+    let verified = AnyReceipt::verify(&request.receipt, &signature, &caller.party).map_err(|_| refused(4085))?;
+    let receipt = verified.receipt();
+    let ReceiptSubject::Command(id) = &receipt.subject else { return Err(refused(4084)) };
+    let id = id.as_str().to_string();
+    let (owner, bytes) = state.commands.get(&id).ok_or_else(|| refused(4094))?;
+    if *owner != caller.party {
+        return Err(refused(4082));
+    }
+    if receipt.subject_hash != super::rpc::document_hash(bytes) {
+        return Err(refused(4084));
+    }
+    let swap = Command::decode(bytes).is_ok_and(|c| matches!(c.op, CommandOp::Swap { .. }));
+    if matches!(verified, AnyReceipt::V2(_)) != swap {
+        return Err(refused(4084));
+    }
+    state.receipts.push((id.clone(), request.receipt));
+    Ok(PostReceiptResponse { command_id: id, ..Default::default() })
+}
+
 impl<B> tonic::codegen::Service<http::Request<B>> for FakeService
 where
     B: tonic::codegen::Body + Send + 'static,
@@ -593,6 +693,32 @@ where
                         .unary(Unary { handler, date }, req)
                         .await
                 }
+                "AckPolicy" => {
+                    let shared = shared.clone();
+                    let handler: Handler<AckPolicyRequest, AckPolicyResponse> =
+                        Arc::new(move |caller, q| ack_policy(&mut shared.lock().unwrap(), caller, q));
+                    tonic::server::Grpc::new(Prost::<AckPolicyResponse, AckPolicyRequest>::default())
+                        .unary(Unary { handler, date }, req)
+                        .await
+                }
+                "PostReceipt" => {
+                    let shared = shared.clone();
+                    let handler: Handler<PostReceiptRequest, PostReceiptResponse> =
+                        Arc::new(move |caller, q| post_receipt(&mut shared.lock().unwrap(), caller, q));
+                    tonic::server::Grpc::new(Prost::<PostReceiptResponse, PostReceiptRequest>::default())
+                        .unary(Unary { handler, date }, req)
+                        .await
+                }
+                "GetAgentConfig" => {
+                    use orderbook_proto::ledger::{GetAgentConfigRequest, GetAgentConfigResponse};
+                    let env = shared.lock().unwrap().agent_env.clone();
+                    let reply = env
+                        .map(|env| GetAgentConfigResponse { env, ..Default::default() })
+                        .ok_or_else(|| Status::unimplemented("not in the fake"));
+                    tonic::server::Grpc::new(Prost::<GetAgentConfigResponse, GetAgentConfigRequest>::default())
+                        .unary(Open { reply }, req)
+                        .await
+                }
                 _ => {
                     let handler: Handler<ListPendingControlRequest, ListPendingControlResponse> =
                         Arc::new(|_, _| Err(Status::unimplemented("not in the fake")));
@@ -617,9 +743,14 @@ impl FakeRpc {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Shared::default();
         let service = FakeService(state.clone());
+        let dapp = FakeDapp(service.clone());
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let server = tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder().add_service(service).serve_with_incoming(incoming).await;
+            let _ = tonic::transport::Server::builder()
+                .add_service(service)
+                .add_service(dapp)
+                .serve_with_incoming(incoming)
+                .await;
         });
         Self { url, state, server }
     }
@@ -852,12 +983,52 @@ mod tests {
             let id = agent_control::controller_id_for(agent_control::ControllerType::Ed25519, &key);
             assert!(out.contains(&id.fingerprint()), "{out}");
         }
-        assert!(out.contains("Owner account: 42") && out.contains("take effect at"), "{out}");
+        assert!(out.contains("Owner account: 42") && out.contains("take effect at about"), "{out}");
+        assert!(out.contains("(1 h after the signature)"), "{out}");
+        // After the rpc accepts, the times printed are the signed entry's own.
+        let stored = agent.store().snapshot().unwrap().unwrap();
+        let signed = stored.log.entries()[0].entry();
+        assert_eq!(signed.effective_at(), signed.created_at().checked_add_secs(3600).unwrap());
+        let times = format!("Signed at {}; it takes effect at {}.", signed.created_at(), signed.effective_at());
+        let accepted = out.find("Accepted by the rpc").unwrap();
+        assert!(out.find(&times).is_some_and(|at| at > accepted), "{out}");
         let fingerprint = super::super::link::party_fingerprint(&agent.party);
         assert!(out.contains(&format!("Linked at seq 1. Party fingerprint (the Agent page shows the same): {fingerprint}")), "{out}");
         // The code was used: linking again is refused, now that controllers are pending.
         let (result, _) = agent.run(link_cmd(&code), &["link"]).await;
         assert!(format!("{:#}", result.unwrap_err()).contains("in effect or pending"));
+    }
+
+    #[tokio::test]
+    async fn a_link_shows_and_pins_the_platform_parties_the_env_lacks_and_never_replaces_one() {
+        let party = |hint: &str, digit: &str| format!("{hint}::1220{}", digit.repeat(64));
+        let (fee, traffic, other) = (party("fee", "a"), party("traffic", "b"), party("other", "c"));
+        let rpc = FakeRpc::start().await;
+        rpc.state().agent_env = Some(format!("NODE_NAME=n1\nPARTY_FEE={other}\nPARTY_PREPAID_TRAFFIC={traffic}\n"));
+        let served = super::super::pins::fetch(&rpc.url).await.unwrap();
+        assert_eq!(served, vec![("PARTY_FEE", other.clone()), ("PARTY_PREPAID_TRAFFIC", traffic.clone())]);
+        // Not confirmed: nothing is pinned.
+        let refused = TestAgent::new([0x16; 32], &rpc, "link-pins-no");
+        let (code, _) = offer(&rpc, LinkPurpose::Link, Some(&refused.party), &[0x3a]);
+        let (result, out) = refused.run(link_cmd(&code), &["no"]).await;
+        assert!(result.is_err());
+        assert!(out.contains(&format!("PARTY_PREPAID_TRAFFIC={traffic}")), "{out}");
+        assert_eq!(crate::read_env_value(&refused.env_file, "PARTY_PREPAID_TRAFFIC"), None);
+        // PARTY_FEE is pinned locally already: only the traffic party is shown and written.
+        let agent = TestAgent::new([0x17; 32], &rpc, "link-pins");
+        crate::upsert_env_value(&agent.env_file, "PARTY_FEE", &fee).unwrap();
+        let (code, _) = offer(&rpc, LinkPurpose::Link, Some(&agent.party), &[0x3b]);
+        let (result, out) = agent.run(link_cmd(&code), &["link"]).await;
+        result.unwrap();
+        let shown = out.find(&format!("  PARTY_PREPAID_TRAFFIC={traffic}\n")).unwrap();
+        assert!(out.find("Type 'link' to continue").is_some_and(|at| at > shown), "{out}");
+        assert!(!out.contains(&other), "{out}");
+        let pinned = out.find(&format!("  PARTY_PREPAID_TRAFFIC={traffic} (pinned now)\n")).unwrap();
+        let picked = out.find("A running agent picks up the pins written now on its next poller round.");
+        assert!(picked.is_some_and(|at| at > pinned), "{out}");
+        assert_eq!(crate::read_env_value(&agent.env_file, "PARTY_FEE"), Some(fee));
+        assert_eq!(crate::read_env_value(&agent.env_file, "PARTY_PREPAID_TRAFFIC"), Some(traffic));
+        assert_eq!(agent.head().map(|h| h.seq), Some(1));
     }
 
     #[tokio::test]
@@ -914,6 +1085,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_a_direct_key_no_policy_scopes_warns_before_the_confirmation() {
+        let rpc = FakeRpc::start().await;
+        let mut agent = TestAgent::new([0x18; 32], &rpc, "add-unscoped");
+        agent.linked(&rpc, 1).await;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]).verifying_key().to_bytes();
+        let add = ControlCommands::Add {
+            code: None,
+            ed25519: Some(hex::encode(key)),
+            label: Some("Bot".into()),
+            capabilities: Some("direct,read".into()),
+            yes: false,
+        };
+        let (result, out) = agent.run(add, &["add"]).await;
+        result.unwrap();
+        let warned = out.find("Warning: no policy scopes").unwrap();
+        assert!(out.find("Type 'add' to continue").is_some_and(|at| at > warned), "{out}");
+        assert!(out.contains("swap, transfer_cc, transfer_token"), "{out}");
+        // Without direct there is nothing to scope.
+        let (result, out) = agent.run(add_ed25519(0x76, true), &[]).await;
+        result.unwrap();
+        assert!(!out.contains("Warning: no policy scopes"), "{out}");
+    }
+
+    #[tokio::test]
     async fn add_by_key_and_capability_changes_follow_the_minimum_rule() {
         let rpc = FakeRpc::start().await;
         let mut agent = TestAgent::new([0xa5; 32], &rpc, "add");
@@ -926,8 +1121,12 @@ mod tests {
         let change = ControlCommands::Capabilities { controller: "Test key".into(), capabilities: "direct,read".into(), force: false, yes: true };
         let (result, out) = agent.run(change, &[]).await;
         result.unwrap();
-        assert!(out.contains("24 h after the signature"), "{out}");
+        assert!(out.contains("takes effect at about") && out.contains("(1 h after the signature)"), "{out}");
         assert_eq!(rpc.seqs(), vec![1, 2, 3]);
+        let stored = agent.store().snapshot().unwrap().unwrap();
+        let signed = stored.log.entries()[2].entry();
+        assert_eq!(signed.effective_at(), signed.created_at().checked_add_secs(3600).unwrap());
+        assert!(out.contains(&format!("Signed at {}; it takes effect at {}.", signed.created_at(), signed.effective_at())), "{out}");
     }
 
     #[tokio::test]
@@ -1137,6 +1336,20 @@ mod tests {
         assert!(err.to_string().contains("not mainnet"), "{err}");
         let chain = TestChain::build([0xac; 32], &party, Network::Devnet, 1).unwrap();
         let err = run_controller_with(sign("devnet", chain.entries[0].bytes()), &Scripted::new(["sign"]), &mut Vec::new()).await.unwrap_err();
+        assert!(err.to_string().contains("only policy, command or read-session"), "{err}");
+        // A sign-in challenge is refused too, even one that names this key.
+        let challenge = agent_control::ControllerChallenge {
+            network: Network::Devnet,
+            rpc: agent_control::RpId::parse("orderbook-devnet.silvana.dev").unwrap(),
+            controller_id: agent_control::controller_id_for(agent_control::ControllerType::Ed25519, &public),
+            agent_party: party.clone(),
+            nonce: agent_control::Nonce16([0x5c; 16]),
+            issued_at: agent_control::UtcTime::parse("2026-11-23T10:00:00Z").unwrap(),
+            expires_at: agent_control::UtcTime::parse("2026-11-23T10:01:00Z").unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let err = run_controller_with(sign("devnet", &challenge), &Scripted::new(["sign"]), &mut Vec::new()).await.unwrap_err();
         assert!(err.to_string().contains("only policy, command or read-session"), "{err}");
         assert!(run_controller_with(sign("devnet", &policy), &Scripted::new(["yes"]), &mut Vec::new()).await.is_err());
         assert!(run_controller_with(sign("devnet", &policy), &Scripted::none(), &mut Vec::new()).await.is_err());

@@ -19,8 +19,8 @@ use crate::proof::ProofEnvelope;
 use crate::sig::ed25519::verify_ed25519_strict;
 use crate::signable::AgentSignable;
 use crate::state::{
-    CONTROLLER_CHANGE_DELAY_SECS, ControlState, ControllerChange, MinimumRuleOutcome,
-    PolicyDocuments, add_secs, apply_entry, change_effective_at, minimum_rule,
+    ControlState, ControllerChange, MinimumRuleOutcome, PolicyDocuments, add_secs, apply_entry,
+    change_effective_at, controller_change_delay_secs, minimum_rule,
 };
 
 /// Why an entry could not be built or finished.
@@ -131,7 +131,7 @@ impl<'a> EntryBuilder<'a> {
     }
 
     fn delayed(&self, created_at: UtcTime) -> Result<UtcTime, BuildError> {
-        add_secs(created_at, CONTROLLER_CHANGE_DELAY_SECS)
+        add_secs(created_at, controller_change_delay_secs(self.state.network()))
             .ok_or_else(|| self.replay_error(ReplayErrorKind::TimeOverflow))
     }
 
@@ -272,7 +272,7 @@ impl<'a> EntryBuilder<'a> {
         let record = advanced
             .controller(change.controller_id())
             .ok_or_else(|| self.replay_error(ReplayErrorKind::UnknownController))?;
-        let effective_at = change_effective_at(record, &change, created_at)
+        let effective_at = change_effective_at(self.state.network(), record, &change, created_at)
             .ok_or_else(|| self.replay_error(ReplayErrorKind::TimeOverflow))?;
         Ok((advanced, outcome.is_violation(), effective_at))
     }
@@ -375,12 +375,13 @@ impl<'a> EntryBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canon::values::Network;
     use crate::controller::Capability;
     use crate::entry::EntryKind;
     use crate::error::CanonErrorKind;
     use crate::policy::DEFAULT_LINKED_RULES;
     use crate::signable::{SignablePurpose, sign_agent};
-    use crate::testkit::{self, Chain, DAY, at};
+    use crate::testkit::{self, Chain, DAY, DEVNET_DELAY, MAINNET_DELAY, at};
 
     fn read_only() -> CapabilitySet {
         CapabilitySet::of(&[Capability::Read])
@@ -457,7 +458,7 @@ mod tests {
         let pending = builder
             .add_controller_from_code(&add_bytes, &add_commitment, &rp, at(DAY))
             .unwrap();
-        assert_eq!(pending.entry().effective_at(), at(2 * DAY));
+        assert_eq!(pending.entry().effective_at(), at(DAY + DEVNET_DELAY));
         let other_owner =
             testkit::add_descriptor(testkit::passkey_controller_from(0x51, read_only()), 7);
         let refused = builder.add_controller_from_code(
@@ -527,6 +528,37 @@ mod tests {
             .remove_controller(&unknown, true, at(2 * DAY))
             .unwrap_err();
         assert_eq!(refused.code_name(), "unknown_controller");
+    }
+
+    #[test]
+    fn the_delay_comes_from_the_state_network() {
+        for (network, delay) in [
+            (Network::Devnet, DEVNET_DELAY),
+            (Network::Mainnet, MAINNET_DELAY),
+        ] {
+            let mut chain = Chain::linked_on(network);
+            assert_eq!(chain.entries[0].effective_at(), at(delay));
+            let key = testkit::ed_key(0x81).verifying_key().to_bytes();
+            let label = Label::parse("Backup key").unwrap();
+            let add = chain
+                .builder()
+                .add_ed25519(key, label, read_only(), at(2 * DAY))
+                .unwrap();
+            assert_eq!(add.entry().effective_at(), at(2 * DAY + delay));
+            let reader = testkit::ed25519_id(0x21);
+            let narrowed = chain
+                .builder()
+                .set_capabilities(&reader, read_only(), true, at(2 * DAY))
+                .unwrap();
+            assert_eq!(narrowed.entry().effective_at(), at(2 * DAY + delay));
+            // A withdrawal still applies at once.
+            chain.push(&add);
+            let withdrawn = chain
+                .builder()
+                .remove_controller(&testkit::ed25519_id(0x81), false, at(2 * DAY + 10))
+                .unwrap();
+            assert_eq!(withdrawn.entry().effective_at(), at(2 * DAY + 10));
+        }
     }
 
     #[test]
@@ -648,7 +680,7 @@ mod golden {
                 "prev=0000000000000000000000000000000000000000000000000000000000000000",
                 "created_at=2026-11-22T12:00:00Z",
                 "kind=link",
-                "effective_at=2026-11-23T12:00:00Z",
+                "effective_at=2026-11-22T13:00:00Z",
                 "owner_account=42",
                 "invite=true",
                 "nonce=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
@@ -663,12 +695,12 @@ mod golden {
         assert_eq!(entry_blocks, blocks);
         assert_eq!(
             entry.hash().to_string(),
-            "9b06b3e8612987e6b36a1946b8d149b3f99356d966f02a14c755ddea8d00635f"
+            "796dd4e8a44a32f21b395c99212cc5f9a5d2e3d37c1c6ff04ce7403ffa3e25f4"
         );
         assert_eq!(
             hex::encode(entry.signature()),
-            "130b4828c6b546de0f3a9b34bddee321e024141ce7658d738b8d8e5f75d60c11\
-             b59dbf0c1c23497090685195f19132789be49e612816b5121cbc8a301813f50c"
+            "1078467e4a17439715efe37979c072f602d67f4975651fbccea33dcabb86d06c\
+             e3e9cfbde9e1e12c449c729eba8cd6f83692887fa4c71e8e00fad33dfeab8c07"
         );
         let doc = PolicyDocument {
             network: Network::Devnet,
@@ -680,10 +712,10 @@ mod golden {
             not_before: None,
             rules: DEFAULT_LINKED_RULES,
         };
-        assert_eq!(doc.encode().unwrap().len(), 1164);
+        assert_eq!(doc.encode().unwrap().len(), 1214);
         assert_eq!(
             doc.hash().unwrap().to_string(),
-            "aafb0ab502dcb88bebad37c97f68ac78b7b369aad2a3bf56262745ddcb193d9b"
+            "561997890deb4585de1fc2371aae015531d8c6c6f3e7898f65d0f80132cfa411"
         );
     }
 }

@@ -2,16 +2,14 @@
 
 use std::io::Write;
 
-use agent_control::{
-    AcceptedPolicy, ControlState, PendingTarget, PolicyDocument, ProofEnvelope, RpPolicy, UtcTime,
-    describe_rules, verify_policy_submission,
-};
+use agent_control::{AcceptedPolicy, ControlState, PendingTarget, PolicyDocument, RpPolicy, UtcTime, describe_rules};
 use agent_logic::control_store::{PendingStatus, StoredLog};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use super::ControlContext;
 use super::link::party_fingerprint;
+use super::policy_accept::{Candidate, Verdict, judge, widening_text};
 use super::rpc::{ControlRpc, RpcError};
 use super::sync::state_of;
 use super::{Standing, standing, verify_remote};
@@ -161,6 +159,12 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
             "policyInForce": state.is_linked().then(|| policy_json(in_force, now)),
             "policyScheduled": scheduled.map(|p| policy_json(Some(p), now)),
             "platformParties": {"PARTY_FEE": fee, "PARTY_PREPAID_TRAFFIC": traffic},
+            "settings": {
+                "autoExecuteCommands": ctx.config.control.auto_execute_commands,
+                "autoAcceptPolicies": ctx.config.control.auto_accept_policies,
+                "swapMaxDeviationBps": ctx.config.control.swap_max_deviation_bps,
+                "vettedPackages": ctx.config.vetted_packages.describe(),
+            },
             "rpIds": rp_ids,
             "remote": remote,
             "storeDir": ctx.store.dir().display().to_string(),
@@ -231,6 +235,12 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
     if fee.is_none() || traffic.is_none() {
         let _ = writeln!(out, "  (an unset party means no payment is treated as a fee or traffic purchase)");
     }
+    let _ = writeln!(
+        out,
+        "Settings:     {}; vetted packages {} (not enforced yet)",
+        ctx.config.control.describe(),
+        ctx.config.vetted_packages.describe()
+    );
     let _ = writeln!(out, "Passkey rp_ids: {}", rp_ids.join(", "));
     match remote {
         Some(remote) => {
@@ -255,11 +265,16 @@ pub async fn run_policy_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out
         match rpc.pending().await {
             Ok(list) => {
                 for item in list.policies {
-                    let verdict = match ProofEnvelope::decode(&item.proof) {
-                        Err(e) => format!("refused: proof does not decode ({})", e.code_name()),
-                        Ok(envelope) => match verify_policy_submission(&state, &item.document, &envelope, now) {
-                            Ok(verified) => format!("acceptable: effective at {}", verified.effective_at),
-                            Err(e) => format!("refused: {}", e.code_name()),
+                    let verdict = match Candidate::from_pending(&item) {
+                        Err(e) => format!("not judged: {e:#}"),
+                        Ok(candidate) => match judge(&state, &candidate, now) {
+                            Verdict::Acceptable(verified) => format!(
+                                "acceptable: it {}; effective at {}",
+                                widening_text(&verified.widening),
+                                verified.effective_at
+                            ),
+                            Verdict::Refused { code, name } => format!("refused: {name} (code {code})"),
+                            Verdict::NotYet => "not yet: issued later than this clock allows".to_string(),
                         },
                     };
                     let rules = PolicyDocument::decode(&item.document)

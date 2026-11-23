@@ -11,11 +11,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use orderbook_proto::orderbook::Instrument;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::fs;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use zeroize::Zeroize;
 
@@ -265,6 +265,10 @@ pub struct BaseConfig {
     pub party_fee: Option<String>,
     /// `PARTY_PREPAID_TRAFFIC`: the prepaid traffic party, pinned locally.
     pub party_prepaid_traffic: Option<String>,
+    /// agent.toml `[control]`: what a linked agent does with pending controller work.
+    pub control: ControlSettings,
+    /// agent.toml `[vetted_packages]`: logged at startup, not enforced yet.
+    pub vetted_packages: VettedPackages,
 }
 
 /// RFQ V2 quote-signing key: public SPKI hex plus the sealed private scalar,
@@ -368,6 +372,8 @@ impl BaseConfig {
             canton_chain: None,
             party_fee: None,
             party_prepaid_traffic: None,
+            control: ControlSettings::default(),
+            vetted_packages: VettedPackages::default(),
         })
     }
 }
@@ -476,7 +482,9 @@ impl BaseConfig {
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
         let strategies = crate::strategy::config::parse_strategies(&agent_toml_str)
             .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
-        Self::assemble_with(agent, strategies, overrides)
+        let sections = parse_control_sections(&agent_toml_str)
+            .with_context(|| format!("Failed to parse {}", agent_toml_path.as_ref().display()))?;
+        Self::assemble_with(agent, strategies, sections, overrides)
     }
 
     /// Lenient loader — if `agent.toml` is missing, use serde defaults
@@ -493,7 +501,7 @@ impl BaseConfig {
         agent_toml_path: P,
         overrides: ConfigOverrides,
     ) -> Result<Self> {
-        let (agent, strategies): (AgentToml, _) = if agent_toml_path.as_ref().exists() {
+        let (agent, strategies, sections): (AgentToml, _, _) = if agent_toml_path.as_ref().exists() {
             let s = fs::read_to_string(agent_toml_path.as_ref()).with_context(|| {
                 format!("Failed to read {}", agent_toml_path.as_ref().display())
             })?;
@@ -501,12 +509,17 @@ impl BaseConfig {
             (
                 toml::from_str(&s).with_context(parse_err)?,
                 crate::strategy::config::parse_strategies(&s).with_context(parse_err)?,
+                parse_control_sections(&s).with_context(parse_err)?,
             )
         } else {
             // Empty string round-trips to AgentToml with all serde defaults.
-            (toml::from_str("").context("AgentToml serde defaults must parse")?, BTreeMap::new())
+            (
+                toml::from_str("").context("AgentToml serde defaults must parse")?,
+                BTreeMap::new(),
+                ControlSections::default(),
+            )
         };
-        Self::assemble_with(agent, strategies, overrides)
+        Self::assemble_with(agent, strategies, sections, overrides)
     }
 
     /// Programmatic constructor for embedding the agent as a LIBRARY — e.g. a
@@ -584,6 +597,8 @@ impl BaseConfig {
             canton_chain: None,
             party_fee: None,
             party_prepaid_traffic: None,
+            control: ControlSettings::default(),
+            vetted_packages: VettedPackages::default(),
         })
     }
 
@@ -739,13 +754,15 @@ impl BaseConfig {
     /// strict/lenient loaders.
     #[cfg(test)]
     fn assemble(agent: AgentToml, overrides: ConfigOverrides) -> Result<Self> {
-        Self::assemble_with(agent, BTreeMap::new(), overrides)
+        Self::assemble_with(agent, BTreeMap::new(), ControlSections::default(), overrides)
     }
 
-    /// [`BaseConfig::assemble`] with the strategy tables from the second TOML pass.
+    /// [`BaseConfig::assemble`] with the strategy tables and control sections from the
+    /// second TOML passes.
     fn assemble_with(
         mut agent: AgentToml,
         strategies: BTreeMap<String, StrategyConfig>,
+        sections: ControlSections,
         overrides: ConfigOverrides,
     ) -> Result<Self> {
         // Instrument registry placeholders — filled by populate_instruments_from_rpc
@@ -763,6 +780,9 @@ impl BaseConfig {
             None => std::env::var("PARTY_AGENT")
                 .map_err(|_| anyhow!("PARTY_AGENT env var (or --party) is required"))?,
         };
+        if sections.controller.as_ref().is_some_and(|c| c.agent_party.as_str() == party_id.trim()) {
+            bail!("[controller] names this agent's own party: a controller key never controls the agent it runs beside");
+        }
 
         let private_key_b58: Zeroizing<String> = match overrides
             .private_key
@@ -1274,6 +1294,8 @@ impl BaseConfig {
             canton_chain: optional_env(crate::control_store::CHAIN_ENV),
             party_fee: pinned_party_env("PARTY_FEE")?,
             party_prepaid_traffic: pinned_party_env("PARTY_PREPAID_TRAFFIC")?,
+            control: sections.control,
+            vetted_packages: sections.vetted_packages,
         };
         config.validate_ranges()?;
         Ok(config)
@@ -2268,8 +2290,223 @@ where
 }
 
 // ============================================================================
+// [control] and [vetted_packages] (a strict second TOML pass)
+// ============================================================================
+
+/// Largest `[control] swap_max_deviation_bps`: 100 %.
+pub const MAX_SWAP_DEVIATION_BPS: u32 = 10_000;
+
+/// `[control]`: what a linked agent does by itself with pending controller work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlSettings {
+    /// Execute pending direct commands without a prompt; otherwise they wait for
+    /// `control execute`.
+    #[serde(default)]
+    pub auto_execute_commands: bool,
+    /// Accept valid pending policies without a prompt; otherwise they wait for
+    /// `control policy accept`.
+    #[serde(default = "default_auto_accept_policies")]
+    pub auto_accept_policies: bool,
+    /// Largest gap between a swap's price and the agent's reference mid, in basis
+    /// points; 0 turns the guard off.
+    #[serde(default = "default_swap_max_deviation_bps")]
+    pub swap_max_deviation_bps: u32,
+}
+
+impl Default for ControlSettings {
+    fn default() -> Self {
+        Self {
+            auto_execute_commands: false,
+            auto_accept_policies: default_auto_accept_policies(),
+            swap_max_deviation_bps: default_swap_max_deviation_bps(),
+        }
+    }
+}
+
+impl ControlSettings {
+    /// The settings as one log line.
+    pub fn describe(&self) -> String {
+        format!(
+            "auto_execute_commands={} auto_accept_policies={} swap_max_deviation_bps={}{}",
+            self.auto_execute_commands,
+            self.auto_accept_policies,
+            self.swap_max_deviation_bps,
+            if self.swap_max_deviation_bps == 0 { " (the deviation guard is off)" } else { "" }
+        )
+    }
+}
+
+/// `[vetted_packages]`: the packages the agent expects its policy to allow.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VettedPackages {
+    /// No section, or `mode = "all"`.
+    #[default]
+    All,
+    /// `mode = "selected"` with 1 to 256 package ids.
+    Selected(BTreeSet<agent_control::PackageId>),
+}
+
+impl VettedPackages {
+    /// The setting as one log line.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::All => "all".to_string(),
+            Self::Selected(ids) => format!("selected ({} packages)", ids.len()),
+        }
+    }
+}
+
+/// `[controller]`: this machine acting as an Ed25519 controller of one linked agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerSettings {
+    /// The controller key file; [`load_controller_section`] resolves it against the
+    /// directory of agent.toml when it is relative.
+    pub key_file: PathBuf,
+    /// The agent this key controls.
+    pub agent_party: agent_control::PartyId,
+    /// `devnet` or `mainnet`; `None` leaves the network to `CANTON_CHAIN`.
+    pub network: Option<agent_control::Network>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerToml {
+    key_file: String,
+    agent_party: String,
+    #[serde(default)]
+    network: Option<String>,
+}
+
+/// `[controller]` of a parsed agent.toml, checked strictly; `key_file` is left as written.
+fn controller_section(table: &toml::Table) -> Result<Option<ControllerSettings>> {
+    let Some(value) = table.get("controller") else {
+        return Ok(None);
+    };
+    let raw = value
+        .clone()
+        .try_into::<ControllerToml>()
+        .map_err(|e| anyhow!("invalid [controller] section: {e}"))?;
+    if raw.key_file.trim().is_empty() {
+        bail!("invalid [controller] section: key_file is empty");
+    }
+    let agent_party = agent_control::PartyId::parse(raw.agent_party.trim()).map_err(|_| {
+        anyhow!("invalid [controller] section: agent_party = {:?} is not a party id", raw.agent_party)
+    })?;
+    let network = match raw.network.as_deref().map(str::trim) {
+        None => None,
+        Some(text) => Some(agent_control::Network::parse(text).map_err(|_| {
+            anyhow!("invalid [controller] section: network = {text:?} is neither \"devnet\" nor \"mainnet\"")
+        })?),
+    };
+    Ok(Some(ControllerSettings { key_file: PathBuf::from(raw.key_file.trim()), agent_party, network }))
+}
+
+/// Reads only `[controller]` of `agent_toml`, strictly, and resolves a relative `key_file`
+/// against the file's directory. `Ok(None)` when the file or the section is absent.
+pub fn load_controller_section(agent_toml: &Path) -> Result<Option<ControllerSettings>> {
+    if !agent_toml.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(agent_toml).with_context(|| format!("Failed to read {}", agent_toml.display()))?;
+    let table: toml::Table =
+        toml::from_str(&text).with_context(|| format!("{} is not valid TOML", agent_toml.display()))?;
+    let Some(mut section) =
+        controller_section(&table).with_context(|| format!("Failed to parse {}", agent_toml.display()))?
+    else {
+        return Ok(None);
+    };
+    if section.key_file.is_relative() {
+        let base = agent_toml.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        section.key_file = base.join(&section.key_file);
+    }
+    Ok(Some(section))
+}
+
+/// The control sections of agent.toml, read in their own strict pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ControlSections {
+    pub(crate) control: ControlSettings,
+    pub(crate) vetted_packages: VettedPackages,
+    pub(crate) controller: Option<ControllerSettings>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VettedPackagesToml {
+    mode: String,
+    #[serde(default)]
+    packages: Option<Vec<String>>,
+}
+
+/// Reads `[control]`, `[vetted_packages]` and `[controller]`: an unknown key or a bad value
+/// refuses. The other agent.toml keys are not read here.
+pub(crate) fn parse_control_sections(toml_str: &str) -> Result<ControlSections> {
+    let table: toml::Table = toml::from_str(toml_str).context("agent.toml is not valid TOML")?;
+    let control = match table.get("control") {
+        None => ControlSettings::default(),
+        Some(value) => value
+            .clone()
+            .try_into::<ControlSettings>()
+            .map_err(|e| anyhow!("invalid [control] section: {e}"))?,
+    };
+    if control.swap_max_deviation_bps > MAX_SWAP_DEVIATION_BPS {
+        bail!(
+            "invalid [control] section: swap_max_deviation_bps = {} is above {MAX_SWAP_DEVIATION_BPS} \
+             (100 %); 0 turns the guard off",
+            control.swap_max_deviation_bps
+        );
+    }
+    let vetted_packages = match table.get("vetted_packages") {
+        None => VettedPackages::All,
+        Some(value) => {
+            let raw = value
+                .clone()
+                .try_into::<VettedPackagesToml>()
+                .map_err(|e| anyhow!("invalid [vetted_packages] section: {e}"))?;
+            vetted_packages_of(raw).context("invalid [vetted_packages] section")?
+        }
+    };
+    let controller = controller_section(&table)?;
+    Ok(ControlSections { control, vetted_packages, controller })
+}
+
+fn vetted_packages_of(raw: VettedPackagesToml) -> Result<VettedPackages> {
+    match (raw.mode.as_str(), raw.packages) {
+        ("all", None) => Ok(VettedPackages::All),
+        ("all", Some(_)) => bail!("mode = \"all\" takes no packages list"),
+        ("selected", None) => bail!("mode = \"selected\" needs a packages list"),
+        ("selected", Some(list)) => {
+            let max = agent_control::MAX_PACKAGES;
+            if list.is_empty() || list.len() > max {
+                bail!("mode = \"selected\" takes 1 to {max} package ids, not {}", list.len());
+            }
+            let mut ids = BTreeSet::new();
+            for (i, text) in list.iter().enumerate() {
+                let id = agent_control::PackageId::parse(text).map_err(|_| {
+                    anyhow!("packages[{i}] = {text:?} is not a package id (64 lowercase hex characters)")
+                })?;
+                if !ids.insert(id) {
+                    bail!("packages[{i}] = {text:?} is listed twice");
+                }
+            }
+            Ok(VettedPackages::Selected(ids))
+        }
+        (other, _) => bail!("mode = {other:?} is neither \"all\" nor \"selected\""),
+    }
+}
+
+// ============================================================================
 // Defaults
 // ============================================================================
+
+fn default_auto_accept_policies() -> bool {
+    true
+}
+
+fn default_swap_max_deviation_bps() -> u32 {
+    100
+}
 
 fn default_auto_settle() -> bool {
     true
@@ -3747,6 +3984,195 @@ mod control_token_tests {
             config.canton_chain = chain;
             let err = config.control_jwt().unwrap_err().to_string();
             assert!(err.contains("CANTON_CHAIN"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_section_tests {
+    use super::*;
+
+    const ID_A: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const ID_B: &str = "ab00000000000000000000000000000000000000000000000000000000000002";
+
+    fn sections(toml: &str) -> ControlSections {
+        parse_control_sections(toml).unwrap()
+    }
+
+    fn refusal(toml: &str) -> String {
+        format!("{:#}", parse_control_sections(toml).unwrap_err())
+    }
+
+    #[test]
+    fn absent_sections_take_the_defaults() {
+        let parsed = sections("auto_settle = true\n[[markets]]\nmarket_id = \"CC-USDC\"\n");
+        assert_eq!(parsed, ControlSections::default());
+        let control = parsed.control;
+        assert!(!control.auto_execute_commands && control.auto_accept_policies);
+        assert_eq!(control.swap_max_deviation_bps, 100);
+        assert_eq!(parsed.vetted_packages, VettedPackages::All);
+        // An empty section is the same as none.
+        assert_eq!(sections("[control]\n[vetted_packages]\nmode = \"all\"\n"), ControlSections::default());
+        let config = BaseConfig::test_minimal().unwrap();
+        assert_eq!((config.control, config.vetted_packages), (ControlSettings::default(), VettedPackages::All));
+    }
+
+    #[test]
+    fn control_settings_are_read_and_bounded() {
+        let parsed = sections(
+            "[control]\nauto_execute_commands = true\nauto_accept_policies = false\nswap_max_deviation_bps = 0\n",
+        );
+        assert_eq!(
+            parsed.control,
+            ControlSettings { auto_execute_commands: true, auto_accept_policies: false, swap_max_deviation_bps: 0 }
+        );
+        assert!(parsed.control.describe().contains("guard is off"), "{}", parsed.control.describe());
+        assert_eq!(sections("[control]\nswap_max_deviation_bps = 10000\n").control.swap_max_deviation_bps, 10_000);
+        for bad in ["10001", "-1", "1.5", "\"100\""] {
+            let err = refusal(&format!("[control]\nswap_max_deviation_bps = {bad}\n"));
+            assert!(err.contains("[control]"), "{bad}: {err}");
+        }
+        let err = refusal("[control]\nauto_execute_commands = \"yes\"\n");
+        assert!(err.contains("[control]"), "{err}");
+    }
+
+    #[test]
+    fn unknown_keys_are_refused_with_the_section_and_key() {
+        let err = refusal("[control]\nauto_execute = true\n");
+        assert!(err.contains("[control]") && err.contains("auto_execute"), "{err}");
+        assert!(err.contains("auto_execute_commands"), "the message lists the known keys: {err}");
+        let err = refusal("[vetted_packages]\nmode = \"all\"\nlist = []\n");
+        assert!(err.contains("[vetted_packages]") && err.contains("list"), "{err}");
+        // The sections must be tables.
+        assert!(refusal("control = 1\n").contains("[control]"));
+        assert!(refusal("vetted_packages = \"all\"\n").contains("[vetted_packages]"));
+    }
+
+    #[test]
+    fn vetted_packages_take_all_or_one_to_256_unique_ids() {
+        let parsed = sections(&format!("[vetted_packages]\nmode = \"selected\"\npackages = [\"{ID_B}\", \"{ID_A}\"]\n"));
+        let VettedPackages::Selected(ids) = &parsed.vetted_packages else { panic!("{parsed:?}") };
+        assert_eq!(ids.iter().map(ToString::to_string).collect::<Vec<_>>(), vec![ID_A.to_string(), ID_B.to_string()]);
+        assert_eq!(parsed.vetted_packages.describe(), "selected (2 packages)");
+
+        let cases = [
+            (format!("mode = \"all\"\npackages = [\"{ID_A}\"]"), "takes no packages"),
+            ("mode = \"selected\"".to_string(), "needs a packages list"),
+            ("mode = \"selected\"\npackages = []".to_string(), "1 to 256"),
+            (format!("mode = \"selected\"\npackages = [\"{ID_A}\", \"{ID_A}\"]"), "listed twice"),
+            (format!("mode = \"selected\"\npackages = [\"{}\"]", ID_B.to_ascii_uppercase()), "not a package id"),
+            (format!("mode = \"selected\"\npackages = [\"{}\"]", &ID_A[1..]), "not a package id"),
+            ("mode = \"some\"".to_string(), "neither"),
+            ("packages = []".to_string(), "mode"),
+        ];
+        for (body, expected) in cases {
+            let err = refusal(&format!("[vetted_packages]\n{body}\n"));
+            assert!(err.contains("[vetted_packages]") && err.contains(expected), "{body}: {err}");
+        }
+        let many: Vec<String> = (0..257u32).map(|i| format!("\"{i:064x}\"")).collect();
+        let err = refusal(&format!("[vetted_packages]\nmode = \"selected\"\npackages = [{}]\n", many.join(", ")));
+        assert!(err.contains("not 257"), "{err}");
+        let most: Vec<String> = (0..256u32).map(|i| format!("\"{i:064x}\"")).collect();
+        let parsed = sections(&format!("[vetted_packages]\nmode = \"selected\"\npackages = [{}]\n", most.join(", ")));
+        assert_eq!(parsed.vetted_packages.describe(), "selected (256 packages)");
+    }
+
+    #[test]
+    fn the_section_the_agent_page_copies_parses() {
+        let page = format!(
+            "[vetted_packages]\nmode = \"selected\"\npackages = [\n  \"{ID_A}\", # splice-amulet 0.1.20\n  \"{ID_B}\", # utility-registry 1.2.3\n]\n"
+        );
+        let VettedPackages::Selected(ids) = sections(&page).vetted_packages else { panic!("{page}") };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(sections("[vetted_packages]\nmode = \"all\"\n").vetted_packages, VettedPackages::All);
+    }
+
+    #[test]
+    fn the_first_pass_stays_lenient_and_the_loader_refuses_a_bad_section() {
+        let toml = "[control]\nbogus = 1\n[vetted_packages]\nmode = \"all\"\n";
+        assert!(toml::from_str::<AgentToml>(toml).is_ok(), "older agents ignore the sections");
+        let path = std::env::temp_dir().join(format!("agent-control-sections-{}.toml", std::process::id()));
+        std::fs::write(&path, toml).unwrap();
+        let strict = BaseConfig::load(&path).map(|_| ()).unwrap_err();
+        let lenient = BaseConfig::load_or_defaults(&path).map(|_| ()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        for err in [strict, lenient] {
+            let text = format!("{err:#}");
+            assert!(text.contains("[control]") && text.contains("bogus"), "{text}");
+        }
+    }
+
+    const PARTY: &str = "agent-1::1220aa00000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn the_controller_section_is_read_strictly() {
+        assert_eq!(sections("[control]\n").controller, None);
+        let parsed = sections(&format!(
+            "[controller]\nkey_file = \"controller/controller.key\"\nagent_party = \"{PARTY}\"\nnetwork = \"devnet\"\n"
+        ));
+        let controller = parsed.controller.unwrap();
+        assert_eq!(controller.key_file, PathBuf::from("controller/controller.key"));
+        assert_eq!(controller.agent_party.as_str(), PARTY);
+        assert_eq!(controller.network, Some(agent_control::Network::Devnet));
+        let no_network = sections(&format!("[controller]\nkey_file = \"k\"\nagent_party = \"{PARTY}\"\n"));
+        assert_eq!(no_network.controller.unwrap().network, None);
+        let cases = [
+            (format!("key_file = \"k\"\nagent_party = \"{PARTY}\"\nparty = \"x\""), "unknown field"),
+            (format!("agent_party = \"{PARTY}\""), "key_file"),
+            ("key_file = \"k\"".to_string(), "agent_party"),
+            (format!("key_file = \" \"\nagent_party = \"{PARTY}\""), "key_file is empty"),
+            ("key_file = \"k\"\nagent_party = \"nobody\"".to_string(), "not a party id"),
+            (format!("key_file = \"k\"\nagent_party = \"{PARTY}\"\nnetwork = \"testnet\""), "neither"),
+            (format!("key_file = 1\nagent_party = \"{PARTY}\""), "[controller]"),
+        ];
+        for (body, expected) in cases {
+            let err = refusal(&format!("[controller]\n{body}\n"));
+            assert!(err.contains("[controller]") && err.contains(expected), "{body}: {err}");
+        }
+        assert!(refusal("controller = \"x\"\n").contains("[controller]"));
+    }
+
+    #[test]
+    fn the_controller_loader_reads_only_its_section_and_resolves_the_key_beside_agent_toml() {
+        let dir = std::env::temp_dir().join(format!("agent-controller-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        assert_eq!(load_controller_section(&path).unwrap(), None, "no file, no section");
+        // Other sections are not read in controller mode, even broken ones.
+        std::fs::write(
+            &path,
+            format!("[control]\nbogus = 1\n[controller]\nkey_file = \"keys/controller.key\"\nagent_party = \"{PARTY}\"\n"),
+        )
+        .unwrap();
+        let section = load_controller_section(&path).unwrap().unwrap();
+        assert_eq!(section.key_file, dir.join("keys/controller.key"));
+        std::fs::write(&path, format!("[controller]\nkey_file = \"/abs/k\"\nagent_party = \"{PARTY}\"\n")).unwrap();
+        assert_eq!(load_controller_section(&path).unwrap().unwrap().key_file, PathBuf::from("/abs/k"));
+        std::fs::write(&path, "auto_settle = true\n").unwrap();
+        assert_eq!(load_controller_section(&path).unwrap(), None);
+        std::fs::write(&path, "[controller]\nkey_file = \"k\"\n").unwrap();
+        assert!(format!("{:#}", load_controller_section(&path).unwrap_err()).contains("agent_party"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn an_agent_whose_controller_section_names_its_own_party_is_refused() {
+        // The same DSO the other env tests set.
+        unsafe { std::env::set_var("DSO", "dso::1220aa") };
+        let toml = format!("[controller]\nkey_file = \"k\"\nagent_party = \"{PARTY}\"\n");
+        let assemble = |party: &str| {
+            let agent: AgentToml = toml::from_str("").unwrap();
+            let overrides = ConfigOverrides { party: Some(party.to_string()), ..Default::default() };
+            BaseConfig::assemble_with(agent, BTreeMap::new(), sections(&toml), overrides).map(|_| ())
+        };
+        let own = format!("{:#}", assemble(PARTY).unwrap_err());
+        assert!(own.contains("names this agent's own party"), "{own}");
+        let own_padded = format!("{:#}", assemble(&format!(" {PARTY} ")).unwrap_err());
+        assert!(own_padded.contains("names this agent's own party"), "{own_padded}");
+        // Another party passes this check, whatever the rest of the environment holds.
+        if let Err(other) = assemble("other::1220bb") {
+            assert!(!format!("{other:#}").contains("names this agent's own party"), "{other:#}");
         }
     }
 }
