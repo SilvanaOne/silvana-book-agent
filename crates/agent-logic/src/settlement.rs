@@ -44,7 +44,7 @@ use crate::clock;
 use crate::client::OrderbookClient;
 use crate::config::{BaseConfig, UNRESOLVED_INSTRUMENT};
 use crate::liquidity::{self, LiquidityManager};
-use crate::order_tracker::{OrderTracker, VerifyResult};
+use crate::order_tracker::{OrderTracker, TermsCheck, VerifyResult};
 use crate::rpc_client::OrderbookRpcClient;
 use crate::runner::{AcceptedRfqTrade, QuotedTrade};
 use crate::shutdown::Shutdown;
@@ -351,24 +351,21 @@ pub trait SettlementBackend: Send + Sync {
     /// Pay DVP or allocation processing fee
     async fn pay_fee(&self, proposal_id: &str, fee_type: &str) -> Result<StepResult>;
 
-    /// Propose DVP (buyer only)
-    async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult>;
+    /// Propose DVP; `proposal` is the agent's own record of the match.
+    async fn propose_dvp(&self, proposal: &SettlementProposal) -> Result<StepResult>;
 
-    /// Accept DVP proposal (seller only)
-    async fn accept_dvp(
-        &self,
-        proposal_id: &str,
-        dvp_proposal_cid: &str,
-        expected_delivery_amount: &str,
-        expected_payment_amount: &str,
-        base_instrument: &str,
-        quote_instrument: &str,
-    ) -> Result<StepResult>;
+    /// Accept the DVP proposal of the agent's own record of the match.
+    async fn accept_dvp(&self, proposal: &SettlementProposal, dvp_proposal_cid: &str) -> Result<StepResult>;
 
-    /// Allocate tokens for settlement.
+    /// Allocate the agent's leg of its own record of the match.
     /// `allocation_cc`: Some(amount) if allocating CC amulets (needs amulet pre-selection),
     /// None if allocating CIP-56 tokens.
-    async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult>;
+    async fn allocate(
+        &self,
+        proposal: &SettlementProposal,
+        dvp_cid: &str,
+        allocation_cc: Option<Decimal>,
+    ) -> Result<StepResult>;
 
     /// Sync on-chain contracts for given settlement IDs
     async fn sync_contracts(&self, settlement_ids: &[String]) -> Result<Vec<DiscoveredContract>>;
@@ -1159,6 +1156,21 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     proposal_id,
                     if is_buyer { "buyer" } else { "seller" }
                 );
+                // Kept either way; its steps run only on the terms adopted before the restart
+                let check = {
+                    let mut t = self.tracker.lock().await;
+                    let check = t.terms_check(&proposal_id, &proposal);
+                    if check == TermsCheck::Unrecorded {
+                        t.record_terms(&proposal_id, &proposal);
+                    }
+                    check
+                };
+                if let TermsCheck::Differs(field) = check {
+                    warn!(
+                        "[{}] Restored proposal differs from its adopted terms ({}); no terms recorded, its steps are refused",
+                        proposal_id, field
+                    );
+                }
                 let state = SettlementState::new(proposal, is_buyer);
                 self.active_settlements.insert(proposal_id.clone(), state);
                 if self.config.auto_settle {
@@ -1186,6 +1198,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
                 let mut tracker = self.tracker.lock().await;
                 tracker.record_settlement_order(&proposal_id, order_id, base_quantity);
+                tracker.record_terms(&proposal_id, &proposal);
             }
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
@@ -1299,6 +1312,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
                 let mut tracker = self.tracker.lock().await;
                 tracker.record_settlement_order(&proposal_id, order_id, base_quantity);
+                tracker.record_terms(&proposal_id, &proposal);
             }
             let state = SettlementState::new(proposal, is_buyer);
             self.active_settlements.insert(proposal_id.clone(), state);
@@ -1372,6 +1386,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             let base_quantity = Decimal::from_str(&proposal.base_quantity).unwrap_or_default();
             let mut tracker = self.tracker.lock().await;
             tracker.record_settlement_order(&proposal_id, order_id, base_quantity);
+            tracker.record_terms(&proposal_id, &proposal);
         }
 
         let state = SettlementState::new(proposal, is_buyer);
@@ -1682,7 +1697,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
                 let alloc_result = tokio::time::timeout(
                     Duration::from_secs(600),
-                    backend.allocate(proposal_id, dvp_cid, allocation_cc),
+                    backend.allocate(&local_state.proposal, dvp_cid, allocation_cc),
                 ).await;
                 let alloc_result = match alloc_result {
                     Ok(r) => r,
@@ -2670,6 +2685,9 @@ fn implausible_amount(proposal: &SettlementProposal) -> Option<(&'static str, &s
     .find(|(_, raw)| Decimal::from_str(raw).is_ok_and(|v| v < Decimal::ZERO || v > max))
 }
 
+/// The refusal of a step whose proposal no longer carries its adopted terms.
+const TERMS_DIFFER: &str = "proposal differs from its adopted terms";
+
 /// The registry check's verdict on one settlement step.
 #[derive(Debug, PartialEq, Eq)]
 enum LegCheck {
@@ -3012,6 +3030,17 @@ async fn advance_single<B: SettlementBackend>(
         LegCheck::Refuse(error) => return AdvanceResult::Error { proposal_id, error },
     }
 
+    // A step commits to the proposal's terms, so it runs only on the adopted ones
+    if !matches!(my_action, NextAction::Wait | NextAction::MulticallAccept | NextAction::None) {
+        let terms = tracker.lock().await.terms_check(&proposal_id, &state.proposal);
+        if let TermsCheck::Differs(field) = terms {
+            return AdvanceResult::Error {
+                proposal_id,
+                error: format!("{TERMS_DIFFER} ({field})"),
+            };
+        }
+    }
+
     // Fees wait for the DVP proposal, so one that is never made costs nothing.
     if fee_waits_for_dvp(my_action, &status) {
         debug!("[{}] {:?} deferred until the DVP proposal exists", proposal_id, my_action);
@@ -3099,7 +3128,7 @@ async fn advance_single<B: SettlementBackend>(
         }
         NextAction::CreateDvp => {
             action_log.lock().await.push((proposal_id.clone(), "CreateDvp"));
-            match backend.propose_dvp(&proposal_id).await {
+            match backend.propose_dvp(&state.proposal).await {
                 Ok(result) => {
                     record_step_completed(
                         &mut rpc_client, &proposal_id, &config.party_id,
@@ -3133,14 +3162,7 @@ async fn advance_single<B: SettlementBackend>(
                 },
             };
             debug!("[{}] Using DvpProposal from on-chain sync: {}", proposal_id, dvp_proposal_cid);
-            match backend.accept_dvp(
-                &proposal_id,
-                &dvp_proposal_cid,
-                &state.proposal.base_quantity,
-                &state.proposal.quote_quantity,
-                &state.proposal.base_instrument,
-                &state.proposal.quote_instrument,
-            ).await {
+            match backend.accept_dvp(&state.proposal, &dvp_proposal_cid).await {
                 Ok(result) => {
                     record_step_completed(
                         &mut rpc_client, &proposal_id, &config.party_id,
@@ -3278,15 +3300,15 @@ mod tests {
         async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
             Err(anyhow::anyhow!("mock backend: pay_fee not used in test"))
         }
-        async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+        async fn propose_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal) -> Result<StepResult> {
             Err(anyhow::anyhow!("mock backend: propose_dvp not used in test"))
         }
         async fn accept_dvp(
-            &self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str,
+            &self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str,
         ) -> Result<StepResult> {
             Err(anyhow::anyhow!("mock backend: accept_dvp not used in test"))
         }
-        async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+        async fn allocate(&self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str, _: Option<Decimal>) -> Result<StepResult> {
             Err(anyhow::anyhow!("mock backend: allocate not used in test"))
         }
         async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
@@ -4789,6 +4811,7 @@ mod tests {
                 order_id: 42,
                 quantity: "1000".to_string(),
                 reserved: true,
+                terms: None,
             }],
         );
         lm.try_commit("p-restored", "USDCx", Decimal::from(1000), Decimal::ZERO).await.unwrap();
@@ -4835,15 +4858,15 @@ mod tests {
         async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
             Err(anyhow::anyhow!("unused"))
         }
-        async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+        async fn propose_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal) -> Result<StepResult> {
             Err(anyhow::anyhow!("unused"))
         }
         async fn accept_dvp(
-            &self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str,
+            &self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str,
         ) -> Result<StepResult> {
             Err(anyhow::anyhow!("unused"))
         }
-        async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+        async fn allocate(&self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str, _: Option<Decimal>) -> Result<StepResult> {
             Err(anyhow::anyhow!("unused"))
         }
         async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
@@ -5170,21 +5193,13 @@ mod tests {
         async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
             self.record("pay_fee")
         }
-        async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+        async fn propose_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal) -> Result<StepResult> {
             self.record("propose_dvp")
         }
-        async fn accept_dvp(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<StepResult> {
+        async fn accept_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str) -> Result<StepResult> {
             self.record("accept_dvp")
         }
-        async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+        async fn allocate(&self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str, _: Option<Decimal>) -> Result<StepResult> {
             self.record("allocate")
         }
         async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
@@ -5406,10 +5421,30 @@ mod tests {
     /// as the executor runs it when `until_done` is set.
     async fn advance_against(
         statuses: Vec<Vec<u8>>,
+        config: BaseConfig,
+        backend: RecordingBackend,
+        state: SettlementState,
+        until_done: bool,
+    ) -> Advanced {
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(
+            0,
+            crate::secret::Secret::seal(&mut [0u8; 32]).unwrap(),
+        )));
+        tracker
+            .lock()
+            .await
+            .record_settlement_order(&state.proposal.proposal_id, 0, Decimal::ONE);
+        advance_tracked(statuses, config, backend, state, until_done, tracker).await
+    }
+
+    /// [`advance_against`] with the adoption records of `tracker`.
+    async fn advance_tracked(
+        statuses: Vec<Vec<u8>>,
         mut config: BaseConfig,
         backend: RecordingBackend,
         state: SettlementState,
         until_done: bool,
+        tracker: Arc<Mutex<OrderTracker>>,
     ) -> Advanced {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.orderbook_grpc_url = format!("http://{}", listener.local_addr().unwrap());
@@ -5428,15 +5463,7 @@ mod tests {
         let lm = ready_lm().await;
         // The buyer side reserves the quote leg
         lm.update_token_balance("CCY", Decimal::from(5000)).await;
-        let tracker = Arc::new(Mutex::new(OrderTracker::new(
-            0,
-            crate::secret::Secret::seal(&mut [0u8; 32]).unwrap(),
-        )));
         let pid = state.proposal.proposal_id.clone();
-        tracker
-            .lock()
-            .await
-            .record_settlement_order(&pid, 0, Decimal::ONE);
         let log = Arc::new(Mutex::new(Vec::new()));
         let advance = |s: SettlementState, shutting_down: bool| {
             advance_single(
@@ -5770,6 +5797,123 @@ mod tests {
         let allocated = [fees, step(ALLOCATION_BUYER, CONFIRMED)].concat();
         let run = advance_against(vec![allocated], lp_config(), RecordingBackend::default(), state, false).await;
         assert!(matches!(run.result, AdvanceResult::NeedsAllocate { .. }));
+    }
+
+    /// Our purchase p1 of 1 USDCx for 2 CCY.
+    fn our_purchase() -> SettlementProposal {
+        let mut p = test_proposal("p1");
+        p.buyer = "test-party".to_string();
+        p.seller = "cp-x".to_string();
+        p.base_quantity = "1".to_string();
+        p.quote_quantity = "2".to_string();
+        p
+    }
+
+    fn empty_tracker() -> Arc<Mutex<OrderTracker>> {
+        Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())))
+    }
+
+    /// The adoption records after adopting `proposal` on the no-reject path.
+    async fn adopted(proposal: SettlementProposal) -> Arc<Mutex<OrderTracker>> {
+        let tracker = empty_tracker();
+        let mut exec = SettlementExecutor::new(&registry_config(), tracker.clone(), MockBackend).unwrap();
+        exec.set_no_reject(true);
+        exec.handle_settlement_update(created_update(proposal)).await.unwrap();
+        tracker
+    }
+
+    /// Restores the saved adoption records of `saved` into a new tracker, as after a
+    /// restart, and streams `resent` to a new executor; returns it and the kept settlement.
+    async fn restore(
+        saved: &Arc<Mutex<OrderTracker>>,
+        resent: SettlementProposal,
+    ) -> (Arc<Mutex<OrderTracker>>, Option<SettlementState>) {
+        let (_, orders, entries) = saved.lock().await.export_state();
+        let entries = serde_json::from_str(&serde_json::to_string(&entries).unwrap()).unwrap();
+        let tracker = empty_tracker();
+        tracker.lock().await.import_state(orders, entries);
+        let id = resent.proposal_id.clone();
+        let mut exec = SettlementExecutor::new(&registry_config(), tracker.clone(), MockBackend).unwrap();
+        exec.handle_settlement_update(created_update(resent)).await.unwrap();
+        let state = exec.active_settlements.get(&id).cloned();
+        (tracker, state)
+    }
+
+    /// One advance of the buyer's restored settlement against `status`.
+    async fn advance_restored(
+        tracker: &Arc<Mutex<OrderTracker>>,
+        state: &Option<SettlementState>,
+        status: Vec<u8>,
+    ) -> Advanced {
+        let mut state = state.clone().expect("the restored settlement is kept");
+        state.dvp_proposal_cid = Some("00proposal".to_string());
+        state.dvp_cid = Some("00dvp".to_string());
+        let backend = RecordingBackend::paying("00dvp");
+        advance_tracked(vec![status], registry_config(), backend, state, false, tracker.clone()).await
+    }
+
+    fn restored_statuses() -> [Vec<u8>; 2] {
+        [
+            side_status(true, NextAction::AcceptDvp, false),
+            [side_status(true, NextAction::Allocate, true), step(DVP_ACCEPT, COMPLETED)].concat(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_restored_proposal_with_its_adopted_terms_goes_ahead() {
+        let mut reformatted = our_purchase();
+        reformatted.quote_quantity = "2.0".to_string();
+        for resent in [our_purchase(), reformatted] {
+            let (tracker, state) = restore(&adopted(our_purchase()).await, resent.clone()).await;
+            let [accept, allocate] = restored_statuses();
+            let run = advance_restored(&tracker, &state, accept).await;
+            assert!(matches!(run.result, AdvanceResult::StepCompleted { .. }), "{resent:?}");
+            assert_eq!(run.backend, ["accept_dvp"]);
+            let run = advance_restored(&tracker, &state, allocate).await;
+            assert!(matches!(run.result, AdvanceResult::NeedsAllocate { .. }), "{resent:?}");
+        }
+    }
+
+    // After a restart, a re-sent proposal with other terms is never signed for
+    #[tokio::test]
+    async fn a_restored_proposal_with_changed_terms_is_neither_accepted_nor_allocated() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let mut changed = our_purchase();
+        changed.quote_quantity = "3".to_string();
+        let (tracker, state) = restore(&adopted(our_purchase()).await, changed.clone()).await;
+        // A second restart keeps the terms adopted first
+        let (again, state_again) = restore(&tracker, changed).await;
+        for (tracker, state) in [(tracker, state), (again, state_again)] {
+            for status in restored_statuses() {
+                let run = advance_restored(&tracker, &state, status).await;
+                assert!(
+                    matches!(&run.result, AdvanceResult::Error { error, .. } if error.contains("quote_quantity")),
+                    "the changed terms went ahead"
+                );
+                assert!(run.backend.is_empty(), "{:?}", run.backend);
+                assert!(!run.reserved);
+            }
+        }
+        assert_eq!(logs.count("differs from its adopted terms (quote_quantity)"), 2);
+    }
+
+    // An older state file has no terms: the first restore records the re-sent ones
+    #[tokio::test]
+    async fn a_restore_from_an_older_state_file_records_the_terms() {
+        let legacy = empty_tracker();
+        let entries = serde_json::from_str(r#"[{"proposal_id":"p1","order_id":0,"quantity":"1","reserved":false}]"#);
+        legacy.lock().await.import_state(Vec::new(), entries.unwrap());
+        let (tracker, state) = restore(&legacy, our_purchase()).await;
+        let run = advance_restored(&tracker, &state, side_status(true, NextAction::AcceptDvp, false)).await;
+        assert_eq!(run.backend, ["accept_dvp"]);
+
+        let mut changed = our_purchase();
+        changed.base_quantity = "1.5".to_string();
+        let (tracker, state) = restore(&tracker, changed).await;
+        let run = advance_restored(&tracker, &state, side_status(true, NextAction::AcceptDvp, false)).await;
+        assert!(matches!(&run.result, AdvanceResult::Error { error, .. } if error.contains("base_quantity")));
+        assert!(run.backend.is_empty(), "{:?}", run.backend);
     }
 
     #[tokio::test]

@@ -59,8 +59,6 @@ use crate::fill_loop::FillDirection;
 use crate::holdings_cache::{HoldingsCache, TEMPLATE_AMULET, TEMPLATE_HOLDING};
 use crate::ledger_client::{AtomicProviderClient, PreSignContext};
 
-/// A reference price older than this, in seconds, is stale.
-pub const REFERENCE_MAX_AGE_SECS: i64 = 60;
 /// The LPs' answer wait the rpc applies to one request or accept (it clamps to 1-30 s).
 const RFQ_WAIT_SECS: u32 = 15;
 /// Bound on one RFQ, price or market call.
@@ -302,6 +300,8 @@ pub(super) struct PriceGuard<'a> {
     pub cc: &'a InstrumentRef,
     /// 0 turns the guard off.
     pub max_bps: u32,
+    /// A reference older than this, in seconds, is stale.
+    pub max_age_secs: i64,
     pub reference: Option<Reference>,
 }
 
@@ -321,7 +321,7 @@ impl PriceGuard<'_> {
         let fresh = |r: &Reference| {
             now.checked_sub(r.at)
                 .and_then(i64::checked_abs)
-                .is_some_and(|age| age <= REFERENCE_MAX_AGE_SECS)
+                .is_some_and(|age| age <= self.max_age_secs)
         };
         let Some(reference) = self.reference.filter(|r| r.mid > Decimal::ZERO && fresh(r)) else {
             return Err(CommandFailure::NoReferencePrice);
@@ -952,6 +952,7 @@ async fn rounds(
         }
     );
     let max_bps = ctx.config.control.swap_max_deviation_bps;
+    let max_age_secs = i64::from(ctx.config.control.swap_reference_max_age_secs);
     let op = &keys.command.op;
     // The binding checks the LP again at signing, against the rules in force then.
     let lp_allowed = |lp: &PartyId| -> bool {
@@ -1023,6 +1024,7 @@ async fn rounds(
             sells_base: plan.sells_base,
             cc: keys.cc,
             max_bps,
+            max_age_secs,
             reference,
         };
         let filter = Filter {
@@ -1190,6 +1192,7 @@ async fn settle_one(
             sells_base: plan.sells_base,
             cc: keys.cc,
             max_bps,
+            max_age_secs: i64::from(ctx.config.control.swap_reference_max_age_secs),
             reference,
         };
         let mut before = |round: &DirectedRound<'_>| -> Result<()> {

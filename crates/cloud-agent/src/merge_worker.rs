@@ -236,6 +236,8 @@ async fn check_and_merge_instrument(
             OperationExpectation::SplitCc {
                 party: config.party_id.clone(),
                 output_amounts: vec![amount_str.clone()],
+                amulet_cids: cids.clone(),
+                dso_party: crate::named_party(&config.dso_party),
             },
         )
     } else {
@@ -261,6 +263,8 @@ async fn check_and_merge_instrument(
                 instrument_id: inst.on_chain_id.clone(),
                 instrument_admin: inst.admin.clone(),
                 amount: amount_str.clone(),
+                command_id: None,
+                input_holding_cids: cids.clone(),
             },
         )
     };

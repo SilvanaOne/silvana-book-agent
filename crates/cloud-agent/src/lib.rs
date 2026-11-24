@@ -42,6 +42,7 @@ pub mod env;
 pub mod fill_loop;
 pub mod holdings_cache;
 pub mod ledger_client;
+mod log_text;
 mod lp_stream;
 pub mod merge_worker;
 pub mod payment_queue;
@@ -53,6 +54,7 @@ mod test_util;
 pub mod ticket_pool;
 pub mod topup;
 pub mod transfer_all;
+pub mod tx_capture;
 pub mod updates_worker;
 #[cfg(feature = "usdcx")]
 pub mod usdcx;
@@ -697,7 +699,7 @@ pub async fn run_cloud_agent(
     // The runner's Ctrl-C handler signals it on first Ctrl-C; every loop with
     // a clone wakes immediately.
     let lp_shutdown = Shutdown::new();
-    control_survey::spawn_summary(lp_shutdown.clone());
+    control_survey::spawn_summary(lp_shutdown.clone(), &config);
     // Pending policies and direct commands of a linked agent, polled every 60 s.
     control::poller::spawn(
         &config,
@@ -937,7 +939,8 @@ pub async fn run_cloud_agent(
             .ok_or_else(|| {
                 anyhow!("auto-topup: MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC rejected")
             })?
-            .with_fee_demand(liquidity_manager);
+            .with_fee_demand(liquidity_manager)
+            .with_pins(prepaid_traffic_pin(&config), named_party(&config.dso_party));
             info!(
                 min_cc = %min_cc,
                 topup_cc = %topup_cc,
@@ -1501,7 +1504,7 @@ pub async fn run_fill(
     // handling — both observe the same signal; `tokio::signal::ctrl_c()` is
     // idempotent across multiple awaiters.)
     let fill_backend_shutdown = Shutdown::new();
-    control_survey::spawn_summary(fill_backend_shutdown.clone());
+    control_survey::spawn_summary(fill_backend_shutdown.clone(), &config);
     let s = fill_backend_shutdown.clone();
     let ctrl_c = agent_logic::supervise::try_spawn("fill backend Ctrl-C", async move {
         match tokio::signal::ctrl_c().await {
@@ -2057,6 +2060,8 @@ pub async fn run_preapproval(
             }
             let expectation = OperationExpectation::RequestPreapproval {
                 party: config.party_id.clone(),
+                operator: named_party(&operator),
+                instrument_admin: named_party(&instrument_admin),
             };
             let result = client
                 .submit_transaction(
@@ -2195,6 +2200,8 @@ pub async fn run_preapproval(
                     );
                     let expectation = OperationExpectation::RequestPreapproval {
                         party: config.party_id.clone(),
+                        operator: named_party(&t.operator),
+                        instrument_admin: named_party(&t.admin),
                     };
                     match client
                         .submit_transaction(
@@ -2363,6 +2370,57 @@ pub async fn run_subscription(
 // Transfer commands
 // ============================================================================
 
+/// A configured party id, when set.
+pub(crate) fn named_party(party: &str) -> Option<String> {
+    let party = party.trim();
+    (!party.is_empty()).then(|| party.to_string())
+}
+
+/// The pinned prepaid-traffic party, when set.
+pub(crate) fn prepaid_traffic_pin(config: &BaseConfig) -> Option<String> {
+    config.party_prepaid_traffic.as_deref().and_then(named_party)
+}
+
+/// Most receivers one batch payment pays.
+const BATCH_PAY_MAX_RECEIVERS: usize = 20;
+/// Most coins one batch payment spends.
+const BATCH_PAY_MAX_COINS: usize = 90;
+
+/// Refuses a batch payment over the receiver or coin limit before it is prepared.
+fn check_batch_pay_limits(targets: &[(String, String)], coins: usize) -> Result<()> {
+    let receivers: std::collections::HashSet<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
+    if receivers.len() > BATCH_PAY_MAX_RECEIVERS {
+        return Err(anyhow!(
+            "batch pay pays at most {} receivers, got {}",
+            BATCH_PAY_MAX_RECEIVERS,
+            receivers.len()
+        ));
+    }
+    if coins > BATCH_PAY_MAX_COINS {
+        return Err(anyhow!(
+            "batch pay spends at most {} coins, got {}; merge coins first",
+            BATCH_PAY_MAX_COINS,
+            coins
+        ));
+    }
+    Ok(())
+}
+
+/// Coins for a batch payment, as indices into `ascending`: at most [`BATCH_PAY_MAX_COINS`] covering
+/// `target`, else `total` alone (`true`: the margin is not covered); `None` when neither.
+fn select_batch_pay_coins(
+    ascending: &[rust_decimal::Decimal],
+    target: rust_decimal::Decimal,
+    total: rust_decimal::Decimal,
+) -> Option<(Vec<usize>, bool)> {
+    // Largest first: a longer selection means no set within the cap covers the goal.
+    let covering = |goal| {
+        Some(payment_queue::select_amulet_indices(ascending, goal))
+            .filter(|p| !p.is_empty() && p.len() <= BATCH_PAY_MAX_COINS)
+    };
+    covering(target).map(|p| (p, false)).or_else(|| covering(total).map(|p| (p, true)))
+}
+
 pub async fn run_transfer(
     config: BaseConfig,
     command: TransferCommands,
@@ -2422,6 +2480,7 @@ pub async fn run_transfer(
                 receiver_party: receiver.clone(),
                 amount: amount.clone(),
                 command_id: command_id.clone(),
+                dso_party: named_party(&config.dso_party),
             };
             let result = client
                 .submit_transaction(
@@ -2539,6 +2598,8 @@ pub async fn run_transfer(
                 instrument_id: wire_instrument_id.clone(),
                 instrument_admin: instrument_admin.clone(),
                 amount: amount.clone(),
+                command_id: None,
+                input_holding_cids: input_holding_cids.clone(),
             };
             let result = client
                 .submit_transaction(
@@ -2635,6 +2696,8 @@ pub async fn run_transfer(
             let expectation = OperationExpectation::SplitCc {
                 party: config.party_id.clone(),
                 output_amounts: output_amounts.clone(),
+                amulet_cids: amulet_cids.clone(),
+                dso_party: named_party(&config.dso_party),
             };
             let result = client
                 .submit_transaction(
@@ -2687,6 +2750,7 @@ pub async fn run_transfer(
             if targets.is_empty() {
                 return Err(anyhow::anyhow!("No payment targets specified"));
             }
+            check_batch_pay_limits(&targets, 0)?;
 
             // Parse strictly so the coverage check below sees real amounts.
             let mut total = rust_decimal::Decimal::ZERO;
@@ -2707,8 +2771,8 @@ pub async fn run_transfer(
                 println!("  {:>3}. {} — {} CC", i + 1, short_party, amount);
             }
 
-            // Auto-select amulets if not provided. Shares the payment queue's
-            // selector so both paths keep the same ordering, cap and margin.
+            // Auto-select amulets if not provided, with the payment queue's selector
+            // and margin, and at most BATCH_PAY_MAX_COINS coins.
             let selected_amulet_cids = if let Some(cids) = amulet_cids {
                 cids
             } else {
@@ -2724,17 +2788,10 @@ pub async fn run_transfer(
                 // The margin is a preference, not a requirement: a wallet that
                 // covers the payments themselves is still allowed to try.
                 let target = payment_queue::with_fee_margin(total).unwrap_or(total);
-                let mut indices = payment_queue::select_amulet_indices(&amounts, target);
-                let mut tight = false;
-                if indices.is_empty() {
-                    indices = payment_queue::select_amulet_indices(&amounts, total);
-                    tight = !indices.is_empty();
-                }
-
-                if indices.is_empty() {
+                let Some((indices, tight)) = select_batch_pay_coins(&amounts, target, total) else {
                     let available: rust_decimal::Decimal =
                         amounts.iter().copied().sum::<rust_decimal::Decimal>();
-                    let considered = payment_queue::MAX_AMULET_INPUTS.min(amounts.len());
+                    let considered = BATCH_PAY_MAX_COINS.min(amounts.len());
                     let best: rust_decimal::Decimal = {
                         let mut sorted = amounts.clone();
                         sorted.sort_by(|a, b| b.cmp(a));
@@ -2750,7 +2807,7 @@ pub async fn run_transfer(
                         best,
                         available
                     ));
-                }
+                };
 
                 let selected_total: rust_decimal::Decimal =
                     indices.iter().map(|&i| amulets[i].amount).sum();
@@ -2787,6 +2844,8 @@ pub async fn run_transfer(
                     .collect()
             };
 
+            check_batch_pay_limits(&targets, selected_amulet_cids.len())?;
+
             if confirm && !dry_run {
                 let lock = agent_logic::confirm::new_confirm_lock();
                 agent_logic::confirm::confirm_transaction(
@@ -2807,10 +2866,17 @@ pub async fn run_transfer(
                 })
                 .collect();
 
-            let op_count = 1; // single BatchPay operation
-            let expectation = OperationExpectation::ExecuteMulticall {
+            let expectation = OperationExpectation::BatchPayCc {
                 party: config.party_id.clone(),
-                op_count,
+                targets: targets
+                    .iter()
+                    .map(|(receiver, amount)| tx_verifier::BatchPayTarget {
+                        receiver: receiver.clone(),
+                        amount: amount.clone(),
+                    })
+                    .collect(),
+                holding_cids: selected_amulet_cids.clone(),
+                dso_party: named_party(&config.dso_party),
             };
 
             let result = client
@@ -2866,6 +2932,8 @@ pub async fn run_transfer(
                 sender_party: config.party_id.clone(),
                 amount: amount.clone(),
                 command_id: command_id.clone(),
+                receiver_party: prepaid_traffic_pin(&config),
+                dso_party: named_party(&config.dso_party),
             };
             let result = client
                 .submit_transaction(
@@ -3291,14 +3359,29 @@ pub fn upsert_env_value(env_file: &std::path::Path, key: &str, value: &str) -> R
         .context("Failed to write .env file")
 }
 
-/// Write all server config values from GetAgentConfigResponse to .env; the platform parties
-/// are pinned only where the env sets none. Returns how the pins stand.
+/// Write all server config values from GetAgentConfigResponse to .env; the platform parties are
+/// pinned only where the env sets none and used by this process at once. Returns how they stand.
 pub fn write_server_config_to_env(
     env_file: &std::path::Path,
     rpc: &str,
     config_resp: &GetAgentConfigResponse,
 ) -> Result<Vec<(&'static str, control::pins::PinState)>> {
-    write_server_config_with(env_file, rpc, config_resp, &|name| std::env::var_os(name))
+    write_server_config_and_install(env_file, rpc, config_resp, &|name| std::env::var_os(name))
+}
+
+/// [`write_server_config_to_env`] with the process env read through `process`.
+fn write_server_config_and_install(
+    env_file: &std::path::Path,
+    rpc: &str,
+    config_resp: &GetAgentConfigResponse,
+    process: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(&'static str, control::pins::PinState)>> {
+    let states = write_server_config_with(env_file, rpc, config_resp, process)?;
+    // The process env was read before the pins were written; a set pin is never replaced.
+    if let Ok(current) = control::platform_parties() {
+        control::install_platform_parties(control::pins::fill_unset(env_file, &current, false));
+    }
+    Ok(states)
 }
 
 fn write_server_config_with(
@@ -3813,6 +3896,9 @@ fn onboarding_control_config(
     config.role = get("AGENT_ROLE").unwrap_or_else(|| "agent".to_string());
     config.token_ttl_secs = 3600;
     config.canton_chain = get(agent_logic::control_store::CHAIN_ENV);
+    // The pins onboarding wrote; the link's attach installs them for this process.
+    config.party_fee = get("PARTY_FEE");
+    config.party_prepaid_traffic = get("PARTY_PREPAID_TRAFFIC");
     Ok(config)
 }
 
@@ -3900,15 +3986,21 @@ mod onboarding_invite_tests {
         let key = agent_logic::secret::Zeroizing::new(bs58::encode(seed).into_string());
         let party = agent_logic::control_store::testing::party_for(seed, "agent-1").unwrap();
         let ledger = bs58::encode([9u8; 32]).into_string();
+        let (fee, traffic) = (format!("fee::1220{}", "a".repeat(64)), format!("traffic::1220{}", "b".repeat(64)));
         std::fs::write(
             &env_file,
-            format!("PARTY_AGENT={party}\nNODE_NAME=n1\nLEDGER_SERVICE_PUBLIC_KEY={ledger}\nCANTON_CHAIN=devnet\n"),
+            format!(
+                "PARTY_AGENT={party}\nNODE_NAME=n1\nLEDGER_SERVICE_PUBLIC_KEY={ledger}\nCANTON_CHAIN=devnet\n\
+                 PARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\n"
+            ),
         )
         .unwrap();
         let config = onboarding_control_config(&env_file, "http://127.0.0.1:1", &key, &|_| None).unwrap();
         assert_eq!(config.party_id, party.to_string());
         assert_eq!(config.canton_chain.as_deref(), Some("devnet"));
         assert_eq!(config.orderbook_grpc_url, "http://127.0.0.1:1");
+        // The link's attach installs these pins for the rest of the onboarding process.
+        assert_eq!((config.party_fee, config.party_prepaid_traffic), (Some(fee), Some(traffic)));
         std::fs::write(&env_file, format!("PARTY_AGENT={party}\n")).unwrap();
         assert!(onboarding_control_config(&env_file, "http://127.0.0.1:1", &key, &|_| None).is_err());
     }
@@ -4122,6 +4214,7 @@ pub async fn complete_ledger_onboarding(
         .filter(|i| !i.registry.is_empty() && !i.operator.is_empty());
     let cc_dso_party = amulet_entry.map(|i| i.registry.clone()).unwrap_or_default();
     // Every preapproval that could not be created, reported once at the end.
+    let mut cc_preapproval_failure: Option<&str> = None;
     let mut preapproval_failures: Vec<String> = Vec::new();
 
     // 11a-CC: Create Splice TransferPreapproval for CC (required for CC auto-completion).
@@ -4143,7 +4236,7 @@ pub async fn complete_ledger_onboarding(
         }
         Err(e) => {
             println!("Warning: could not query existing Splice CC preapprovals: {:#}", e);
-            preapproval_failures.push("CC (Splice): existing-preapproval query failed".to_string());
+            cc_preapproval_failure = Some("existing-preapproval query failed");
             None
         }
     };
@@ -4157,13 +4250,15 @@ pub async fn complete_ledger_onboarding(
             println!(
                 "Warning: no usable Amulet entry in the preapproval target list; skipping CC preapproval."
             );
-            preapproval_failures.push("CC (Splice): no Amulet preapproval target".to_string());
+            cc_preapproval_failure = Some("no Amulet preapproval target");
         } else if let Some(amulet) = amulet_entry {
             let dso_for_cc = amulet.registry.clone();
             let amulet_operator = amulet.operator.clone();
             println!("Creating Splice preapproval for CC...");
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
+                operator: named_party(&amulet_operator),
+                instrument_admin: named_party(&dso_for_cc),
             };
             match client
                 .submit_transaction(
@@ -4189,7 +4284,7 @@ pub async fn complete_ledger_onboarding(
                 ),
                 Err(e) => {
                     println!("Warning: failed to create CC preapproval: {:#}", e);
-                    preapproval_failures.push("CC (Splice): creation failed".to_string());
+                    cc_preapproval_failure = Some("creation failed");
                 }
             }
         }
@@ -4235,6 +4330,8 @@ pub async fn complete_ledger_onboarding(
             );
             let expectation = OperationExpectation::RequestPreapproval {
                 party: cfg.party_id.clone(),
+                operator: named_party(&t.operator),
+                instrument_admin: named_party(&t.admin),
             };
             match client
                 .submit_transaction(
@@ -4463,7 +4560,11 @@ pub async fn complete_ledger_onboarding(
             )
             .ok_or_else(|| {
                 anyhow!("auto-topup: MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC rejected")
-            })?;
+            })?
+            .with_pins(
+                read_env_value(env_file, "PARTY_PREPAID_TRAFFIC").as_deref().and_then(named_party),
+                read_env_value(env_file, "DSO").as_deref().and_then(named_party),
+            );
 
             if canton_chain == "devnet" {
                 // Devnet: faucet above funded the agent's CC amulet wallet, so an
@@ -4530,17 +4631,29 @@ pub async fn complete_ledger_onboarding(
 
     // Reported last so a single unreachable registry cannot cost the agent its
     // user service, faucet and traffic seed.
-    if !preapproval_failures.is_empty() {
-        anyhow::bail!(
-            "onboarding finished, but {} CIP-56 preapproval(s) failed — retry with \
-             `preapproval request --instrument-admin <PARTY>` for: {}",
-            preapproval_failures.len(),
-            preapproval_failures.join(", ")
-        );
+    if let Some(text) = preapproval_failure_text(cc_preapproval_failure, &preapproval_failures) {
+        anyhow::bail!("{text}");
     }
 
     println!("\n=== Onboarding complete! ===");
     Ok(())
+}
+
+/// The error an onboarding ends with when a preapproval failed: the CC (Splice) one and the
+/// CIP-56 ones, each with its own retry; `None` when none failed.
+fn preapproval_failure_text(cc: Option<&str>, cip56_admins: &[String]) -> Option<String> {
+    let mut failed = Vec::new();
+    if let Some(reason) = cc {
+        failed.push(format!("the CC (Splice) preapproval failed ({reason}) — re-run `onboard` to retry it"));
+    }
+    if !cip56_admins.is_empty() {
+        failed.push(format!(
+            "{} CIP-56 preapproval(s) failed — retry with `preapproval request --instrument-admin <PARTY>` for: {}",
+            cip56_admins.len(),
+            cip56_admins.join(", ")
+        ));
+    }
+    (!failed.is_empty()).then(|| format!("onboarding finished, but {}", failed.join("; and ")))
 }
 
 // ============================================================================
@@ -5684,6 +5797,8 @@ pub async fn atomic_split_denominations(
             let expectation = OperationExpectation::SplitCc {
                 party: config.party_id.clone(),
                 output_amounts: output_amounts.clone(),
+                amulet_cids: input_cids.clone(),
+                dso_party: named_party(&config.dso_party),
             };
             v1_client
                 .submit_transaction(
@@ -7297,6 +7412,20 @@ mod onboard_key_tests {
     }
 
     #[test]
+    fn a_failed_cc_preapproval_is_reported_apart_from_the_cip56_ones() {
+        let cc = preapproval_failure_text(Some("creation failed"), &[]).unwrap();
+        assert!(cc.contains("the CC (Splice) preapproval failed (creation failed)"), "{cc}");
+        assert!(cc.contains("re-run `onboard`") && !cc.contains("CIP-56"), "{cc}");
+        let admins = vec!["reg::1220aa".to_string()];
+        let cip56 = preapproval_failure_text(None, &admins).unwrap();
+        assert!(cip56.contains("1 CIP-56 preapproval(s) failed") && cip56.ends_with("for: reg::1220aa"), "{cip56}");
+        assert!(!cip56.contains("CC (Splice)"), "{cip56}");
+        let both = preapproval_failure_text(Some("creation failed"), &admins).unwrap();
+        assert!(both.starts_with("onboarding finished, but the CC (Splice)") && both.contains("; and 1 CIP-56"), "{both}");
+        assert_eq!(preapproval_failure_text(None, &[]), None);
+    }
+
+    #[test]
     fn test_read_env_value_strips_quotes() {
         let env = scratch_env(Some(
             "PLAIN=v\nDQ=\"v\"\nSQ='v'\nSPACED=  \"v\"  \nINNER=a\"b\n",
@@ -7459,6 +7588,24 @@ mod onboard_key_tests {
         let err = write_server_config_with(&fresh, "http://rpc", &bad, &|_| None).unwrap_err().to_string();
         assert!(err.contains("refusing to pin PARTY_FEE"), "{err}");
         assert_eq!(std::fs::read(&fresh).unwrap(), before, "nothing written");
+    }
+
+    #[test]
+    fn onboarding_installs_the_pins_it_writes_for_this_process() {
+        let party = |hint: &str, digit: &str| format!("{hint}::1220{}", digit.repeat(64));
+        let (fee, traffic) = (party("fee", "7"), party("traffic", "8"));
+        let env = format!("SYNCHRONIZER_ID=s\nPARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\n");
+        let served = GetAgentConfigResponse { env, ..Default::default() };
+        let both = control::PlatformParties { fee: Some(fee), prepaid_traffic: Some(traffic) };
+        // Other tests install their own pins meanwhile; a run they interleave is repeated.
+        let held = (0..20).any(|_| {
+            control::install_platform_parties(control::PlatformParties::default());
+            let env = scratch_env(Some("PARTY_AGENT=p::1220\n"));
+            // The shell's own PARTY_FEE or PARTY_PREPAID_TRAFFIC is not read.
+            write_server_config_and_install(&env, "http://rpc", &served, &|_| None).unwrap();
+            control::platform_parties().unwrap() == both
+        });
+        assert!(held, "the process copy holds both pins after the write");
     }
 
     // The default moved to mainnet: a re-run in a devnet folder must not mix the two.
@@ -7667,5 +7814,59 @@ mod transfer_tests {
         let created = vec![created("#pkg:Splice.Amulet:Amulet", "a1")];
         assert_eq!(pending_transfer_offer(&created), None);
         assert_eq!(pending_transfer_offer(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod batch_pay_limit_tests {
+    use super::*;
+
+    fn targets(n: usize) -> Vec<(String, String)> {
+        (0..n).map(|i| (format!("r{i}::1220aa"), "1".to_string())).collect()
+    }
+
+    #[test]
+    fn batch_pay_refuses_more_than_20_receivers_and_90_coins() {
+        assert!(check_batch_pay_limits(&targets(20), 90).is_ok());
+        let err = check_batch_pay_limits(&targets(21), 1).unwrap_err().to_string();
+        assert_eq!(err, "batch pay pays at most 20 receivers, got 21");
+        let err = check_batch_pay_limits(&targets(2), 91).unwrap_err().to_string();
+        assert!(err.starts_with("batch pay spends at most 90 coins, got 91"), "{err}");
+        // A receiver paid twice counts once.
+        let mut twice = targets(20);
+        twice.push(twice[0].clone());
+        assert!(check_batch_pay_limits(&twice, 1).is_ok());
+    }
+
+    #[test]
+    fn batch_pay_selects_at_most_90_coins_when_90_cover_the_payment() {
+        use rust_decimal::Decimal;
+        let coins = vec![Decimal::ONE; 100];
+        let select = |total: Decimal| {
+            let target = payment_queue::with_fee_margin(total).unwrap();
+            select_batch_pay_coins(&coins, target, total)
+        };
+        // The 2% margin on 89 needs 91 coins: the payments alone are covered by 89.
+        let (picked, tight) = select(Decimal::from(89)).expect("89 coins cover 89");
+        assert!(picked.len() <= BATCH_PAY_MAX_COINS, "{} coins", picked.len());
+        assert!(check_batch_pay_limits(&targets(1), picked.len()).is_ok());
+        let covered = picked.iter().try_fold(Decimal::ZERO, |sum, &i| sum.checked_add(coins[i])).unwrap();
+        assert!(covered >= Decimal::from(89), "{covered}");
+        assert!(tight);
+        // Within the cap the margin is still preferred.
+        let (picked, tight) = select(Decimal::from(50)).expect("51 coins cover the margin");
+        assert_eq!((picked.len(), tight), (51, false));
+        // Nothing of 90 coins covers 91: refused rather than a larger set.
+        assert_eq!(select(Decimal::from(91)), None);
+        // A single covering coin is still the smallest one.
+        let mixed = [Decimal::ONE, Decimal::from(60), Decimal::from(500)];
+        let target = payment_queue::with_fee_margin(Decimal::from(50)).unwrap();
+        assert_eq!(select_batch_pay_coins(&mixed, target, Decimal::from(50)), Some((vec![1], false)));
+    }
+
+    #[test]
+    fn named_party_ignores_blank_values() {
+        assert_eq!(named_party(" dso::1220aa "), Some("dso::1220aa".to_string()));
+        assert_eq!(named_party("  "), None);
     }
 }

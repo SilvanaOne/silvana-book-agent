@@ -1235,6 +1235,7 @@ fn request_for(
                 receiver_party: receiver.as_str().to_string(),
                 amount: amount.clone(),
                 command_id: canton_id.clone(),
+                dso_party: None,
             };
             let params = Params::TransferCc(TransferCcParams {
                 receiver_party: receiver.as_str().to_string(),
@@ -1267,6 +1268,8 @@ fn request_for(
                 instrument_id: instrument.id.as_str().to_string(),
                 instrument_admin: instrument.admin.as_str().to_string(),
                 amount: amount.clone(),
+                command_id: Some(canton_id),
+                input_holding_cids: vec![],
             };
             let params = Params::TransferCip56(TransferCip56Params {
                 instrument_id: instrument.id.as_str().to_string(),
@@ -1338,6 +1341,11 @@ fn classify(
         },
         Ok(_) => Submitted::Again("the ledger-service answered without a signature".to_string()),
         Err(e) => {
+            // The packages check of every signature, run before the binding
+            if let Some(packages) = e.downcast_ref::<intent::PackageRefusal>().filter(|_| !signed) {
+                let (refused, code, name) = packages.signature_refusal().receipt_code();
+                return Submitted::Answered { refused, code, name, from_ledger: false };
+            }
             let text = format!("{e:#}");
             let code = ledger_answer(&text);
             match (signed, code) {
@@ -1465,7 +1473,10 @@ async fn attempt(exec: &mut Executor<'_>, ready: Ready) -> Result<Handled> {
     let pinned = platform.pinned().map_err(|e| anyhow!(e))?;
     let envelope = ProofEnvelope::decode(&pending.proof)
         .map_err(|e| anyhow!("the proof does not decode ({})", e.code_name()))?;
-    let (req, expectation) = request_for(&command, &pending, &envelope, &ctx.config.party_id)?;
+    let (req, mut expectation) = request_for(&command, &pending, &envelope, &ctx.config.party_id)?;
+    if let OperationExpectation::TransferCc { dso_party, .. } = &mut expectation {
+        *dso_party = crate::named_party(&ctx.config.dso_party);
+    }
     let offset = match tokio::time::timeout(LEDGER_END_TIMEOUT, exec.ledger.ledger_end()).await {
         Ok(Ok(offset)) if offset > 0 => offset,
         Ok(Ok(_)) => return Ok(Handled::NotYet("the ledger end is unknown".into())),

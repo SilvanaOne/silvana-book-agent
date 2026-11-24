@@ -512,6 +512,8 @@ pub struct DAppProviderClient {
     /// runner (which owns its own DAppProviderClient and runs in a
     /// dedicated task — see [`crate::topup::TopupRunner::spawn`]).
     topup_trigger: Option<crate::topup::TopupTrigger>,
+    /// `[verify]` and `[vetted_packages]` as installed when the client was made.
+    signing: Arc<crate::control::SigningSettings>,
 }
 
 impl DAppProviderClient {
@@ -535,6 +537,7 @@ impl DAppProviderClient {
             signer: AgentSigner::anonymous()?,
             ledger_service_public_key: [0u8; 32],
             topup_trigger: None,
+            signing: crate::control::signing_settings(),
         })
     }
 
@@ -561,6 +564,7 @@ impl DAppProviderClient {
             signer,
             ledger_service_public_key: *ledger_service_public_key,
             topup_trigger: None,
+            signing: crate::control::signing_settings(),
         })
     }
 
@@ -573,6 +577,12 @@ impl DAppProviderClient {
     #[cfg(test)]
     fn with_bounds(mut self, bounds: CallBounds) -> Self {
         self.bounds = bounds;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_signing(mut self, settings: crate::control::SigningSettings) -> Self {
+        self.signing = Arc::new(settings);
         self
     }
 
@@ -615,6 +625,7 @@ impl DAppProviderClient {
             signer,
             ledger_service_public_key: *ledger_service_public_key,
             topup_trigger: None,
+            signing: crate::control::signing_settings(),
         })
     }
 
@@ -1160,7 +1171,7 @@ impl DAppProviderClient {
                 prepared.prepared_transaction_hash.clone(),
                 prepared.hashing_scheme_version.clone(),
                 expectation.clone(),
-                VerifyMode { strict_all: strict },
+                VerifyMode { strict_all: strict, setting: self.signing.verify },
                 verbose,
                 self.party_id.clone(),
             )
@@ -1263,6 +1274,9 @@ impl DAppProviderClient {
             } else if directed.is_some() {
                 bail!("a directed transaction is signed only by a linked agent; nothing was signed");
             }
+            let hash_check = &verification.hash_check;
+            check_packages_before_signing(self.signer.guard(), &self.signing, &prepared_bytes, hash_check, &prepared.command_id)
+                .await?;
             if let Some(hook) = pre_sign.as_mut() {
                 hook(&PreSignContext {
                     command_id: &prepared.command_id,
@@ -1273,6 +1287,18 @@ impl DAppProviderClient {
                 })
                 .context("refused before signing")?;
             }
+
+            crate::tx_capture::before_signing(crate::tx_capture::Signing {
+                party: &self.party_id,
+                expectation,
+                request: crate::tx_capture::Request::Ledger(&req),
+                prepared_transaction: &prepared_bytes,
+                server_hash_base64: &prepared.prepared_transaction_hash,
+                hashing_scheme_version: &prepared.hashing_scheme_version,
+                command_id: &prepared.command_id,
+                fees_json: &prepared.fees_json,
+                verification: &verification,
+            });
 
             // 3. Determine which hash to sign (32 non-zero bytes either way)
             let hash_to_sign = select_hash_to_sign(&verification, &prepared.prepared_transaction_hash)?;
@@ -1290,7 +1316,7 @@ impl DAppProviderClient {
             }
             let signature = self.signer.sign_transaction(&authorization, &hash_to_sign)?;
             let request = crate::control::OwnRequest::Ledger(req.params.as_ref());
-            crate::control_survey::record_signed_observed(expectation, &self.party_id, request, &verification, &facts, strict);
+            crate::control_survey::record_signed_observed(expectation, &self.party_id, request, &verification, &facts, strict, &prepared_bytes);
 
             // 4. Execute (catch gRPC errors for update-based recovery).
             //    Echo back the server's fees_json verbatim — the server
@@ -2001,6 +2027,54 @@ fn check_linked_content(
     Ok(())
 }
 
+/// The packages check of every signature: `[vetted_packages]` when it selects and, once
+/// linked, the packages rule in force. A refusal is logged here and never sent anywhere.
+async fn check_packages_before_signing(
+    guard: &agent_logic::signer::ControlGuard,
+    settings: &crate::control::SigningSettings,
+    prepared_transaction: &[u8],
+    hash_check: &HashCheck,
+    command_id: &str,
+) -> Result<()> {
+    let Some(refusal) = package_refusal(guard, settings, prepared_transaction, hash_check)? else {
+        return Ok(());
+    };
+    let label = match refusal.package() {
+        Some(id) => crate::control_survey::refusal_label(&id.to_string(), settings.catalog.as_deref()).await,
+        None => None,
+    };
+    let label = label.map(|label| format!(" ({label})")).unwrap_or_default();
+    tracing::error!("{refusal}{label}; nothing was signed [{command_id}]");
+    Err(anyhow::Error::new(refusal))
+}
+
+/// The refusal of [`check_packages_before_signing`], if any, read without awaiting.
+fn package_refusal(
+    guard: &agent_logic::signer::ControlGuard,
+    settings: &crate::control::SigningSettings,
+    prepared_transaction: &[u8],
+    hash_check: &HashCheck,
+) -> Result<Option<crate::control::intent::PackageRefusal>> {
+    let view = guard.view();
+    let rules = match view.as_deref() {
+        None => None,
+        Some(view) => {
+            let now = agent_logic::clock::unix_now()
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+                .and_then(agent_control::UtcTime::from_unix_secs)
+                .ok_or_else(|| anyhow!("package_not_allowed: the local clock is unreadable; nothing was signed"))?;
+            Some(view.state().rules_at(now).rules())
+        }
+    };
+    let checked = crate::control::intent::check_signature_packages(
+        prepared_transaction,
+        hash_check,
+        &settings.vetted_packages,
+        rules,
+    );
+    Ok(checked.err())
+}
+
 /// The computed hash when it matched the server's, otherwise the server hash
 /// (which must be exactly 32 non-zero bytes).
 fn select_hash_to_sign(verification: &tx_verifier::VerificationResult, server_hash_base64: &str) -> Result<TxHash> {
@@ -2066,10 +2140,26 @@ pub const EXECUTE_OUTCOME_UNKNOWN: &str = "EXECUTE_OUTCOME_UNKNOWN";
 /// True when an error from [`AtomicProviderClient::submit_atomic_transaction`]
 /// means the transaction may have committed (recovery scan unavailable) — the
 /// caller must reconcile before retrying with different inputs.
-/// Also true for [`EXECUTE_OUTCOME_UNKNOWN`] errors.
+/// Also true for [`EXECUTE_OUTCOME_UNKNOWN`] errors, never for a typed refusal made before
+/// signing, whatever its text; a marker is raised as a fresh error, as in [`mark_uncertain`].
 pub fn is_ambiguous_execute_error(err: &anyhow::Error) -> bool {
+    if is_presign_refusal(err) {
+        return false;
+    }
     let text = format!("{err:#}");
     text.contains(ATOMIC_EXECUTE_AMBIGUOUS) || text.contains(EXECUTE_OUTCOME_UNKNOWN)
+}
+
+/// Whether the chain of `err` holds a typed refusal made before any signature.
+pub(crate) fn is_presign_refusal(err: &anyhow::Error) -> bool {
+    use crate::control::intent::{ContentRefusal, PackageRefusal, SignatureRefusal};
+    let typed = |link: &(dyn std::error::Error + 'static)| {
+        link.is::<PackageRefusal>() || link.is::<ContentRefusal>() || link.is::<SignatureRefusal>()
+    };
+    err.downcast_ref::<PackageRefusal>().is_some()
+        || err.downcast_ref::<ContentRefusal>().is_some()
+        || err.downcast_ref::<SignatureRefusal>().is_some()
+        || err.chain().any(typed)
 }
 
 /// Whether an execute failure the ledger service reported proves nothing was
@@ -2340,6 +2430,8 @@ pub struct AtomicProviderClient {
     party_id: String,
     signer: AgentSigner,
     ledger_service_public_key: [u8; 32],
+    /// `[verify]` and `[vetted_packages]` as installed when the client was made.
+    signing: Arc<crate::control::SigningSettings>,
 }
 
 impl AtomicProviderClient {
@@ -2395,7 +2487,14 @@ impl AtomicProviderClient {
             party_id: party_id.to_string(),
             signer,
             ledger_service_public_key: *ledger_service_public_key,
+            signing: crate::control::signing_settings(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_signing(mut self, settings: crate::control::SigningSettings) -> Self {
+        self.signing = Arc::new(settings);
+        self
     }
 
     /// A client of `party_id` on `channel` with short bounds, for a fake ledger-service.
@@ -2694,7 +2793,7 @@ impl AtomicProviderClient {
                 prepared.prepared_transaction_hash.clone(),
                 prepared.hashing_scheme_version.clone(),
                 expectation.clone(),
-                VerifyMode { strict_all: strict },
+                VerifyMode { strict_all: strict, setting: self.signing.verify },
                 verbose,
                 self.party_id.clone(),
             )
@@ -2723,7 +2822,8 @@ impl AtomicProviderClient {
             }
 
             if !verification.accepted {
-                if force && !strict {
+                // A strict operation is never signed past a rejection.
+                if force && !strict && !expectation.requires_hash_match() {
                     warn!(
                         "Atomic transaction verification REJECTED but --force is set, proceeding: {}",
                         verification.rejection_reason.as_deref().unwrap_or("unknown")
@@ -2766,6 +2866,9 @@ impl AtomicProviderClient {
             } else if directed.is_some() {
                 bail!("a directed transaction is signed only by a linked agent; nothing was signed");
             }
+            let hash_check = &verification.hash_check;
+            check_packages_before_signing(self.signer.guard(), &self.signing, &prepared_bytes, hash_check, &prepared.command_id)
+                .await?;
             if let Some(hook) = pre_sign.as_mut() {
                 hook(&PreSignContext {
                     command_id: &prepared.command_id,
@@ -2776,6 +2879,18 @@ impl AtomicProviderClient {
                 })
                 .context("refused before signing")?;
             }
+
+            crate::tx_capture::before_signing(crate::tx_capture::Signing {
+                party: &self.party_id,
+                expectation,
+                request: crate::tx_capture::Request::Atomic(&req),
+                prepared_transaction: &prepared_bytes,
+                server_hash_base64: &prepared.prepared_transaction_hash,
+                hashing_scheme_version: &prepared.hashing_scheme_version,
+                command_id: &prepared.command_id,
+                fees_json: &prepared.fees_json,
+                verification: &verification,
+            });
 
             // 3. Hash selection (server hash unless it matched; 32 non-zero bytes either way)
             let hash_to_sign = select_hash_to_sign(&verification, &prepared.prepared_transaction_hash)?;
@@ -2792,7 +2907,7 @@ impl AtomicProviderClient {
             }
             let signature = self.signer.sign_transaction(&authorization, &hash_to_sign)?;
             let request = crate::control::OwnRequest::Atomic(req.params.as_ref());
-            crate::control_survey::record_signed_observed(expectation, &self.party_id, request, &verification, &facts, strict);
+            crate::control_survey::record_signed_observed(expectation, &self.party_id, request, &verification, &facts, strict, &prepared_bytes);
 
             // 4. Execute — echo fees_json verbatim
             let result = match self
@@ -3004,6 +3119,8 @@ mod quote_window_tests {
             valid_until_micros,
             lp_input_holding_cids: vec!["00lp1".into()],
             user_input_holding_cids: vec!["00u1".into()],
+            expected_fees: vec![],
+            fee_party: None,
         }
     }
 
@@ -3664,6 +3781,54 @@ mod bounded_io_tests {
         assert!(after.0 > before.0 && after.2 > before.2, "{before:?} -> {after:?}");
     }
 
+    /// [`signed_prepare`] carrying `prepared` as its transaction.
+    fn signed_prepare_carrying(party: &str, prepared: &[u8]) -> Vec<u8> {
+        let (txid, cmd, version, fees) = ("tx-1", "cmd-1", "V2", "[]");
+        let hash = BASE64.encode([1u8; 32]);
+        let mut m = Vec::new();
+        put_bytes(1, txid.as_bytes(), &mut m);
+        put_bytes(2, hash.as_bytes(), &mut m);
+        put_bytes(3, cmd.as_bytes(), &mut m);
+        put_bytes(5, prepared, &mut m);
+        put_bytes(6, version.as_bytes(), &mut m);
+        put_bytes(8, fees.as_bytes(), &mut m);
+        signature_field(30, &message_signing::canonical_prepare_response(txid, &hash, cmd, prepared, version), &mut m);
+        signature_field(31, &message_signing::canonical_tx_fees_authorization(party, txid, fees), &mut m);
+        m
+    }
+
+    #[tokio::test]
+    async fn both_submit_paths_capture_the_servers_bytes_right_before_signing() {
+        use crate::tx_capture::test_sink;
+        // An empty transaction and empty metadata
+        let prepared = vec![0x0a, 0x00, 0x12, 0x00];
+        let ledger = |error_field: u64| SigningLedger {
+            prepare: signed_prepare_carrying("party", &prepared),
+            execute: Ok(signed_failure("Transaction failed: rejected", error_field)),
+        };
+        let tickets = OperationExpectation::IssueTickets { lp_party: "lp".into(), ticket_count: 1 };
+        let (_, ledger_lines) = test_sink::collect(submit_once(ledger(4))).await;
+        let (_, atomic_lines) = test_sink::collect(submit_atomic_once(ledger(3), tickets.clone())).await;
+        for (lines, path) in [(&ledger_lines, "ledger"), (&atomic_lines, "atomic")] {
+            assert_eq!(lines.len(), 1, "one record per signature: {lines:?}");
+            let line = &lines[0];
+            assert_eq!((line["kind"].as_str(), line["path"].as_str()), (Some("issue_tickets"), Some(path)));
+            assert_eq!((line["command_id"].as_str(), line["hashing_scheme_version"].as_str()), (Some("cmd-1"), Some("V2")));
+            assert_eq!(line["server_hash_hex"], hex::encode([1u8; 32]));
+            let captured = BASE64.decode(line["prepared_transaction"].as_str().unwrap()).unwrap();
+            assert_eq!(captured, prepared, "the bytes the server sent");
+        }
+        // A dry run signs nothing and captures nothing
+        let (url, server) = serve(tonic::service::Routes::new(ledger(4))).await;
+        let mut c = DAppProviderClient::from_channel(lazy_channel(&url), "party", "agent", &key(), 3600, None, &server_key())
+            .unwrap()
+            .with_bounds(short_bounds());
+        let dry = c.submit_with_retries(preapproval_request(), &tickets, false, true, false, 1);
+        let (dry, lines) = test_sink::collect(tokio::time::timeout(Duration::from_secs(30), dry)).await;
+        server.abort();
+        assert!(matches!(dry, Ok(Ok(_))) && lines.is_empty(), "{lines:?}");
+    }
+
     #[test]
     fn server_failures_are_definite_only_with_proof() {
         for definite in [
@@ -3753,7 +3918,7 @@ mod bounded_io_tests {
             pre_approval: true,
         };
         let accept_dvp = OperationExpectation::AcceptDvp {
-            seller_party: "party".into(),
+            acceptor: "party".into(),
             proposal_id: "p1".into(),
             dvp_proposal_cid: "00ab".into(),
             expected_delivery_amount: "1".into(),
@@ -3762,6 +3927,7 @@ mod bounded_io_tests {
             expected_delivery_instrument_admin: "admin".into(),
             expected_payment_instrument_id: "QUOTE".into(),
             expected_payment_instrument_admin: "admin".into(),
+            terms: None,
         };
         for expectation in [usdcx, accept_dvp] {
             assert!(expectation.requires_hash_match());
@@ -3777,6 +3943,42 @@ mod bounded_io_tests {
             let text = format!("{err:#}");
             assert!(text.contains("Transaction verification REJECTED"), "{text}");
             assert!(!hook_ran, "nothing may be signed");
+        }
+    }
+
+    #[tokio::test]
+    async fn force_never_signs_an_atomic_operation_that_requires_a_hash_match() {
+        use crate::tx_capture::test_sink;
+        let usdcx = OperationExpectation::UsdcxUpdatePreApproval {
+            party: "party".into(),
+            network: "mainnet".into(),
+            pre_approval: true,
+        };
+        let accept_dvp = OperationExpectation::AcceptDvp {
+            acceptor: "party".into(),
+            proposal_id: "p1".into(),
+            dvp_proposal_cid: "00ab".into(),
+            expected_delivery_amount: "1".into(),
+            expected_payment_amount: "2".into(),
+            expected_delivery_instrument_id: "BASE".into(),
+            expected_delivery_instrument_admin: "admin".into(),
+            expected_payment_instrument_id: "QUOTE".into(),
+            expected_payment_instrument_admin: "admin".into(),
+            terms: None,
+        };
+        // An empty transaction with an empty submitter, so a local hash differing from the server's [1; 32]
+        let prepared = [0x0a, 0x00, 0x12, 0x02, 0x12, 0x00];
+        let local = tx_verifier::hasher::try_compute_hash(&prepared, "V2");
+        assert!(matches!(local, Ok(hash) if hash != [1u8; 32]), "{local:?}");
+        for expectation in [usdcx, accept_dvp] {
+            assert!(expectation.requires_hash_match());
+            for prepare in [signed_prepare_carrying("party", &prepared), signed_prepare("party")] {
+                let ledger = SigningLedger { prepare, execute: Ok(signed_failure("Transaction failed: rejected", 3)) };
+                let (err, lines) = test_sink::collect(submit_atomic_once(ledger, expectation.clone())).await;
+                let text = format!("{err:#}");
+                assert!(text.starts_with(ATOMIC_VERIFICATION_REJECTED), "{text}");
+                assert!(lines.is_empty(), "nothing may be signed: {lines:?}");
+            }
         }
     }
 
@@ -3808,6 +4010,30 @@ mod bounded_io_tests {
         assert!(is_ambiguous_execute_error(&err));
         assert!(is_ambiguous_execute_error(&anyhow!("{ATOMIC_EXECUTE_AMBIGUOUS}: z")));
         assert!(!is_ambiguous_execute_error(&anyhow!("Transaction failed: INACTIVE_CONTRACTS")));
+    }
+
+    #[test]
+    fn a_refusal_before_signing_is_never_ambiguous_whatever_its_text() {
+        use crate::control::intent::{ContentRefusal, PackageRefusal, SignatureRefusal, UnmatchedHash};
+        let text = format!("{ATOMIC_EXECUTE_AMBIGUOUS} {EXECUTE_OUTCOME_UNKNOWN}");
+        let refusals = [
+            anyhow::Error::new(PackageRefusal::Unreadable(text.clone())),
+            anyhow::Error::new(PackageRefusal::HashUnmatched(UnmatchedHash::Uncomputed(text.clone()))),
+            anyhow!(ContentRefusal::BadRequest(text.clone())),
+            anyhow::Error::new(SignatureRefusal::Packages(text.clone())),
+            anyhow::Error::new(SignatureRefusal::Content(ContentRefusal::Unreadable(text.clone())))
+                .context("refused before signing"),
+        ];
+        for err in refusals {
+            let shown = format!("{err:#}");
+            assert!(shown.contains(ATOMIC_EXECUTE_AMBIGUOUS) && shown.contains(EXECUTE_OUTCOME_UNKNOWN), "{shown}");
+            assert!(!is_ambiguous_execute_error(&err), "nothing was signed: {shown}");
+            // After an earlier execute that may still commit, the outcome is unknown again
+            assert!(is_ambiguous_execute_error(&mark_uncertain(err, Some("cmd-1"))), "{shown}");
+        }
+        let marked = anyhow!("Transaction failed: x").context(format!("{ATOMIC_EXECUTE_AMBIGUOUS}: transport"));
+        assert!(is_ambiguous_execute_error(&marked));
+        assert!(is_ambiguous_execute_error(&anyhow!("{EXECUTE_OUTCOME_UNKNOWN}: ledger scan incomplete")));
     }
 
     // ---- retry policy ----
@@ -4052,6 +4278,7 @@ mod bounded_io_tests {
             burn_holding_cids: Vec::new(),
             hash_check,
             coverage: tx_verifier::Coverage::Fields,
+            would_refuse: Vec::new(),
         }
     }
 
@@ -4211,7 +4438,12 @@ mod bounded_io_tests {
         /// A signed prepare carrying `prepared` and, unless `wrong_hash`, its own hash.
         fn signed_prepare_of(party: &str, prepared: &[u8], wrong_hash: bool) -> Vec<u8> {
             let computed = tx_verifier::hasher::try_compute_hash(prepared, "V2").expect("the fixture hashes");
-            let hash = BASE64.encode(if wrong_hash { [3u8; 32] } else { computed });
+            signed_prepare_hashed(party, prepared, if wrong_hash { [3u8; 32] } else { computed })
+        }
+
+        /// A signed prepare carrying `prepared` and `server_hash`, whatever `prepared` hashes to.
+        fn signed_prepare_hashed(party: &str, prepared: &[u8], server_hash: [u8; 32]) -> Vec<u8> {
+            let hash = BASE64.encode(server_hash);
             let (txid, cmd, version, fees) = ("tx-1", "cmd-1", "V2", "[]");
             let mut m = Vec::new();
             put_bytes(1, txid.as_bytes(), &mut m);
@@ -4364,16 +4596,23 @@ mod bounded_io_tests {
         async fn drill_substituted_split_merge_and_traffic_content() {
             let seed = [0x91; 32];
             let (_, me) = link(seed).await;
+            let rejected = |reason: String| format!("{VERIFICATION_REJECTED}: {reason}");
             // A split whose content pays another party.
-            let split = OperationExpectation::SplitCc { party: me.clone(), output_amounts: vec!["1".into()] };
-            let o = submit_linked(seed, split_request(), split, |me| root_creating(me, &[("0a", me, "1.0"), ("0b", EVE, "5.0")]), false, false).await;
-            refused_before_signing(&o, "content check refused before signing");
-            assert!(format!("{:#}", o.err).contains(EVE));
+            let split = OperationExpectation::SplitCc { party: me.clone(), output_amounts: vec!["1".into()], amulet_cids: vec![], dso_party: None };
+            let body = |me: &str| {
+                fixture::rewritten(&fixture::cc_split(me, &["1"], "10", "9", "cmd-1"), |p| {
+                    fixture::exercise_mut(p, "0").unwrap().children.push("11".into());
+                    p.transaction.as_mut().unwrap().nodes.push(fixture::node("11", NodeType::Create(fixture::amulet("00e9", EVE, "5.0"))));
+                })
+            };
+            let o = submit_linked(seed, split_request(), split, body, false, false).await;
+            refused_before_signing(&o, &rejected(format!("the split creates an Amulet for {EVE}")));
             // A merge (a CIP-56 transfer to self) whose content pays another party.
+            let token = "USDCx";
             let merge_req = PrepareTransactionRequest {
                 params: Some(Params::TransferCip56(TransferCip56Params {
-                    instrument_id: "Amulet".into(),
-                    instrument_admin: DSO.into(),
+                    instrument_id: token.into(),
+                    instrument_admin: fixture::registry(),
                     receiver_party: me.clone(),
                     amount: "5".into(),
                     ..Default::default()
@@ -4383,31 +4622,52 @@ mod bounded_io_tests {
             let merge = OperationExpectation::TransferCip56 {
                 sender_party: me.clone(),
                 receiver_party: me.clone(),
-                instrument_id: "Amulet".into(),
-                instrument_admin: DSO.into(),
+                instrument_id: token.into(),
+                instrument_admin: fixture::registry(),
                 amount: "5".into(),
+                command_id: None,
+                input_holding_cids: vec![],
             };
-            let o = submit_linked(seed, merge_req, merge, |_| root_creating(&me, &[("0c", EVE, "5.0")]), false, false).await;
-            refused_before_signing(&o, "is not a leg of this transfer_cip56 request");
+            let body = |me: &str| fixture::token_transfer(&shape(me, EVE, me, "5", "5", "cmd-1"), token);
+            let o = submit_linked(seed, merge_req, merge, body, false, false).await;
+            refused_before_signing(&o, &rejected(format!("unexpected holding of 5 for {EVE}")));
             // A traffic top-up whose content pays a party other than the pinned one.
-            let traffic_req = PrepareTransactionRequest {
-                params: Some(Params::PrepayTraffic(PrepayTrafficParams {
-                    amount: "20".into(),
-                    command_id: "c".into(),
-                    ..Default::default()
-                })),
-                ..Default::default()
+            let traffic_req = PrepayTrafficParams { amount: "20".into(), command_id: "c".into(), ..Default::default() };
+            let traffic_req = PrepareTransactionRequest { params: Some(Params::PrepayTraffic(traffic_req)), ..Default::default() };
+            let pinned = fixture::party("traffic", 0x7f);
+            let traffic = OperationExpectation::PrepayTraffic {
+                sender_party: me.clone(),
+                amount: "20".into(),
+                command_id: "c".into(),
+                receiver_party: Some(pinned.clone()),
+                dso_party: None,
             };
-            let traffic = OperationExpectation::PrepayTraffic { sender_party: me.clone(), amount: "20".into(), command_id: "c".into() };
-            let o = submit_linked(seed, traffic_req, traffic, |_| root_creating(&me, &[("0d", EVE, "20")]), false, false).await;
-            refused_before_signing(&o, "is not a leg of this prepay_traffic request");
+            let body = |me: &str| fixture::cc_transfer(&shape(me, EVE, EVE, "20", "100", "c"));
+            let o = submit_linked(seed, traffic_req, traffic, body, false, false).await;
+            refused_before_signing(&o, &rejected(format!("the transfer receiver {EVE} is not {pinned}")));
+        }
+
+        /// A transfer of `amount` from `me`'s holding of `input`, declared to `declared` and paid to `paid`.
+        fn shape(me: &str, paid: &str, declared: &str, amount: &str, input: &str, command_id: &str) -> fixture::Shape {
+            let change = (rust_decimal::Decimal::from_str_exact(input).unwrap() - rust_decimal::Decimal::from_str_exact(amount).unwrap()).normalize();
+            fixture::Shape {
+                agent: me.into(),
+                paid: paid.into(),
+                declared: declared.into(),
+                amount: amount.into(),
+                input: input.into(),
+                change: change.to_string(),
+                extra: None,
+                second_root: false,
+                command_id: command_id.into(),
+            }
         }
 
         fn transfer_request() -> PrepareTransactionRequest {
             PrepareTransactionRequest {
                 params: Some(Params::TransferCc(TransferCcParams {
-                    receiver_party: BOB.into(),
-                    amount: "1".into(),
+                    receiver_party: fixture::bob(),
+                    amount: "10".into(),
                     command_id: "cmd-1".into(),
                     ..Default::default()
                 })),
@@ -4418,57 +4678,57 @@ mod bounded_io_tests {
         fn transfer_expectation(me: &str) -> OperationExpectation {
             OperationExpectation::TransferCc {
                 sender_party: me.into(),
-                receiver_party: BOB.into(),
-                amount: "1".into(),
+                receiver_party: fixture::bob(),
+                amount: "10".into(),
                 command_id: "cmd-1".into(),
+                dso_party: None,
             }
         }
 
-        /// A TransferCc the inspector accepts: one TransferFactory_Transfer root paying BOB 1.
-        fn transfer_nodes(me: &str) -> Vec<(&'static str, N)> {
-            let chosen = record(vec![(
-                "transfer",
-                record(vec![("sender", party(me)), ("receiver", party(BOB)), ("amount", numeric("1.0"))]),
-            )]);
-            let root = exercise(("Splice.ExternalPartyAmuletRules", "ExternalPartyAmuletRules"), "TransferFactory_Transfer", me, chosen, &["1"]);
-            vec![("0", N::Ex(root)), ("1", N::Cr(amulet("1a", BOB, "1.0")))]
+        /// The SDK's 10 CC transfer to bob, as [`transfer_bytes`], rewritten by `change`.
+        fn transfer_with(me: &str, change: impl FnOnce(&mut PreparedTransaction)) -> Vec<u8> {
+            fixture::rewritten(&transfer_bytes(me, "cmd-1"), change)
         }
 
         #[tokio::test]
         async fn drill_second_root_extra_act_as_and_unmodelled_templates() {
             let seed = [0x92; 32];
             let (_, me) = link(seed).await;
+            let rejected = |reason: &str| format!("{VERIFICATION_REJECTED}: {reason}");
             // A second root on a TransferCc.
             let body = |me: &str| {
-                let mut nodes = transfer_nodes(me);
-                let second = exercise(("Splice.AmuletRules", "AmuletRules"), "AmuletRules_Transfer", me, record(vec![]), &["3"]);
-                nodes.push(("2", N::Ex(second)));
-                nodes.push(("3", N::Cr(amulet("1b", EVE, "3.25"))));
-                prepared(&["0", "2"], nodes, &[me])
+                transfer_with(me, |p| {
+                    let second = exercise(("Splice.AmuletRules", "AmuletRules"), "AmuletRules_Transfer", me, record(vec![]), &["12"]);
+                    let tx = p.transaction.as_mut().unwrap();
+                    tx.nodes.push(fixture::node("11", NodeType::Exercise(second)));
+                    tx.nodes.push(fixture::node("12", NodeType::Create(amulet("1b", EVE, "3.25"))));
+                    tx.roots.push("11".into());
+                })
             };
             let o = submit_linked(seed, transfer_request(), transfer_expectation(&me), body, false, false).await;
-            refused_before_signing(&o, "is not a leg of this transfer_cc request");
+            refused_before_signing(&o, &rejected("expected 1 root node, got 2"));
             // act_as with an extra party.
-            let body = |me: &str| prepared(&["0"], transfer_nodes(me), &[me, EVE]);
+            let body = |me: &str| {
+                transfer_with(me, |p| p.metadata.as_mut().unwrap().submitter_info.as_mut().unwrap().act_as.push(EVE.into()))
+            };
             let o = submit_linked(seed, transfer_request(), transfer_expectation(&me), body, false, false).await;
-            refused_before_signing(&o, "not exactly this agent");
+            refused_before_signing(&o, &rejected(&format!("act_as is {:?}, not only {me}", [me.as_str(), EVE])));
             // A template outside the model.
             let body = |me: &str| {
-                let mut nodes = transfer_nodes(me);
-                if let Some((_, N::Ex(root))) = nodes.first_mut() {
-                    root.children.push("2".into());
-                }
-                nodes.push(("2", N::Cr(create(("Foo.Bar", "Baz"), "1c", record(vec![]), me))));
-                prepared(&["0"], nodes, &[me])
+                transfer_with(me, |p| {
+                    fixture::exercise_mut(p, "0").unwrap().children.push("11".into());
+                    let foreign = create(("Foo.Bar", "Baz"), "1c", record(vec![]), me);
+                    p.transaction.as_mut().unwrap().nodes.push(fixture::node("11", NodeType::Create(foreign)));
+                })
             };
             let o = submit_linked(seed, transfer_request(), transfer_expectation(&me), body, false, false).await;
-            refused_before_signing(&o, "templates outside the model: Foo.Bar:Baz");
+            refused_before_signing(&o, &rejected("unexpected Create of Foo.Bar.Baz in the transfer"));
             // A mismatched hash is refused for every operation once linked.
-            let body = |me: &str| prepared(&["0"], transfer_nodes(me), &[me]);
+            let body = |me: &str| transfer_bytes(me, "cmd-1");
             let o = submit_linked(seed, transfer_request(), transfer_expectation(&me), body, true, false).await;
             refused_before_signing(&o, "Transaction verification REJECTED");
             // The clean transfer passes the check and reaches the execute.
-            let body = |me: &str| prepared(&["0"], transfer_nodes(me), &[me]);
+            let body = |me: &str| transfer_bytes(me, "cmd-1");
             let o = submit_linked(seed, transfer_request(), transfer_expectation(&me), body, false, false).await;
             assert!(format!("{:#}", o.err).contains("Transaction failed: rejected"), "{:#}", o.err);
             assert_eq!(o.executes, 1);
@@ -4478,7 +4738,7 @@ mod bounded_io_tests {
         async fn force_is_refused_on_both_paths_when_linked() {
             let seed = [0x93; 32];
             let (key, me) = link(seed).await;
-            let body = |me: &str| prepared(&["0"], transfer_nodes(me), &[me]);
+            let body = |me: &str| transfer_bytes(me, "cmd-1");
             let o = submit_linked(seed, transfer_request(), transfer_expectation(&me), body, false, true).await;
             refused_before_signing(&o, FORCE_REFUSED_WHEN_LINKED);
 
@@ -4583,7 +4843,7 @@ mod bounded_io_tests {
                 .unwrap()
                 .with_bounds(short_bounds());
             assert!(!c.signer.guard().strict(), "unlinked when the transaction starts");
-            let split = OperationExpectation::SplitCc { party: me.clone(), output_amounts: vec!["1".into()] };
+            let split = OperationExpectation::SplitCc { party: me.clone(), output_amounts: vec!["1".into()], amulet_cids: vec![], dso_party: None };
             let submit = c.submit_with_retries(split_request(), &split, false, false, false, 1);
             let err = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded").unwrap_err();
             server.abort();
@@ -4666,6 +4926,7 @@ mod bounded_io_tests {
                 receiver_party: fixture::bob(),
                 amount: "10".into(),
                 command_id: canton_id,
+                dso_party: None,
             };
             (command, req, expectation)
         }
@@ -4737,14 +4998,353 @@ mod bounded_io_tests {
             // Directed, but the ledger-service chose another command id: refused before the binding.
             let (result, executes, seen) = submit_directed_once([0xd3; 32], |party, _| transfer_bytes(party, "send-transfer-1"), false).await;
             let text = format!("{:#}", result.unwrap_err());
-            assert!(text.contains("command_id_mismatch"), "{text}");
+            assert!(text.contains("command id send-transfer-1 is not the requested ctl-"), "{text}");
             assert_eq!((executes, seen.len()), (0, 0), "{text}");
-            // Undirected, with a directed id: the content check refuses it.
+            // Undirected, with a directed id the request itself names: the content check refuses it.
             let seed = [0xd4; 32];
             let (_, me) = link(seed).await;
-            let (_, req, expectation) = directed_transfer(&me);
-            let o = submit_linked(seed, req, expectation, |party| transfer_bytes(party, "ctl-01890a5d-ac96-774b-bcce-b302099a8057"), false, false).await;
+            let directed_id = "ctl-01890a5d-ac96-774b-bcce-b302099a8057";
+            let (_, mut req, mut expectation) = directed_transfer(&me);
+            if let Some(Params::TransferCc(params)) = req.params.as_mut() {
+                params.command_id = directed_id.into();
+            }
+            if let OperationExpectation::TransferCc { command_id, .. } = &mut expectation {
+                *command_id = directed_id.into();
+            }
+            let o = submit_linked(seed, req, expectation, |party| transfer_bytes(party, directed_id), false, false).await;
             refused_before_signing(&o, "reserved_command_id");
+        }
+
+        // ---- packages: [vetted_packages] and the rule in force, before every signature ----
+
+        const OFF_LIST: &str = "00000000000000000000000000000000000000000000000000000000000000aa";
+
+        fn vetted(ids: &[&str]) -> crate::control::SigningSettings {
+            let ids = ids.iter().map(|id| agent_control::PackageId::parse(id).unwrap()).collect();
+            crate::control::SigningSettings {
+                vetted_packages: agent_logic::config::VettedPackages::Selected(ids),
+                ..Default::default()
+            }
+        }
+
+        /// An undirected transfer of 10 CC to bob on the V1 path, under `settings`.
+        async fn transfer_under(seed: [u8; 32], settings: crate::control::SigningSettings) -> Outcome {
+            let prepare = |party: &str| signed_prepare_of(party, &transfer_bytes(party, "cmd-1"), false);
+            transfer_prepared(seed, settings, prepare, false).await
+        }
+
+        /// [`transfer_under`] with the signed prepare `prepare` makes for the party, and `force`.
+        async fn transfer_prepared(
+            seed: [u8; 32],
+            settings: crate::control::SigningSettings,
+            prepare: impl FnOnce(&str) -> Vec<u8>,
+            force: bool,
+        ) -> Outcome {
+            let party = party_for(seed, "agent-1").unwrap().to_string();
+            let key = Secret::seal(&mut { seed }).unwrap();
+            let executes = Arc::new(AtomicU32::new(0));
+            let ledger = Counting {
+                inner: SigningLedger {
+                    prepare: prepare(&party),
+                    execute: Ok(signed_failure("Transaction failed: rejected", 4)),
+                },
+                executes: Arc::clone(&executes),
+            };
+            let (url, server) = serve(tonic::service::Routes::new(ledger)).await;
+            let mut c = DAppProviderClient::from_channel(lazy_channel(&url), &party, "agent", &key, 3600, None, &server_key())
+                .unwrap()
+                .with_bounds(short_bounds())
+                .with_signing(settings);
+            let req = PrepareTransactionRequest {
+                params: Some(Params::TransferCc(TransferCcParams {
+                    receiver_party: fixture::bob(),
+                    amount: "10".into(),
+                    command_id: "cmd-1".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let expectation = OperationExpectation::TransferCc {
+                sender_party: party.clone(),
+                receiver_party: fixture::bob(),
+                amount: "10".into(),
+                command_id: "cmd-1".into(),
+                dso_party: None,
+            };
+            let submit = c.submit_with_retries(req, &expectation, false, false, force, 1);
+            let err = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded").unwrap_err();
+            server.abort();
+            Outcome { err, executes: executes.load(AtomicOrdering::SeqCst) }
+        }
+
+        /// Ticket issuance of an unlinked agent on the atomic path, under `settings`; the
+        /// transaction is a CC transfer of [`fixture::PKG`] unless `body` gives one.
+        async fn tickets_under(seed: [u8; 32], settings: crate::control::SigningSettings, body: Option<Vec<u8>>) -> Outcome {
+            let prepare = |party: &str| {
+                let body = body.unwrap_or_else(|| transfer_bytes(party, "cmd-1"));
+                signed_prepare_of(party, &body, false)
+            };
+            tickets_prepared(seed, settings, prepare).await
+        }
+
+        /// [`tickets_under`] with the signed prepare `prepare` makes for the party.
+        async fn tickets_prepared(
+            seed: [u8; 32],
+            settings: crate::control::SigningSettings,
+            prepare: impl FnOnce(&str) -> Vec<u8>,
+        ) -> Outcome {
+            let party = party_for(seed, "agent-1").unwrap().to_string();
+            let key = Secret::seal(&mut { seed }).unwrap();
+            let executes = Arc::new(AtomicU32::new(0));
+            let ledger = AtomicCounting(Counting {
+                inner: SigningLedger {
+                    prepare: prepare(&party),
+                    execute: Ok(signed_failure("Transaction failed: rejected", 3)),
+                },
+                executes: Arc::clone(&executes),
+            });
+            let (url, server) = serve(tonic::service::Routes::new(ledger)).await;
+            let mut c = AtomicProviderClient::with_channel(lazy_channel(&url), &party, "agent", &key, 3600, None, &server_key(), short_bounds())
+                .unwrap()
+                .with_signing(settings);
+            assert!(!c.signer.guard().strict());
+            let req = PrepareAtomicTransactionRequest {
+                params: Some(AtomicParams::IssueTickets(IssueTicketsParams { ticket_ids: vec!["t1".into()] })),
+                ..Default::default()
+            };
+            let tickets = OperationExpectation::IssueTickets { lp_party: party.clone(), ticket_count: 1 };
+            let submit = c.submit_atomic_with_retries(req, &tickets, false, false, false, 1);
+            let err = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded").unwrap_err();
+            server.abort();
+            Outcome { err, executes: executes.load(AtomicOrdering::SeqCst) }
+        }
+
+        fn reached_the_execute(outcome: &Outcome) {
+            let text = format!("{:#}", outcome.err);
+            assert!(text.contains("Transaction failed: rejected"), "{text}");
+            assert_eq!(outcome.executes, 1, "signed and executed once: {text}");
+        }
+
+        #[tokio::test]
+        async fn a_package_outside_vetted_packages_is_refused_on_both_paths_before_signing() {
+            let refused = format!("package_not_allowed: package {} is outside [vetted_packages]", fixture::PKG);
+            for o in [
+                transfer_under([0xe1; 32], vetted(&[OFF_LIST])).await,
+                tickets_under([0xe1; 32], vetted(&[OFF_LIST]), None).await,
+            ] {
+                refused_before_signing(&o, &refused);
+                // Typed, so a direct command's receipt answers it as its binding would
+                let typed = o.err.downcast_ref::<crate::control::intent::PackageRefusal>();
+                assert!(matches!(typed, Some(crate::control::intent::PackageRefusal::Local(_))), "{:#}", o.err);
+            }
+            // A selection that lists every package the transaction uses signs as before.
+            reached_the_execute(&transfer_under([0xe1; 32], vetted(&[OFF_LIST, fixture::PKG])).await);
+            reached_the_execute(&tickets_under([0xe1; 32], vetted(&[fixture::PKG]), None).await);
+            // `all`, the default, checks nothing, not even package ids it could not read.
+            let unreadable = || Some(root_creating("agent-1::1220aa", &[("0a", BOB, "1")]));
+            reached_the_execute(&transfer_under([0xe1; 32], crate::control::SigningSettings::default()).await);
+            reached_the_execute(&tickets_under([0xe1; 32], crate::control::SigningSettings::default(), None).await);
+            reached_the_execute(&tickets_under([0xe1; 32], crate::control::SigningSettings::default(), unreadable()).await);
+            // A selection refuses a transaction whose package ids cannot be read.
+            let o = tickets_under([0xe1; 32], vetted(&[fixture::PKG]), unreadable()).await;
+            refused_before_signing(&o, "package_not_allowed: the transaction's packages are unreadable");
+        }
+
+        #[tokio::test]
+        async fn the_package_rule_in_force_judges_undirected_signatures_of_a_linked_agent() {
+            use agent_control::policy::Allowlist;
+            use agent_control::{DEFAULT_LINKED_RULES, PackageId, Rules};
+            let selecting = |id: &str| Rules {
+                packages: Allowlist { any: false, items: vec![PackageId::parse(id).unwrap()] },
+                ..DEFAULT_LINKED_RULES
+            };
+            let cases = [
+                ([0xe6; 32], OFF_LIST, &[][..], Some("outside the packages rule of the policy in force")),
+                ([0xe7; 32], fixture::PKG, &[][..], None),
+                ([0xf1; 32], fixture::PKG, &[fixture::PKG][..], None),
+                ([0xf2; 32], fixture::PKG, &[OFF_LIST][..], Some("outside [vetted_packages]")),
+                ([0xf4; 32], OFF_LIST, &[fixture::PKG][..], Some("outside the packages rule of the policy in force")),
+            ];
+            for (seed, rule, local, refused) in cases {
+                let party = party_for(seed, "agent-1").unwrap();
+                let base = std::env::temp_dir().join(format!("linked-packages-{:02x}-{}", seed[0], std::process::id()));
+                let _ = std::fs::remove_dir_all(&base);
+                let store = ControlStore::open(&base, Network::Devnet, &party);
+                let (chain, document) = crate::control::commands::tests::accepting(seed, &party, selecting(rule));
+                {
+                    let lock = store.lock().await.unwrap();
+                    store.append(&lock, &chain.entries, &[document]).unwrap();
+                }
+                let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+                agent_logic::signer::install(Arc::new(ControlGuard::load(store, public, None).unwrap())).unwrap();
+                let settings = if local.is_empty() { crate::control::SigningSettings::default() } else { vetted(local) };
+                let o = transfer_under(seed, settings).await;
+                match refused {
+                    Some(expected) => {
+                        refused_before_signing(&o, &format!("package_not_allowed: package {} is {expected}", fixture::PKG));
+                    }
+                    None => reached_the_execute(&o),
+                }
+                let _ = std::fs::remove_dir_all(&base);
+            }
+        }
+
+        /// `bytes` with its node seeds dropped, so no hash can be computed locally.
+        fn unseeded(bytes: &[u8]) -> Vec<u8> {
+            let mut tx = PreparedTransaction::decode(bytes).unwrap();
+            tx.transaction.as_mut().unwrap().node_seeds.clear();
+            tx.encode_to_vec()
+        }
+
+        #[tokio::test]
+        async fn a_package_selection_signs_only_a_hash_the_agent_computed_itself() {
+            use crate::control::intent::{PackageRefusal, UnmatchedHash};
+            let mismatch = "package_not_allowed: the local transaction hash does not match the server's, so its packages are unverified";
+            let mismatched = |party: &str| signed_prepare_of(party, &transfer_bytes(party, "cmd-1"), true);
+            let uncomputed = |party: &str| signed_prepare_hashed(party, &unseeded(&transfer_bytes(party, "cmd-1")), [3u8; 32]);
+            assert!(tx_verifier::hasher::try_compute_hash(&unseeded(&transfer_bytes("p", "cmd-1")), "V2").is_err());
+            let listed = || vetted(&[fixture::PKG]);
+            for o in [
+                transfer_prepared([0xe2; 32], listed(), mismatched, false).await,
+                tickets_prepared([0xe2; 32], listed(), mismatched).await,
+            ] {
+                refused_before_signing(&o, mismatch);
+                let typed = o.err.downcast_ref::<PackageRefusal>();
+                assert_eq!(typed, Some(&PackageRefusal::HashUnmatched(UnmatchedHash::Mismatch)), "{:#}", o.err);
+            }
+            for o in [
+                transfer_prepared([0xe2; 32], listed(), uncomputed, false).await,
+                tickets_prepared([0xe2; 32], listed(), uncomputed).await,
+            ] {
+                refused_before_signing(&o, "package_not_allowed: the local transaction hash was not computed (");
+                refused_before_signing(&o, "), so its packages are unverified");
+                let typed = o.err.downcast_ref::<PackageRefusal>();
+                assert!(matches!(typed, Some(PackageRefusal::HashUnmatched(UnmatchedHash::Uncomputed(_)))), "{:#}", o.err);
+            }
+            // `all` signs the server hash after the same mismatch, as before
+            let all = crate::control::SigningSettings::default;
+            reached_the_execute(&transfer_prepared([0xe2; 32], all(), mismatched, false).await);
+            reached_the_execute(&tickets_prepared([0xe2; 32], all(), mismatched).await);
+            reached_the_execute(&transfer_prepared([0xe2; 32], all(), uncomputed, false).await);
+            reached_the_execute(&tickets_prepared([0xe2; 32], all(), uncomputed).await);
+        }
+
+        #[tokio::test]
+        async fn force_does_not_skip_the_hash_rule_of_a_package_selection() {
+            use crate::control::intent::{PackageRefusal, UnmatchedHash};
+            use crate::control::SigningSettings;
+            let mismatched = |party: &str| signed_prepare_of(party, &transfer_bytes(party, "cmd-1"), true);
+            let enforce = |vetted_packages| SigningSettings {
+                verify: tx_verifier::VerifySetting::Enforce,
+                vetted_packages,
+                ..Default::default()
+            };
+            let listed = || enforce(vetted(&[fixture::PKG]).vetted_packages);
+            // Enforce refuses the mismatch, and --force of an unlinked agent passes that refusal
+            let o = transfer_prepared([0xe4; 32], listed(), mismatched, false).await;
+            refused_before_signing(&o, VERIFICATION_REJECTED);
+            let o = transfer_prepared([0xe4; 32], listed(), mismatched, true).await;
+            refused_before_signing(&o, "package_not_allowed: the local transaction hash does not match the server's");
+            let typed = o.err.downcast_ref::<PackageRefusal>();
+            assert_eq!(typed, Some(&PackageRefusal::HashUnmatched(UnmatchedHash::Mismatch)), "{:#}", o.err);
+            // Without a selection, --force signs the server hash as before
+            let all = enforce(agent_logic::config::VettedPackages::All);
+            reached_the_execute(&transfer_prepared([0xe4; 32], all, mismatched, true).await);
+        }
+
+        /// `bytes` with every use of [`fixture::PKG`] replaced by `id`, of the same length.
+        fn with_package(bytes: &[u8], id: &str) -> Vec<u8> {
+            let (from, to) = (fixture::PKG.as_bytes(), id.as_bytes());
+            assert_eq!(from.len(), to.len());
+            let (mut out, mut rest) = (Vec::with_capacity(bytes.len()), bytes);
+            while !rest.is_empty() {
+                if rest.starts_with(from) {
+                    out.extend_from_slice(to);
+                    rest = &rest[from.len()..];
+                } else {
+                    out.push(rest[0]);
+                    rest = &rest[1..];
+                }
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn a_refused_package_is_named_by_one_bounded_lookup_and_a_signature_looks_nothing_up() {
+            use crate::control::test_support::{FakeRpc, TestAgent};
+            use crate::control::SigningSettings;
+            use crate::control_survey::{PackageCatalog, RpcCatalog};
+            use orderbook_proto::orderbook::{ListNodePackagesResponse, NodePackage};
+            // Ids no other test names, so nothing is known of them yet
+            let (on_v1, on_atomic, unmapped) = ("1b".repeat(32), "2c".repeat(32), "3d".repeat(32));
+            let rpc = FakeRpc::start().await;
+            let agent = TestAgent::new([0xe3; 32], &rpc, "refusal-names");
+            let catalog: Arc<dyn PackageCatalog> = Arc::new(RpcCatalog::for_config(&agent.config).unwrap());
+            let with = |settings: SigningSettings| SigningSettings { catalog: Some(Arc::clone(&catalog)), ..settings };
+            let v1 = |id: &str| {
+                let id = id.to_string();
+                move |party: &str| signed_prepare_of(party, &with_package(&transfer_bytes(party, "cmd-1"), &id), false)
+            };
+            let atomic = v1;
+            let listing = |packages: &[(&str, &str)]| ListNodePackagesResponse {
+                network: "devnet".into(),
+                packages: packages
+                    .iter()
+                    .map(|(id, name)| NodePackage {
+                        package_id: id.to_string(),
+                        package_name: name.to_string(),
+                        package_version: "0.1.17".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let calls = || rpc.state().node_package_calls.len();
+            let logs = crate::test_util::LogBuf::default();
+            let _capture = logs.capture(tracing::Level::ERROR);
+            let refusal = |id: &str| format!("package_not_allowed: package {id} is outside [vetted_packages]");
+            let line = |id: &str, label: &str| format!("{}{label}; nothing was signed [cmd-1]", refusal(id));
+            let (on_v1, on_atomic, unmapped) = (on_v1.as_str(), on_atomic.as_str(), unmapped.as_str());
+
+            // The rpc fails: the refusal stands, logged with the id alone
+            let o = transfer_prepared([0xe2; 32], with(vetted(&[OFF_LIST])), v1(on_v1), false).await;
+            refused_before_signing(&o, &refusal(on_v1));
+            assert_eq!((calls(), logs.count(&line(on_v1, ""))), (1, 1));
+            // Within the backoff the next refusal asks nothing
+            let o = transfer_prepared([0xe2; 32], with(vetted(&[OFF_LIST])), v1(on_v1), false).await;
+            refused_before_signing(&o, &refusal(on_v1));
+            assert_eq!((calls(), logs.count(&line(on_v1, ""))), (1, 2));
+            // It answers: one lookup names the package, which is kept for the next refusal
+            rpc.state().node_packages = Some(listing(&[(on_v1, "splice-amulet")]));
+            crate::control_survey::SURVEY.end_refusal_backoff();
+            for seen in 1..=2 {
+                let o = transfer_prepared([0xe2; 32], with(vetted(&[OFF_LIST])), v1(on_v1), false).await;
+                refused_before_signing(&o, &refusal(on_v1));
+                assert_eq!((calls(), logs.count(&line(on_v1, " (splice-amulet 0.1.17)"))), (2, seen));
+            }
+            rpc.state().node_packages = Some(listing(&[(on_v1, "splice-amulet"), (on_atomic, "splice-wallet")]));
+            crate::control_survey::SURVEY.end_refusal_backoff();
+            let o = tickets_prepared([0xe2; 32], with(vetted(&[OFF_LIST])), atomic(on_atomic)).await;
+            refused_before_signing(&o, &refusal(on_atomic));
+            assert_eq!((calls(), logs.count(&line(on_atomic, " (splice-wallet 0.1.17)"))), (3, 1));
+
+            // A signature makes no lookup, with a selection or without
+            reached_the_execute(&transfer_prepared([0xe2; 32], with(vetted(&[unmapped])), v1(unmapped), false).await);
+            reached_the_execute(&tickets_prepared([0xe2; 32], with(vetted(&[unmapped])), atomic(unmapped)).await);
+            reached_the_execute(&transfer_prepared([0xe2; 32], with(SigningSettings::default()), v1(unmapped), false).await);
+            assert_eq!(calls(), 3);
+
+            // Off a control network there is no catalog, so no lookup
+            assert!(SigningSettings::from_config(&agent.config).catalog.is_some());
+            let mut config = agent.config.clone();
+            config.canton_chain = Some("testnet".into());
+            let off_list = agent_control::PackageId::parse(OFF_LIST).unwrap();
+            config.vetted_packages = agent_logic::config::VettedPackages::Selected([off_list].into());
+            let settings = SigningSettings::from_config(&config);
+            assert!(settings.catalog.is_none());
+            let o = transfer_prepared([0xe2; 32], settings, v1(unmapped), false).await;
+            refused_before_signing(&o, &refusal(unmapped));
+            assert_eq!((calls(), logs.count(&line(unmapped, ""))), (3, 1));
         }
     }
 }

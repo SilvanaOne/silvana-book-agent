@@ -39,7 +39,7 @@ use orderbook_proto::ledger::{
     ExecuteTransactionResponse, McAcceptDvpAndAllocate, McBatchTransfer, McTransferTarget,
     MultiCallOp, PrepareTransactionRequest, TransactionOperation,
 };
-use tx_verifier::OperationExpectation;
+use tx_verifier::{ExpectedDvpTerms, OperationExpectation};
 
 use crate::holdings_cache::{CcView, ReservationGuard, TEMPLATE_HOLDING};
 use crate::ledger_client::{self, is_ambiguous_execute_error, within, DAppProviderClient};
@@ -427,6 +427,7 @@ impl MulticallSettler {
         alloc_processing_fee_usd: &str,
         allocation_instrument_id: &str,
         allocation_cc: Option<Decimal>,
+        terms: Option<ExpectedDvpTerms>,
     ) -> Result<StepResult> {
         // Defense-in-depth against the USD-as-CC regression: if the "CC" fee
         // equals the proposal's USD fee (and USD is non-zero), upstream skipped
@@ -491,7 +492,7 @@ impl MulticallSettler {
         let reserved = ReservationGuard::new(Arc::clone(self.amulet_cache.inner()), holding_cids.clone());
 
         let prepared = self
-            .prepare_settle(proposal_id, dvp_proposal_cid, allocation_instrument_id, &fee_targets, holding_cids)
+            .prepare_settle(proposal_id, dvp_proposal_cid, allocation_instrument_id, &fee_targets, holding_cids, terms)
             .await;
         self.execute_reserved(reserved, prepared, proposal_id, EXECUTE_WAIT, submit_multicall)
             .await
@@ -540,6 +541,7 @@ impl MulticallSettler {
         allocation_instrument_id: &str,
         fee_targets: &[FeeTarget],
         mut holding_cids: Vec<String>,
+        terms: Option<ExpectedDvpTerms>,
     ) -> Result<Prepared> {
         let config = &self.config;
         // Only holdings of THIS instrument under its registrar may enter the pool;
@@ -617,6 +619,7 @@ impl MulticallSettler {
         let expectation = OperationExpectation::ExecuteMulticall {
             party: self.config.party_id.clone(),
             op_count,
+            terms,
         };
         let request = PrepareTransactionRequest {
             operation: TransactionOperation::ExecuteMulticall as i32,
@@ -823,7 +826,7 @@ mod settle_tests {
             client,
             holding_cids: vec![AMULET.to_string()],
             request: PrepareTransactionRequest::default(),
-            expectation: OperationExpectation::ExecuteMulticall { party: "p".into(), op_count: 1 },
+            expectation: OperationExpectation::ExecuteMulticall { party: "p".into(), op_count: 1, terms: None },
         })
     }
 
@@ -937,7 +940,7 @@ mod settle_tests {
     }
 
     async fn settle(s: &MulticallSettler, instrument: &str, allocation: Decimal) -> Result<StepResult> {
-        s.accept_and_settle("p1", "00dvp", "0.1", "0.1", "0.2", "0.2", instrument, Some(allocation)).await
+        s.accept_and_settle("p1", "00dvp", "0.1", "0.1", "0.2", "0.2", instrument, Some(allocation), None).await
     }
 
     // A failed connect before the CIP-56 lookup used to return without releasing the amulets

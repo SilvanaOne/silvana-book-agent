@@ -74,6 +74,8 @@ pub struct TopupRunner {
     in_flight: Arc<TokioMutex<()>>,
     fee_demand: Option<Arc<LiquidityManager>>,
     held_since: HeldSince,
+    traffic_party: Option<String>,
+    dso_party: Option<String>,
 }
 
 impl TopupRunner {
@@ -94,6 +96,8 @@ impl TopupRunner {
                 in_flight: Arc::new(TokioMutex::new(())),
                 fee_demand: None,
                 held_since: HeldSince::default(),
+                traffic_party: None,
+                dso_party: None,
             }),
             _ => None,
         }
@@ -102,6 +106,13 @@ impl TopupRunner {
     /// Also top up when balance plus credit is below the largest fee reserved for an in-flight settlement.
     pub fn with_fee_demand(mut self, lm: Arc<LiquidityManager>) -> Self {
         self.fee_demand = Some(lm);
+        self
+    }
+
+    /// The parties the top-up transfer is checked against.
+    pub fn with_pins(mut self, traffic_party: Option<String>, dso_party: Option<String>) -> Self {
+        self.traffic_party = traffic_party;
+        self.dso_party = dso_party;
         self
     }
 
@@ -230,6 +241,8 @@ impl TopupRunner {
             sender_party: self.party_id.clone(),
             amount: amount_str.clone(),
             command_id: command_id.clone(),
+            receiver_party: self.traffic_party.clone(),
+            dso_party: self.dso_party.clone(),
         };
         let request = PrepareTransactionRequest {
             operation: TransactionOperation::PrepayTraffic as i32,

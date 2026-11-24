@@ -6,8 +6,8 @@
 //!   [`OperationExpectation::coverage`] names the operations it does not check yet
 //! - Hasher computes the full 3-layer SHA-256 hash, and [`HashCheck`] records how it
 //!   compared with the server hash
-//! - By default a mismatched or uncomputed hash falls back to the server hash
-//!   (`computed_hash` is all zero); [`VerifyMode::strict_all`] refuses it instead
+//! - A mismatched or uncomputed hash refuses under `strict_all`, or for checked fields that enforce
+//!   ([`VerifyMode::check_mode`]); else the server hash is signed (`computed_hash` is all zero)
 //!
 //! USDCx bridge operations and AcceptDvp are always strict: they are inspected fail-closed and
 //! signed only with a matching hash ([`OperationExpectation::requires_hash_match`]).
@@ -27,17 +27,38 @@ pub mod types;
 pub mod usdcx;
 mod usdcx_inspect;
 
-pub use types::{Coverage, HashCheck, InspectionResult, OperationExpectation, VerificationResult};
+pub use types::{
+    BatchPayTarget, CheckMode, Coverage, ExpectedDvpTerms, ExpectedFee, ExpectedQuantity, HashCheck,
+    InspectionResult, OperationExpectation, VerificationResult, VerifySetting, WouldRefuse,
+};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
-/// How strictly the hash comparison is enforced.
+/// How strictly the checks are enforced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VerifyMode {
-    /// Refuse a mismatched or uncomputed hash for every operation, not only strict ones.
+    /// Refuse a mismatched or uncomputed hash for every operation, not only strict ones,
+    /// and enforce every check (a linked agent).
     pub strict_all: bool,
+    /// `[verify] mode` of an agent that is not linked.
+    pub setting: VerifySetting,
+}
+
+impl VerifyMode {
+    /// How `expectation`'s newer checks act: `strict_all` and an operation that needs a
+    /// matching hash enforce whatever the setting; otherwise the setting decides.
+    pub fn check_mode(&self, expectation: &OperationExpectation) -> CheckMode {
+        if self.strict_all || expectation.requires_hash_match() {
+            return CheckMode::Enforce;
+        }
+        match self.setting {
+            VerifySetting::Default => expectation.default_check_mode(),
+            VerifySetting::Observe => CheckMode::Observe,
+            VerifySetting::Enforce => CheckMode::Enforce,
+        }
+    }
 }
 
 /// Verify a prepared transaction and compute its hash.
@@ -87,22 +108,28 @@ pub fn verify_and_hash_with(
     verbose: bool,
 ) -> Result<VerificationResult> {
     let coverage = expectation.coverage();
+    let check = mode.check_mode(expectation);
     let mut warnings = Vec::new();
+    let mut would_refuse = Vec::new();
 
     // Step 1: Inspect transaction fields against expectation
-    let (inspection, burn_holding_cids) =
+    let (inspection, observed, burn_holding_cids) =
         match usdcx_inspect::inspect(prepared_transaction_bytes, expectation)? {
             Some(usdcx) => {
                 if verbose {
                     inspector::log_verbose(prepared_transaction_bytes, expectation);
                 }
-                (usdcx.result, usdcx.burn_holding_cids)
+                (usdcx.result, Vec::new(), usdcx.burn_holding_cids)
             }
-            None => (
-                inspector::inspect(prepared_transaction_bytes, expectation, verbose)?,
-                Vec::new(),
-            ),
+            None => {
+                let (result, observed) =
+                    inspector::inspect_observing(prepared_transaction_bytes, expectation, verbose)?;
+                (result, observed, Vec::new())
+            }
         };
+    let refused_unhashed = || HashCheck::Uncomputed {
+        reason: "the inspection refused the transaction".to_string(),
+    };
     if !inspection.accepted {
         return Ok(VerificationResult {
             accepted: false,
@@ -111,14 +138,37 @@ pub fn verify_and_hash_with(
             warnings: inspection.warnings,
             rejection_reason: inspection.rejection_reason,
             burn_holding_cids: Vec::new(),
-            hash_check: HashCheck::Uncomputed {
-                reason: "the inspection refused the transaction".to_string(),
-            },
+            hash_check: refused_unhashed(),
             coverage,
+            would_refuse,
         });
     }
     warnings.extend(inspection.warnings);
-    let strict = mode.strict_all || expectation.requires_hash_match();
+    // A failed check that refuses only under enforce
+    if let Some(first) = observed.first() {
+        if check == CheckMode::Enforce {
+            return Ok(VerificationResult {
+                accepted: false,
+                computed_hash: [0u8; 32],
+                summary: inspection.summary,
+                warnings,
+                rejection_reason: Some(first.clone()),
+                burn_holding_cids: Vec::new(),
+                hash_check: refused_unhashed(),
+                coverage,
+                would_refuse,
+            });
+        }
+        for reason in observed {
+            warn!("TX verification (observe): enforce would refuse: {reason}");
+            would_refuse.push(WouldRefuse::Inspector(reason));
+        }
+    }
+    // An operation whose fields are checked binds its signature to them when it enforces
+    let strict = mode.strict_all
+        || expectation.requires_hash_match()
+        || (check == CheckMode::Enforce && coverage == Coverage::Fields);
+    let observed_hash = coverage == Coverage::Fields;
 
     // Step 2: Compute hash from PreparedTransaction (a decode failure is an error)
     let computed = match hasher::decode_and_hash(prepared_transaction_bytes, hashing_scheme_version)? {
@@ -134,7 +184,6 @@ pub fn verify_and_hash_with(
     let computed_hash = match computed {
         Ok(hash) => hash,
         Err(reason) => {
-            let hash_check = HashCheck::Uncomputed { reason };
             if strict {
                 return Ok(VerificationResult {
                     accepted: false,
@@ -147,9 +196,15 @@ pub fn verify_and_hash_with(
                             .to_string(),
                     ),
                     burn_holding_cids: Vec::new(),
-                    hash_check,
+                    hash_check: HashCheck::Uncomputed { reason },
                     coverage,
+                    would_refuse,
                 });
+            }
+            if observed_hash {
+                let observed = format!("no hash was computed ({reason}); the server hash is signed");
+                warn!("TX verification (observe): enforce would refuse: {observed}");
+                would_refuse.push(WouldRefuse::Hash(observed));
             }
             // Fall back to the server hash
             return Ok(VerificationResult {
@@ -162,8 +217,9 @@ pub fn verify_and_hash_with(
                 warnings,
                 rejection_reason: None,
                 burn_holding_cids,
-                hash_check,
+                hash_check: HashCheck::Uncomputed { reason },
                 coverage,
+                would_refuse,
             });
         }
     };
@@ -188,6 +244,7 @@ pub fn verify_and_hash_with(
             burn_holding_cids,
             hash_check: HashCheck::Match,
             coverage,
+            would_refuse,
         });
     }
     let server_shown = if server_hash_bytes.is_some() { server_hex.as_str() } else { "(not base64)" };
@@ -214,7 +271,13 @@ pub fn verify_and_hash_with(
             burn_holding_cids: Vec::new(),
             hash_check,
             coverage,
+            would_refuse,
         });
+    }
+    if observed_hash {
+        let observed = format!("{rejection}; the server hash is signed");
+        warn!("TX verification (observe): enforce would refuse: {observed}");
+        would_refuse.push(WouldRefuse::Hash(observed));
     }
     warnings.push(rejection);
     // Return sentinel so caller falls back to server hash (safe)
@@ -230,6 +293,7 @@ pub fn verify_and_hash_with(
         burn_holding_cids,
         hash_check,
         coverage,
+        would_refuse,
     })
 }
 
@@ -242,28 +306,27 @@ mod tests {
 
     const P: &str = "alice::1220aa";
     const Q: &str = "bob::1220bb";
-    const STRICT: VerifyMode = VerifyMode { strict_all: true };
+    const STRICT: VerifyMode = VerifyMode { strict_all: true, setting: VerifySetting::Default };
+    const SETTINGS: [VerifySetting; 3] = [VerifySetting::Default, VerifySetting::Observe, VerifySetting::Enforce];
 
-    fn transfer_cc() -> (PreparedTransaction, OperationExpectation) {
-        let mut ex = exercise("TransferFactory_Transfer", &[P], vec![]);
-        ex.template_id = Some(ident("Splice.ExternalPartyAmuletRules", "ExternalPartyAmuletRules"));
-        ex.chosen_value = Some(record(vec![(
-            "transfer",
-            record(vec![("sender", party(P)), ("receiver", party(Q)), ("amount", numeric("1.0"))]),
-        )]));
-        let p = prepared(&["0"], vec![exercise_node("0", ex)], vec![seed(0, 1)], &[P]);
-        let exp = OperationExpectation::TransferCc {
-            sender_party: P.into(),
-            receiver_party: Q.into(),
-            amount: "1".into(),
-            command_id: "cmd".into(),
-        };
-        (p, exp)
+    fn unlinked(setting: VerifySetting) -> VerifyMode {
+        VerifyMode { strict_all: false, setting }
     }
 
-    fn split_cc() -> (PreparedTransaction, OperationExpectation) {
+    /// A captured CLI transfer: an operation whose fields are checked.
+    fn transfer_cc() -> (PreparedTransaction, OperationExpectation) {
+        use prost::Message;
+        let line = include_str!("../tests/fixtures/devnet-20261124/transfer_cc.jsonl").lines().nth(1).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(line).unwrap();
+        let bytes = BASE64.decode(raw["prepared_transaction"].as_str().unwrap()).unwrap();
+        let exp = serde_json::from_value(raw["expectation"].clone()).unwrap();
+        (PreparedTransaction::decode(bytes.as_slice()).unwrap(), exp)
+    }
+
+    /// An operation whose fields are not checked yet.
+    fn multicall() -> (PreparedTransaction, OperationExpectation) {
         let p = prepared(&["0"], vec![exercise_node("0", exercise("C", &[P], vec![]))], vec![seed(0, 1)], &[P]);
-        (p, OperationExpectation::SplitCc { party: P.into(), output_amounts: vec!["1".into()] })
+        (p, OperationExpectation::ExecuteMulticall { party: P.into(), op_count: 1, terms: None })
     }
 
     fn unseeded(mut p: PreparedTransaction) -> PreparedTransaction {
@@ -281,7 +344,7 @@ mod tests {
 
     #[test]
     fn both_modes_sign_a_matching_hash() {
-        for (p, exp) in [transfer_cc(), split_cc()] {
+        for (p, exp) in [transfer_cc(), multicall()] {
             let bytes = encode(&p);
             let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
             for mode in [VerifyMode::default(), STRICT] {
@@ -295,7 +358,7 @@ mod tests {
 
     #[test]
     fn strict_all_refuses_a_mismatch_for_a_non_strict_operation() {
-        for (p, exp) in [transfer_cc(), split_cc()] {
+        for (p, exp) in [transfer_cc(), multicall()] {
             assert!(!exp.requires_hash_match());
             let bytes = encode(&p);
             let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
@@ -309,7 +372,7 @@ mod tests {
 
     #[test]
     fn strict_all_refuses_an_uncomputable_hash() {
-        for (p, exp) in [transfer_cc(), split_cc()] {
+        for (p, exp) in [transfer_cc(), multicall()] {
             let bytes = encode(&unseeded(p));
             assert!(hasher::try_compute_hash(&bytes, "V2").is_err());
             let r = verify(&bytes, &[7u8; 32], &exp, STRICT);
@@ -321,7 +384,7 @@ mod tests {
 
     #[test]
     fn default_mode_keeps_the_explicit_fallback() {
-        for (p, exp) in [transfer_cc(), split_cc()] {
+        for (p, exp) in [transfer_cc(), multicall()] {
             let bytes = encode(&p);
             let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
             for r in [
@@ -383,6 +446,7 @@ mod tests {
             receiver_party: Q.into(),
             amount: "2".into(),
             command_id: "cmd".into(),
+            dso_party: None,
         };
         let r = verify(&encode(&p), &[7u8; 32], &wrong, VerifyMode::default());
         assert!(!r.accepted);
@@ -427,9 +491,10 @@ mod tests {
             UsdcxReclaimHolding { .. } => 30,
             UsdcxUpdatePreApproval { .. } => 31,
             UsdcxTerminateAgreement { .. } => 32,
+            BatchPayCc { .. } => 33,
         }
     }
-    const VARIANTS: usize = 33;
+    const VARIANTS: usize = 34;
 
     fn every_expectation() -> Vec<OperationExpectation> {
         use OperationExpectation::*;
@@ -437,9 +502,9 @@ mod tests {
         let net = || String::from("mainnet");
         vec![
             PayFee { sender_party: P.into(), fee_party: Q.into(), proposal_id: s(), fee_type: "dvp".into() },
-            ProposeDvp { buyer_party: P.into(), seller_party: Q.into(), proposal_id: s(), synchronizer_id: s() },
+            ProposeDvp { proposer: P.into(), counterparty: Q.into(), proposal_id: s(), synchronizer_id: s(), terms: None },
             AcceptDvp {
-                seller_party: P.into(),
+                acceptor: P.into(),
                 proposal_id: s(),
                 dvp_proposal_cid: s(),
                 expected_delivery_amount: "1".into(),
@@ -448,13 +513,14 @@ mod tests {
                 expected_delivery_instrument_admin: s(),
                 expected_payment_instrument_id: s(),
                 expected_payment_instrument_admin: s(),
+                terms: None,
             },
-            Allocate { party: P.into(), proposal_id: s(), dvp_cid: s() },
+            Allocate { party: P.into(), proposal_id: s(), dvp_cid: s(), terms: None, settlement_operator: None },
             CancelDvpProposal { party: P.into(), dvp_proposal_cid: s() },
             RejectDvpProposal { party: P.into(), dvp_proposal_cid: s() },
-            TransferCc { sender_party: P.into(), receiver_party: Q.into(), amount: "1".into(), command_id: s() },
-            PrepayTraffic { sender_party: P.into(), amount: "1".into(), command_id: s() },
-            RequestPreapproval { party: P.into() },
+            TransferCc { sender_party: P.into(), receiver_party: Q.into(), amount: "1".into(), command_id: s(), dso_party: None },
+            PrepayTraffic { sender_party: P.into(), amount: "1".into(), command_id: s(), receiver_party: None, dso_party: None },
+            RequestPreapproval { party: P.into(), operator: None, instrument_admin: None },
             RequestRecurringPrepaid { party: P.into(), app_party: Q.into(), amount: "1".into() },
             RequestRecurringPayasyougo { party: P.into(), app_party: Q.into(), amount: "1".into() },
             RequestUserService { party: P.into() },
@@ -464,10 +530,18 @@ mod tests {
                 instrument_id: s(),
                 instrument_admin: s(),
                 amount: "1".into(),
+                command_id: None,
+                input_holding_cids: vec![],
             },
             AcceptCip56 { receiver_party: P.into(), contract_id: s() },
-            SplitCc { party: P.into(), output_amounts: vec!["1".into()] },
-            ExecuteMulticall { party: P.into(), op_count: 1 },
+            SplitCc { party: P.into(), output_amounts: vec!["1".into()], amulet_cids: vec![], dso_party: None },
+            ExecuteMulticall { party: P.into(), op_count: 1, terms: None },
+            BatchPayCc {
+                party: P.into(),
+                targets: vec![BatchPayTarget { receiver: Q.into(), amount: "1".into() }],
+                holding_cids: vec![],
+                dso_party: None,
+            },
             LockHoldings { party: P.into(), amount: "1".into(), instrument_id: s(), context: s() },
             ProcessLockUnlockRequests { party: P.into(), request_count: 1 },
             ResizeLock { party: P.into(), new_amount: "1".into() },
@@ -490,6 +564,8 @@ mod tests {
                 valid_until_micros: 0,
                 lp_input_holding_cids: vec![],
                 user_input_holding_cids: vec![],
+                expected_fees: vec![],
+                fee_party: None,
             },
             IssueTickets { lp_party: P.into(), ticket_count: 1 },
             SplitHoldings { lp_party: P.into(), instrument_id: s(), split_count: 1, input_cids: vec![] },
@@ -514,11 +590,144 @@ mod tests {
     }
 
     #[test]
+    fn the_default_table_enforces_only_the_operations_that_need_a_matching_hash() {
+        use OperationExpectation::*;
+        for exp in every_expectation() {
+            let expected = if exp.requires_hash_match() { CheckMode::Enforce } else { CheckMode::Observe };
+            assert_eq!(exp.default_check_mode(), expected, "{exp:?}");
+            let strict_today = matches!(exp, AcceptDvp { .. }) || exp.is_usdcx();
+            assert_eq!(exp.default_check_mode() == CheckMode::Enforce, strict_today, "{exp:?}");
+        }
+        let (_, transfer) = transfer_cc();
+        assert_eq!(transfer.default_check_mode(), CheckMode::Observe, "a newly checked operation observes first");
+    }
+
+    #[test]
+    fn the_setting_picks_the_check_mode_and_a_linked_agent_always_enforces() {
+        for exp in every_expectation() {
+            let strict = exp.requires_hash_match();
+            let pick = |setting| unlinked(setting).check_mode(&exp);
+            assert_eq!(pick(VerifySetting::Default), exp.default_check_mode(), "{exp:?}");
+            let observe = if strict { CheckMode::Enforce } else { CheckMode::Observe };
+            assert_eq!(pick(VerifySetting::Observe), observe, "observe never weakens {exp:?}");
+            assert_eq!(pick(VerifySetting::Enforce), CheckMode::Enforce, "{exp:?}");
+            for setting in SETTINGS {
+                let linked = VerifyMode { strict_all: true, setting };
+                assert_eq!(linked.check_mode(&exp), CheckMode::Enforce, "{setting:?} {exp:?}");
+            }
+        }
+        assert_eq!(VerifyMode::default(), unlinked(VerifySetting::Default));
+    }
+
+    #[test]
+    fn an_enforced_operation_with_field_checks_refuses_an_unmatched_hash() {
+        let (p, exp) = transfer_cc();
+        assert_eq!(exp.coverage(), Coverage::Fields);
+        let bytes = encode(&p);
+        let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
+        let r = verify(&bytes, &[7u8; 32], &exp, unlinked(VerifySetting::Enforce));
+        assert!(!r.accepted, "{r:?}");
+        assert_eq!((r.computed_hash, r.hash_check), ([0u8; 32], mismatch(&[7u8; 32], h)));
+        assert!(r.rejection_reason.unwrap().contains("Hash mismatch"));
+        assert!(r.would_refuse.is_empty());
+
+        let r = verify(&encode(&unseeded(p)), &h, &exp, unlinked(VerifySetting::Enforce));
+        assert!(!r.accepted, "{r:?}");
+        assert!(matches!(r.hash_check, HashCheck::Uncomputed { .. }), "{:?}", r.hash_check);
+        assert!(r.rejection_reason.unwrap().contains("could not be computed"));
+
+        let r = verify(&bytes, &h, &exp, unlinked(VerifySetting::Enforce));
+        assert!(r.accepted && r.would_refuse.is_empty(), "{r:?}");
+        assert_eq!((r.computed_hash, r.hash_check), (h, HashCheck::Match));
+    }
+
+    #[test]
+    fn an_observed_operation_signs_the_server_hash_and_records_that_enforce_would_refuse() {
+        let (p, exp) = transfer_cc();
+        let bytes = encode(&p);
+        let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
+        for setting in [VerifySetting::Default, VerifySetting::Observe] {
+            let r = verify(&bytes, &[7u8; 32], &exp, unlinked(setting));
+            assert!(r.accepted && r.rejection_reason.is_none(), "{setting:?}: {r:?}");
+            assert_eq!((r.computed_hash, r.hash_check), ([0u8; 32], mismatch(&[7u8; 32], h)));
+            assert!(r.warnings.iter().any(|w| w.starts_with("Hash mismatch")), "{:?}", r.warnings);
+            assert!(
+                matches!(r.would_refuse.as_slice(), [WouldRefuse::Hash(text)] if text.starts_with("Hash mismatch")),
+                "{setting:?}: {:?}",
+                r.would_refuse
+            );
+
+            let r = verify(&encode(&unseeded(p.clone())), &h, &exp, unlinked(setting));
+            assert!(r.accepted, "{setting:?}: {r:?}");
+            assert_eq!(r.computed_hash, [0u8; 32]);
+            assert!(
+                matches!(r.would_refuse.as_slice(), [WouldRefuse::Hash(text)] if text.starts_with("no hash was computed")),
+                "{setting:?}: {:?}",
+                r.would_refuse
+            );
+
+            let r = verify(&bytes, &h, &exp, unlinked(setting));
+            assert!(r.accepted && r.would_refuse.is_empty(), "{setting:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn an_operation_without_field_checks_keeps_the_fallback_in_every_setting() {
+        let (p, exp) = multicall();
+        assert_eq!(exp.coverage(), Coverage::Unverified);
+        let bytes = encode(&p);
+        let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
+        for setting in SETTINGS {
+            let r = verify(&bytes, &[7u8; 32], &exp, unlinked(setting));
+            assert!(r.accepted, "{setting:?}: {r:?}");
+            assert_eq!((r.computed_hash, r.hash_check), ([0u8; 32], mismatch(&[7u8; 32], h)));
+            assert!(r.would_refuse.is_empty(), "{setting:?}: {:?}", r.would_refuse);
+            let r = verify(&encode(&unseeded(p.clone())), &h, &exp, unlinked(setting));
+            assert!(r.accepted && r.would_refuse.is_empty(), "{setting:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_linked_agent_refuses_an_unmatched_hash_whatever_the_setting() {
+        for (p, exp) in [transfer_cc(), multicall()] {
+            let bytes = encode(&p);
+            for setting in SETTINGS {
+                let linked = VerifyMode { strict_all: true, setting };
+                let r = verify(&bytes, &[7u8; 32], &exp, linked);
+                assert!(!r.accepted && r.would_refuse.is_empty(), "{setting:?} {exp:?}");
+                let r = verify(&encode(&unseeded(p.clone())), &[7u8; 32], &exp, linked);
+                assert!(!r.accepted, "{setting:?} {exp:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_inspection_refusal_refuses_in_every_setting() {
+        let (p, _) = transfer_cc();
+        let wrong = OperationExpectation::TransferCc {
+            sender_party: P.into(),
+            receiver_party: Q.into(),
+            amount: "2".into(),
+            command_id: "cmd".into(),
+            dso_party: None,
+        };
+        let bytes = encode(&p);
+        let h = hasher::try_compute_hash(&bytes, "V2").unwrap();
+        for setting in SETTINGS {
+            for strict_all in [false, true] {
+                let r = verify(&bytes, &h, &wrong, VerifyMode { strict_all, setting });
+                assert!(!r.accepted && r.rejection_reason.is_some(), "{setting:?} {strict_all}");
+                assert!(r.would_refuse.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn coverage_agrees_with_the_inspector() {
         let all = every_expectation();
         let indices: BTreeSet<usize> = all.iter().map(variant).collect();
         assert_eq!((all.len(), indices.len()), (VARIANTS, VARIANTS), "one expectation per variant");
-        let (p, _) = split_cc();
+        let (p, _) = multicall();
         let bytes = encode(&p);
         let mut unverified = 0;
         for exp in &all {
@@ -535,6 +744,6 @@ mod tests {
                 assert_eq!(r.coverage, exp.coverage(), "{exp:?}");
             }
         }
-        assert_eq!(unverified, 15);
+        assert_eq!(unverified, 11);
     }
 }

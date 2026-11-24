@@ -8,6 +8,7 @@
 //! agent-side state needed for verification and deduplication.
 
 use anyhow::{anyhow, Result};
+use orderbook_proto::orderbook::SettlementProposal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -284,10 +285,67 @@ pub struct SavedSettlementOrder {
     /// reservation and always had pending_quantity applied at adoption.
     #[serde(default = "default_reserved")]
     pub reserved: bool,
+    /// The terms adopted with the proposal; absent in older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms: Option<AdoptedTerms>,
 }
 
 fn default_reserved() -> bool {
     true
+}
+
+/// What the agent adopted for a settlement: both parties and both legs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptedTerms {
+    pub buyer: String,
+    pub seller: String,
+    pub base_instrument: String,
+    pub base_quantity: String,
+    pub quote_instrument: String,
+    pub quote_quantity: String,
+}
+
+impl AdoptedTerms {
+    pub fn of(proposal: &SettlementProposal) -> Self {
+        Self {
+            buyer: proposal.buyer.clone(),
+            seller: proposal.seller.clone(),
+            base_instrument: proposal.base_instrument.clone(),
+            base_quantity: proposal.base_quantity.clone(),
+            quote_instrument: proposal.quote_instrument.clone(),
+            quote_quantity: proposal.quote_quantity.clone(),
+        }
+    }
+
+    /// The first field of `proposal` that differs from these terms; quantities compare by value.
+    pub fn first_difference(&self, proposal: &SettlementProposal) -> Option<&'static str> {
+        let texts = [
+            ("buyer", &self.buyer, &proposal.buyer),
+            ("seller", &self.seller, &proposal.seller),
+            ("base_instrument", &self.base_instrument, &proposal.base_instrument),
+            ("quote_instrument", &self.quote_instrument, &proposal.quote_instrument),
+        ];
+        let amounts = [
+            ("base_quantity", &self.base_quantity, &proposal.base_quantity),
+            ("quote_quantity", &self.quote_quantity, &proposal.quote_quantity),
+        ];
+        texts
+            .into_iter()
+            .find(|(_, adopted, now)| adopted != now)
+            .or_else(|| amounts.into_iter().find(|(_, adopted, now)| !same_amount(adopted, now)))
+            .map(|(field, _, _)| field)
+    }
+}
+
+/// Equal text, or two plain decimals of the same exact value.
+fn same_amount(a: &str, b: &str) -> bool {
+    let exact = |s: &str| {
+        s.bytes()
+            .all(|c| c.is_ascii_digit() || c == b'.' || c == b'-')
+            .then(|| Decimal::from_str_exact(s).ok())
+            .flatten()
+    };
+    a == b || matches!((exact(a), exact(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Serializable mirror of `AcceptedRfqTrade` from runner.rs
@@ -636,6 +694,7 @@ mod tests {
             order_id: 42,
             quantity: "1.0".to_string(),
             reserved: true,
+            terms: None,
         });
         state.accepted_rfq_trades.push(SavedAcceptedRfqTrade {
             proposal_id: "rfq-1".to_string(),
@@ -1017,6 +1076,7 @@ mod tests {
             order_id: 2,
             quantity: "0.5".to_string(),
             reserved: true,
+            terms: None,
         });
 
         // Completed proposals: 1500 items (should be capped to 1000)
@@ -1109,17 +1169,59 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.reserved);
+        assert_eq!(legacy.terms, None);
 
         // New unreserved entry round-trips as false
-        let entry = SavedSettlementOrder {
+        let mut entry = SavedSettlementOrder {
             proposal_id: "p2".to_string(),
             order_id: 7,
             quantity: "1.5".to_string(),
             reserved: false,
+            terms: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("terms"), "{json}");
         let back: SavedSettlementOrder = serde_json::from_str(&json).unwrap();
         assert!(!back.reserved);
         assert_eq!(back.order_id, 7);
+
+        let proposal = SettlementProposal {
+            buyer: "b".to_string(),
+            seller: "s".to_string(),
+            base_quantity: "1".to_string(),
+            quote_quantity: "2".to_string(),
+            ..Default::default()
+        };
+        entry.terms = Some(AdoptedTerms::of(&proposal));
+        let back: SavedSettlementOrder = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(back.terms, entry.terms);
+    }
+
+    #[test]
+    fn adopted_terms_compare_quantities_by_value() {
+        let adopted = SettlementProposal {
+            buyer: "b".to_string(),
+            seller: "s".to_string(),
+            base_instrument: "BASE".to_string(),
+            base_quantity: "1".to_string(),
+            quote_instrument: "QUOTE".to_string(),
+            quote_quantity: "2".to_string(),
+            ..Default::default()
+        };
+        let terms = AdoptedTerms::of(&adopted);
+        assert_eq!(terms.first_difference(&adopted), None);
+        let resent = |change: fn(&mut SettlementProposal)| {
+            let mut p = adopted.clone();
+            change(&mut p);
+            terms.first_difference(&p)
+        };
+        assert_eq!(resent(|p| p.quote_quantity = "2.000".to_string()), None);
+        assert_eq!(resent(|p| p.quote_quantity = "3".to_string()), Some("quote_quantity"));
+        assert_eq!(resent(|p| p.quote_quantity = "2e0".to_string()), Some("quote_quantity"));
+        assert_eq!(resent(|p| p.base_quantity = "1.0000000000000000000000000000001".to_string()), Some("base_quantity"));
+        assert_eq!(resent(|p| p.buyer = "x".to_string()), Some("buyer"));
+        assert_eq!(resent(|p| p.seller = "x".to_string()), Some("seller"));
+        assert_eq!(resent(|p| p.base_instrument = "X".to_string()), Some("base_instrument"));
+        assert_eq!(resent(|p| p.quote_instrument = "X".to_string()), Some("quote_instrument"));
     }
 }

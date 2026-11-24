@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 
 /// Longest wait for a typed answer.
-pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Where typed answers come from.
 #[allow(clippy::double_must_use)]
@@ -131,6 +131,11 @@ mod tests {
             assert!(err.to_string().contains("not confirmed"), "{err}");
         }
         assert!(confirm_typed(&Scripted::new(Vec::<String>::new()), &mut out, "link", Yes::NotGiven).await.is_err());
+    }
+
+    #[test]
+    fn a_typed_answer_is_awaited_for_15_minutes() {
+        assert_eq!(PROMPT_TIMEOUT, Duration::from_secs(15 * 60));
     }
 
     #[tokio::test]

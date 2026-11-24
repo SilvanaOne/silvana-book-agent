@@ -88,8 +88,13 @@ pub fn resolve(options: &ControllerOptions, online: &OnlineArgs) -> Result<Targe
         (Some(agent), _) => agent.trim().to_string(),
         (None, Some(section)) => section.agent_party.to_string(),
         (None, None) => bail!(
-            "no agent: give --agent <party>, or a [controller] section in {}",
-            options.config.display()
+            "no agent: give --agent <party>, or a [controller] section in {}{}",
+            options.config.display(),
+            if options.local_party.is_some() {
+                "; this folder is an agent: use `cloud-agent control show`"
+            } else {
+                ""
+            }
         ),
     };
     let agent = PartyId::parse(&agent_text)
@@ -1797,6 +1802,37 @@ mod tests {
             ..none
         };
         assert_eq!(resolve(&mainnet, &flags).unwrap().network, Network::Mainnet);
+    }
+
+    #[test]
+    fn an_agent_folder_without_a_target_is_pointed_to_control_show() {
+        let config = std::env::temp_dir()
+            .join("controller-no-section")
+            .join("agent.toml");
+        let agent_folder = ControllerOptions {
+            config,
+            local_party: Some("agent-1::1220ab".into()),
+            ..ControllerOptions::default()
+        };
+        let err = resolve(&agent_folder, &OnlineArgs::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no agent")
+                && err.contains("this folder is an agent: use `cloud-agent control show`"),
+            "{err}"
+        );
+        let elsewhere = ControllerOptions {
+            local_party: None,
+            ..agent_folder
+        };
+        let err = resolve(&elsewhere, &OnlineArgs::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no agent") && !err.contains("this folder"),
+            "{err}"
+        );
     }
 
     #[test]

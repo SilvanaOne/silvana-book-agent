@@ -16,8 +16,8 @@ use orderbook_proto::orderbook::{
     ControlHead, ControlHeartbeat, ControlLinkPurpose, ControlLinkStatus, ControlLogEntry,
     ControlPolicyDocument, ControlPolicyView, ControlVerification, GetAgentControlLogRequest,
     GetAgentControlLogResponse, GetControlDescriptorRequest, GetControlDescriptorResponse,
-    GetPolicyRequest, GetPolicyResponse, ListPendingControlRequest, ListPendingControlResponse,
-    PostReceiptRequest, PostReceiptResponse,
+    GetPolicyRequest, GetPolicyResponse, ListNodePackagesRequest, ListNodePackagesResponse,
+    ListPendingControlRequest, ListPendingControlResponse, PostReceiptRequest, PostReceiptResponse,
 };
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
@@ -96,6 +96,12 @@ impl ServerTime for AckPolicyResponse {
 impl ServerTime for PostReceiptResponse {
     fn server_time(&self) -> Option<&prost_types::Timestamp> {
         None
+    }
+}
+
+impl ServerTime for ListNodePackagesResponse {
+    fn server_time(&self) -> Option<&prost_types::Timestamp> {
+        self.as_of.as_ref()
     }
 }
 
@@ -634,6 +640,14 @@ impl ControlRpc {
         let mut client = self.client();
         self.call(client.post_receipt(request)).await
     }
+
+    /// The packages the node vets, as the rpc lists them; `include_removed` adds those it
+    /// no longer vets.
+    pub async fn node_packages(&self, include_removed: bool) -> Result<ListNodePackagesResponse, RpcError> {
+        let request = self.request(ListNodePackagesRequest { include_removed })?;
+        let mut client = self.client();
+        self.call(client.list_node_packages(request)).await
+    }
 }
 
 /// The head of the last of `entries`; an empty upload is refused locally.
@@ -748,6 +762,33 @@ mod tests {
         let unset = prost_types::Timestamp { seconds: 0, nanos: 0 };
         assert_eq!(response_secs(Some(&unset), &metadata), Some(header));
         assert_eq!(response_secs(Some(&field), &MetadataMap::new()), Some(header + 500));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_packages_are_read_with_a_control_token_and_named_for_the_survey() {
+        use crate::control::test_support::{FakeRpc, TestAgent};
+        use crate::control_survey::{NamedPackage, PackageCatalog, RpcCatalog};
+        use orderbook_proto::orderbook::NodePackage;
+        let rpc = FakeRpc::start().await;
+        let agent = TestAgent::new([0x71; 32], &rpc, "rpc-node-packages");
+        let catalog = RpcCatalog::for_config(&agent.config).unwrap();
+        assert!(catalog.packages().await.unwrap_err().contains("unreachable"), "no list yet: ids only");
+        let id = "1a".repeat(32);
+        rpc.state().node_packages = Some(ListNodePackagesResponse {
+            network: "devnet".into(),
+            packages: vec![NodePackage {
+                package_id: id.clone(),
+                package_name: "splice-amulet".into(),
+                package_version: "0.1.17".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let client = ControlRpc::connect(&agent.config).await.unwrap();
+        let reply = client.node_packages(false).await.unwrap();
+        assert_eq!((reply.packages.len(), reply.as_of.is_some()), (1, true));
+        assert_eq!(catalog.packages().await.unwrap(), vec![NamedPackage { id, label: "splice-amulet 0.1.17".into() }]);
+        assert_eq!(rpc.state().node_package_calls, vec![true, false, true], "the survey asks with removed ones");
     }
 
     #[tokio::test]

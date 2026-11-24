@@ -2919,16 +2919,16 @@ mod loop_tests {
         async fn pay_fee(&self, _: &str, _: &str) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }
-        async fn propose_dvp(&self, _: &str) -> Result<crate::settlement::StepResult> {
+        async fn propose_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }
         async fn accept_dvp(
-            &self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str,
+            &self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str,
         ) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }
         async fn allocate(
-            &self, _: &str, _: &str, _: Option<rust_decimal::Decimal>,
+            &self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str, _: Option<rust_decimal::Decimal>,
         ) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }

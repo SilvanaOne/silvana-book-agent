@@ -35,7 +35,7 @@ use orderbook_proto::rfqv2::{
     AtomicQuoteEnvelope, ExecuteAtomicTransactionResponse as AtomicExecuteResponse,
     PrepareAtomicTransactionRequest,
 };
-use tx_verifier::OperationExpectation;
+use tx_verifier::{ExpectedFee, OperationExpectation};
 
 use crate::fill_loop::{FillDirection, MarkerNotSaved};
 use crate::holdings_cache::{
@@ -292,19 +292,14 @@ pub async fn ensure_receiver_preapproval(
         "Creating receiver preapproval for {} (admin {}, operator {})",
         on_chain_id, admin, operator
     );
-    let expectation = OperationExpectation::RequestPreapproval {
-        party: config.party_id.clone(),
-    };
-    let request = PrepareTransactionRequest {
-        operation: TransactionOperation::RequestPreapproval as i32,
-        params: Some(V1Params::RequestPreapproval(RequestPreapprovalParams {
+    let (expectation, request) = preapproval_submission(
+        &config.party_id,
+        RequestPreapprovalParams {
             instrument_admin: admin.clone(),
             instrument_allowances: vec![],
             operator,
-        })),
-        request_signature: None,
-        controller_command: None,
-    };
+        },
+    );
     // The submit runs in its own task; past its wait the ledger state decides
     let mut submitter = client.clone();
     let submit = supervise::try_spawn("receiver preapproval", async move {
@@ -343,6 +338,25 @@ pub async fn ensure_receiver_preapproval(
         return Ok(true);
     }
     bail!("receiver preapproval submission {lost}, and no preapproval for admin {admin} is visible yet")
+}
+
+/// The preapproval request of `party` and its expectation, both from the same `params`.
+fn preapproval_submission(
+    party: &str,
+    params: RequestPreapprovalParams,
+) -> (OperationExpectation, PrepareTransactionRequest) {
+    let expectation = OperationExpectation::RequestPreapproval {
+        party: party.to_string(),
+        operator: Some(params.operator.clone()),
+        instrument_admin: Some(params.instrument_admin.clone()),
+    };
+    let request = PrepareTransactionRequest {
+        operation: TransactionOperation::RequestPreapproval as i32,
+        params: Some(V1Params::RequestPreapproval(params)),
+        request_signature: None,
+        controller_command: None,
+    };
+    (expectation, request)
 }
 
 /// Whether a full (no allowance list) preapproval for `admin` exists.
@@ -1207,6 +1221,8 @@ impl AtomicSwapper {
             valid_until_micros,
             lp_input_holding_cids: params.lp_input_holding_cids.clone(),
             user_input_holding_cids: own_cids.clone(),
+            expected_fees: expected_fees(&signed_fees),
+            fee_party: self.config.party_fee.clone(),
         };
         let req = PrepareAtomicTransactionRequest {
             params: Some(AtomicParams::AtomicDvpSettle(params)),
@@ -1581,6 +1597,19 @@ impl AtomicSwapper {
     }
 }
 
+/// The signed fees of a quote, as the verifier checks the settle against them.
+pub(crate) fn expected_fees(signed: &[orderbook_proto::rfqv2::AtomicFeeSpec]) -> Vec<ExpectedFee> {
+    signed
+        .iter()
+        .map(|f| ExpectedFee {
+            receiver: f.receiver.clone(),
+            instrument_admin: f.instrument_admin.clone(),
+            instrument_id: f.instrument_id.clone(),
+            amount: f.amount.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1638,6 +1667,27 @@ mod tests {
         assert!(!is_deterministic_prepare_rejection(
             "PrepareAtomicTransaction RPC failed (Unavailable): transport error"
         ));
+    }
+
+    #[test]
+    fn the_preapproval_expectation_names_the_requested_operator_and_admin() {
+        let params = RequestPreapprovalParams {
+            instrument_admin: "registry::1220aa".into(),
+            instrument_allowances: vec![],
+            operator: "operator::1220bb".into(),
+        };
+        let (expectation, request) = preapproval_submission("me::1220cc", params.clone());
+        assert_eq!(request.operation, TransactionOperation::RequestPreapproval as i32);
+        let Some(V1Params::RequestPreapproval(sent)) = request.params else {
+            panic!("not a preapproval request");
+        };
+        assert_eq!(sent, params);
+        let OperationExpectation::RequestPreapproval { party, operator, instrument_admin } = expectation else {
+            panic!("not a preapproval expectation");
+        };
+        assert_eq!(party, "me::1220cc");
+        assert_eq!(operator.as_deref(), Some(sent.operator.as_str()));
+        assert_eq!(instrument_admin.as_deref(), Some(sent.instrument_admin.as_str()));
     }
 }
 
@@ -1706,6 +1756,21 @@ mod settle_tests {
             ..Default::default()
         };
         (env, accepted)
+    }
+
+    // The settle is checked against exactly the quote's signed fees
+    #[test]
+    fn the_expected_fees_are_the_signed_fees() {
+        let signed = vec![fee("dso::1220aa", "Amulet", "1.5"), fee("dso::1220aa", "Amulet", "0.25")];
+        let expected = super::expected_fees(&signed);
+        assert_eq!(expected.len(), 2);
+        for (e, f) in expected.iter().zip(&signed) {
+            assert_eq!(
+                (&e.receiver, &e.instrument_admin, &e.instrument_id, &e.amount),
+                (&f.receiver, &f.instrument_admin, &f.instrument_id, &f.amount)
+            );
+        }
+        assert!(super::expected_fees(&[]).is_empty());
     }
 
     fn fee(admin: &str, id: &str, amount: &str) -> AtomicFeeSpec {

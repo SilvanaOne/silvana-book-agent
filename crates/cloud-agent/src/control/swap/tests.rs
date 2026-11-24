@@ -555,12 +555,22 @@ struct Counts {
     prepares: AtomicU32,
     signatures: AtomicU32,
     scans: AtomicU32,
+    /// Why each refused settle was refused before its signature.
+    refusals: Mutex<Vec<String>>,
 }
 
 impl Counts {
     fn get(&self) -> (u32, u32, u32) {
         let n = |a: &AtomicU32| a.load(Ordering::SeqCst);
         (n(&self.accepts), n(&self.prepares), n(&self.signatures))
+    }
+
+    fn refused(&self, reason: String) {
+        agent_logic::sync::lock(&self.refusals).push(reason);
+    }
+
+    fn refusals(&self) -> Vec<String> {
+        agent_logic::sync::lock(&self.refusals).clone()
     }
 }
 
@@ -582,6 +592,8 @@ struct Submit {
     alter: Alter,
     end: End,
     mismatch: bool,
+    /// Verifies as an unlinked agent that only observes the inspection's findings.
+    observe: bool,
     counts: Arc<Counts>,
     carried_command: Arc<AtomicU32>,
     /// The next prepare only fails with this.
@@ -626,14 +638,16 @@ impl DirectedSubmit for Submit {
             hash.to_vec()
         };
         let server = base64::engine::general_purpose::STANDARD.encode(server);
-        let verification = tx_verifier::verify_and_hash_with(
-            &bytes,
-            &server,
-            "V2",
-            expectation,
-            VerifyMode { strict_all: true },
-            false,
-        )?;
+        let mode = if self.observe {
+            VerifyMode { strict_all: false, setting: tx_verifier::VerifySetting::Observe }
+        } else {
+            VerifyMode { strict_all: true, ..VerifyMode::default() }
+        };
+        let verification =
+            tx_verifier::verify_and_hash_with(&bytes, &server, "V2", expectation, mode, false)?;
+        if let Some(reason) = verification.rejection_reason.as_ref() {
+            self.counts.refused(reason.clone());
+        }
         let facts =
             tx_verifier::facts::extract_facts(&bytes, &self.agent).map_err(|e| e.to_string());
         let request = OwnRequest::Atomic(req.params.as_ref());
@@ -646,7 +660,10 @@ impl DirectedSubmit for Submit {
             &facts,
             command,
         )
-        .map_err(|refusal| anyhow!(refusal))?;
+        .map_err(|refusal| {
+            self.counts.refused(refusal.to_string());
+            anyhow!(refusal)
+        })?;
         let canton_id = command.canton_command_id();
         bind(&PreSignContext {
             command_id: &canton_id,
@@ -1066,6 +1083,7 @@ async fn desk(
         alter,
         end,
         mismatch: false,
+        observe: false,
         counts: Arc::clone(&counts),
         carried_command: Arc::new(AtomicU32::new(0)),
         refuse_once: None,
@@ -1235,6 +1253,9 @@ fn guard_of<'a>(
         sells_base,
         cc,
         max_bps: 100,
+        max_age_secs: i64::from(
+            agent_logic::config::ControlSettings::default().swap_reference_max_age_secs,
+        ),
         reference,
     }
 }
@@ -1285,12 +1306,31 @@ fn the_guard_measures_the_adverse_deviation_with_the_cc_fee() {
         guard(&sell_tok, true, None).check(at, dec("10"), dec("20"), Decimal::ZERO),
         Err(CommandFailure::NoReferencePrice)
     );
-    let stale = Some(Reference {
-        mid: dec("2"),
-        at: at - 61,
-    });
+    let aged = |secs: i64| {
+        Some(Reference {
+            mid: dec("2"),
+            at: at - secs,
+        })
+    };
     assert_eq!(
-        guard(&sell_tok, true, stale).check(at, dec("10"), dec("20"), Decimal::ZERO),
+        guard(&sell_tok, true, aged(301)).check(at, dec("10"), dec("20"), Decimal::ZERO),
+        Err(CommandFailure::NoReferencePrice)
+    );
+    // The age bound is the setting: 300 s by default, here 30 s.
+    assert_eq!(
+        guard(&sell_tok, true, aged(120)).check(at, dec("10"), dec("20"), Decimal::ZERO),
+        Ok(())
+    );
+    let strict = |reference| PriceGuard {
+        max_age_secs: 30,
+        ..guard(&sell_tok, true, reference)
+    };
+    assert_eq!(
+        strict(aged(30)).check(at, dec("10"), dec("20"), Decimal::ZERO),
+        Ok(())
+    );
+    assert_eq!(
+        strict(aged(31)).check(at, dec("10"), dec("20"), Decimal::ZERO),
         Err(CommandFailure::NoReferencePrice)
     );
     let off = PriceGuard {
@@ -1312,6 +1352,7 @@ fn the_filter_takes_only_exact_capped_quotes_at_the_minimum_and_ranks_them() {
             sells_base: true,
             cc: &cc_ref,
             max_bps: 0,
+            max_age_secs: 300,
             reference: None,
         },
         fee_party: Some(&fee_party),
@@ -1543,8 +1584,7 @@ async fn every_rewrite_of_the_settle_is_refused_with_zero_signatures() {
     let ctx = agent.context().await;
     let me = agent.party.to_string();
     let content = failed(CommandFailure::ContentRefused);
-    // The net under the minimum is the evaluator's command_mismatch (reason 5); the rest are content refusals.
-    let mismatch = (5, "command_mismatch");
+    // Every rewrite is a content refusal: short proceeds break the agent's own balance first.
     let drills: Vec<(&str, Alter)> = vec![
         (
             "sold A+1e-10",
@@ -1591,11 +1631,7 @@ async fn every_rewrite_of_the_settle_is_refused_with_zero_signatures() {
     ];
     let mut seen = Vec::new();
     for (what, alter) in drills {
-        let expected = if what == "less than the minimum" {
-            mismatch
-        } else {
-            content
-        };
+        let expected = content;
         let o = order(tok(), "12.5", cc(), "24", "0");
         let (mut ledger, counts) = desk(
             &agent,
@@ -1682,6 +1718,8 @@ async fn every_rewrite_of_the_settle_is_refused_with_zero_signatures() {
         valid_until_micros: 1,
         lp_input_holding_cids: vec![LP_INPUT.into()],
         user_input_holding_cids: vec!["00ab01".into()],
+        expected_fees: vec![],
+        fee_party: None,
     };
     let hash = base64::engine::general_purpose::STANDARD
         .encode(tx_verifier::hasher::try_compute_hash(&bytes, "V2").unwrap());
@@ -1690,7 +1728,7 @@ async fn every_rewrite_of_the_settle_is_refused_with_zero_signatures() {
         &hash,
         "V2",
         &expectation,
-        VerifyMode { strict_all: true },
+        VerifyMode { strict_all: true, ..VerifyMode::default() },
         false,
     )
     .unwrap();
@@ -1805,7 +1843,9 @@ async fn the_price_guard_drops_deviating_quotes_first_and_checks_again_at_signin
     // Only deviating quotes: 1411; no reference or a stale one: 1410; nothing accepted.
     let stale = Some(Reference {
         mid: dec("2"),
-        at: agent_logic::clock::now_secs_i64() - 61,
+        at: agent_logic::clock::now_secs_i64()
+            - i64::from(agent.config.control.swap_reference_max_age_secs)
+            - 1,
     });
     for (references, failure) in [
         (vec![mid("1.5")], CommandFailure::PriceDeviation),
@@ -1909,8 +1949,27 @@ async fn the_scope_names_the_lps_asked_and_the_one_the_settle_may_pay() {
         Some(vec!["lp-one".to_string()])
     );
     assert_eq!(counts.get(), (1, 1, 1));
-    // A settle on another LP's venue is refused by the scope with 1112, unsigned.
+    // A settle on another LP's venue is refused unsigned: linked, by the inspection's venue rule,
     let other_venue: Alter = Arc::new(|s: &mut Settle| s.venue_lp = lp2());
+    let (mut ledger, counts) = desk(
+        &agent,
+        vec![vec![quotes[1].clone()]],
+        vec![mid("2")],
+        Arc::clone(&other_venue),
+        End::Executed,
+    )
+    .await;
+    let handled = execute(&ctx, &receipts, &mut ledger, &item(&agent, &o)).await;
+    assert_eq!(
+        (code_of(&handled), counts.get()),
+        ((1407, "content_refused"), (1, 1, 0))
+    );
+    let refusals = counts.refusals();
+    assert!(
+        refusals.first().is_some_and(|r| r.starts_with("AtomicDvpSettle: the venue's LP ")),
+        "{refusals:?}"
+    );
+    // and, with that inspection only observed, by the scope with 1112.
     let (mut ledger, counts) = desk(
         &agent,
         vec![vec![quotes[1].clone()]],
@@ -1919,6 +1978,7 @@ async fn the_scope_names_the_lps_asked_and_the_one_the_settle_may_pay() {
         End::Executed,
     )
     .await;
+    ledger.desk.submit.observe = true;
     let handled = execute(&ctx, &receipts, &mut ledger, &item(&agent, &o)).await;
     assert_eq!(
         (code_of(&handled), counts.get()),
@@ -2453,16 +2513,16 @@ async fn the_agents_atomic_client_signs_a_directed_settle_once_and_only_after_it
         panic!("an executed swap posts v2")
     };
     assert_eq!(receipt.receipt.outcome, ReceiptOutcome::Executed);
-    // What the binding refuses, the content check refuses, or a hash the agent did not
-    // compute: each is prepared once and never executed.
+    // What the content check refuses, or a hash the agent did not compute: each is
+    // prepared once and never executed.
     let drills: Vec<WireDrill> = vec![
         (
             "less than the minimum",
             Arc::new(|s: &mut Settle| s.created[1].amount = "23.9".into()),
             false,
-            (5, "command_mismatch"),
-            ReceiptOutcome::Refused,
-            1,
+            content,
+            ReceiptOutcome::Failed,
+            0,
         ),
         (
             "another command id",
@@ -2608,7 +2668,7 @@ async fn a_reference_gone_stale_while_the_quotes_arrive_takes_no_quote() {
     )
     .await;
     // The reference is fresh when read; the quotes arrive after it went stale.
-    let late = REFERENCE_MAX_AGE_SECS + 40;
+    let late = i64::from(agent.config.control.swap_reference_max_age_secs) + 40;
     ledger.desk.slow_quotes = Some((Arc::clone(&receipts.ahead), late));
     let handled = execute(&ctx, &receipts, &mut ledger, &item(&agent, &o)).await;
     assert_eq!(counts.get(), (0, 0, 0), "nothing accepted: {handled:?}");
@@ -2616,6 +2676,54 @@ async fn a_reference_gone_stale_while_the_quotes_arrive_takes_no_quote() {
         receipts.last(&agent.party).receipt().outcome,
         ReceiptOutcome::Failed
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reference_two_minutes_old_passes_at_the_default_age() {
+    let (_rpc, mut agent) = agent(0xd5, "swap-age", None).await;
+    let receipts = Receipts::default();
+    let o = order(tok(), "12.5", cc(), "24", "0");
+    let quotes = vec![info("q1", &lp(), "12.5", "25", None)];
+    // A calculated cross price carries the time of its inputs, minutes behind.
+    let aged = |secs: i64| {
+        Some(Reference {
+            mid: dec("2"),
+            at: agent_logic::clock::now_secs_i64() - secs,
+        })
+    };
+    let ctx = agent.context().await;
+    let (mut ledger, counts) = desk(
+        &agent,
+        vec![quotes.clone()],
+        vec![aged(120)],
+        as_is(),
+        End::Executed,
+    )
+    .await;
+    let handled = execute(&ctx, &receipts, &mut ledger, &item(&agent, &o)).await;
+    assert!(matches!(handled, Handled::Executed { .. }), "{handled:?}");
+    assert_eq!(counts.get(), (1, 1, 1), "checked at the quote and at signing");
+    // Older than the setting: 1410, before the accept or at signing.
+    agent.config.control.swap_reference_max_age_secs = 60;
+    let ctx = agent.context().await;
+    for (references, counted) in [
+        (vec![aged(120)], (0, 0, 0)),
+        (vec![aged(0), aged(120)], (1, 1, 0)),
+    ] {
+        let (mut ledger, counts) = desk(
+            &agent,
+            vec![quotes.clone()],
+            references,
+            as_is(),
+            End::Executed,
+        )
+        .await;
+        let handled = execute(&ctx, &receipts, &mut ledger, &item(&agent, &o)).await;
+        assert_eq!(
+            (code_of(&handled), counts.get()),
+            (failed(CommandFailure::NoReferencePrice), counted)
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

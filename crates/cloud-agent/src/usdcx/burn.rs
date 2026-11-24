@@ -272,6 +272,10 @@ fn classify(
         }
         Err(e) => {
             let text = format!("{e:#}");
+            // The agent's own refusal before signing: no marker its text quotes counts.
+            if crate::ledger_client::is_presign_refusal(&e) {
+                return if signed { Submitted::Rejected(text) } else { Submitted::NotSigned(e) };
+            }
             if let Some(fields) = marker_fields(&text, "USDCX_BURN_COMMITTED") {
                 return Submitted::Committed {
                     update_id: field(&fields, "update_id"),
@@ -283,7 +287,7 @@ fn classify(
             }
             // An earlier execute that may still commit, or the server's own
             // unknown outcome, decides first.
-            if text.contains("EXECUTE_OUTCOME_UNKNOWN") || text.contains("USDCX_OUTCOME_UNKNOWN") {
+            if crate::ledger_client::is_ambiguous_execute_error(&e) || text.contains("USDCX_OUTCOME_UNKNOWN") {
                 return Submitted::Unknown(text);
             }
             // The server refused before submitting this signature (its reason
@@ -938,5 +942,63 @@ mod tests {
                 "{doubt}"
             );
         }
+    }
+
+    #[test]
+    fn a_refusal_before_signing_is_never_an_unknown_outcome_whatever_its_text() {
+        use crate::control::intent::{ContentRefusal, PackageRefusal, SignatureRefusal};
+        let markers = "Transaction failed: USDCX_BURN_COMMITTED request_id=r update_id=u EXECUTE_OUTCOME_UNKNOWN \
+                       ATOMIC_EXECUTE_AMBIGUOUS USDCX_OUTCOME_UNKNOWN USDCX_BURN_PENDING DUPLICATE_COMMAND \
+                       SUBMISSION_ALREADY_IN_FLIGHT Command already submitted USDCX_NOT_SUBMITTED transport error";
+        let refusals = |text: &str| -> [anyhow::Error; 3] {
+            [
+                anyhow::Error::new(PackageRefusal::Unreadable(text.into())),
+                anyhow::Error::new(ContentRefusal::BadRequest(text.into())),
+                anyhow::Error::new(SignatureRefusal::Packages(text.into())).context("refused before signing"),
+            ]
+        };
+        for refusal in refusals(markers) {
+            let shown = format!("{refusal:#}");
+            assert!(shown.contains("EXECUTE_OUTCOME_UNKNOWN") && shown.contains("USDCX_OUTCOME_UNKNOWN"), "{shown}");
+            assert!(matches!(classify(Err(refusal), true), Submitted::Rejected(_)), "{shown}");
+        }
+        for refusal in refusals(markers) {
+            assert!(matches!(classify(Err(refusal), false), Submitted::NotSigned(_)));
+        }
+        // An earlier execute that may still commit is re-raised as a fresh, untyped error.
+        for refusal in refusals("the request is not this agent's") {
+            let marked = crate::ledger_client::mark_uncertain(refusal, Some("c"));
+            assert!(matches!(classify(Err(marked), true), Submitted::Unknown(_)));
+        }
+    }
+
+    #[test]
+    fn a_later_refusal_never_closes_a_burn_an_earlier_signature_may_commit() {
+        use crate::control::intent::{ContentRefusal, PackageRefusal, SignatureRefusal};
+        // Reasons that, from this attempt alone, read as a definite rejection.
+        for text in [
+            "Transaction failed: INSUFFICIENT_FUNDS",
+            "Transaction failed: USDCX_NOT_SUBMITTED: row",
+            "the request is not this agent's",
+        ] {
+            let refusals: [anyhow::Error; 3] = [
+                anyhow::Error::new(PackageRefusal::Unreadable(text.into())),
+                anyhow::Error::new(ContentRefusal::BadRequest(text.into())),
+                anyhow::Error::new(SignatureRefusal::Packages(text.into())).context("refused before signing"),
+            ];
+            for refusal in refusals {
+                // Attempt 1 signed and its execute may still commit; attempt 2 was refused before
+                // signing. The guarded submit hands the refusal back as it does then.
+                let delivered = crate::ledger_client::mark_uncertain(refusal, Some("usdcx-burn-attempt-1"));
+                let shown = format!("{delivered:#}");
+                // Unknown runs the ledger check (settle_until_known); Rejected would mark the burn
+                // Failed and NotSigned would end the command with no check.
+                assert!(matches!(classify(Err(delivered), true), Submitted::Unknown(_)), "{shown}");
+            }
+        }
+        // With no earlier execute in doubt, the refusal leaves this attempt unsigned.
+        let alone = anyhow::Error::new(PackageRefusal::Unreadable("Transaction failed: X".into()));
+        let delivered = crate::ledger_client::mark_uncertain(alone, None);
+        assert!(matches!(classify(Err(delivered), false), Submitted::NotSigned(_)));
     }
 }

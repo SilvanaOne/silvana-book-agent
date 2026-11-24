@@ -14,6 +14,16 @@ use super::rpc::{ControlRpc, RpcError};
 use super::sync::state_of;
 use super::{Standing, standing, verify_remote};
 
+/// `[vetted_packages]` in words: a selection is checked before every signature.
+pub(crate) fn vetted_packages_text(vetted: &agent_logic::config::VettedPackages) -> String {
+    match vetted {
+        agent_logic::config::VettedPackages::All => "all (no check)".to_string(),
+        agent_logic::config::VettedPackages::Selected(_) => {
+            format!("{}, enforced on every signature (package_not_allowed)", vetted.describe())
+        }
+    }
+}
+
 fn now_utc() -> Result<UtcTime> {
     agent_logic::clock::unix_now()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
@@ -163,7 +173,10 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
                 "autoExecuteCommands": ctx.config.control.auto_execute_commands,
                 "autoAcceptPolicies": ctx.config.control.auto_accept_policies,
                 "swapMaxDeviationBps": ctx.config.control.swap_max_deviation_bps,
+                "swapReferenceMaxAgeSecs": ctx.config.control.swap_reference_max_age_secs,
                 "vettedPackages": ctx.config.vetted_packages.describe(),
+                "vettedPackagesEnforced": ctx.config.vetted_packages != agent_logic::config::VettedPackages::All,
+                "verifyMode": ctx.config.verify.mode.as_str(),
             },
             "rpIds": rp_ids,
             "remote": remote,
@@ -237,9 +250,10 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
     }
     let _ = writeln!(
         out,
-        "Settings:     {}; vetted packages {} (not enforced yet)",
+        "Settings:     {}; vetted packages {}; verify mode {}",
         ctx.config.control.describe(),
-        ctx.config.vetted_packages.describe()
+        vetted_packages_text(&ctx.config.vetted_packages),
+        ctx.config.verify.mode.as_str()
     );
     let _ = writeln!(out, "Passkey rp_ids: {}", rp_ids.join(", "));
     match remote {
@@ -330,4 +344,20 @@ pub async fn run_policy_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_logic::config::VettedPackages;
+
+    #[test]
+    fn a_selection_is_stated_as_enforced_on_every_signature() {
+        assert_eq!(vetted_packages_text(&VettedPackages::All), "all (no check)");
+        let one = VettedPackages::Selected([agent_control::PackageId([1; 32])].into_iter().collect());
+        assert_eq!(
+            vetted_packages_text(&one),
+            "selected (1 packages), enforced on every signature (package_not_allowed)"
+        );
+    }
 }

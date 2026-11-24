@@ -612,13 +612,14 @@ settle_before_secs = 1800
 - The mid-price poller, balance refresh, and the settlement subscription keep running. **V1 transition behavior:** an in-flight V1 DVP that still needs *this agent's* fee or allocation steps is **actively cancelled server-side on encounter** — reservations released and the counterparty notified within one poll cycle, instead of stranding until deadline expiry (without live V1-stream registration the server's fee gate would classify the agent as a regular user and the DVP could never complete). One this agent has already allocated for is left alone and can still settle via the operator. Leftover on-chain DvpProposals are reaped by the DvpProposal GC; the counterparty's already-paid fees are not refunded — still prefer flipping during a quiet V1 window.
 - Startup fails loudly unless `[liquidity_provider.rfq_v2].enabled = true` and at least one enabled market has `[markets.rfq.v2].enabled = true`; a failed RFQ V2 setup is also fatal in this mode (nothing left to quote). `--orders-only` conflicts with it.
 
-**`[control]` and `[vetted_packages]`** apply to an agent linked to controllers (see [docs/control.md](docs/control.md)). Both are optional. They are read strictly: an unknown key or a value out of range stops startup with a message naming the section and the key. The running agent logs both at startup and reads them only then, so restart it after a change; each `control` command reads them when it runs.
+**`[control]` and `[vetted_packages]`** apply to an agent linked to controllers (see [docs/control.md](docs/control.md)); `[vetted_packages]` applies to every agent. Both are optional. They are read strictly: an unknown key, a value out of range, or one of their keys placed at the top level of agent.toml or below another table's header stops startup with a message naming the section and the key. The running agent logs both at startup and reads them only then, so restart it after a change; each `control` command reads them when it runs.
 
 ```toml
 [control]
 auto_execute_commands = false   # run pending direct commands without a prompt (default false)
 auto_accept_policies = true     # accept valid pending policies without a prompt (default true)
 swap_max_deviation_bps = 100    # largest gap between a swap's price and the reference mid; 0 turns it off; at most 10000
+swap_reference_max_age_secs = 300 # oldest reference mid the guard takes, in seconds; 30 to 3600
 
 [vetted_packages]
 mode = "selected"               # or "all", with no packages key (the default)
@@ -627,7 +628,9 @@ packages = [
 ]
 ```
 
-`selected` takes 1 to 256 different package ids. The Agent page's Packages tab copies this section for you. The agent does not enforce this section yet. What binds is the packages rule of the agent's signed policy: the agent checks it before it signs the transaction of a direct command, and the ledger service can refuse a transaction that uses a package outside it.
+`selected` takes 1 to 256 different package ids. The Agent page's Packages tab copies this section for you. With `selected`, the agent checks every transaction before it signs it and refuses one that uses a package outside the list (`package_not_allowed`), and it signs only when its own hash of the transaction matches the server's, so the bytes it checked are the bytes it signs; `all` checks nothing. A linked agent also checks the packages rule of its signed policy before every signature, and the ledger service can refuse a transaction that uses a package outside it.
+
+An optional `[verify]` section sets `mode = "default"`, `"observe"` or `"enforce"`: how the verifier's newer checks act while the agent is not linked (see [docs/control.md](docs/control.md)). A linked agent enforces them all.
 
 ### Grid Orders
 
@@ -698,7 +701,7 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `--no-restore`      | Skip loading previous state from `agent-state.json`          |
 | `--no-reject`       | Accept all proposals without RFQ-state verification          |
 | `--dry-run`         | Prepare and verify transactions without signing or executing (not available for `agent`; `buy` and `sell` still accept real quotes) |
-| `--force`           | Sign and execute even if verification fails                  |
+| `--force`           | Sign and execute even if verification fails (never under a `[vetted_packages]` selection) |
 | `--confirm`         | Prompt for confirmation before signing each transaction; no answer within 120s, or 120s waiting behind another prompt, declines it |
 | `--verbose`         | Enable verbose logging                                       |
 | `--config <PATH>`   | Path to agent.toml (default: `agent.toml`)                   |

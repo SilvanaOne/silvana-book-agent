@@ -17,7 +17,7 @@ use orderbook_proto::ledger::prepare_transaction_request::Params;
 use orderbook_proto::rfqv2::prepare_atomic_transaction_request::Params as AtomicParams;
 use rust_decimal::Decimal;
 use tx_verifier::facts::{DvpTerms, FlowKind, QuoteSide, TxFacts, ValueFlow};
-use tx_verifier::{HashCheck, OperationExpectation, VerificationResult};
+use tx_verifier::{ExpectedDvpTerms, HashCheck, OperationExpectation, VerificationResult};
 
 /// Platform parties pinned in the agent's own env, never taken from server data.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -64,6 +64,17 @@ pub enum ContentRefusal {
     Unmodelled(Vec<String>),
     BadRequest(String),
     UnexpectedOutflow { operation: &'static str, flow: ValueFlow },
+    /// Nothing else is wrong, but a leg goes to a platform party whose pin is not set.
+    PinMissing { operation: &'static str, pin: &'static str },
+}
+
+/// The pins a request may need, by their env names.
+const FEE_PIN: &str = "PARTY_FEE";
+const PREPAID_TRAFFIC_PIN: &str = "PARTY_PREPAID_TRAFFIC";
+
+/// `text` with control, line separator and bidi characters replaced by spaces.
+fn clean(text: &str) -> String {
+    text.chars().map(|c| if crate::log_text::is_log_unsafe(c) { ' ' } else { c }).collect()
 }
 
 impl fmt::Display for ContentRefusal {
@@ -71,7 +82,7 @@ impl fmt::Display for ContentRefusal {
         f.write_str("content check refused before signing: ")?;
         match self {
             Self::HashNotMatched => f.write_str("the transaction hash was not computed locally"),
-            Self::Unreadable(reason) => write!(f, "the transaction content is unreadable: {reason}"),
+            Self::Unreadable(reason) => write!(f, "the transaction content is unreadable: {}", clean(reason)),
             Self::ActAs(parties) => write!(f, "act_as is {parties:?}, not exactly this agent"),
             Self::Unmodelled(templates) => {
                 write!(f, "templates outside the model: {}", templates.join(", "))
@@ -82,6 +93,9 @@ impl fmt::Display for ContentRefusal {
                 "{} {}@{} ({:?}) to {} is not a leg of this {operation} request",
                 flow.amount, flow.instrument_id, flow.instrument_admin, flow.kind, flow.to
             ),
+            Self::PinMissing { operation, pin } => {
+                write!(f, "{pin} is not set, so the platform leg of this {operation} request is unchecked")
+            }
         }
     }
 }
@@ -94,6 +108,8 @@ enum Recipient {
     Party(String),
     /// The holders of a lock the agent asked for; not known locally.
     LockHolders,
+    /// A platform party whose pin is not set: any receiver, and the check then refuses.
+    Unpinned,
 }
 
 /// One value movement the agent's request explains.
@@ -108,6 +124,7 @@ struct Leg {
 }
 
 const TRANSFER_KINDS: &[FlowKind] = &[FlowKind::Holding, FlowKind::PendingTransfer];
+const HOLDING_KINDS: &[FlowKind] = &[FlowKind::Holding];
 const ALLOCATION_KINDS: &[FlowKind] = &[FlowKind::Allocation];
 const LOCK_KINDS: &[FlowKind] = &[FlowKind::Lock];
 const BURN_KINDS: &[FlowKind] = &[FlowKind::Burn];
@@ -134,6 +151,7 @@ impl Leg {
         let to = match &self.to {
             Recipient::Party(party) => flow.to == *party,
             Recipient::LockHolders => flow.kind == FlowKind::Lock,
+            Recipient::Unpinned => true,
         };
         to && self.kinds.contains(&flow.kind)
             && self.instrument_admin.as_ref().is_none_or(|a| *a == flow.instrument_admin)
@@ -174,27 +192,97 @@ fn dvp_leg(agent: &str, terms: &DvpTerms) -> Option<Leg> {
     ))
 }
 
-/// The leg of the one DvP with `proposal_id` that the agent is a party to.
-fn dvp_leg_for(agent: &str, facts: &TxFacts, proposal_id: &str) -> Result<Vec<Leg>, ContentRefusal> {
-    let mut legs: Vec<Leg> = facts
-        .dvp
-        .iter()
-        .filter(|t| t.proposal_id.as_deref() == Some(proposal_id))
-        .filter_map(|t| dvp_leg(agent, t))
-        .collect();
-    legs.dedup();
-    if legs.len() > 1 {
+/// One CC payment leg per receiver, its targets summed in first-seen order, as the
+/// batch payment pays them.
+fn cc_payment_legs<'t>(targets: impl IntoIterator<Item = (&'t str, &'t str)>) -> Result<Vec<Leg>, ContentRefusal> {
+    let mut sums: Vec<(&str, Decimal)> = Vec::new();
+    for (receiver, text) in targets {
+        let paid = amount(text, "a payment amount")?;
+        match sums.iter_mut().find(|(r, _)| *r == receiver) {
+            Some((_, sum)) => {
+                *sum = sum
+                    .checked_add(paid)
+                    .ok_or_else(|| ContentRefusal::BadRequest(format!("the payments to {receiver} overflow")))?;
+            }
+            None => sums.push((receiver, paid)),
+        }
+    }
+    Ok(sums.into_iter().map(|(to, sum)| Leg::exact(to, None, Some(AMULET), sum, HOLDING_KINDS)).collect())
+}
+
+/// The longest a settlement the agent allocates to may stay open from now: 72 h.
+const MAX_SETTLE_WINDOW_MICROS: i64 = 259_200_000_000;
+
+/// Why an allocation's deadlines are refused at `now_micros`, if they are.
+fn deadline_refusal(allocation: &tx_verifier::facts::AllocationFact, now_micros: i64) -> Option<String> {
+    let settle_before = allocation.settle_before_micros;
+    if allocation.allocate_before_micros > settle_before {
+        return Some("its allocation deadline is after its settlement deadline".to_string());
+    }
+    let window = settle_before.checked_sub(now_micros);
+    window
+        .is_none_or(|w| w > MAX_SETTLE_WINDOW_MICROS)
+        .then(|| "its settlement deadline is more than 72 h away".to_string())
+}
+
+/// The leg of an Allocate: the agent's side of the terms it recorded, explained only by
+/// the transaction's allocation for that proposal.
+fn allocate_legs(
+    agent: &str,
+    facts: &TxFacts,
+    proposal_id: &str,
+    terms: Option<&ExpectedDvpTerms>,
+) -> Result<Vec<Leg>, ContentRefusal> {
+    let Some(terms) = terms else {
         return Err(ContentRefusal::BadRequest(format!(
-            "the transaction carries several DvP terms for proposal {proposal_id}"
+            "the allocation for proposal {proposal_id} carries no recorded DvP terms"
+        )));
+    };
+    if terms.proposal_id != proposal_id {
+        return Err(ContentRefusal::BadRequest(format!(
+            "the recorded terms are of proposal {}, not {proposal_id}",
+            terms.proposal_id
         )));
     }
-    Ok(legs)
+    let (to, quantity) = if terms.seller == agent {
+        (&terms.buyer, &terms.delivery)
+    } else if terms.buyer == agent {
+        (&terms.seller, &terms.payment)
+    } else {
+        return Err(ContentRefusal::BadRequest(format!(
+            "the agent is neither buyer nor seller of proposal {proposal_id}"
+        )));
+    };
+    let leg = Leg::exact(
+        to,
+        Some(&quantity.instrument_admin),
+        Some(&quantity.instrument_id),
+        amount(&quantity.amount, "the allocation amount")?,
+        ALLOCATION_KINDS,
+    );
+    let now = agent_logic::clock::now_utc().timestamp_micros();
+    let own = facts.allocations.iter().filter(|a| a.settlement_ref_id == proposal_id && a.sender == agent);
+    if let Some(why) = own.filter_map(|a| deadline_refusal(a, now)).next() {
+        return Err(ContentRefusal::BadRequest(format!("the allocation for proposal {proposal_id} is refused: {why}")));
+    }
+    let bound = facts.allocations.iter().any(|a| {
+        a.settlement_ref_id == proposal_id
+            && a.sender == agent
+            && leg.matches(&ValueFlow {
+                to: a.receiver.clone(),
+                instrument_admin: a.instrument_admin.clone(),
+                instrument_id: a.instrument_id.clone(),
+                amount: a.amount,
+                kind: FlowKind::Allocation,
+            })
+    });
+    Ok(if bound { vec![leg] } else { Vec::new() })
 }
 
 /// The legs of an AcceptDvp: the agent's side, to the counterparty of matching terms.
 fn accept_dvp_legs(agent: &str, facts: &TxFacts, e: &OperationExpectation) -> Result<Vec<Leg>, ContentRefusal> {
     let OperationExpectation::AcceptDvp {
-        seller_party,
+        acceptor,
         proposal_id,
         expected_delivery_amount,
         expected_payment_amount,
@@ -202,6 +290,7 @@ fn accept_dvp_legs(agent: &str, facts: &TxFacts, e: &OperationExpectation) -> Re
         expected_delivery_instrument_admin,
         expected_payment_instrument_id,
         expected_payment_instrument_admin,
+        terms,
         ..
     } = e
     else {
@@ -211,7 +300,8 @@ fn accept_dvp_legs(agent: &str, facts: &TxFacts, e: &OperationExpectation) -> Re
     let payment = amount(expected_payment_amount, "the payment amount")?;
     let agreed = |t: &&DvpTerms| {
         t.proposal_id.as_deref() == Some(proposal_id.as_str())
-            && t.seller == *seller_party
+            && (t.buyer == *acceptor || t.seller == *acceptor)
+            && terms.as_ref().is_none_or(|r| t.buyer == r.buyer && t.seller == r.seller)
             && t.delivery.amount == delivery
             && t.delivery.instrument_id == *expected_delivery_instrument_id
             && t.delivery.instrument_admin == *expected_delivery_instrument_admin
@@ -232,7 +322,7 @@ fn settle_legs(
     e: &OperationExpectation,
     request: OwnRequest<'_>,
     platform: &PlatformParties,
-) -> Result<Vec<Leg>, ContentRefusal> {
+) -> Result<(Vec<Leg>, Option<&'static str>), ContentRefusal> {
     let OperationExpectation::AtomicDvpSettle {
         user_party,
         venue_cid,
@@ -249,10 +339,10 @@ fn settle_legs(
         ..
     } = e
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     if user_party != agent {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let base = amount(base_amount, "the base amount")?;
     let quote = amount(quote_amount, "the quote amount")?;
@@ -268,36 +358,83 @@ fn settle_legs(
     } else {
         (base_leg(base), quote_leg(Decimal::ZERO))
     };
-    // Every fee a settle makes the agent pay goes to the pinned fee party, or it is refused.
+    let (pays, gets) = if buy {
+        ((quote_instrument_admin, quote_instrument_id, quote), (base_instrument_admin, base_instrument_id, base))
+    } else {
+        ((base_instrument_admin, base_instrument_id, base), (quote_instrument_admin, quote_instrument_id, quote))
+    };
+    // Every fee a settle makes the agent pay goes to the pinned fee party, or it is refused;
+    // without the pin it is refused for that alone.
     let unpinned = |receiver: &str| platform.fee.as_deref() != Some(receiver);
-    if let Some(fee) = facts
-        .atomic_settle
-        .as_ref()
-        .filter(|s| s.user == agent)
-        .and_then(|s| s.fees.iter().find(|f| unpinned(&f.receiver)))
-    {
+    let own_fees = facts.atomic_settle.as_ref().filter(|s| s.user == agent).map(|s| s.fees.as_slice()).unwrap_or_default();
+    let mut missing = (platform.fee.is_none() && !own_fees.is_empty()).then_some(FEE_PIN);
+    if let Some(fee) = own_fees.iter().filter(|_| platform.fee.is_some()).find(|f| unpinned(&f.receiver)) {
         return Err(ContentRefusal::BadRequest(format!(
             "a settle fee of {} {}@{} goes to {}, not to the pinned PARTY_FEE",
             fee.amount, fee.id, fee.admin, fee.receiver
         )));
     }
     let mut legs = vec![own];
+    let mut fees = Vec::new();
     if let OwnRequest::Atomic(Some(AtomicParams::AtomicDvpSettle(params))) = request {
         for fee in &params.lp_fees {
-            if unpinned(&fee.receiver) {
+            if platform.fee.is_none() {
+                missing = Some(FEE_PIN);
+            } else if unpinned(&fee.receiver) {
                 return Err(ContentRefusal::BadRequest(format!(
                     "the request pays a settle fee to {}, not to the pinned PARTY_FEE",
                     fee.receiver
                 )));
             }
+            let fee_amount = amount(&fee.amount, "an LP fee amount")?;
+            fees.push((&fee.instrument_admin, &fee.instrument_id, fee_amount));
             legs.push(Leg::exact(
                 &fee.receiver,
                 Some(&fee.instrument_admin),
                 Some(&fee.instrument_id),
-                amount(&fee.amount, "an LP fee amount")?,
+                fee_amount,
                 TRANSFER_KINDS,
             ));
         }
+    }
+    // Per instrument, the agent's consumed holdings less the unlocked ones it gets are exactly
+    // its leg and the signed fees less its proceeds, so LP change never absorbs its own inputs.
+    use std::collections::BTreeMap;
+    fn tally<'a>(
+        totals: &mut BTreeMap<(&'a str, &'a str), Decimal>,
+        instrument: (&'a str, &'a str),
+        amount: Decimal,
+        add: bool,
+    ) -> Result<(), ContentRefusal> {
+        let total = totals.entry(instrument).or_insert(Decimal::ZERO);
+        let next = if add { total.checked_add(amount) } else { total.checked_sub(amount) };
+        *total = next.ok_or_else(|| ContentRefusal::BadRequest("the agent's holdings overflow a decimal".to_string()))?;
+        Ok(())
+    }
+    let mut lost = BTreeMap::new();
+    let mut owed = BTreeMap::new();
+    for h in &facts.consumed {
+        tally(&mut lost, (&h.instrument_admin, &h.instrument_id), h.amount, true)?;
+    }
+    for h in facts.inflows.iter().filter(|h| !h.locked) {
+        tally(&mut lost, (&h.instrument_admin, &h.instrument_id), h.amount, false)?;
+    }
+    tally(&mut owed, (pays.0, pays.1), pays.2, true)?;
+    tally(&mut owed, (gets.0, gets.1), gets.2, false)?;
+    for &(admin, id, fee) in &fees {
+        tally(&mut owed, (admin, id), fee, true)?;
+    }
+    for instrument in owed.keys() {
+        lost.entry(*instrument).or_insert(Decimal::ZERO);
+    }
+    let unbalanced = lost.iter().find(|(instrument, have)| owed.get(*instrument).copied().unwrap_or(Decimal::ZERO) != **have);
+    if let Some(((admin, id), have)) = unbalanced {
+        let want = owed.get(&(*admin, *id)).copied().unwrap_or(Decimal::ZERO);
+        return Err(ContentRefusal::BadRequest(format!(
+            "the agent's {}@{} holdings drop by {have}, not by its leg and fees less its proceeds, {want}",
+            clean(id),
+            clean(admin)
+        )));
     }
     let settle_is_the_request = facts.roots.len() == 1
         && facts.roots.first().is_some_and(|r| {
@@ -318,11 +455,17 @@ fn settle_legs(
     if settle_is_the_request {
         legs.push(Leg { amount: None, ..lp_change });
     }
-    Ok(legs)
+    Ok((legs, missing))
 }
 
-/// The legs of the agent's own multicall operations.
-fn multicall_legs(agent: &str, facts: &TxFacts, params: &Params) -> Result<Vec<Leg>, ContentRefusal> {
+/// The legs of the agent's own multicall operations; an accept or allocation pays only
+/// the leg of the DvP terms the agent recorded.
+fn multicall_legs(
+    agent: &str,
+    facts: &TxFacts,
+    params: &Params,
+    terms: Option<&ExpectedDvpTerms>,
+) -> Result<Vec<Leg>, ContentRefusal> {
     let Params::ExecuteMulticall(params) = params else {
         return Ok(Vec::new());
     };
@@ -352,19 +495,11 @@ fn multicall_legs(agent: &str, facts: &TxFacts, params: &Params) -> Result<Vec<L
                 }
             }
             McOp::BatchPay(pay) => {
-                for t in &pay.targets {
-                    legs.push(Leg::exact(
-                        &t.receiver,
-                        None,
-                        Some(AMULET),
-                        amount(&t.amount, "a payment amount")?,
-                        TRANSFER_KINDS,
-                    ));
-                }
+                legs.extend(cc_payment_legs(pay.targets.iter().map(|t| (t.receiver.as_str(), t.amount.as_str())))?);
             }
-            McOp::Allocate(a) => legs.extend(dvp_leg_for(agent, facts, &a.proposal_id)?),
-            McOp::AcceptDvp(a) => legs.extend(dvp_leg_for(agent, facts, &a.proposal_id)?),
-            McOp::AcceptDvpAndAllocate(a) => legs.extend(dvp_leg_for(agent, facts, &a.proposal_id)?),
+            McOp::Allocate(a) => legs.extend(allocate_legs(agent, facts, &a.proposal_id, terms)?),
+            McOp::AcceptDvp(a) => legs.extend(allocate_legs(agent, facts, &a.proposal_id, terms)?),
+            McOp::AcceptDvpAndAllocate(a) => legs.extend(allocate_legs(agent, facts, &a.proposal_id, terms)?),
             McOp::AcceptTransferInstruction(_)
             | McOp::WithdrawAllocation(_)
             | McOp::ProposeDvp(_)
@@ -382,17 +517,18 @@ fn expected_legs(
     expectation: &OperationExpectation,
     request: OwnRequest<'_>,
     facts: &TxFacts,
-) -> Result<Vec<Leg>, ContentRefusal> {
+) -> Result<(Vec<Leg>, Option<&'static str>), ContentRefusal> {
     use OperationExpectation as E;
     let ledger_params = match request {
         OwnRequest::Ledger(params) => params,
         OwnRequest::Atomic(_) => None,
     };
-    Ok(match expectation {
+    let mut missing = None;
+    let legs = match expectation {
         E::TransferCc { receiver_party, amount: a, .. } => {
             vec![Leg::exact(receiver_party, None, Some(AMULET), amount(a, "the transfer amount")?, TRANSFER_KINDS)]
         }
-        E::TransferCip56 { sender_party, receiver_party, instrument_id, instrument_admin, amount: a } => {
+        E::TransferCip56 { sender_party, receiver_party, instrument_id, instrument_admin, amount: a, .. } => {
             if receiver_party == sender_party {
                 Vec::new()
             } else {
@@ -405,27 +541,41 @@ fn expected_legs(
                 )]
             }
         }
-        E::PrepayTraffic { amount: a, .. } => match &platform.prepaid_traffic {
-            Some(party) => vec![Leg::exact(party, None, Some(AMULET), amount(a, "the traffic amount")?, TRANSFER_KINDS)],
-            None => Vec::new(),
-        },
-        E::PayFee { .. } => match &platform.fee {
-            Some(party) => vec![Leg {
-                to: Recipient::Party(party.clone()),
-                instrument_admin: None,
-                instrument_id: None,
-                amount: None,
-                kinds: ANY_KIND,
-            }],
-            None => Vec::new(),
-        },
+        E::PrepayTraffic { amount: a, .. } => {
+            let leg = Leg::exact("", None, Some(AMULET), amount(a, "the traffic amount")?, TRANSFER_KINDS);
+            let to = match &platform.prepaid_traffic {
+                Some(party) => Recipient::Party(party.clone()),
+                None => {
+                    missing = Some(PREPAID_TRAFFIC_PIN);
+                    Recipient::Unpinned
+                }
+            };
+            vec![Leg { to, ..leg }]
+        }
+        E::PayFee { .. } => {
+            let to = match &platform.fee {
+                Some(party) => Recipient::Party(party.clone()),
+                None => {
+                    missing = Some(FEE_PIN);
+                    Recipient::Unpinned
+                }
+            };
+            vec![Leg { to, instrument_admin: None, instrument_id: None, amount: None, kinds: ANY_KIND }]
+        }
         E::AcceptDvp { .. } => accept_dvp_legs(agent, facts, expectation)?,
-        E::Allocate { proposal_id, .. } => dvp_leg_for(agent, facts, proposal_id)?,
-        E::ExecuteMulticall { .. } => match ledger_params {
-            Some(params) => multicall_legs(agent, facts, params)?,
+        E::Allocate { proposal_id, terms, .. } => allocate_legs(agent, facts, proposal_id, terms.as_ref())?,
+        E::ExecuteMulticall { terms, .. } => match ledger_params {
+            Some(params) => multicall_legs(agent, facts, params, terms.as_ref())?,
             None => Vec::new(),
         },
-        E::AtomicDvpSettle { .. } => settle_legs(agent, facts, expectation, request, platform)?,
+        E::BatchPayCc { targets, .. } => {
+            cc_payment_legs(targets.iter().map(|t| (t.receiver.as_str(), t.amount.as_str())))?
+        }
+        E::AtomicDvpSettle { .. } => {
+            let (legs, pin) = settle_legs(agent, facts, expectation, request, platform)?;
+            missing = pin;
+            legs
+        }
         E::RequestRecurringPrepaid { app_party, amount: a, .. } => {
             let mut legs = vec![Leg::exact(app_party, None, None, amount(a, "the payment amount")?, TRANSFER_KINDS)];
             if let Some(Params::RequestRecurringPrepaid(p)) = ledger_params {
@@ -471,7 +621,8 @@ fn expected_legs(
         | E::UsdcxReclaimHolding { .. }
         | E::UsdcxUpdatePreApproval { .. }
         | E::UsdcxTerminateAgreement { .. } => Vec::new(),
-    })
+    };
+    Ok((legs, missing))
 }
 
 /// The whole-transaction check of a linked agent, before any signature that no command
@@ -523,7 +674,8 @@ fn check_content(
     check_command_id(directed, &facts.command_id).map_err(|e| {
         ContentRefusal::BadRequest(format!("the transaction's command id {:?} is refused: {}", facts.command_id, e.code_name()))
     })?;
-    let legs = expected_legs(agent, platform, expectation, request, facts)?;
+    let (legs, missing_pin) = expected_legs(agent, platform, expectation, request, facts)?;
+    let operation = crate::control_survey::operation_kind(expectation);
     let mut used = vec![false; legs.len()];
     for flow in facts.outflows.iter().filter(|f| f.to != agent) {
         let slot = legs
@@ -533,14 +685,14 @@ fn check_content(
         match slot {
             Some((_, used)) => *used = true,
             None => {
-                return Err(ContentRefusal::UnexpectedOutflow {
-                    operation: crate::control_survey::operation_kind(expectation),
-                    flow: flow.clone(),
-                });
+                return Err(ContentRefusal::UnexpectedOutflow { operation, flow: flow.clone() });
             }
         }
     }
-    Ok(())
+    match missing_pin {
+        Some(pin) => Err(ContentRefusal::PinMissing { operation, pin }),
+        None => Ok(()),
+    }
 }
 
 /// What one directed signature is bound to: the state read under the control lock, the
@@ -592,7 +744,7 @@ impl fmt::Display for SignatureRefusal {
             }
             Self::Binding(BindingRefusal::Directed(d)) => write!(f, "the command is refused: {}", d.code_name()),
             Self::Package(id) => write!(f, "package {id} is outside the rules in force"),
-            Self::Packages(reason) => write!(f, "the transaction's packages are unreadable: {reason}"),
+            Self::Packages(reason) => write!(f, "the transaction's packages are unreadable: {}", clean(reason)),
         }
     }
 }
@@ -607,6 +759,114 @@ fn enforced_packages(prepared_transaction: &[u8]) -> Result<BTreeSet<PackageId>,
         .iter()
         .map(|id| PackageId::parse(id).map_err(|_| SignatureRefusal::Packages(format!("package id {id:?}"))))
         .collect()
+}
+
+/// Why the packages of a signature were refused (`package_not_allowed`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageRefusal {
+    /// A package outside `[vetted_packages]`.
+    Local(PackageId),
+    /// A package outside the packages rule of the policy in force.
+    Policy(PackageId),
+    /// The package ids could not be read, so a selection cannot be checked.
+    Unreadable(String),
+    /// No local hash matched the server's, so the checked bytes need not be the signed ones.
+    HashUnmatched(UnmatchedHash),
+}
+
+/// What the hash check saw instead of a match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnmatchedHash {
+    /// The local hash differs from the server's.
+    Mismatch,
+    /// No local hash was computed, for this reason.
+    Uncomputed(String),
+}
+
+impl PackageRefusal {
+    /// The refused package, when the ids were read.
+    pub fn package(&self) -> Option<&PackageId> {
+        match self {
+            Self::Local(id) | Self::Policy(id) => Some(id),
+            Self::Unreadable(_) | Self::HashUnmatched(_) => None,
+        }
+    }
+
+    /// The same refusal as a directed signature's binding gives it, for its receipt.
+    pub fn signature_refusal(&self) -> SignatureRefusal {
+        match self {
+            Self::Local(id) | Self::Policy(id) => SignatureRefusal::Package(*id),
+            Self::Unreadable(reason) => SignatureRefusal::Packages(reason.clone()),
+            Self::HashUnmatched(UnmatchedHash::Mismatch) => {
+                SignatureRefusal::Packages("the transaction hash did not match".to_string())
+            }
+            Self::HashUnmatched(UnmatchedHash::Uncomputed(_)) => {
+                SignatureRefusal::Packages("the transaction hash was not computed".to_string())
+            }
+        }
+    }
+}
+
+impl fmt::Display for PackageRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = ReasonCode::PackageNotAllowed.code_name();
+        match self {
+            Self::Local(id) => write!(f, "{code}: package {id} is outside [vetted_packages]"),
+            Self::Policy(id) => write!(f, "{code}: package {id} is outside the packages rule of the policy in force"),
+            Self::Unreadable(reason) => write!(f, "{code}: the transaction's packages are unreadable: {}", clean(reason)),
+            Self::HashUnmatched(UnmatchedHash::Mismatch) => write!(
+                f,
+                "{code}: the local transaction hash does not match the server's, so its packages are unverified"
+            ),
+            Self::HashUnmatched(UnmatchedHash::Uncomputed(reason)) => {
+                let reason: String = reason.chars().take(MAX_REFUSAL_REASON_CHARS).collect();
+                let reason = clean(&reason);
+                write!(f, "{code}: the local transaction hash was not computed ({reason}), so its packages are unverified")
+            }
+        }
+    }
+}
+
+/// Characters of an uncomputed hash's reason shown in its refusal.
+const MAX_REFUSAL_REASON_CHARS: usize = 160;
+
+impl std::error::Error for PackageRefusal {}
+
+/// Every template and interface package must be in `[vetted_packages]` and in `policy`'s packages
+/// rule, each when it selects, on bytes whose hash matched; neither selecting reads nothing.
+pub fn check_signature_packages(
+    prepared_transaction: &[u8],
+    hash_check: &HashCheck,
+    local: &agent_logic::config::VettedPackages,
+    policy: Option<&agent_control::Rules>,
+) -> Result<(), PackageRefusal> {
+    let local = match local {
+        agent_logic::config::VettedPackages::All => None,
+        agent_logic::config::VettedPackages::Selected(ids) => Some(ids),
+    };
+    let policy = policy.filter(|rules| !rules.packages.any);
+    if local.is_none() && policy.is_none() {
+        return Ok(());
+    }
+    // Otherwise the server hash is signed, which need not be of the bytes read here
+    match hash_check {
+        HashCheck::Match => {}
+        HashCheck::Mismatch { .. } => return Err(PackageRefusal::HashUnmatched(UnmatchedHash::Mismatch)),
+        HashCheck::Uncomputed { reason } => {
+            return Err(PackageRefusal::HashUnmatched(UnmatchedHash::Uncomputed(reason.clone())));
+        }
+    }
+    let used = enforced_packages(prepared_transaction).map_err(|e| match e {
+        SignatureRefusal::Packages(reason) => PackageRefusal::Unreadable(reason),
+        other => PackageRefusal::Unreadable(other.to_string()),
+    })?;
+    if let Some(id) = local.and_then(|ids| used.iter().find(|id| !ids.contains(*id))) {
+        return Err(PackageRefusal::Local(*id));
+    }
+    match policy {
+        Some(rules) => check_packages(rules, &used).map_err(PackageRefusal::Policy),
+        None => Ok(()),
+    }
 }
 
 /// The crate's end-to-end binding of one directed operation.
@@ -688,12 +948,16 @@ pub fn check_directed_swap(
     check_directed(agent, platform, prepared, directed, Some(venue_cid), authorize_directed_swap)
 }
 
+#[cfg(test)] #[path = "intent_captured_tests.rs"] mod captured_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
     use orderbook_proto::ledger::{
-        ExecuteMultiCallParams, McAcceptDvpAndAllocate, McBatchTransfer, McTransferTarget, MultiCallOp,
+        ExecuteMultiCallParams, McAcceptDvpAndAllocate, McBatchPay, McBatchTransfer, McPaymentTarget,
+        McTransferTarget, MultiCallOp,
     };
+    use tx_verifier::facts::AllocationFact;
+    use tx_verifier::{BatchPayTarget, ExpectedQuantity};
     use orderbook_proto::rfqv2::{AtomicDvpSettleParams, AtomicFeeSpec};
     use tx_verifier::Coverage;
     use tx_verifier::facts::{ExerciseFact, Quantity, SettleFacts};
@@ -731,6 +995,7 @@ mod tests {
             burn_holding_cids: Vec::new(),
             hash_check: HashCheck::Match,
             coverage: Coverage::Fields,
+            would_refuse: Vec::new(),
         }
     }
 
@@ -757,6 +1022,7 @@ mod tests {
             receiver_party: BOB.into(),
             amount: amount.into(),
             command_id: "c".into(),
+            dso_party: None,
         }
     }
 
@@ -802,7 +1068,7 @@ mod tests {
 
     #[test]
     fn merges_and_splits_move_nothing_to_others() {
-        let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec!["1".into()] };
+        let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec!["1".into()], amulet_cids: vec![], dso_party: None };
         assert_eq!(check(&split, facts(vec![cc(ME, "1")])), Ok(()));
         refused_outflow(check(&split, facts(vec![cc(EVE, "1")])));
         let merge = OperationExpectation::TransferCip56 {
@@ -811,6 +1077,8 @@ mod tests {
             instrument_id: "TOK".into(),
             instrument_admin: "reg::1220ab".into(),
             amount: "5".into(),
+            command_id: None,
+            input_holding_cids: vec![],
         };
         assert_eq!(check(&merge, facts(vec![flow(ME, "reg::1220ab", "TOK", "5", FlowKind::PendingTransfer)])), Ok(()));
         refused_outflow(check(&merge, facts(vec![flow(EVE, "reg::1220ab", "TOK", "5", FlowKind::Holding)])));
@@ -818,13 +1086,18 @@ mod tests {
 
     #[test]
     fn platform_parties_count_only_for_fee_and_traffic_operations() {
-        let traffic = OperationExpectation::PrepayTraffic { sender_party: ME.into(), amount: "20".into(), command_id: "c".into() };
+        let traffic = OperationExpectation::PrepayTraffic { sender_party: ME.into(), amount: "20".into(), command_id: "c".into(), receiver_party: None, dso_party: None };
         assert_eq!(check(&traffic, facts(vec![cc(TRAFFIC, "20")])), Ok(()));
         refused_outflow(check(&traffic, facts(vec![cc(EVE, "20")])));
         refused_outflow(check(&traffic, facts(vec![cc(TRAFFIC, "21")])));
-        // Unset pins reclassify nothing.
+        // Without the pin the top-up is refused for that alone; anything else wrong still refuses as such.
         let none = PlatformParties::default();
-        refused_outflow(check_with(&traffic, OwnRequest::Ledger(None), facts(vec![cc(TRAFFIC, "20")]), &none));
+        let unpinned = check_with(&traffic, OwnRequest::Ledger(None), facts(vec![cc(TRAFFIC, "20")]), &none);
+        assert_eq!(unpinned, Err(ContentRefusal::PinMissing { operation: "prepay_traffic", pin: PREPAID_TRAFFIC_PIN }));
+        let text = unpinned.unwrap_err().to_string();
+        assert!(text.contains("PARTY_PREPAID_TRAFFIC is not set"), "{text}");
+        refused_outflow(check_with(&traffic, OwnRequest::Ledger(None), facts(vec![cc(TRAFFIC, "20"), cc(EVE, "1")]), &none));
+        refused_outflow(check_with(&traffic, OwnRequest::Ledger(None), facts(vec![cc(TRAFFIC, "21")]), &none));
         let fee = OperationExpectation::PayFee {
             sender_party: ME.into(),
             fee_party: EVE.into(),
@@ -835,7 +1108,7 @@ mod tests {
         refused_outflow(check(&fee, facts(vec![cc(EVE, "0.3")])));
         // A pinned party is no leg of another operation.
         refused_outflow(check(&transfer_cc("1"), facts(vec![cc(BOB, "1"), cc(FEE, "0.3")])));
-        let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec![] };
+        let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec![], amulet_cids: vec![], dso_party: None };
         refused_outflow(check(&split, facts(vec![cc(TRAFFIC, "1")])));
     }
 
@@ -849,26 +1122,85 @@ mod tests {
         }
     }
 
+    fn recorded(buyer: &str, seller: &str) -> ExpectedDvpTerms {
+        let quantity = |admin: &str, id: &str, amount: &str| ExpectedQuantity {
+            instrument_admin: admin.into(),
+            instrument_id: id.into(),
+            amount: amount.into(),
+        };
+        ExpectedDvpTerms {
+            proposal_id: "p1".into(),
+            buyer: buyer.into(),
+            seller: seller.into(),
+            delivery: quantity("reg::1220ab", "TOK", "4.0000000000"),
+            payment: quantity(DSO, AMULET, "8"),
+        }
+    }
+
+    fn allocated(reference: &str, leg: &ValueFlow) -> AllocationFact {
+        AllocationFact {
+            contract_id: "a1".into(),
+            settlement_ref_id: reference.into(),
+            transfer_leg_id: "1".into(),
+            sender: ME.into(),
+            receiver: leg.to.clone(),
+            instrument_admin: leg.instrument_admin.clone(),
+            instrument_id: leg.instrument_id.clone(),
+            amount: leg.amount,
+            executor: "op::1220dd".into(),
+            allocate_before_micros: 1,
+            settle_before_micros: 2,
+        }
+    }
+
+    #[test]
+    fn an_allocation_pays_the_recorded_leg_of_its_own_proposal() {
+        let allocate = |terms: Option<ExpectedDvpTerms>| OperationExpectation::Allocate {
+            party: ME.into(),
+            proposal_id: "p1".into(),
+            dvp_cid: "d".into(),
+            terms,
+            settlement_operator: None,
+        };
+        let with = |reference: &str, leg: &ValueFlow| TxFacts { allocations: vec![allocated(reference, leg)], ..facts(vec![leg.clone()]) };
+        let seller_leg = flow(BOB, "reg::1220ab", "TOK", "4", FlowKind::Allocation);
+        let buyer_leg = flow(BOB, DSO, AMULET, "8", FlowKind::Allocation);
+        // The seller delivers and the buyer pays, as the agent recorded it, with no DvP in the transaction.
+        assert_eq!(check(&allocate(Some(recorded(BOB, ME))), with("p1", &seller_leg)), Ok(()));
+        assert_eq!(check(&allocate(Some(recorded(ME, BOB))), with("p1", &buyer_leg)), Ok(()));
+        // Without recorded terms, or with another proposal's, nothing is explained.
+        assert!(matches!(check(&allocate(None), with("p1", &seller_leg)), Err(ContentRefusal::BadRequest(_))));
+        let mut other = recorded(BOB, ME);
+        other.proposal_id = "p2".into();
+        assert!(matches!(check(&allocate(Some(other)), with("p1", &seller_leg)), Err(ContentRefusal::BadRequest(_))));
+        assert!(matches!(check(&allocate(Some(recorded(BOB, EVE))), with("p1", &seller_leg)), Err(ContentRefusal::BadRequest(_))));
+        // Only the allocation of this proposal explains the leg; DvP terms alone no longer do.
+        refused_outflow(check(&allocate(Some(recorded(BOB, ME))), with("p2", &seller_leg)));
+        let mut dvp_only = facts(vec![seller_leg.clone()]);
+        dvp_only.dvp = vec![terms("p1", BOB, ME)];
+        refused_outflow(check(&allocate(Some(recorded(BOB, ME))), dvp_only));
+        // Another amount, the other side's leg, or the leg twice is refused.
+        let five = flow(BOB, "reg::1220ab", "TOK", "5", FlowKind::Allocation);
+        refused_outflow(check(&allocate(Some(recorded(BOB, ME))), with("p1", &five)));
+        refused_outflow(check(&allocate(Some(recorded(BOB, ME))), with("p1", &buyer_leg)));
+        let mut twice = with("p1", &seller_leg);
+        twice.outflows.push(seller_leg.clone());
+        twice.allocations.push(allocated("p1", &seller_leg));
+        refused_outflow(check(&allocate(Some(recorded(BOB, ME))), twice));
+        // A leg another party sends explains nothing of the agent's.
+        let mut theirs = with("p1", &seller_leg);
+        if let Some(a) = theirs.allocations.first_mut() {
+            a.sender = BOB.into();
+        }
+        refused_outflow(check(&allocate(Some(recorded(BOB, ME))), theirs));
+    }
+
     #[test]
     fn dvp_legs_follow_the_agents_side_of_its_own_proposal() {
-        let allocate = OperationExpectation::Allocate { party: ME.into(), proposal_id: "p1".into(), dvp_cid: "d".into() };
         let seller_leg = flow(BOB, "reg::1220ab", "TOK", "4", FlowKind::Allocation);
-        let mut f = facts(vec![seller_leg.clone()]);
-        f.dvp = vec![terms("p1", BOB, ME)];
-        assert_eq!(check(&allocate, f.clone()), Ok(()));
-        // The buyer pays instead.
-        let mut buyer = facts(vec![flow(BOB, DSO, AMULET, "8", FlowKind::Allocation)]);
-        buyer.dvp = vec![terms("p1", ME, BOB)];
-        assert_eq!(check(&allocate, buyer), Ok(()));
-        // Terms of another proposal explain nothing.
-        let mut other = f.clone();
-        other.dvp = vec![terms("p2", BOB, ME)];
-        refused_outflow(check(&allocate, other));
-        f.outflows = vec![flow(BOB, "reg::1220ab", "TOK", "5", FlowKind::Allocation)];
-        refused_outflow(check(&allocate, f));
 
         let accept = OperationExpectation::AcceptDvp {
-            seller_party: ME.into(),
+            acceptor: ME.into(),
             proposal_id: "p1".into(),
             dvp_proposal_cid: "c".into(),
             expected_delivery_amount: "4".into(),
@@ -877,6 +1209,7 @@ mod tests {
             expected_delivery_instrument_admin: "reg::1220ab".into(),
             expected_payment_instrument_id: AMULET.into(),
             expected_payment_instrument_admin: DSO.into(),
+            terms: None,
         };
         let mut f = facts(vec![seller_leg.clone()]);
         f.dvp = vec![terms("p1", BOB, ME)];
@@ -887,6 +1220,166 @@ mod tests {
         f.dvp = vec![bigger];
         f.outflows = vec![flow(BOB, "reg::1220ab", "TOK", "40", FlowKind::Allocation)];
         refused_outflow(check(&accept, f));
+        // A buyer's accept agrees by its role too, and recorded terms must name both parties.
+        let mut buyer = facts(vec![flow(BOB, DSO, AMULET, "8", FlowKind::Allocation)]);
+        buyer.dvp = vec![terms("p1", ME, BOB)];
+        assert_eq!(check(&accept, buyer.clone()), Ok(()));
+        let with_terms = |t: ExpectedDvpTerms| {
+            let mut e = accept.clone();
+            if let OperationExpectation::AcceptDvp { terms, .. } = &mut e {
+                *terms = Some(t);
+            }
+            e
+        };
+        assert_eq!(check(&with_terms(recorded(ME, BOB)), buyer.clone()), Ok(()));
+        refused_outflow(check(&with_terms(recorded(ME, EVE)), buyer));
+    }
+
+    #[test]
+    fn batch_payments_accept_only_direct_holdings() {
+        let pending = flow(BOB, DSO, AMULET, "2", FlowKind::PendingTransfer);
+        let e = OperationExpectation::BatchPayCc {
+            party: ME.into(),
+            targets: vec![BatchPayTarget { receiver: BOB.into(), amount: "2".into() }],
+            holding_cids: vec![],
+            dso_party: None,
+        };
+        assert_eq!(check(&e, facts(vec![cc(BOB, "2")])), Ok(()));
+        refused_outflow(check(&e, facts(vec![pending.clone()])));
+        let params = Params::ExecuteMulticall(ExecuteMultiCallParams {
+            operations: vec![MultiCallOp {
+                op: Some(McOp::BatchPay(McBatchPay {
+                    targets: vec![McPaymentTarget { receiver: BOB.into(), amount: "2".into(), ..Default::default() }],
+                })),
+            }],
+            holding_cids: vec![],
+        });
+        let multicall = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1, terms: None };
+        let request = OwnRequest::Ledger(Some(&params));
+        assert_eq!(check_with(&multicall, request, facts(vec![cc(BOB, "2")]), &pins()), Ok(()));
+        refused_outflow(check_with(&multicall, request, facts(vec![pending]), &pins()));
+    }
+
+    #[test]
+    fn a_batch_payment_pays_each_receiver_its_summed_targets() {
+        let target = |receiver: &str, amount: &str| BatchPayTarget { receiver: receiver.into(), amount: amount.into() };
+        let e = OperationExpectation::BatchPayCc {
+            party: ME.into(),
+            targets: vec![target(BOB, "1.5"), target(EVE, "2"), target(BOB, "2.5")],
+            holding_cids: vec![],
+            dso_party: None,
+        };
+        assert_eq!(check(&e, facts(vec![cc(BOB, "4"), cc(EVE, "2")])), Ok(()));
+        refused_outflow(check(&e, facts(vec![cc(BOB, "1.5"), cc(BOB, "2.5"), cc(EVE, "2")])));
+        refused_outflow(check(&e, facts(vec![cc(BOB, "4.1"), cc(EVE, "2")])));
+        let huge = OperationExpectation::BatchPayCc {
+            party: ME.into(),
+            targets: vec![target(BOB, "79228162514264337593543950335"), target(BOB, "1")],
+            holding_cids: vec![],
+            dso_party: None,
+        };
+        assert!(matches!(check(&huge, facts(vec![])), Err(ContentRefusal::BadRequest(_))));
+        // The batch-pay operations of a multicall are paid the same way.
+        let pay = |receiver: &str, amount: &str| McPaymentTarget { receiver: receiver.into(), amount: amount.into(), ..Default::default() };
+        let params = Params::ExecuteMulticall(ExecuteMultiCallParams {
+            operations: vec![MultiCallOp {
+                op: Some(McOp::BatchPay(McBatchPay { targets: vec![pay(BOB, "1.5"), pay(EVE, "2"), pay(BOB, "2.5")] })),
+            }],
+            holding_cids: vec![],
+        });
+        let multicall = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1, terms: None };
+        let request = OwnRequest::Ledger(Some(&params));
+        assert_eq!(check_with(&multicall, request, facts(vec![cc(BOB, "4"), cc(EVE, "2")]), &pins()), Ok(()));
+        refused_outflow(check_with(&multicall, request, facts(vec![cc(BOB, "1.5"), cc(BOB, "2.5"), cc(EVE, "2")]), &pins()));
+    }
+
+    #[test]
+    fn a_taker_multicall_allocates_only_the_recorded_leg() {
+        let quantity = |admin: &str, id: &str, amount: &str| Quantity {
+            instrument_admin: admin.into(),
+            instrument_id: id.into(),
+            amount: dec(amount),
+        };
+        let recorded_quantity = |admin: &str, id: &str, amount: &str| ExpectedQuantity {
+            instrument_admin: admin.into(),
+            instrument_id: id.into(),
+            amount: amount.into(),
+        };
+        // The accepted quote: the agent buys 10 TOK for 20 USD.
+        let quote = ExpectedDvpTerms {
+            proposal_id: "p1".into(),
+            buyer: ME.into(),
+            seller: BOB.into(),
+            delivery: recorded_quantity("reg::1220ab", "TOK", "10"),
+            payment: recorded_quantity("usd::1220ab", "USD", "20"),
+        };
+        let paid = |reference: &str, amount: &str| {
+            let leg = flow(BOB, "usd::1220ab", "USD", amount, FlowKind::Allocation);
+            let dvp = DvpTerms {
+                delivery: quantity("reg::1220ab", "TOK", "10"),
+                payment: quantity("usd::1220ab", "USD", amount),
+                ..terms("p1", ME, BOB)
+            };
+            TxFacts { dvp: vec![dvp], allocations: vec![allocated(reference, &leg)], ..facts(vec![leg]) }
+        };
+        let params = Params::ExecuteMulticall(ExecuteMultiCallParams {
+            operations: vec![MultiCallOp {
+                op: Some(McOp::AcceptDvpAndAllocate(McAcceptDvpAndAllocate { proposal_id: "p1".into(), dvp_proposal_cid: "c".into() })),
+            }],
+            holding_cids: vec![],
+        });
+        let request = OwnRequest::Ledger(Some(&params));
+        let multicall = |terms: Option<ExpectedDvpTerms>| OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1, terms };
+        assert_eq!(check_with(&multicall(Some(quote.clone())), request, paid("p1", "20"), &pins()), Ok(()));
+        // A proposal of the same id that makes the agent pay 200 USD is not the accepted quote.
+        refused_outflow(check_with(&multicall(Some(quote.clone())), request, paid("p1", "200"), &pins()));
+        // Without recorded terms nothing is explained, and another proposal's allocation is refused.
+        let unrecorded = check_with(&multicall(None), request, paid("p1", "200"), &pins());
+        assert!(matches!(unrecorded, Err(ContentRefusal::BadRequest(_))), "{unrecorded:?}");
+        refused_outflow(check_with(&multicall(Some(quote.clone())), request, paid("p2", "20"), &pins()));
+        let mut other = quote;
+        other.proposal_id = "p2".into();
+        let mismatched = check_with(&multicall(Some(other)), request, paid("p1", "20"), &pins());
+        assert!(matches!(mismatched, Err(ContentRefusal::BadRequest(_))), "{mismatched:?}");
+    }
+
+    #[test]
+    fn an_allocation_settles_within_the_deadline_bound() {
+        let allocate = OperationExpectation::Allocate {
+            party: ME.into(),
+            proposal_id: "p1".into(),
+            dvp_cid: "d".into(),
+            terms: Some(recorded(BOB, ME)),
+            settlement_operator: None,
+        };
+        let leg = flow(BOB, "reg::1220ab", "TOK", "4", FlowKind::Allocation);
+        let now = agent_logic::clock::now_utc().timestamp_micros();
+        let hour = 3_600_000_000_i64;
+        let with = |allocate_before: i64, settle_before: i64| {
+            let mut a = allocated("p1", &leg);
+            a.allocate_before_micros = now + allocate_before * hour;
+            a.settle_before_micros = now + settle_before * hour;
+            TxFacts { allocations: vec![a], ..facts(vec![leg.clone()]) }
+        };
+        assert_eq!(check(&allocate, with(24, 48)), Ok(()));
+        for (allocate_before, settle_before) in [(24, 365 * 24), (2, 1)] {
+            let result = check(&allocate, with(allocate_before, settle_before));
+            assert!(matches!(result, Err(ContentRefusal::BadRequest(_))), "{allocate_before} {settle_before}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn refusal_texts_carry_no_control_characters() {
+        let text = ContentRefusal::Unreadable("a\u{1b}[31mb\nc\u{2028}d\u{202e}e\u{7f}f\u{200f}g\u{2066}h".into()).to_string();
+        for c in ['\u{1b}', '\n', '\u{2028}', '\u{202e}', '\u{7f}', '\u{200f}', '\u{2066}'] {
+            assert!(!text.contains(c), "{text:?}");
+        }
+        assert!(text.ends_with("unreadable: a [31mb c d e f g h"), "{text:?}");
+        let uncomputed = PackageRefusal::HashUnmatched(UnmatchedHash::Uncomputed("x\u{2029}y".into()));
+        assert_eq!(uncomputed.signature_refusal(), SignatureRefusal::Packages("the transaction hash was not computed".into()));
+        assert!(uncomputed.to_string().contains("(x y)"), "{uncomputed}");
+        let mismatch = PackageRefusal::HashUnmatched(UnmatchedHash::Mismatch).signature_refusal();
+        assert_eq!(mismatch, SignatureRefusal::Packages("the transaction hash did not match".into()));
     }
 
     #[test]
@@ -904,9 +1397,11 @@ mod tests {
             ],
             holding_cids: vec![],
         });
-        let e = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 2 };
-        let mut f = facts(vec![cc(BOB, "2"), flow(BOB, "reg::1220ab", "TOK", "4", FlowKind::Allocation)]);
+        let e = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 2, terms: Some(recorded(BOB, ME)) };
+        let leg = flow(BOB, "reg::1220ab", "TOK", "4", FlowKind::Allocation);
+        let mut f = facts(vec![cc(BOB, "2"), leg.clone()]);
         f.dvp = vec![terms("p1", BOB, ME)];
+        f.allocations = vec![allocated("p1", &leg)];
         assert_eq!(check_with(&e, OwnRequest::Ledger(Some(&params)), f.clone(), &pins()), Ok(()));
         // A sub-operation the agent did not ask for is refused.
         f.outflows.push(cc(EVE, "2"));
@@ -932,11 +1427,20 @@ mod tests {
             valid_until_micros: 0,
             lp_input_holding_cids: vec!["h-lp".into()],
             user_input_holding_cids: vec!["h1".into(), "h2".into()],
+            expected_fees: vec![],
+            fee_party: None,
         }
     }
 
+    fn held(cid: &str, admin: &str, id: &str, amount: &str) -> tx_verifier::facts::HoldingFact {
+        tx_verifier::facts::HoldingFact { contract_id: cid.into(), instrument_admin: admin.into(), instrument_id: id.into(), amount: dec(amount), locked: false }
+    }
+
+    /// A buy of 4 TOK for 8 CC, whose 0.5 CC fee and payment come from a 10 CC input.
     fn settle_facts(outflows: Vec<ValueFlow>) -> TxFacts {
         TxFacts {
+            consumed: vec![held("h1", DSO, AMULET, "10")],
+            inflows: vec![held("c1", "reg::1220ab", "TOK", "4"), held("c2", DSO, AMULET, "1.5")],
             roots: vec![ExerciseFact { template: VENUE_TEMPLATE.into(), choice: SETTLE_CHOICE.into(), contract_id: "v1".into() }],
             atomic_settle: Some(SettleFacts {
                 venue_cid: "v1".into(),
@@ -967,11 +1471,11 @@ mod tests {
         let lp_change = flow(BOB, "reg::1220ab", "TOK", "96", FlowKind::Holding);
         let f = settle_facts(vec![cc(BOB, "8"), cc(FEE, "0.5"), lp_change.clone()]);
         assert_eq!(check_with(&e, req, f.clone(), &pins()), Ok(()));
-        // The fee only to the pinned fee party.
-        match check_with(&e, req, f.clone(), &PlatformParties::default()) {
-            Err(ContentRefusal::BadRequest(text)) => assert!(text.contains("PARTY_FEE"), "{text}"),
-            other => panic!("expected the unpinned fee to refuse, got {other:?}"),
-        }
+        // The fee only to the pinned fee party: without the pin it is refused for that alone.
+        assert_eq!(
+            check_with(&e, req, f.clone(), &PlatformParties::default()),
+            Err(ContentRefusal::PinMissing { operation: "atomic_dvp_settle", pin: FEE_PIN })
+        );
         // A second root voids the LP change allowance.
         let mut two = f.clone();
         two.roots.push(ExerciseFact { template: "Splice.AmuletRules:AmuletRules".into(), choice: "AmuletRules_Transfer".into(), contract_id: "x".into() });
@@ -989,6 +1493,8 @@ mod tests {
         if let Some(s) = sell.atomic_settle.as_mut() {
             s.side = QuoteSide::Sell;
         }
+        sell.consumed = vec![held("h1", "reg::1220ab", "TOK", "4")];
+        sell.inflows = vec![held("c1", DSO, AMULET, "8")];
         assert_eq!(check_with(&settle("Sell"), OwnRequest::Atomic(None), sell, &pins()), Ok(()));
     }
 
@@ -1026,8 +1532,12 @@ mod tests {
         // Without a pin no settle fee passes; another party's settle is not judged by it.
         assert!(matches!(
             check_with(&e, OwnRequest::Atomic(Some(&pinned)), with_fee(FEE, AMULET), &PlatformParties::default()),
-            Err(ContentRefusal::BadRequest(_))
+            Err(ContentRefusal::PinMissing { pin: FEE_PIN, .. })
         ));
+        // A fee the request does not sign is still an unexplained outflow without the pin.
+        let mut unsigned = with_fee(FEE, AMULET);
+        unsigned.outflows.push(cc(EVE, "0.5"));
+        refused_outflow(check_with(&e, OwnRequest::Atomic(Some(&pinned)), unsigned, &PlatformParties::default()));
         let mut theirs = with_fee(BOB, AMULET);
         if let Some(s) = theirs.atomic_settle.as_mut() {
             s.user = EVE.into();
@@ -1037,6 +1547,70 @@ mod tests {
             *user_party = EVE.into();
         }
         assert_eq!(check_with(&lp, OwnRequest::Atomic(None), TxFacts { outflows: vec![], ..theirs }, &pins()), Ok(()));
+    }
+
+    #[test]
+    fn lp_change_never_absorbs_the_agents_own_inputs() {
+        // A buy of 100 CC for 10 USDCx whose 1 CC fee the agent funds from a 5000 CC input.
+        const USDCX: &str = "reg::1220ab";
+        let mut e = settle("Buy");
+        if let OperationExpectation::AtomicDvpSettle {
+            base_amount,
+            quote_amount,
+            base_instrument_id,
+            base_instrument_admin,
+            quote_instrument_id,
+            quote_instrument_admin,
+            ..
+        } = &mut e
+        {
+            *base_amount = "100".into();
+            *quote_amount = "10".into();
+            *base_instrument_id = AMULET.into();
+            *base_instrument_admin = DSO.into();
+            *quote_instrument_id = "USDCx".into();
+            *quote_instrument_admin = USDCX.into();
+        }
+        let params = AtomicParams::AtomicDvpSettle(AtomicDvpSettleParams {
+            lp_fees: vec![AtomicFeeSpec { receiver: FEE.into(), instrument_admin: DSO.into(), instrument_id: AMULET.into(), amount: "1".into() }],
+            ..Default::default()
+        });
+        let req = OwnRequest::Atomic(Some(&params));
+        let pays = || vec![flow(BOB, USDCX, "USDCx", "10", FlowKind::Holding), cc(FEE, "1"), cc(BOB, "900")];
+        let settled = |outflows: Vec<ValueFlow>, inflows: Vec<tx_verifier::facts::HoldingFact>| {
+            let mut f = settle_facts(outflows);
+            f.consumed = vec![held("h1", USDCX, "USDCx", "10"), held("h2", DSO, AMULET, "5000")];
+            f.inflows = inflows;
+            if let Some(s) = f.atomic_settle.as_mut() {
+                s.base_amount = dec("100");
+                s.quote_amount = dec("10");
+            }
+            f
+        };
+        let honest = || vec![held("c1", DSO, AMULET, "100"), held("c2", DSO, AMULET, "4999")];
+        assert_eq!(check_with(&e, req, settled(pays(), honest()), &pins()), Ok(()));
+        // Its 4999 CC change sent to the LP would pass for the LP's change.
+        let mut robbed = pays();
+        robbed.push(cc(BOB, "4999"));
+        match check_with(&e, req, settled(robbed, vec![held("c1", DSO, AMULET, "100")]), &pins()) {
+            Err(ContentRefusal::BadRequest(text)) => assert!(text.contains("4900") && text.contains(AMULET), "{text}"),
+            other => panic!("expected the agent's CC to fall short, got {other:?}"),
+        }
+        // Short proceeds do not balance either, nor change locked to others.
+        let short = vec![held("c1", DSO, AMULET, "99"), held("c2", DSO, AMULET, "4999")];
+        assert!(matches!(check_with(&e, req, settled(pays(), short), &pins()), Err(ContentRefusal::BadRequest(_))));
+        let mut locked = honest();
+        if let Some(change) = locked.last_mut() {
+            change.locked = true;
+        }
+        assert!(matches!(check_with(&e, req, settled(pays(), locked), &pins()), Err(ContentRefusal::BadRequest(_))));
+    }
+
+    #[test]
+    fn an_unreadable_packages_reason_is_shown_clean() {
+        let shown = SignatureRefusal::Packages("a\u{2028}b\nc\u{202E}d".into()).to_string();
+        assert!(shown.contains("a b c d"), "{shown:?}");
+        assert!(!shown.chars().any(crate::log_text::is_log_unsafe), "{shown:?}");
     }
 
     #[test]
@@ -1105,6 +1679,17 @@ mod tests {
             item: &PendingCommand,
             alter: impl Fn(&mut fixture::Shape),
         ) -> Result<DirectedAuthorization, SignatureRefusal> {
+            bound_in(party, state, item, alter, VerifyMode { strict_all: true, ..VerifyMode::default() }).1
+        }
+
+        /// [`bound`] on a verification in `mode`, which it also returns.
+        fn bound_in(
+            party: &PartyId,
+            state: &ControlState,
+            item: &PendingCommand,
+            alter: impl Fn(&mut fixture::Shape),
+            mode: VerifyMode,
+        ) -> (VerificationResult, Result<DirectedAuthorization, SignatureRefusal>) {
             let command = Command::decode(&item.command).unwrap();
             let mut shape = fixture::Shape {
                 agent: party.to_string(),
@@ -1124,12 +1709,11 @@ mod tests {
                 receiver_party: fixture::bob(),
                 amount: "10".into(),
                 command_id: command.canton_command_id(),
+                dso_party: Some(fixture::dso()),
             };
             let hash = tx_verifier::hasher::try_compute_hash(&bytes, "V2").unwrap();
             let server_hash = base64::engine::general_purpose::STANDARD.encode(hash);
-            let verification =
-                tx_verifier::verify_and_hash_with(&bytes, &server_hash, "V2", &expectation, VerifyMode { strict_all: true }, false)
-                    .unwrap();
+            let verification = tx_verifier::verify_and_hash_with(&bytes, &server_hash, "V2", &expectation, mode, false).unwrap();
             let facts = tx_verifier::facts::extract_facts(&bytes, party.as_str()).map_err(|e| e.to_string());
             let envelope = ProofEnvelope::decode(&item.proof).unwrap();
             let cc = canton_coin(&PartyId::parse(&fixture::dso()).unwrap()).unwrap();
@@ -1137,7 +1721,9 @@ mod tests {
             let ctx = EvalContext { agent_party: party, cc: &cc, platform: &platform, now, usage: &usage };
             let directed = DirectedSignature { state, now, command: &item.command, envelope: &envelope, ctx: &ctx };
             let request = OwnRequest::Ledger(None);
-            check_directed_transfer(party.as_str(), &PlatformParties::default(), &expectation, request, &verification, &facts, &bytes, &directed)
+            let bound =
+                check_directed_transfer(party.as_str(), &PlatformParties::default(), &expectation, request, &verification, &facts, &bytes, &directed);
+            (verification, bound)
         }
 
         #[test]
@@ -1145,23 +1731,45 @@ mod tests {
             let (party, state, item) = case(None);
             let done = bound(&party, &state, &item, |_| {}).unwrap();
             assert!(done.decision.allowed, "{:?}", done.decision);
-            match bound(&party, &state, &item, |s| s.second_root = true) {
+            let eve = fixture::eve();
+            type Rewrite = fn(&mut fixture::Shape);
+            let rewrites: [(Rewrite, String); 4] = [
+                (|s| s.second_root = true, "expected 1 root node, got 2".into()),
+                (
+                    |s| s.command_id = "ctl-00000000-0000-7000-8000-000000000000".into(),
+                    "command id ctl-00000000-0000-7000-8000-000000000000 is not the requested ctl-".into(),
+                ),
+                (|s| s.extra = Some((fixture::eve(), "1".into())), format!("unexpected Amulet of 1 for {eve}")),
+                (|s| s.paid = fixture::eve(), format!("unexpected Amulet of 10 for {eve}")),
+            ];
+            // Linked, the inspection refuses each rewrite first, so its hash is never matched
+            let linked = VerifyMode { strict_all: true, ..VerifyMode::default() };
+            for (alter, reason) in &rewrites {
+                let (verification, refused) = bound_in(&party, &state, &item, alter, linked);
+                let rejected = verification.rejection_reason.unwrap_or_default();
+                assert!(rejected.contains(reason.as_str()), "{reason}: {rejected}");
+                assert_eq!(refused.err(), Some(SignatureRefusal::Content(ContentRefusal::HashNotMatched)), "{reason}");
+            }
+            // With the inspection only observed, each rewrite is still refused by its own rule
+            let observed = VerifyMode { strict_all: false, setting: tx_verifier::VerifySetting::Observe };
+            let bound = |alter: Rewrite| bound_in(&party, &state, &item, alter, observed).1;
+            match bound(|s| s.second_root = true) {
                 Err(SignatureRefusal::Binding(BindingRefusal::Binding(BindingError::RootCount))) => {}
                 other => panic!("expected root_count, got {other:?}"),
             }
-            match bound(&party, &state, &item, |s| s.command_id = "ctl-00000000-0000-7000-8000-000000000000".into()) {
+            match bound(|s| s.command_id = "ctl-00000000-0000-7000-8000-000000000000".into()) {
                 Err(SignatureRefusal::Content(ContentRefusal::BadRequest(text))) => {
                     assert!(text.contains("command_id_mismatch"), "{text}")
                 }
                 other => panic!("expected command_id_mismatch, got {other:?}"),
             }
-            match bound(&party, &state, &item, |s| s.extra = Some((fixture::eve(), "1".into()))) {
+            match bound(|s| s.extra = Some((fixture::eve(), "1".into()))) {
                 Err(SignatureRefusal::Content(ContentRefusal::UnexpectedOutflow { flow, .. })) => {
                     assert_eq!(flow.to, fixture::eve())
                 }
                 other => panic!("expected the extra outflow to refuse, got {other:?}"),
             }
-            match bound(&party, &state, &item, |s| s.paid = fixture::eve()) {
+            match bound(|s| s.paid = fixture::eve()) {
                 Err(SignatureRefusal::Content(ContentRefusal::UnexpectedOutflow { .. })) => {}
                 other => panic!("expected the substituted leg to refuse, got {other:?}"),
             }
@@ -1180,6 +1788,64 @@ mod tests {
             let selected = Rules { packages: Allowlist { any: false, items: vec![ours] }, ..DEFAULT_LINKED_RULES };
             let (party, state, item) = case(Some(selected));
             assert!(bound(&party, &state, &item, |_| {}).is_ok());
+        }
+
+        #[test]
+        fn a_package_selection_signs_only_bytes_whose_hash_matched() {
+            use agent_logic::config::VettedPackages;
+            let bytes = fixture::cc_transfer(&fixture::Shape {
+                agent: ME.into(),
+                paid: fixture::bob(),
+                declared: fixture::bob(),
+                amount: "10".into(),
+                input: "100".into(),
+                change: "90".into(),
+                extra: None,
+                second_root: false,
+                command_id: "cmd-1".into(),
+            });
+            let ours = PackageId::parse(fixture::PKG).unwrap();
+            let listed = VettedPackages::Selected([ours].into_iter().collect());
+            let rules = Rules { packages: Allowlist { any: false, items: vec![ours] }, ..DEFAULT_LINKED_RULES };
+            let unmatched = [
+                (HashCheck::Mismatch { server_hex: "aa".into(), computed_hex: "bb".into() }, UnmatchedHash::Mismatch),
+                (HashCheck::Uncomputed { reason: "no hash".into() }, UnmatchedHash::Uncomputed("no hash".into())),
+            ];
+            for (hash, seen) in &unmatched {
+                let refused = Err(PackageRefusal::HashUnmatched(seen.clone()));
+                // A selection, local or the policy's, signs nothing it could not bind to its hash
+                assert_eq!(check_signature_packages(&bytes, hash, &listed, None), refused);
+                assert_eq!(check_signature_packages(&bytes, hash, &VettedPackages::All, Some(&rules)), refused);
+                // No selection: nothing changes and nothing is read
+                assert_eq!(check_signature_packages(b"not a transaction", hash, &VettedPackages::All, None), Ok(()));
+                assert_eq!(check_signature_packages(&bytes, hash, &VettedPackages::All, Some(&DEFAULT_LINKED_RULES)), Ok(()));
+            }
+            assert_eq!(check_signature_packages(&bytes, &HashCheck::Match, &listed, None), Ok(()));
+            assert_eq!(check_signature_packages(&bytes, &HashCheck::Match, &listed, Some(&rules)), Ok(()));
+            let mismatch = PackageRefusal::HashUnmatched(UnmatchedHash::Mismatch);
+            assert_eq!(
+                mismatch.to_string(),
+                "package_not_allowed: the local transaction hash does not match the server's, so its packages are unverified"
+            );
+            let forced = UnmatchedHash::Uncomputed("the inspection refused the transaction".into());
+            let uncomputed = PackageRefusal::HashUnmatched(forced);
+            assert_eq!(
+                uncomputed.to_string(),
+                "package_not_allowed: the local transaction hash was not computed (the inspection refused the \
+                 transaction), so its packages are unverified"
+            );
+            // A reason is cut and kept on one line
+            let text = |reason: String| PackageRefusal::HashUnmatched(UnmatchedHash::Uncomputed(reason)).to_string();
+            let shown = |reason: &str| {
+                format!("package_not_allowed: the local transaction hash was not computed ({reason}), so its packages are unverified")
+            };
+            assert_eq!(text(format!("a\nb\t\u{7f}{}", "x".repeat(300))), shown(&format!("a b  {}", "x".repeat(155))));
+            assert_eq!(text("é".repeat(200)), shown(&"é".repeat(160)));
+            let unreadable = PackageRefusal::Unreadable("x".into()).signature_refusal().receipt_code();
+            for refused in [mismatch, uncomputed] {
+                assert_eq!(refused.package(), None);
+                assert_eq!(refused.signature_refusal().receipt_code(), unreadable);
+            }
         }
     }
 
@@ -1358,11 +2024,11 @@ mod tests {
             let facts = facts_of(&bytes).unwrap();
             assert!(facts.unmodelled.is_empty(), "{facts:?}");
             assert_eq!(facts.outflows, vec![cc(TRAFFIC, "500")]);
-            let e = OperationExpectation::PrepayTraffic { sender_party: ME.into(), amount: "500".into(), command_id: "c".into() };
+            let e = OperationExpectation::PrepayTraffic { sender_party: ME.into(), amount: "500".into(), command_id: "c".into(), receiver_party: None, dso_party: None };
             assert_eq!(checked(&e, OwnRequest::Ledger(None), &bytes), Ok(()));
-            // Without the pinned traffic party the same payment is not explained.
+            // Without the pinned traffic party the same payment is refused for the pin alone.
             let none = check_before_signing(ME, &PlatformParties::default(), &e, OwnRequest::Ledger(None), &matched(), &facts_of(&bytes));
-            assert!(matches!(none, Err(ContentRefusal::UnexpectedOutflow { .. })), "{none:?}");
+            assert!(matches!(none, Err(ContentRefusal::PinMissing { pin: PREPAID_TRAFFIC_PIN, .. })), "{none:?}");
         }
 
         #[test]
@@ -1404,8 +2070,41 @@ mod tests {
                 }))],
                 holding_cids: vec![],
             });
-            let e = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1 };
+            let e = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1, terms: None };
             assert_eq!(checked(&e, OwnRequest::Ledger(Some(&params)), &bytes), Ok(()));
+        }
+
+        /// One root create of the agent's own request, as the ledger-service prepares it.
+        fn request_tx(cid: &str, template: (&str, &str), argument: Value) -> Vec<u8> {
+            encode(&["r"], vec![node("r", NodeType::Create(create(cid, template, argument, &[ME])))], Vec::new())
+        }
+
+        #[test]
+        fn a_preapproval_and_a_user_service_request_of_a_linked_agent_pass() {
+            use orderbook_proto::ledger::{RequestPreapprovalParams, RequestUserServiceParams};
+            let dso = val(Sum::Optional(Box::new(v2::Optional { value: Some(Box::new(party(DSO))) })));
+            let proposal = record(vec![("receiver", party(ME)), ("provider", party(BOB)), ("expectedDso", dso)]);
+            let bytes = request_tx("p1", ("Splice.Wallet.TransferPreapproval", "TransferPreapprovalProposal"), proposal);
+            let params = Params::RequestPreapproval(RequestPreapprovalParams {
+                instrument_admin: DSO.into(),
+                instrument_allowances: vec![],
+                operator: BOB.into(),
+            });
+            let e = OperationExpectation::RequestPreapproval { party: ME.into(), operator: None, instrument_admin: None };
+            assert_eq!(checked(&e, OwnRequest::Ledger(Some(&params)), &bytes), Ok(()));
+            let user = record(vec![("operator", party(BOB)), ("user", party(ME))]);
+            let bytes = request_tx("u1", ("Utility.Settlement.App.V1.Service.User", "UserServiceRequest"), user.clone());
+            let params = Params::RequestUserService(RequestUserServiceParams { reference_id: None, party_name: None });
+            let e = OperationExpectation::RequestUserService { party: ME.into() };
+            assert_eq!(checked(&e, OwnRequest::Ledger(Some(&params)), &bytes), Ok(()));
+            // The same entity in another module is still outside the model.
+            let bytes = request_tx("u2", ("Utility.Collateral.App.Service.User", "UserServiceRequest"), user);
+            match checked(&e, OwnRequest::Ledger(Some(&params)), &bytes) {
+                Err(ContentRefusal::Unmodelled(templates)) => {
+                    assert_eq!(templates, ["Utility.Collateral.App.Service.User:UserServiceRequest"])
+                }
+                other => panic!("expected the lookalike to refuse, got {other:?}"),
+            }
         }
 
         #[test]
@@ -1419,7 +2118,7 @@ mod tests {
                 nodes.push(node(id, NodeType::Create(create(id, template, record(vec![("dso", party(DSO))]), &[DSO]))));
             }
             let bytes = encode(&["r"], nodes, vec![config_state("cs1"), amulet("in1", ME, "509.5000000000")]);
-            let e = OperationExpectation::PrepayTraffic { sender_party: ME.into(), amount: "500".into(), command_id: "c".into() };
+            let e = OperationExpectation::PrepayTraffic { sender_party: ME.into(), amount: "500".into(), command_id: "c".into(), receiver_party: None, dso_party: None };
             match checked(&e, OwnRequest::Ledger(None), &bytes) {
                 Err(ContentRefusal::Unmodelled(templates)) => assert_eq!(
                     templates,

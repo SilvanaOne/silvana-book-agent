@@ -267,8 +267,10 @@ pub struct BaseConfig {
     pub party_prepaid_traffic: Option<String>,
     /// agent.toml `[control]`: what a linked agent does with pending controller work.
     pub control: ControlSettings,
-    /// agent.toml `[vetted_packages]`: logged at startup, not enforced yet.
+    /// agent.toml `[vetted_packages]`: checked before every signature when `selected`.
     pub vetted_packages: VettedPackages,
+    /// agent.toml `[verify]`: how the verifier's newer checks act while not linked.
+    pub verify: VerifySettings,
 }
 
 /// RFQ V2 quote-signing key: public SPKI hex plus the sealed private scalar,
@@ -374,6 +376,7 @@ impl BaseConfig {
             party_prepaid_traffic: None,
             control: ControlSettings::default(),
             vetted_packages: VettedPackages::default(),
+            verify: VerifySettings::default(),
         })
     }
 }
@@ -599,6 +602,7 @@ impl BaseConfig {
             party_prepaid_traffic: None,
             control: ControlSettings::default(),
             vetted_packages: VettedPackages::default(),
+            verify: VerifySettings::default(),
         })
     }
 
@@ -1296,6 +1300,7 @@ impl BaseConfig {
             party_prepaid_traffic: pinned_party_env("PARTY_PREPAID_TRAFFIC")?,
             control: sections.control,
             vetted_packages: sections.vetted_packages,
+            verify: sections.verify,
         };
         config.validate_ranges()?;
         Ok(config)
@@ -2295,6 +2300,120 @@ where
 
 /// Largest `[control] swap_max_deviation_bps`: 100 %.
 pub const MAX_SWAP_DEVIATION_BPS: u32 = 10_000;
+/// Least `[control] swap_reference_max_age_secs`, in seconds.
+pub const MIN_SWAP_REFERENCE_MAX_AGE_SECS: u32 = 30;
+/// Largest `[control] swap_reference_max_age_secs`, in seconds.
+pub const MAX_SWAP_REFERENCE_MAX_AGE_SECS: u32 = 3_600;
+
+/// The keys of the control sections, with their section; one at the top level, or in a
+/// table that keeps unknown keys, is refused.
+const SECTION_KEYS: [(&str, &str); 10] = [
+    ("auto_execute_commands", "control"),
+    ("auto_accept_policies", "control"),
+    ("swap_max_deviation_bps", "control"),
+    ("swap_reference_max_age_secs", "control"),
+    ("mode", "vetted_packages"),
+    ("packages", "vetted_packages"),
+    ("key_file", "controller"),
+    ("agent_party", "controller"),
+    ("network", "controller"),
+    ("mode", "verify"),
+];
+
+/// The sections read in this strict pass.
+const STRICT_SECTIONS: [&str; 4] = ["control", "vetted_packages", "controller", "verify"];
+
+/// `[verify] mode`: how the verifier's newer checks act while the agent is not linked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyModeSetting {
+    /// Each operation's default: the checks that are new to it are observed.
+    #[default]
+    Default,
+    /// Observe the newer checks of every operation: log and count, sign as before.
+    Observe,
+    /// Enforce every check: refuse.
+    Enforce,
+}
+
+impl VerifyModeSetting {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Observe => "observe",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// `[verify]`: the verifier's settings; a linked agent enforces every check whatever they say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifySettings {
+    #[serde(default)]
+    pub mode: VerifyModeSetting,
+}
+
+/// The sections a section key belongs under, as `[a] or [b]`.
+fn sections_of(key: &str) -> String {
+    let names: Vec<String> =
+        SECTION_KEYS.iter().filter(|(k, _)| *k == key).map(|(_, section)| format!("[{section}]")).collect();
+    names.join(" or ")
+}
+
+/// The first section key, as `(key, where)`, in a table that keeps unknown keys; the strict
+/// sections and `[markets.strategy]` refuse unknown keys themselves.
+fn misplaced_section_key(table: &toml::Table) -> Option<(String, String)> {
+    for (name, value) in table {
+        if STRICT_SECTIONS.contains(&name.as_str()) {
+            continue;
+        }
+        if let Some(found) = misplaced_in(value, name, None) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// [`misplaced_section_key`] under the table or array of tables `value` at `path`; `entry`
+/// names the array entry it is in, by its id when it has one.
+fn misplaced_in(value: &toml::Value, path: &str, entry: Option<&str>) -> Option<(String, String)> {
+    match value {
+        toml::Value::Table(table) => misplaced_in_table(table, path, format!("[{path}]"), entry),
+        toml::Value::Array(items) => items.iter().enumerate().find_map(|(i, item)| {
+            let toml::Value::Table(table) = item else { return None };
+            let own = ["market_id", "venue"].iter().find_map(|id| {
+                table.get(*id).and_then(toml::Value::as_str).map(|v| format!("{id} = {v:?}"))
+            });
+            let own = own.unwrap_or_else(|| format!("entry {}", i.saturating_add(1)));
+            let label = match entry {
+                Some(outer) => format!("{outer}, {own}"),
+                None => own,
+            };
+            misplaced_in_table(table, path, format!("[[{path}]]"), Some(&label))
+        }),
+        _ => None,
+    }
+}
+
+fn misplaced_in_table(table: &toml::Table, path: &str, header: String, entry: Option<&str>) -> Option<(String, String)> {
+    for (key, inner) in table {
+        if SECTION_KEYS.iter().any(|(k, _)| k == key) {
+            let at = match entry {
+                Some(entry) => format!("{header} ({entry})"),
+                None => header,
+            };
+            return Some((key.clone(), at));
+        }
+        if path == "markets" && key == "strategy" {
+            continue;
+        }
+        if let Some(found) = misplaced_in(inner, &format!("{path}.{key}"), entry) {
+            return Some(found);
+        }
+    }
+    None
+}
 
 /// `[control]`: what a linked agent does by itself with pending controller work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -2312,6 +2431,9 @@ pub struct ControlSettings {
     /// points; 0 turns the guard off.
     #[serde(default = "default_swap_max_deviation_bps")]
     pub swap_max_deviation_bps: u32,
+    /// Oldest reference mid the swap price guard takes, in seconds (30 to 3600).
+    #[serde(default = "default_swap_reference_max_age_secs")]
+    pub swap_reference_max_age_secs: u32,
 }
 
 impl Default for ControlSettings {
@@ -2320,6 +2442,7 @@ impl Default for ControlSettings {
             auto_execute_commands: false,
             auto_accept_policies: default_auto_accept_policies(),
             swap_max_deviation_bps: default_swap_max_deviation_bps(),
+            swap_reference_max_age_secs: default_swap_reference_max_age_secs(),
         }
     }
 }
@@ -2328,11 +2451,12 @@ impl ControlSettings {
     /// The settings as one log line.
     pub fn describe(&self) -> String {
         format!(
-            "auto_execute_commands={} auto_accept_policies={} swap_max_deviation_bps={}{}",
+            "auto_execute_commands={} auto_accept_policies={} swap_max_deviation_bps={}{} swap_reference_max_age_secs={}",
             self.auto_execute_commands,
             self.auto_accept_policies,
             self.swap_max_deviation_bps,
-            if self.swap_max_deviation_bps == 0 { " (the deviation guard is off)" } else { "" }
+            if self.swap_max_deviation_bps == 0 { " (the deviation guard is off)" } else { "" },
+            self.swap_reference_max_age_secs
         )
     }
 }
@@ -2429,6 +2553,7 @@ pub(crate) struct ControlSections {
     pub(crate) control: ControlSettings,
     pub(crate) vetted_packages: VettedPackages,
     pub(crate) controller: Option<ControllerSettings>,
+    pub(crate) verify: VerifySettings,
 }
 
 #[derive(Deserialize)]
@@ -2439,10 +2564,22 @@ struct VettedPackagesToml {
     packages: Option<Vec<String>>,
 }
 
-/// Reads `[control]`, `[vetted_packages]` and `[controller]`: an unknown key or a bad value
-/// refuses. The other agent.toml keys are not read here.
+/// Reads `[control]`, `[vetted_packages]`, `[controller]` and `[verify]`: an unknown key or a
+/// bad value refuses. The other agent.toml keys are not read here.
 pub(crate) fn parse_control_sections(toml_str: &str) -> Result<ControlSections> {
     let table: toml::Table = toml::from_str(toml_str).context("agent.toml is not valid TOML")?;
+    // The other passes ignore an unknown top-level key, so a section key there would be lost.
+    if let Some((key, _)) = SECTION_KEYS.iter().find(|(key, _)| table.contains_key(*key)) {
+        bail!("{key} belongs under {}, not at the top level of agent.toml", sections_of(key));
+    }
+    // A key below a table header joins that table, whose unknown keys are ignored too.
+    if let Some((key, at)) = misplaced_section_key(&table) {
+        bail!(
+            "{key} belongs under {}, not under {at} of agent.toml: a key joins the table whose \
+             header is above it",
+            sections_of(&key)
+        );
+    }
     let control = match table.get("control") {
         None => ControlSettings::default(),
         Some(value) => value
@@ -2457,6 +2594,13 @@ pub(crate) fn parse_control_sections(toml_str: &str) -> Result<ControlSections> 
             control.swap_max_deviation_bps
         );
     }
+    let age = control.swap_reference_max_age_secs;
+    if !(MIN_SWAP_REFERENCE_MAX_AGE_SECS..=MAX_SWAP_REFERENCE_MAX_AGE_SECS).contains(&age) {
+        bail!(
+            "invalid [control] section: swap_reference_max_age_secs = {age} is not between \
+             {MIN_SWAP_REFERENCE_MAX_AGE_SECS} and {MAX_SWAP_REFERENCE_MAX_AGE_SECS} seconds"
+        );
+    }
     let vetted_packages = match table.get("vetted_packages") {
         None => VettedPackages::All,
         Some(value) => {
@@ -2468,7 +2612,13 @@ pub(crate) fn parse_control_sections(toml_str: &str) -> Result<ControlSections> 
         }
     };
     let controller = controller_section(&table)?;
-    Ok(ControlSections { control, vetted_packages, controller })
+    let verify = match table.get("verify") {
+        None => VerifySettings::default(),
+        Some(value) => {
+            value.clone().try_into::<VerifySettings>().map_err(|e| anyhow!("invalid [verify] section: {e}"))?
+        }
+    };
+    Ok(ControlSections { control, vetted_packages, controller, verify })
 }
 
 fn vetted_packages_of(raw: VettedPackagesToml) -> Result<VettedPackages> {
@@ -2506,6 +2656,10 @@ fn default_auto_accept_policies() -> bool {
 
 fn default_swap_max_deviation_bps() -> u32 {
     100
+}
+
+fn default_swap_reference_max_age_secs() -> u32 {
+    300
 }
 
 fn default_auto_settle() -> bool {
@@ -4024,7 +4178,12 @@ mod control_section_tests {
         );
         assert_eq!(
             parsed.control,
-            ControlSettings { auto_execute_commands: true, auto_accept_policies: false, swap_max_deviation_bps: 0 }
+            ControlSettings {
+                auto_execute_commands: true,
+                auto_accept_policies: false,
+                swap_max_deviation_bps: 0,
+                swap_reference_max_age_secs: 300,
+            }
         );
         assert!(parsed.control.describe().contains("guard is off"), "{}", parsed.control.describe());
         assert_eq!(sections("[control]\nswap_max_deviation_bps = 10000\n").control.swap_max_deviation_bps, 10_000);
@@ -4037,6 +4196,27 @@ mod control_section_tests {
     }
 
     #[test]
+    fn the_swap_reference_age_defaults_to_300_and_takes_30_to_3600() {
+        assert_eq!(ControlSettings::default().swap_reference_max_age_secs, 300);
+        let described = ControlSettings::default().describe();
+        assert!(described.ends_with(" swap_reference_max_age_secs=300"), "{described}");
+        for ok in [30, 300, 3600] {
+            let control = sections(&format!("[control]\nswap_reference_max_age_secs = {ok}\n")).control;
+            assert_eq!(control.swap_reference_max_age_secs, ok);
+            assert!(control.describe().ends_with(&format!(" swap_reference_max_age_secs={ok}")), "{ok}");
+        }
+        for bad in ["0", "29", "3601"] {
+            let err = refusal(&format!("[control]\nswap_reference_max_age_secs = {bad}\n"));
+            assert!(err.contains("[control]") && err.contains(&format!("swap_reference_max_age_secs = {bad}")), "{err}");
+            assert!(err.contains("30") && err.contains("3600"), "the message names the range: {err}");
+        }
+        for bad in ["-1", "1.5", "\"300\""] {
+            let err = refusal(&format!("[control]\nswap_reference_max_age_secs = {bad}\n"));
+            assert!(err.contains("[control]"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn unknown_keys_are_refused_with_the_section_and_key() {
         let err = refusal("[control]\nauto_execute = true\n");
         assert!(err.contains("[control]") && err.contains("auto_execute"), "{err}");
@@ -4046,6 +4226,164 @@ mod control_section_tests {
         // The sections must be tables.
         assert!(refusal("control = 1\n").contains("[control]"));
         assert!(refusal("vetted_packages = \"all\"\n").contains("[vetted_packages]"));
+    }
+
+    #[test]
+    fn a_section_key_at_the_top_level_is_refused_with_its_section() {
+        let cases = [
+            ("auto_execute_commands = true", "auto_execute_commands belongs under [control]"),
+            ("auto_accept_policies = false", "auto_accept_policies belongs under [control]"),
+            ("swap_max_deviation_bps = 50", "swap_max_deviation_bps belongs under [control]"),
+            ("swap_reference_max_age_secs = 600", "swap_reference_max_age_secs belongs under [control]"),
+            ("mode = \"all\"", "mode belongs under [vetted_packages]"),
+            ("packages = []", "packages belongs under [vetted_packages]"),
+            ("key_file = \"k\"", "key_file belongs under [controller]"),
+            ("agent_party = \"p\"", "agent_party belongs under [controller]"),
+            ("network = \"devnet\"", "network belongs under [controller]"),
+        ];
+        for (line, expected) in cases {
+            let err = refusal(&format!("auto_settle = true\n{line}\n[[markets]]\nmarket_id = \"CC-USDC\"\n"));
+            assert!(err.contains(expected), "{line}: {err}");
+        }
+        // The same keys under their sections load.
+        let parsed = sections(&format!(
+            "auto_settle = true\n[control]\nauto_execute_commands = true\nauto_accept_policies = false\n\
+             swap_max_deviation_bps = 50\nswap_reference_max_age_secs = 600\n\
+             [vetted_packages]\nmode = \"selected\"\npackages = [\"{ID_A}\"]\n\
+             [controller]\nkey_file = \"k\"\nagent_party = \"{PARTY}\"\nnetwork = \"devnet\"\n"
+        ));
+        let control = parsed.control;
+        assert!(control.auto_execute_commands && !control.auto_accept_policies, "{control:?}");
+        assert_eq!((control.swap_max_deviation_bps, control.swap_reference_max_age_secs), (50, 600));
+        assert_eq!(parsed.vetted_packages.describe(), "selected (1 packages)");
+        assert_eq!(parsed.controller.and_then(|c| c.network), Some(agent_control::Network::Devnet));
+        // The daemon's loaders refuse such a file too.
+        let path = std::env::temp_dir().join(format!("agent-misplaced-key-{}.toml", std::process::id()));
+        std::fs::write(&path, "auto_settle = true\nauto_execute_commands = true\n").unwrap();
+        let strict = BaseConfig::load(&path).map(|_| ()).unwrap_err();
+        let lenient = BaseConfig::load_or_defaults(&path).map(|_| ()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        for err in [strict, lenient] {
+            let text = format!("{err:#}");
+            assert!(text.contains("auto_execute_commands belongs under [control]"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_verify_section_takes_default_observe_or_enforce() {
+        assert_eq!(sections("auto_settle = true\n").verify.mode, VerifyModeSetting::Default);
+        assert_eq!(sections("[verify]\n").verify, VerifySettings::default());
+        for (text, mode) in [
+            ("default", VerifyModeSetting::Default),
+            ("observe", VerifyModeSetting::Observe),
+            ("enforce", VerifyModeSetting::Enforce),
+        ] {
+            let parsed = sections(&format!("[verify]\nmode = \"{text}\"\n"));
+            assert_eq!(parsed.verify.mode, mode);
+            assert_eq!(mode.as_str(), text);
+        }
+        for body in ["mode = \"strict\"", "mode = 1", "mode = \"Observe\"", "level = \"observe\""] {
+            let err = refusal(&format!("[verify]\n{body}\n"));
+            assert!(err.contains("[verify]"), "{body}: {err}");
+        }
+        assert!(refusal("verify = \"observe\"\n").contains("[verify]"));
+        let err = refusal("mode = \"observe\"\n");
+        assert!(err.contains("mode belongs under [vetted_packages] or [verify]"), "{err}");
+        let config = BaseConfig::test_minimal().unwrap();
+        assert_eq!(config.verify, VerifySettings::default());
+    }
+
+    /// One table header of each kind the lenient pass reads, each with a key of its own.
+    const LENIENT_TABLES: [(&str, &str); 12] = [
+        ("[liquidity_provider]\nname = \"lp\"", "[liquidity_provider]"),
+        ("[liquidity_provider]\nname = \"lp\"\n[liquidity_provider.rfq_v2]\nenabled = true", "[liquidity_provider.rfq_v2]"),
+        (
+            "[liquidity_provider]\nname = \"lp\"\n[liquidity_provider.rfq_v2.denominations]\nCC = [\"100x10\"]",
+            "[liquidity_provider.rfq_v2.denominations]",
+        ),
+        ("[[markets]]\nmarket_id = \"CC-USDC\"", "[[markets]] (market_id = \"CC-USDC\")"),
+        ("[[markets]]\nmarket_id = \"CC-USDC\"\n[markets.rfq]\nmin_quantity = \"1\"", "[markets.rfq] (market_id = \"CC-USDC\")"),
+        (
+            "[[markets]]\nmarket_id = \"CC-USDC\"\n[markets.rfq]\nmin_quantity = \"1\"\n[markets.rfq.v2]\nenabled = true",
+            "[markets.rfq.v2] (market_id = \"CC-USDC\")",
+        ),
+        (
+            "[[markets]]\nmarket_id = \"CC-USDC\"\n[markets.rfq.pool_impact]\nenabled = false",
+            "[markets.rfq.pool_impact] (market_id = \"CC-USDC\")",
+        ),
+        (
+            "[[markets]]\nmarket_id = \"CC-USDC\"\n[[markets.bid_levels]]\ndelta_percent = 1.0\nquantity = \"1\"",
+            "[[markets.bid_levels]] (market_id = \"CC-USDC\", entry 1)",
+        ),
+        ("[[markets]]\nmarket_id = \"A-B\"\n[[markets]]\nenabled = true", "[[markets]] (entry 2)"),
+        ("[[venue_overrides]]\nvenue = \"v\"", "[[venue_overrides]] (venue = \"v\")"),
+        ("[[venue_overrides]]\nvenue = \"v\"\n[venue_overrides.rfq]\nenabled = true", "[venue_overrides.rfq] (venue = \"v\")"),
+        ("[unknown_table]\nx = 1", "[unknown_table]"),
+    ];
+
+    #[test]
+    fn a_section_key_below_a_lenient_table_is_refused_with_the_table_named() {
+        for (header, at) in LENIENT_TABLES {
+            let toml = format!("auto_settle = true\n{header}\n");
+            assert!(parse_control_sections(&toml).is_ok(), "{toml}");
+            for (key, _) in SECTION_KEYS {
+                let toml = format!("auto_settle = true\n{header}\n{key} = true\n");
+                let err = refusal(&toml);
+                let expected = format!("{key} belongs under {}, not under {at} of agent.toml", sections_of(key));
+                assert!(err.contains(&expected), "{toml}\n{err}");
+            }
+        }
+        let err = refusal("[liquidity_provider]\nname = \"lp\"\nauto_execute_commands = true\n");
+        assert!(err.starts_with("auto_execute_commands belongs under [control], not under [liquidity_provider]"), "{err}");
+        // An inline table or array entry is read the same way.
+        let err = refusal("[[markets]]\nmarket_id = \"X\"\nbid_levels = [{ delta_percent = 1.0, quantity = \"1\", network = \"devnet\" }]\n");
+        assert!(err.contains("network belongs under [controller], not under [[markets.bid_levels]]"), "{err}");
+    }
+
+    #[test]
+    fn the_strategy_table_and_the_strict_sections_keep_their_own_keys() {
+        // `mode` is a key of `[markets.strategy]`, which refuses unknown keys itself.
+        let toml = format!(
+            "auto_settle = true\n[[markets]]\nmarket_id = \"CC-USDC\"\n[markets.strategy]\nkind = \"noise_taker\"\n\
+             mode = \"maker\"\n[control]\nauto_execute_commands = true\n[vetted_packages]\nmode = \"selected\"\n\
+             packages = [\"{ID_A}\"]\n[controller]\nkey_file = \"k\"\nagent_party = \"{PARTY}\"\nnetwork = \"devnet\"\n\
+             [verify]\nmode = \"enforce\"\n"
+        );
+        let parsed = sections(&toml);
+        assert!(parsed.control.auto_execute_commands);
+        assert_eq!(parsed.verify.mode, VerifyModeSetting::Enforce);
+        assert_eq!(parsed.vetted_packages.describe(), "selected (1 packages)");
+    }
+
+    /// Reads the agent.toml files listed in `AGENT_TOML_FILES` (one path per line) with the
+    /// strict pass; none is listed by default.
+    #[test]
+    #[ignore]
+    #[allow(clippy::disallowed_methods)]
+    fn listed_agent_toml_files_pass_the_strict_pass() {
+        let list = std::env::var("AGENT_TOML_FILES").unwrap_or_default();
+        let mut read = 0;
+        for path in list.lines().map(str::trim).filter(|p| !p.is_empty()) {
+            let text = std::fs::read_to_string(path).unwrap();
+            if let Err(e) = parse_control_sections(&text) {
+                panic!("{path}: {e:#}");
+            }
+            read += 1;
+        }
+        println!("{read} agent.toml files pass");
+    }
+
+    #[test]
+    fn every_key_the_sections_take_is_refused_at_the_top_level() {
+        for section in ["control", "vetted_packages", "controller", "verify"] {
+            // The strict sections name the keys they take.
+            let err = refusal(&format!("[{section}]\nbogus = 1\n"));
+            let taken: Vec<&str> = err.split('`').skip(1).step_by(2).filter(|key| *key != "bogus").collect();
+            assert!(!taken.is_empty(), "{err}");
+            for key in taken {
+                assert!(SECTION_KEYS.contains(&(key, section)), "{key} of [{section}] is not checked: {err}");
+            }
+        }
     }
 
     #[test]

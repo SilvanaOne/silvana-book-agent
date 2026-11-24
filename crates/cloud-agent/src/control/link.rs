@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use orderbook_proto::orderbook::ControlLinkStatus;
 
 use super::ControlContext;
-use super::prompt::{Prompter, Yes, confirm_typed};
+use super::prompt::{PROMPT_TIMEOUT, Prompter, Yes, confirm_typed};
 use super::rpc::{ControlRpc, Descriptor};
 use super::sync;
 
@@ -131,6 +131,33 @@ fn write_descriptor(out: &mut dyn Write, ctx: &ControlContext, descriptor: &Link
     );
 }
 
+/// What to check on the Agent page before typing `link` for an invite: its row under Create
+/// agent shows the same party, owner account and passkey.
+fn write_page_check(out: &mut dyn Write, ctx: &ControlContext, descriptor: &LinkDescriptor) {
+    let passkeys: Vec<String> = descriptor
+        .controllers()
+        .iter()
+        .filter(|c| matches!(c.key(), ControllerKey::WebAuthn(_)))
+        .map(|c| c.id().fingerprint())
+        .collect();
+    let passkeys = match passkeys.as_slice() {
+        [] => String::new(),
+        [one] => format!(", your passkey {one}"),
+        many => format!(", your passkeys {}", many.join(", ")),
+    };
+    let _ = writeln!(
+        out,
+        "On the Agent page, under Create agent, check: party fingerprint {}, owner account {}{passkeys}.",
+        party_fingerprint(&ctx.party),
+        descriptor.owner_account()
+    );
+    let _ = writeln!(
+        out,
+        "You have {} min to type 'link'. It is the only chance to link with this invite: a re-run of `onboard` does not link.",
+        PROMPT_TIMEOUT.as_secs().checked_div(60).unwrap_or_default()
+    );
+}
+
 /// The descriptor of `commitment`, refused early when the rpc reports it closed.
 async fn fetch_descriptor(rpc: &ControlRpc, commitment: &Commitment) -> Result<(Descriptor, LinkDescriptor)> {
     let descriptor = rpc.descriptor(commitment).await.map_err(|e| anyhow!("fetching the code's descriptor failed: {e}"))?;
@@ -200,6 +227,9 @@ async fn sign_descriptor(
         write_unscoped(out, &prepared.state, now, controller.id(), controller.capabilities());
     }
     super::pins::write_offer(out, &planned.pins);
+    if planned.allow_invite {
+        write_page_check(out, ctx, &decoded);
+    }
     let (state, _) = prepared.release();
     confirm_typed(prompter, out, phrase, yes).await?;
     let (lock, state) = sync::relock(ctx, state.head()).await?;

@@ -236,6 +236,10 @@ pub(crate) struct FakeState {
     pub receipts: Vec<(String, Vec<u8>)>,
     /// The env GetAgentConfig answers with; none answers Unimplemented.
     pub agent_env: Option<String>,
+    /// What ListNodePackages answers, `as_of` set by the fake; none answers Unavailable.
+    pub node_packages: Option<orderbook_proto::orderbook::ListNodePackagesResponse>,
+    /// The `include_removed` of each ListNodePackages call.
+    pub node_package_calls: Vec<bool>,
 }
 
 pub(crate) type Shared = Arc<Mutex<FakeState>>;
@@ -709,6 +713,21 @@ where
                         .unary(Unary { handler, date }, req)
                         .await
                 }
+                "ListNodePackages" => {
+                    use orderbook_proto::orderbook::{ListNodePackagesRequest, ListNodePackagesResponse};
+                    let shared = shared.clone();
+                    let handler: Handler<ListNodePackagesRequest, ListNodePackagesResponse> = Arc::new(move |_, q| {
+                        let mut state = shared.lock().unwrap();
+                        state.node_package_calls.push(q.include_removed);
+                        let mut response =
+                            state.node_packages.clone().ok_or_else(|| Status::unavailable("agent control unavailable"))?;
+                        response.as_of = server_time(&state);
+                        Ok(response)
+                    });
+                    tonic::server::Grpc::new(Prost::<ListNodePackagesResponse, ListNodePackagesRequest>::default())
+                        .unary(Unary { handler, date }, req)
+                        .await
+                }
                 "GetAgentConfig" => {
                     use orderbook_proto::ledger::{GetAgentConfigRequest, GetAgentConfigResponse};
                     let env = shared.lock().unwrap().agent_env.clone();
@@ -902,13 +921,24 @@ pub(crate) fn offer(rpc: &FakeRpc, purpose: LinkPurpose, party: Option<&PartyId>
             .unwrap()
         })
         .collect();
+    offer_of(rpc, purpose, party, controllers, controller_seeds.first().copied().unwrap_or(1))
+}
+
+/// [`offer`] for any controllers; `nonce` fills the descriptor's nonce.
+pub(crate) fn offer_of(
+    rpc: &FakeRpc,
+    purpose: LinkPurpose,
+    party: Option<&PartyId>,
+    controllers: Vec<ControllerDescriptor>,
+    nonce: u8,
+) -> (String, Vec<u8>) {
     let expires = UtcTime::from_unix_secs(agent_logic::clock::now_secs_i64() + 3600).unwrap();
     let descriptor = LinkDescriptor::new(
         Network::Devnet,
         purpose,
         OwnerAccount::new(42).unwrap(),
         party.cloned(),
-        Nonce16([controller_seeds.first().copied().unwrap_or(1); 16]),
+        Nonce16([nonce; 16]),
         expires,
         controllers,
     )
@@ -985,6 +1015,7 @@ mod tests {
         }
         assert!(out.contains("Owner account: 42") && out.contains("take effect at about"), "{out}");
         assert!(out.contains("(1 h after the signature)"), "{out}");
+        assert!(!out.contains("under Create agent"), "only an invite has a row there: {out}");
         // After the rpc accepts, the times printed are the signed entry's own.
         let stored = agent.store().snapshot().unwrap().unwrap();
         let signed = stored.log.entries()[0].entry();
@@ -1143,9 +1174,11 @@ mod tests {
         for needle in ["linked, head seq 2", "Test key", "Extra key", "Policy in force: the default rules", "PARTY_FEE=unset", "silvana.link", "--offline", "devnet:2:", fingerprint.as_str()] {
             assert!(out.contains(needle), "{needle}: {out}");
         }
+        assert!(out.contains("swap_max_deviation_bps=100 swap_reference_max_age_secs=300;"), "{out}");
         let (result, out) = agent.run(ControlCommands::Show { json: true, offline: true }, &[]).await;
         result.unwrap();
         let view: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(view["settings"]["swapReferenceMaxAgeSecs"], 300);
         assert_eq!(view["partyFingerprint"], fingerprint.as_str());
         assert_eq!(view["head"]["seq"], 2);
         assert_eq!(view["controllers"].as_array().unwrap().len(), 2);
@@ -1498,6 +1531,44 @@ mod tests {
         let out = String::from_utf8_lossy(&out).into_owned();
         let fingerprint = super::super::link::party_fingerprint(&agent.party);
         assert!(out.contains(&format!("confirm this agent by checking its party fingerprint: {fingerprint}")), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_invite_link_says_what_to_check_on_the_agent_page_before_the_prompt() {
+        use agent_control::{BackupPolicy, Origin, RpId, RpPolicy, WebAuthnKey};
+        let rpc = FakeRpc::start().await;
+        let agent = TestAgent::new([0xf3; 32], &rpc, "invite-check");
+        let spki = hex::decode(
+            "3059301306072a8648ce3d020106082a8648ce3d03010703420004261efbd3550cf068ef013ed7366ba32f\
+             5d6fe557b4b2abce8ade58cba168a55e1788a0b29a56a6abec4084c0c96bd3dcbca6b507f35dbea9e985708479d8bdc9",
+        )
+        .unwrap();
+        let rp_id = RpId::parse(RpPolicy::DEVNET_RP_ID).unwrap();
+        let origins = vec![Origin::parse("https://book-devnet.silvana.link").unwrap()];
+        let key = WebAuthnKey::new(&spki, vec![7u8; 16], rp_id, origins, BackupPolicy::Any).unwrap();
+        let capabilities = CapabilitySet::of(&[Capability::Policy, Capability::Direct, Capability::Read]);
+        let passkey =
+            ControllerDescriptor::new(ControllerKey::WebAuthn(key), Label::parse("Mac passkey").unwrap(), capabilities).unwrap();
+        let passkey_fingerprint = passkey.id().fingerprint();
+        let (code, _) = offer_of(&rpc, LinkPurpose::Link, None, vec![passkey], 0x38);
+        let commitment = agent_control::parse_link_code(&code).unwrap();
+        let ctx = agent.context().await;
+        let client = super::super::ControlRpc::connect(&ctx.config).await.unwrap();
+        let mut out = Vec::new();
+        let invite = "AGT-A4DQOBYHA4DQOBYHA4DQOBYHA4";
+        super::super::link::run_invite_link(&ctx, &client, &Scripted::new(["link"]), &mut out, invite, commitment)
+            .await
+            .unwrap()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out).into_owned();
+        let fingerprint = super::super::link::party_fingerprint(&agent.party);
+        let check = format!(
+            "On the Agent page, under Create agent, check: party fingerprint {fingerprint}, owner account 42, \
+             your passkey {passkey_fingerprint}.\nYou have 15 min to type 'link'."
+        );
+        let shown = out.find(&check).unwrap_or_else(|| panic!("{out}"));
+        assert!(out.find("Type 'link' to continue").is_some_and(|prompt| prompt > shown), "{out}");
+        assert!(out.contains("a re-run of `onboard` does not link"), "{out}");
     }
 
     /// The fake's rows equal the local log, byte for byte.

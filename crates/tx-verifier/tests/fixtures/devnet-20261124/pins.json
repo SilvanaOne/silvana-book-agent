@@ -1,0 +1,6 @@
+{
+  "party_fee": "orderbook-fee::1220f0fb5073625c0444e79548cef0cd395bf22650726e6f5a54b1e2500184af4b0f",
+  "party_prepaid_traffic": "19f421b4e40658b5::12202f97e53df5bf2e258eeda4d7e5bcbcaaaa2c9c01a0c5e298fe69224e66a7585d",
+  "dso": "DSO::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a",
+  "settlement_operator": "orderbook-app-devnet-1::122034faf8f4af71d107a42441f8bc90cabfd63ab4386fc7f17d15d6e3b01c5bd2ae"
+}

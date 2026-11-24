@@ -628,6 +628,8 @@ async fn split_cc(
     let expectation = OperationExpectation::SplitCc {
         party: config.party_id.clone(),
         output_amounts: output_amounts.clone(),
+        amulet_cids: input_cids.to_vec(),
+        dso_party: crate::named_party(&config.dso_party),
     };
     let resp = client
         .submit_transaction(

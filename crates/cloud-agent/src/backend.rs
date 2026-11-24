@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use agent_logic::config::BaseConfig;
 use agent_logic::confirm::ConfirmLock;
@@ -25,7 +25,8 @@ use orderbook_proto::ledger::{
     PrepareTransactionRequest, ProposeDvpParams, TransactionOperation,
 };
 
-use tx_verifier::OperationExpectation;
+use orderbook_proto::orderbook::SettlementProposal;
+use tx_verifier::{ExpectedDvpTerms, ExpectedQuantity, OperationExpectation};
 
 use crate::acs_worker::spawn_acs_worker;
 use crate::holdings_cache::{instrument_key, CcView, HoldingsCache, CC_INSTRUMENT};
@@ -87,6 +88,36 @@ pub fn bucket_by_usd(
         *bucket = bucket.saturating_add(1);
     }
     h
+}
+
+/// The DvP terms of the agent's own record of a match, each instrument resolved to its
+/// on-chain id and registry admin as for AcceptDvp.
+pub(crate) fn recorded_terms(config: &BaseConfig, proposal: &SettlementProposal) -> Result<ExpectedDvpTerms> {
+    let (delivery_id, delivery_admin) = config.try_resolve_instrument(&proposal.base_instrument)?;
+    let (payment_id, payment_admin) = config.try_resolve_instrument(&proposal.quote_instrument)?;
+    Ok(ExpectedDvpTerms {
+        proposal_id: proposal.proposal_id.clone(),
+        buyer: proposal.buyer.clone(),
+        seller: proposal.seller.clone(),
+        delivery: ExpectedQuantity {
+            instrument_admin: delivery_admin,
+            instrument_id: delivery_id,
+            amount: proposal.base_quantity.clone(),
+        },
+        payment: ExpectedQuantity {
+            instrument_admin: payment_admin,
+            instrument_id: payment_id,
+            amount: proposal.quote_quantity.clone(),
+        },
+    })
+}
+
+/// [`recorded_terms`], or `None` with a warning: the verifier then only warns, and a
+/// linked agent's content check refuses an allocation without them.
+fn recorded_terms_or_warn(config: &BaseConfig, proposal: &SettlementProposal) -> Option<ExpectedDvpTerms> {
+    recorded_terms(config, proposal)
+        .map_err(|e| warn!("[{}] DvP terms not recorded for verification: {:#}", proposal.proposal_id, e))
+        .ok()
 }
 
 /// Settlement backend that uses DAppProviderService gRPC (no direct ledger access)
@@ -167,7 +198,8 @@ impl CloudSettlementBackend {
         }
     }
 
-    async fn propose_dvp_inner(&self, proposal_id: &str) -> Result<StepResult> {
+    async fn propose_dvp_inner(&self, proposal: &SettlementProposal) -> Result<StepResult> {
+        let proposal_id = proposal.proposal_id.as_str();
         if self.confirm && !self.dry_run {
             agent_logic::confirm::confirm_transaction(
                 &self.confirm_lock,
@@ -178,11 +210,14 @@ impl CloudSettlementBackend {
 
         let mut client = self.create_client().await?;
 
+        let counterparty =
+            if proposal.buyer == self.config.party_id { &proposal.seller } else { &proposal.buyer };
         let expectation = OperationExpectation::ProposeDvp {
-            buyer_party: self.config.party_id.clone(),
-            seller_party: String::new(), // not known at this level
+            proposer: self.config.party_id.clone(),
+            counterparty: counterparty.clone(),
             proposal_id: proposal_id.to_string(),
             synchronizer_id: self.config.synchronizer_id.clone(),
+            terms: recorded_terms_or_warn(&self.config, proposal),
         };
 
         let result = client
@@ -213,19 +248,11 @@ impl CloudSettlementBackend {
         })
     }
 
-    async fn accept_dvp_inner(
-        &self,
-        proposal_id: &str,
-        dvp_proposal_cid: &str,
-        expected_delivery_amount: &str,
-        expected_payment_amount: &str,
-        base_instrument: &str,
-        quote_instrument: &str,
-    ) -> Result<StepResult> {
+    async fn accept_dvp_inner(&self, proposal: &SettlementProposal, dvp_proposal_cid: &str) -> Result<StepResult> {
+        let proposal_id = proposal.proposal_id.as_str();
         // Both legs need a registry admin from local config; the verifier refuses an
         // empty one, so nothing is prepared without them.
-        let (del_id, del_admin) = self.config.try_resolve_instrument(base_instrument)?;
-        let (pay_id, pay_admin) = self.config.try_resolve_instrument(quote_instrument)?;
+        let terms = recorded_terms(&self.config, proposal)?;
 
         if self.confirm && !self.dry_run {
             agent_logic::confirm::confirm_transaction(
@@ -238,15 +265,16 @@ impl CloudSettlementBackend {
         let mut client = self.create_client().await?;
 
         let expectation = OperationExpectation::AcceptDvp {
-            seller_party: self.config.party_id.clone(),
+            acceptor: self.config.party_id.clone(),
             proposal_id: proposal_id.to_string(),
             dvp_proposal_cid: dvp_proposal_cid.to_string(),
-            expected_delivery_amount: expected_delivery_amount.to_string(),
-            expected_payment_amount: expected_payment_amount.to_string(),
-            expected_delivery_instrument_id: del_id,
-            expected_delivery_instrument_admin: del_admin,
-            expected_payment_instrument_id: pay_id,
-            expected_payment_instrument_admin: pay_admin,
+            expected_delivery_amount: terms.delivery.amount.clone(),
+            expected_payment_amount: terms.payment.amount.clone(),
+            expected_delivery_instrument_id: terms.delivery.instrument_id.clone(),
+            expected_delivery_instrument_admin: terms.delivery.instrument_admin.clone(),
+            expected_payment_instrument_id: terms.payment.instrument_id.clone(),
+            expected_payment_instrument_admin: terms.payment.instrument_admin.clone(),
+            terms: Some(terms),
         };
 
         let result = client
@@ -323,37 +351,26 @@ impl SettlementBackend for CloudSettlementBackend {
         paid
     }
 
-    async fn propose_dvp(&self, proposal_id: &str) -> Result<StepResult> {
-        let proposed = self.propose_dvp_inner(proposal_id).await;
+    async fn propose_dvp(&self, proposal: &SettlementProposal) -> Result<StepResult> {
+        let proposed = self.propose_dvp_inner(proposal).await;
         self.nudge_topup();
         proposed
     }
 
-    async fn accept_dvp(
-        &self,
-        proposal_id: &str,
-        dvp_proposal_cid: &str,
-        expected_delivery_amount: &str,
-        expected_payment_amount: &str,
-        base_instrument: &str,
-        quote_instrument: &str,
-    ) -> Result<StepResult> {
-        let accepted = self
-            .accept_dvp_inner(
-                proposal_id,
-                dvp_proposal_cid,
-                expected_delivery_amount,
-                expected_payment_amount,
-                base_instrument,
-                quote_instrument,
-            )
-            .await;
+    async fn accept_dvp(&self, proposal: &SettlementProposal, dvp_proposal_cid: &str) -> Result<StepResult> {
+        let accepted = self.accept_dvp_inner(proposal, dvp_proposal_cid).await;
         self.nudge_topup();
         accepted
     }
 
-    async fn allocate(&self, proposal_id: &str, dvp_cid: &str, allocation_cc: Option<Decimal>) -> Result<StepResult> {
-        let allocated = self.payment_queue.submit_allocate(proposal_id, dvp_cid, allocation_cc).await;
+    async fn allocate(
+        &self,
+        proposal: &SettlementProposal,
+        dvp_cid: &str,
+        allocation_cc: Option<Decimal>,
+    ) -> Result<StepResult> {
+        let terms = recorded_terms_or_warn(&self.config, proposal);
+        let allocated = self.payment_queue.submit_allocate(&proposal.proposal_id, dvp_cid, allocation_cc, terms).await;
         self.nudge_topup();
         allocated
     }
@@ -514,6 +531,54 @@ mod runtime_tests {
         shutdown.signal();
     }
 
+    fn proposal(base: &str, quote: &str) -> SettlementProposal {
+        SettlementProposal {
+            proposal_id: "p1".into(),
+            buyer: "buyer::1220aa".into(),
+            seller: "seller::1220bb".into(),
+            base_instrument: base.into(),
+            quote_instrument: quote.into(),
+            base_quantity: "1".into(),
+            quote_quantity: "2".into(),
+            ..Default::default()
+        }
+    }
+
+    // The terms of the agent's own record, resolved as AcceptDvp resolves its legs
+    #[test]
+    fn recorded_terms_follow_the_proposal() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.dso_party = "dso::1220aa".to_string();
+        config.populate_instruments_from_rpc(vec![
+            orderbook_proto::orderbook::Instrument {
+                instrument_id: "CC".to_string(),
+                instrument_type: "token".to_string(),
+                symbol: "CC".to_string(),
+                registry: Some("dso::1220aa".to_string()),
+                ..Default::default()
+            },
+            orderbook_proto::orderbook::Instrument {
+                instrument_id: "TOK".to_string(),
+                symbol: "TOK".to_string(),
+                registry: Some("reg::1220cc".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let terms = recorded_terms(&config, &proposal("TOK", "CC")).unwrap();
+        assert_eq!(
+            terms,
+            ExpectedDvpTerms {
+                proposal_id: "p1".into(),
+                buyer: "buyer::1220aa".into(),
+                seller: "seller::1220bb".into(),
+                delivery: ExpectedQuantity { instrument_admin: "reg::1220cc".into(), instrument_id: "TOK".into(), amount: "1".into() },
+                payment: ExpectedQuantity { instrument_admin: "dso::1220aa".into(), instrument_id: "Amulet".into(), amount: "2".into() },
+            }
+        );
+        assert!(recorded_terms(&config, &proposal("UNLISTED", "CC")).is_err());
+        assert_eq!(recorded_terms_or_warn(&config, &proposal("CC", "UNLISTED")), None);
+    }
+
     // Each settlement step nudges the prepaid top-up runner, paid or refused
     #[tokio::test]
     async fn settlement_steps_nudge_the_topup_runner() {
@@ -537,11 +602,13 @@ mod runtime_tests {
         .with_topup_trigger(crate::topup::TopupTrigger::from_sender(tx));
         let bounded = std::time::Duration::from_secs(10);
         assert!(tokio::time::timeout(bounded, backend.pay_fee("p1", "dvp")).await.unwrap().is_err());
-        assert!(tokio::time::timeout(bounded, backend.propose_dvp("p1")).await.unwrap().is_err());
-        let refused = backend.accept_dvp("p1", "00dvp", "1", "2", "UNLISTED", "CC");
+        assert!(tokio::time::timeout(bounded, backend.propose_dvp(&proposal("UNLISTED", "CC"))).await.unwrap().is_err());
+        let unlisted = proposal("UNLISTED", "CC");
+        let refused = backend.accept_dvp(&unlisted, "00dvp");
         assert!(tokio::time::timeout(bounded, refused).await.unwrap().is_err());
         // No CC leg, so the allocation is not held back for coins
-        assert!(tokio::time::timeout(bounded, backend.allocate("p1", "00dvp", None)).await.unwrap().is_err());
+        let allocated = backend.allocate(&unlisted, "00dvp", None);
+        assert!(tokio::time::timeout(bounded, allocated).await.unwrap().is_err());
         let mut nudges = 0;
         while rx.try_recv().is_ok() {
             nudges += 1;
@@ -580,7 +647,7 @@ mod runtime_tests {
         .unwrap();
         for (base, quote) in [("UNLISTED", "CC"), ("CC", "UNLISTED")] {
             let err = backend
-                .accept_dvp("p1", "00dvp", "1", "2", base, quote)
+                .accept_dvp(&proposal(base, quote), "00dvp")
                 .await
                 .unwrap_err();
             let text = format!("{err:#}");

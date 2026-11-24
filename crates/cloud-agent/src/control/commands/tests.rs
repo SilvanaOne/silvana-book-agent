@@ -37,6 +37,39 @@ pub(crate) mod fixture {
 
     pub(crate) const PKG: &str = "5f6c3e7d9a1b2c4d8e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d";
 
+    /// `requestedAt` of every transfer; `executeBefore` follows 40 s later, as the SDK sets it.
+    const REQUESTED_AT: i64 = 1_795_489_110_609_724;
+    const EXECUTE_WITHIN: i64 = 40_000_000;
+
+    const AMULET: (&str, &str) = ("Splice.Amulet", "Amulet");
+    const AMULET_RULES: (&str, &str) = ("Splice.AmuletRules", "AmuletRules");
+    const RULES: (&str, &str) = (
+        "Splice.ExternalPartyAmuletRules",
+        "ExternalPartyAmuletRules",
+    );
+    const CONFIG: (&str, &str) = (
+        "Splice.ExternalPartyConfigState",
+        "ExternalPartyConfigState",
+    );
+    const PREAPPROVAL: (&str, &str) = ("Splice.AmuletRules", "TransferPreapproval");
+    const FACTORY: (&str, &str) = ("Splice.Api.Token.TransferInstructionV1", "TransferFactory");
+    const EVENT_LOG: (&str, &str) = ("Splice.Api.Token.TransferEventsV2", "EventLog");
+    const HOLDING: (&str, &str) = ("Utility.Registry.Holding.V0.Holding", "Holding");
+    const TOKEN_PREAPPROVAL: (&str, &str) = (
+        "Utility.Registry.App.V0.Model.TransferPreapproval",
+        "TransferPreapproval",
+    );
+    const TRANSFER_RULE: (&str, &str) = ("Utility.Registry.V0.Rule.Transfer", "TransferRule");
+    const ALLOCATION_FACTORY: (&str, &str) = (
+        "Utility.Registry.App.V0.Service.AllocationFactory",
+        "AllocationFactory",
+    );
+
+    /// The spent coin or holding, the payment and the change of every transfer.
+    const INPUT: &str = "00d101";
+    const PAID: &str = "00e101";
+    const CHANGE: &str = "00e201";
+
     pub(crate) fn party(hint: &str, byte: u8) -> String {
         format!("{hint}::1220{}", hex::encode([byte; 32]))
     }
@@ -57,7 +90,12 @@ pub(crate) mod fixture {
         party("registry", 0xcc)
     }
 
-    fn ident(module: &str, entity: &str) -> Identifier {
+    /// The app provider of the preapprovals and the activity marker.
+    fn provider() -> String {
+        party("provider", 0xa1)
+    }
+
+    fn ident((module, entity): (&str, &str)) -> Identifier {
         Identifier {
             package_id: PKG.into(),
             module_name: module.into(),
@@ -94,17 +132,51 @@ pub(crate) mod fixture {
         val(Sum::Text(t.into()))
     }
 
-    fn create(
-        cid: &str,
-        (module, entity): (&str, &str),
-        argument: Value,
-        signatories: &[&str],
-    ) -> Create {
+    fn cid_v(cid: &str) -> Value {
+        val(Sum::ContractId(cid.into()))
+    }
+
+    fn list(elements: Vec<Value>) -> Value {
+        val(Sum::List(v2::List { elements }))
+    }
+
+    fn optional(value: Option<Value>) -> Value {
+        val(Sum::Optional(Box::new(v2::Optional {
+            value: value.map(Box::new),
+        })))
+    }
+
+    fn variant(constructor: &str, value: Value) -> Value {
+        val(Sum::Variant(Box::new(v2::Variant {
+            variant_id: None,
+            constructor: constructor.into(),
+            value: Some(Box::new(value)),
+        })))
+    }
+
+    fn text_map(entries: Vec<(&str, Value)>) -> Value {
+        val(Sum::TextMap(v2::TextMap {
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| v2::text_map::Entry {
+                    key: key.into(),
+                    value: Some(value),
+                })
+                .collect(),
+        }))
+    }
+
+    /// An empty `Metadata`.
+    fn meta() -> Value {
+        record(vec![("values", text_map(Vec::new()))])
+    }
+
+    fn create(cid: &str, template: (&str, &str), argument: Value, signatories: &[&str]) -> Create {
         Create {
             lf_version: "2.1".into(),
             contract_id: cid.into(),
             package_name: "pkg".into(),
-            template_id: Some(ident(module, entity)),
+            template_id: Some(ident(template)),
             argument: Some(argument),
             signatories: signatories.iter().map(|p| p.to_string()).collect(),
             ..Default::default()
@@ -113,7 +185,7 @@ pub(crate) mod fixture {
 
     fn exercise(
         cid: &str,
-        (module, entity): (&str, &str),
+        template: (&str, &str),
         choice: &str,
         acting: &str,
         consuming: bool,
@@ -124,7 +196,7 @@ pub(crate) mod fixture {
             lf_version: "2.1".into(),
             contract_id: cid.into(),
             package_name: "pkg".into(),
-            template_id: Some(ident(module, entity)),
+            template_id: Some(ident(template)),
             acting_parties: vec![acting.to_string()],
             choice_id: choice.into(),
             chosen_value: Some(chosen),
@@ -134,7 +206,18 @@ pub(crate) mod fixture {
         }
     }
 
-    fn node(id: &str, node_type: NodeType) -> daml_transaction::Node {
+    fn fetch(cid: &str, template: (&str, &str), acting: &str) -> Fetch {
+        Fetch {
+            lf_version: "2.1".into(),
+            contract_id: cid.into(),
+            package_name: "pkg".into(),
+            template_id: Some(ident(template)),
+            acting_parties: vec![acting.to_string()],
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn node(id: &str, node_type: NodeType) -> daml_transaction::Node {
         daml_transaction::Node {
             node_id: id.into(),
             versioned_node: Some(daml_transaction::node::VersionedNode::V1(V1Node {
@@ -150,7 +233,7 @@ pub(crate) mod fixture {
             ("owner", party_v(owner)),
             ("amount", record(vec![("initialAmount", numeric(amount))])),
         ]);
-        create(cid, ("Splice.Amulet", "Amulet"), arg, &[&dso, owner])
+        create(cid, AMULET, arg, &[&dso, owner])
     }
 
     pub(crate) fn holding(cid: &str, owner: &str, id: &str, amount: &str) -> Create {
@@ -168,40 +251,82 @@ pub(crate) mod fixture {
             ),
             ("amount", numeric(amount)),
         ]);
-        create(
-            cid,
-            ("Utility.Registry.Holding.V0.Holding", "Holding"),
-            arg,
-            &[&registry, owner],
-        )
+        create(cid, HOLDING, arg, &[&registry, owner])
     }
 
     fn config_state(cid: &str) -> Create {
         let dso = dso();
-        create(
-            cid,
-            (
-                "Splice.ExternalPartyConfigState",
-                "ExternalPartyConfigState",
-            ),
-            record(vec![("dso", party_v(&dso))]),
-            &[&dso],
-        )
+        create(cid, CONFIG, record(vec![("dso", party_v(&dso))]), &[&dso])
     }
 
-    fn transfer_arg(sender: &str, receiver: &str, amount: &str, admin: &str, id: &str) -> Value {
-        record(vec![(
-            "transfer",
-            record(vec![
-                ("sender", party_v(sender)),
-                ("receiver", party_v(receiver)),
-                ("amount", numeric(amount)),
-                (
-                    "instrumentId",
-                    record(vec![("admin", party_v(admin)), ("id", text(id))]),
+    /// Whether the shape returns change to the agent.
+    fn has_change(s: &Shape) -> bool {
+        rust_decimal::Decimal::from_str_exact(&s.change).map_or(true, |d| !d.is_zero())
+    }
+
+    /// The `transfer` record of a `TransferFactory_Transfer`, spending [`INPUT`].
+    fn transfer_v(s: &Shape, admin: &str, id: &str) -> Value {
+        record(vec![
+            ("sender", party_v(&s.agent)),
+            ("receiver", party_v(&s.declared)),
+            ("amount", numeric(&s.amount)),
+            (
+                "instrumentId",
+                record(vec![("admin", party_v(admin)), ("id", text(id))]),
+            ),
+            ("requestedAt", val(Sum::Timestamp(REQUESTED_AT))),
+            (
+                "executeBefore",
+                val(Sum::Timestamp(REQUESTED_AT + EXECUTE_WITHIN)),
+            ),
+            ("inputHoldingCids", list(vec![cid_v(INPUT)])),
+            ("meta", meta()),
+        ])
+    }
+
+    fn extra_args(context: Vec<(&str, Value)>) -> Value {
+        record(vec![
+            ("context", record(vec![("values", text_map(context))])),
+            ("meta", meta()),
+        ])
+    }
+
+    /// A `TransferFactory_Transfer` on `cid` of `template`, through the factory interface,
+    /// that completed with [`PAID`] and, when there is any, [`CHANGE`].
+    fn factory_transfer(
+        s: &Shape,
+        (cid, template): (&str, (&str, &str)),
+        (admin, id): (&str, &str),
+        context: Vec<(&str, Value)>,
+        children: &[&str],
+    ) -> Exercise {
+        let chosen = record(vec![
+            ("expectedAdmin", party_v(admin)),
+            ("transfer", transfer_v(s, admin, id)),
+            ("extraArgs", extra_args(context)),
+        ]);
+        let mut root = exercise(cid, template, "TransferFactory_Transfer", &s.agent, false, chosen, children);
+        root.interface_id = Some(ident(FACTORY));
+        let change: Vec<Value> = if has_change(s) { vec![cid_v(CHANGE)] } else { Vec::new() };
+        root.exercise_result = Some(record(vec![
+            (
+                "output",
+                variant(
+                    "TransferInstructionResult_Completed",
+                    record(vec![("receiverHoldingCids", list(vec![cid_v(PAID)]))]),
                 ),
-            ]),
-        )])
+            ),
+            ("senderChangeCids", list(change)),
+            ("meta", meta()),
+        ]));
+        root
+    }
+
+    /// The DSO's non-consuming holdings log on `cid`, which moves nothing.
+    fn holdings_log(cid: &str, template: (&str, &str)) -> Exercise {
+        let mut log = exercise(cid, template, "EventLog_HoldingsChange", &dso(), false, record(vec![]), &[]);
+        log.interface_id = Some(ident(EVENT_LOG));
+        log
     }
 
     fn encode(
@@ -211,19 +336,12 @@ pub(crate) mod fixture {
         act_as: &str,
         command_id: &str,
     ) -> Vec<u8> {
-        let node_seeds = nodes
-            .iter()
-            .map(|n| daml_transaction::NodeSeed {
-                node_id: n.node_id.parse().unwrap(),
-                seed: vec![7u8; 32],
-            })
-            .collect();
-        PreparedTransaction {
+        let mut prepared = PreparedTransaction {
             transaction: Some(DamlTransaction {
                 version: "2.1".into(),
                 roots: roots.iter().map(|r| r.to_string()).collect(),
                 nodes,
-                node_seeds,
+                node_seeds: Vec::new(),
             }),
             metadata: Some(Metadata {
                 submitter_info: Some(SubmitterInfo {
@@ -240,8 +358,41 @@ pub(crate) mod fixture {
                     .collect(),
                 ..Default::default()
             }),
+        };
+        seed(&mut prepared);
+        prepared.encode_to_vec()
+    }
+
+    /// Seeds every node, so the hash computes.
+    fn seed(prepared: &mut PreparedTransaction) {
+        if let Some(tx) = prepared.transaction.as_mut() {
+            tx.node_seeds = tx
+                .nodes
+                .iter()
+                .map(|n| daml_transaction::NodeSeed {
+                    node_id: n.node_id.parse().unwrap(),
+                    seed: vec![7u8; 32],
+                })
+                .collect();
         }
-        .encode_to_vec()
+    }
+
+    /// `bytes` as `change` rewrites them, every node seeded again.
+    pub(crate) fn rewritten(bytes: &[u8], change: impl FnOnce(&mut PreparedTransaction)) -> Vec<u8> {
+        let mut prepared = PreparedTransaction::decode(bytes).unwrap();
+        change(&mut prepared);
+        seed(&mut prepared);
+        prepared.encode_to_vec()
+    }
+
+    /// The exercise of node `id`.
+    pub(crate) fn exercise_mut<'a>(prepared: &'a mut PreparedTransaction, id: &str) -> Option<&'a mut Exercise> {
+        let tx = prepared.transaction.as_mut()?;
+        let node = tx.nodes.iter_mut().find(|n| n.node_id == id)?;
+        match node.versioned_node.as_mut()? {
+            daml_transaction::node::VersionedNode::V1(V1Node { node_type: Some(NodeType::Exercise(e)) }) => Some(e),
+            _ => None,
+        }
     }
 
     /// One transfer and what a ledger-service may change in it.
@@ -262,146 +413,226 @@ pub(crate) mod fixture {
         pub command_id: String,
     }
 
-    /// A CC transfer through the external party's amulet rules.
+    /// A CC transfer through the external party's amulet rules, completed by a
+    /// `TransferPreapproval_SendV2` on the declared receiver's preapproval.
     pub(crate) fn cc_transfer(s: &Shape) -> Vec<u8> {
         let dso = dso();
-        let mut children = vec!["1", "2", "3", "4", "5"];
-        if s.extra.is_some() {
-            children.push("6");
+        let any_cid = |cid: &str| variant("AV_ContractId", cid_v(cid));
+        let context = vec![
+            ("amulet-rules", any_cid("00a201")),
+            ("external-party-config-state", any_cid("00c101")),
+            ("featured-app-right", any_cid("00b201")),
+            ("open-round", any_cid("00a301")),
+            ("transfer-preapproval", any_cid("00b101")),
+        ];
+        let root = factory_transfer(s, ("00a101", RULES), (&dso, "Amulet"), context, &["1", "2"]);
+        let send = record(vec![
+            (
+                "context",
+                record(vec![
+                    ("externalPartyConfigState", cid_v("00c101")),
+                    ("featuredAppRight", optional(Some(cid_v("00b201")))),
+                ]),
+            ),
+            ("inputs", list(vec![variant("InputAmulet", cid_v(INPUT))])),
+            ("amount", numeric(&s.amount)),
+            ("sender", party_v(&s.agent)),
+            ("description", optional(None)),
+            ("meta", optional(None)),
+        ]);
+        let change = has_change(s);
+        let mut sent = vec!["3", "4", "5", "6"];
+        if change {
+            sent.push("7");
         }
-        let chosen = transfer_arg(&s.agent, &s.declared, &s.amount, &dso, "Amulet");
-        let rules = (
-            "Splice.ExternalPartyAmuletRules",
-            "ExternalPartyAmuletRules",
-        );
+        sent.push("8");
+        if s.extra.is_some() {
+            sent.push("9");
+        }
+        let marker = record(vec![
+            ("dso", party_v(&dso)),
+            ("provider", party_v(&provider())),
+            ("beneficiary", party_v(&provider())),
+            ("weight", numeric("1.0")),
+        ]);
         let mut nodes = vec![
-            node(
-                "0",
-                NodeType::Exercise(exercise(
-                    "00aa01",
-                    rules,
-                    "TransferFactory_Transfer",
-                    &s.agent,
-                    false,
-                    chosen,
-                    &children,
-                )),
-            ),
-            node(
-                "1",
-                NodeType::Fetch(Fetch {
-                    lf_version: "2.1".into(),
-                    contract_id: "00c101".into(),
-                    package_name: "pkg".into(),
-                    template_id: Some(ident(
-                        "Splice.ExternalPartyConfigState",
-                        "ExternalPartyConfigState",
-                    )),
-                    acting_parties: vec![s.agent.clone()],
-                    ..Default::default()
-                }),
-            ),
+            node("0", NodeType::Exercise(root)),
+            node("1", NodeType::Fetch(fetch("00b101", PREAPPROVAL, &dso))),
             node(
                 "2",
                 NodeType::Exercise(exercise(
-                    "00d101",
-                    ("Splice.Amulet", "Amulet"),
-                    "Archive",
+                    "00b101",
+                    PREAPPROVAL,
+                    "TransferPreapproval_SendV2",
                     &s.agent,
-                    true,
-                    record(vec![]),
-                    &[],
+                    false,
+                    send,
+                    &sent,
                 )),
             ),
-            node("3", NodeType::Create(amulet("00e101", &s.paid, &s.amount))),
-            node("4", NodeType::Create(amulet("00e201", &s.agent, &s.change))),
+            node("3", NodeType::Fetch(fetch("00c101", CONFIG, &dso))),
+            node(
+                "4",
+                NodeType::Exercise(exercise(INPUT, AMULET, "Archive", &s.agent, true, record(vec![]), &[])),
+            ),
             node(
                 "5",
                 NodeType::Create(create(
                     "00e301",
                     ("Splice.Amulet", "FeaturedAppActivityMarker"),
-                    record(vec![]),
+                    marker,
                     &[&dso],
                 )),
             ),
+            node("6", NodeType::Create(amulet(PAID, &s.paid, &s.amount))),
         ];
+        if change {
+            nodes.push(node("7", NodeType::Create(amulet(CHANGE, &s.agent, &s.change))));
+        }
+        nodes.push(node("8", NodeType::Exercise(holdings_log("00c101", CONFIG))));
         if let Some((to, amount)) = &s.extra {
-            nodes.push(node("6", NodeType::Create(amulet("00e401", to, amount))));
+            nodes.push(node("9", NodeType::Create(amulet("00e401", to, amount))));
         }
         let mut roots = vec!["0"];
         if s.second_root {
-            roots.push("7");
-            nodes.push(node(
-                "7",
-                NodeType::Fetch(Fetch {
-                    lf_version: "2.1".into(),
-                    contract_id: "00c101".into(),
-                    package_name: "pkg".into(),
-                    template_id: Some(ident(
-                        "Splice.ExternalPartyConfigState",
-                        "ExternalPartyConfigState",
-                    )),
-                    acting_parties: vec![s.agent.clone()],
-                    ..Default::default()
-                }),
-            ));
+            roots.push("10");
+            nodes.push(node("10", NodeType::Fetch(fetch("00c101", CONFIG, &s.agent))));
         }
-        encode(
-            &roots,
-            nodes,
-            vec![config_state("00c101"), amulet("00d101", &s.agent, &s.input)],
-            &s.agent,
-            &s.command_id,
-        )
+        let preapproval = record(vec![
+            ("dso", party_v(&dso)),
+            ("receiver", party_v(&s.declared)),
+            ("provider", party_v(&provider())),
+        ]);
+        let featured = record(vec![("dso", party_v(&dso)), ("provider", party_v(&provider()))]);
+        let inputs = vec![
+            create("00a101", RULES, record(vec![("dso", party_v(&dso))]), &[&dso]),
+            config_state("00c101"),
+            create("00b101", PREAPPROVAL, preapproval, &[&s.declared, &dso]),
+            create("00b201", ("Splice.Amulet", "FeaturedAppRight"), featured, &[&dso]),
+            amulet(INPUT, &s.agent, &s.input),
+        ];
+        encode(&roots, nodes, inputs, &s.agent, &s.command_id)
     }
 
-    /// A CIP-56 transfer of a registry holding through its transfer factory.
+    /// A CIP-56 transfer of a registry holding on the declared receiver's preapproval,
+    /// completed by a direct transfer; a transfer to the agent itself is a [`token_merge`].
     pub(crate) fn token_transfer(s: &Shape, id: &str) -> Vec<u8> {
+        if s.declared == s.agent {
+            return token_merge(s, id);
+        }
         let registry = registry();
-        let chosen = transfer_arg(&s.agent, &s.declared, &s.amount, &registry, id);
-        let factory = ("Utility.Registry.V0.Rule.Transfer", "TransferFactory");
-        let holding_t = ("Utility.Registry.Holding.V0.Holding", "Holding");
-        let nodes = vec![
-            node(
-                "0",
-                NodeType::Exercise(exercise(
-                    "00f101",
-                    factory,
-                    "TransferFactory_Transfer",
-                    &s.agent,
-                    false,
-                    chosen,
-                    &["1", "2", "3"],
-                )),
-            ),
-            node(
-                "1",
-                NodeType::Exercise(exercise(
-                    "00d101",
-                    holding_t,
-                    "Archive",
-                    &s.agent,
-                    true,
-                    record(vec![]),
-                    &[],
-                )),
-            ),
+        let any_cid = |cid: &str| variant("AV_ContractId", cid_v(cid));
+        let context = || vec![("utility.digitalasset.com/instrument-configuration", any_cid("00f301"))];
+        let root = factory_transfer(s, ("00f101", TOKEN_PREAPPROVAL), (&registry, id), context(), &["1"]);
+        let chosen = record(vec![
+            ("transfer", transfer_v(s, &registry, id)),
+            ("extraArgs", extra_args(context())),
+        ]);
+        let change = has_change(s);
+        let moved: &[&str] = if change { &["2", "3", "4"] } else { &["2", "3"] };
+        let mut direct = exercise("00f201", TRANSFER_RULE, "TransferRule_DirectTransfer", &s.agent, false, chosen, moved);
+        direct.acting_parties.push(s.declared.clone());
+        let mut nodes = vec![
+            node("0", NodeType::Exercise(root)),
+            node("1", NodeType::Exercise(direct)),
             node(
                 "2",
-                NodeType::Create(holding("00e101", &s.paid, id, &s.amount)),
+                NodeType::Exercise(exercise(INPUT, HOLDING, "Archive", &s.agent, true, record(vec![]), &[])),
             ),
+            node("3", NodeType::Create(holding(PAID, &s.paid, id, &s.amount))),
+        ];
+        if change {
+            nodes.push(node("4", NodeType::Create(holding(CHANGE, &s.agent, id, &s.change))));
+        }
+        let preapproval = record(vec![
+            ("operator", party_v(&provider())),
+            ("receiver", party_v(&s.declared)),
+            ("instrumentAdmin", party_v(&registry)),
+            ("instrumentAllowances", list(Vec::new())),
+        ]);
+        let rule = record(vec![
+            ("operator", party_v(&provider())),
+            ("provider", party_v(&registry)),
+            ("registrar", party_v(&registry)),
+        ]);
+        let inputs = vec![
+            holding(INPUT, &s.agent, id, &s.input),
+            create("00f101", TOKEN_PREAPPROVAL, preapproval, &[&s.declared]),
+            create("00f201", TRANSFER_RULE, rule, &[&registry]),
+        ];
+        encode(&["0"], nodes, inputs, &s.agent, &s.command_id)
+    }
+
+    /// The agent's transfer to itself on the registry's allocation factory: one internal
+    /// transfer of the same payload merges [`INPUT`] into one holding, with change if it splits.
+    fn token_merge(s: &Shape, id: &str) -> Vec<u8> {
+        let registry = registry();
+        let any_cid = |cid: &str| variant("AV_ContractId", cid_v(cid));
+        let context = vec![("utility.digitalasset.com/instrument-configuration", any_cid("00f301"))];
+        let root = factory_transfer(s, ("00f401", ALLOCATION_FACTORY), (&registry, id), context, &["1"]);
+        let payload = root.chosen_value.clone().expect("the transfer has its argument");
+        let change = has_change(s);
+        let moved: &[&str] = if change { &["2", "3", "4", "5"] } else { &["2", "3", "4"] };
+        let chosen = record(vec![("payload", payload)]);
+        let mut internal = exercise("00f401", ALLOCATION_FACTORY, "AllocationFactory_TransferInternal", &registry, false, chosen, moved);
+        internal.acting_parties.push(s.agent.clone());
+        internal.exercise_result = root.exercise_result.clone();
+        let mut nodes = vec![
+            node("0", NodeType::Exercise(root)),
+            node("1", NodeType::Exercise(internal)),
+            node("2", NodeType::Fetch(fetch(INPUT, HOLDING, &s.agent))),
             node(
                 "3",
-                NodeType::Create(holding("00e201", &s.agent, id, &s.change)),
+                NodeType::Exercise(exercise(INPUT, HOLDING, "Archive", &s.agent, true, record(vec![]), &[])),
             ),
+            node("4", NodeType::Create(holding(PAID, &s.paid, id, &s.amount))),
         ];
-        encode(
-            &["0"],
-            nodes,
-            vec![holding("00d101", &s.agent, id, &s.input)],
-            &s.agent,
-            &s.command_id,
-        )
+        if change {
+            nodes.push(node("5", NodeType::Create(holding(CHANGE, &s.agent, id, &s.change))));
+        }
+        let factory = record(vec![
+            ("provider", party_v(&registry)),
+            ("registrar", party_v(&registry)),
+            ("operator", party_v(&provider())),
+        ]);
+        let inputs = vec![
+            holding(INPUT, &s.agent, id, &s.input),
+            create("00f401", ALLOCATION_FACTORY, factory, &[&registry]),
+        ];
+        encode(&["0"], nodes, inputs, &s.agent, &s.command_id)
+    }
+
+    /// The agent's coin [`INPUT`] of `input` split into its own `outputs` and `change`.
+    pub(crate) fn cc_split(agent: &str, outputs: &[&str], input: &str, change: &str, command_id: &str) -> Vec<u8> {
+        let dso = dso();
+        let output = |amount: &str| {
+            record(vec![
+                ("receiver", party_v(agent)),
+                ("receiverFeeRatio", numeric("0.0")),
+                ("amount", numeric(amount)),
+            ])
+        };
+        let transfer = record(vec![
+            ("sender", party_v(agent)),
+            ("provider", party_v(agent)),
+            ("inputs", list(vec![variant("InputAmulet", cid_v(INPUT))])),
+            ("outputs", list(outputs.iter().map(|a| output(a)).collect())),
+        ]);
+        let chosen = record(vec![("transfer", transfer), ("expectedDso", optional(Some(party_v(&dso))))]);
+        let archive = exercise(INPUT, AMULET, "Archive", agent, true, record(vec![]), &[]);
+        let mut below = vec![NodeType::Exercise(archive)];
+        for (n, amount) in outputs.iter().enumerate() {
+            below.push(NodeType::Create(amulet(&format!("00e1{n:02}"), agent, amount)));
+        }
+        below.push(NodeType::Create(amulet(CHANGE, agent, change)));
+        below.push(NodeType::Exercise(holdings_log("00a401", AMULET_RULES)));
+        let ids: Vec<String> = (1..=below.len()).map(|n| n.to_string()).collect();
+        let children: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let root = exercise("00a401", AMULET_RULES, "AmuletRules_Transfer", agent, false, chosen, &children);
+        let mut nodes = vec![node("0", NodeType::Exercise(root))];
+        nodes.extend(children.iter().zip(below).map(|(id, n)| node(id, n)));
+        let rules = create("00a401", AMULET_RULES, record(vec![("dso", party_v(&dso))]), &[&dso]);
+        encode(&["0"], nodes, vec![rules, amulet(INPUT, agent, input)], agent, command_id)
     }
 }
 
@@ -559,6 +790,8 @@ struct Counts {
     signatures: AtomicU32,
     scans: AtomicU32,
     remints: AtomicU32,
+    /// Why each refused transaction was refused before its signature.
+    refusals: Mutex<Vec<String>>,
 }
 
 impl Counts {
@@ -567,6 +800,15 @@ impl Counts {
             self.prepares.load(Ordering::SeqCst),
             self.signatures.load(Ordering::SeqCst),
         )
+    }
+
+    fn refused(&self, reason: String) -> anyhow::Error {
+        agent_logic::sync::lock(&self.refusals).push(reason.clone());
+        anyhow!(reason)
+    }
+
+    fn refusals(&self) -> Vec<String> {
+        agent_logic::sync::lock(&self.refusals).clone()
     }
 }
 
@@ -679,14 +921,12 @@ impl DirectedLedger for FakeLedger {
             &BASE64.encode(hash),
             "V2",
             expectation,
-            VerifyMode { strict_all: true },
+            VerifyMode { strict_all: true, ..VerifyMode::default() },
             false,
         )?;
         if !verification.accepted {
-            bail!(
-                "{VERIFICATION_REJECTED}: {}",
-                verification.rejection_reason.clone().unwrap_or_default()
-            );
+            let reason = verification.rejection_reason.clone().unwrap_or_default();
+            return Err(self.counts.refused(format!("{VERIFICATION_REJECTED}: {reason}")));
         }
         let facts =
             tx_verifier::facts::extract_facts(&bytes, &self.party).map_err(|e| e.to_string());
@@ -701,7 +941,10 @@ impl DirectedLedger for FakeLedger {
             &facts,
             command,
         )
-        .map_err(|refusal| anyhow!(refusal))?;
+        .map_err(|refusal| {
+            let _ = self.counts.refused(refusal.to_string());
+            anyhow!(refusal)
+        })?;
         if let Some((ahead, secs)) = &self.jump {
             ahead.store(*secs, Ordering::SeqCst);
         }
@@ -1146,24 +1389,41 @@ async fn substituted_content_a_second_root_an_extra_outflow_and_another_command_
     let (_rpc, agent) = linked(0x75, "exec-drills").await;
     let ctx = agent.context().await;
     let failure = agent_control::CommandFailure::ContentRefused;
-    let drills: Vec<(&str, Build)> = vec![
-        ("substituted", honest(|s| s.paid = fixture::eve(), None)),
-        ("declared", honest(|s| s.declared = fixture::eve(), None)),
-        ("second root", honest(|s| s.second_root = true, None)),
+    let (bob, eve) = (fixture::bob(), fixture::eve());
+    // Each drill and the rule of the inspection that refuses it.
+    let drills: Vec<(&str, Build, String)> = vec![
+        (
+            "substituted",
+            honest(|s| s.paid = fixture::eve(), None),
+            format!("unexpected Amulet of 10 for {eve}"),
+        ),
+        (
+            "declared",
+            honest(|s| s.declared = fixture::eve(), None),
+            format!("transfer.receiver={eve}, expected={bob}"),
+        ),
+        (
+            "second root",
+            honest(|s| s.second_root = true, None),
+            "expected 1 root node, got 2".into(),
+        ),
         (
             "extra outflow",
             honest(|s| s.extra = Some((fixture::eve(), "1".into())), None),
+            format!("unexpected Amulet of 1 for {eve}"),
         ),
         (
             "command id",
             honest(|s| s.command_id = "send-transfer-1".into(), None),
+            "command id send-transfer-1 is not the requested ctl-".into(),
         ),
         (
             "token to another",
             honest(|s| s.paid = fixture::eve(), Some("USDCx")),
+            format!("unexpected holding of 10 for {eve}"),
         ),
     ];
-    for (name, build) in drills {
+    for (name, build, reason) in drills {
         let op = if name.starts_with("token") {
             transfer_token(&fixture::bob(), "USDCx", "10")
         } else {
@@ -1191,6 +1451,11 @@ async fn substituted_content_a_second_root_an_extra_outflow_and_another_command_
             "{name}"
         );
         assert_eq!(counts.get(), (1, 0), "{name}: prepared, never signed");
+        let refusals = counts.refusals();
+        assert!(
+            refusals.len() == 1 && refusals.iter().all(|r| r.contains(&reason)),
+            "{name}: {refusals:?}"
+        );
         let receipt = receipts.last(&agent.party);
         assert_eq!(
             (receipt.outcome, receipt.reason_code),
@@ -2376,4 +2641,28 @@ async fn a_signed_attempt_whose_outcome_stays_unknown_past_the_grace_is_alerted_
             "{kept:?}"
         );
     }
+}
+
+#[test]
+fn a_package_refusal_before_the_binding_is_answered_as_the_binding_answers_it() {
+    use super::intent::{PackageRefusal, UnmatchedHash};
+    let id = agent_control::PackageId([3; 32]);
+    let refused = Submitted::Answered { refused: true, code: 19, name: "package_not_allowed", from_ledger: false };
+    for refusal in [PackageRefusal::Local(id), PackageRefusal::Policy(id)] {
+        assert_eq!(classify(Ok(Err(anyhow::Error::new(refusal))), false, None), refused);
+    }
+    let content = agent_control::CommandFailure::ContentRefused;
+    for refusal in [
+        PackageRefusal::Unreadable("x".into()),
+        PackageRefusal::HashUnmatched(UnmatchedHash::Mismatch),
+        PackageRefusal::HashUnmatched(UnmatchedHash::Uncomputed("no hash".into())),
+    ] {
+        assert_eq!(
+            classify(Ok(Err(anyhow::Error::new(refusal))), false, None),
+            Submitted::Answered { refused: false, code: content.code(), name: content.code_name(), from_ledger: false }
+        );
+    }
+    // The same words untyped are tried again, as any other failure before a signature.
+    let untyped = classify(Ok(Err(anyhow!("package_not_allowed: package 03 is outside [vetted_packages]"))), false, None);
+    assert!(matches!(untyped, Submitted::Again(_)), "{untyped:?}");
 }

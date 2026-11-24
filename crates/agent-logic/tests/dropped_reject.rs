@@ -29,21 +29,13 @@ impl SettlementBackend for UnusedBackend {
     async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
         Err(anyhow::anyhow!("unused"))
     }
-    async fn propose_dvp(&self, _: &str) -> Result<StepResult> {
+    async fn propose_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal) -> Result<StepResult> {
         Err(anyhow::anyhow!("unused"))
     }
-    async fn accept_dvp(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<StepResult> {
+    async fn accept_dvp(&self, _: &SettlementProposal, _: &str) -> Result<StepResult> {
         Err(anyhow::anyhow!("unused"))
     }
-    async fn allocate(&self, _: &str, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+    async fn allocate(&self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str, _: Option<Decimal>) -> Result<StepResult> {
         Err(anyhow::anyhow!("unused"))
     }
     async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {

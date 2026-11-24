@@ -16,7 +16,7 @@ pub mod rpc;
 pub mod show;
 pub mod sync;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,52 @@ static PLATFORM: RwLock<Option<PlatformParties>> = RwLock::new(None);
 /// Installs the locally pinned platform parties of this process.
 pub fn install_platform_parties(parties: PlatformParties) {
     *agent_logic::sync::write(&PLATFORM) = Some(parties);
+}
+
+/// The agent.toml settings every signature of this process applies: `[verify]` and
+/// `[vetted_packages]`; the defaults until attach installs them.
+#[derive(Clone, Default)]
+pub struct SigningSettings {
+    pub verify: tx_verifier::VerifySetting,
+    pub vetted_packages: agent_logic::config::VettedPackages,
+    /// Where a refusal's package name is looked up; only on a control network.
+    pub catalog: Option<Arc<dyn crate::control_survey::PackageCatalog>>,
+}
+
+impl std::fmt::Debug for SigningSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningSettings")
+            .field("verify", &self.verify)
+            .field("vetted_packages", &self.vetted_packages)
+            .field("catalog", &self.catalog.is_some())
+            .finish()
+    }
+}
+
+impl SigningSettings {
+    pub fn from_config(config: &BaseConfig) -> Self {
+        use agent_logic::config::VerifyModeSetting as M;
+        let verify = match config.verify.mode {
+            M::Default => tx_verifier::VerifySetting::Default,
+            M::Observe => tx_verifier::VerifySetting::Observe,
+            M::Enforce => tx_verifier::VerifySetting::Enforce,
+        };
+        let catalog = crate::control_survey::RpcCatalog::for_config(config)
+            .map(|catalog| Arc::new(catalog) as Arc<dyn crate::control_survey::PackageCatalog>);
+        Self { verify, vetted_packages: config.vetted_packages.clone(), catalog }
+    }
+}
+
+static SIGNING: RwLock<Option<Arc<SigningSettings>>> = RwLock::new(None);
+
+/// Installs the signing settings of this process; clients made later carry them.
+pub fn install_signing_settings(settings: SigningSettings) {
+    *agent_logic::sync::write(&SIGNING) = Some(Arc::new(settings));
+}
+
+/// The installed signing settings, else the defaults.
+pub fn signing_settings() -> Arc<SigningSettings> {
+    agent_logic::sync::read(&SIGNING).clone().unwrap_or_default()
 }
 
 /// The installed platform parties, else `PARTY_FEE` and `PARTY_PREPAID_TRAFFIC` from the env.
@@ -350,6 +396,7 @@ pub async fn attach_with(
     source: &dyn LogSource,
 ) -> Result<Arc<ControlGuard>> {
     install_platform_parties(PlatformParties::from_config(config));
+    install_signing_settings(SigningSettings::from_config(config));
     let signer = agent_logic::signer::resolve_with(&config.private_key, env)
         .context("refusing to start")?;
     let guard = Arc::clone(signer.guard());

@@ -450,9 +450,10 @@ pub fn spawn(
     executor: Arc<dyn CommandExecutor>,
 ) {
     info!(
-        "agent control settings: {}; vetted_packages: {} (not enforced yet)",
+        "agent control settings: {}; vetted_packages: {}; verify: {}",
         config.control.describe(),
-        config.vetted_packages.describe()
+        super::show::vetted_packages_text(&config.vetted_packages),
+        config.verify.mode.as_str()
     );
     if dry_run {
         info!("agent control: the poller does not run under --dry-run");

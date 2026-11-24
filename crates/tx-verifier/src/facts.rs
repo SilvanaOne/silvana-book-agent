@@ -54,6 +54,8 @@ pub struct TxFacts {
     pub unlisted_inputs: Vec<String>,
     /// The terms of every created or input DvP contract, without repeats.
     pub dvp: Vec<DvpTerms>,
+    /// Every allocation of a DvP leg the transaction creates, in node order.
+    pub allocations: Vec<AllocationFact>,
     /// The terms of the atomic settle the transaction runs, if any.
     pub atomic_settle: Option<SettleFacts>,
     /// Created or exercised templates outside the model, as `module:entity`, sorted.
@@ -124,6 +126,25 @@ pub struct DvpTerms {
     pub seller: String,
     pub delivery: Quantity,
     pub payment: Quantity,
+}
+
+/// An allocation of one transfer leg of a settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationFact {
+    pub contract_id: String,
+    /// `settlement.settlementRef.id`: the DvP proposal id.
+    pub settlement_ref_id: String,
+    pub transfer_leg_id: String,
+    pub sender: String,
+    pub receiver: String,
+    pub instrument_admin: String,
+    pub instrument_id: String,
+    pub amount: Decimal,
+    pub executor: String,
+    /// `settlement.allocateBefore`, in microseconds since the epoch.
+    pub allocate_before_micros: i64,
+    /// `settlement.settleBefore`, in microseconds since the epoch.
+    pub settle_before_micros: i64,
 }
 
 /// The terms of an atomic settle.
@@ -332,6 +353,9 @@ pub fn extract_facts(
     let mut locks = Vec::new();
     for &(model, c) in &creates {
         let arg = argument(c)?;
+        if matches!(model, Model::AmuletAllocation | Model::LegAllocation) {
+            facts.allocations.push(allocation_fact(&c.contract_id, arg)?);
+        }
         let transient = consumed.contains(c.contract_id.as_str());
         let flow = match model {
             Model::Amulet | Model::RegistryHolding if !transient => {
@@ -619,6 +643,11 @@ const MODELS: &[(&str, &str, Model)] = &[
         "UserService",
         Model::Neutral,
     ),
+    (
+        "Utility.Settlement.App.V1.Service.User",
+        "UserServiceRequest",
+        Model::Neutral,
+    ),
     ("AtomicDVP", "SettlementTicket", Model::Neutral),
     (
         "Splice.ExternalPartyAmuletRules",
@@ -633,6 +662,11 @@ const MODELS: &[(&str, &str, Model)] = &[
     ("Splice.AmuletEventLog", "AmuletEventLog", Model::Neutral),
     ("Splice.AmuletRules", "AmuletRules", Model::Neutral),
     ("Splice.AmuletRules", "TransferPreapproval", Model::Neutral),
+    (
+        "Splice.Wallet.TransferPreapproval",
+        "TransferPreapprovalProposal",
+        Model::Neutral,
+    ),
     ("Splice.Amulet", "FeaturedAppRight", Model::Neutral),
     (
         "Utility.Registry.V0.Rule.Transfer",
@@ -767,6 +801,27 @@ fn leg_flow(leg: &Record, party: &str, kind: FlowKind) -> Result<Option<ValueFlo
         amount: amount_field(leg, "amount")?,
         kind,
     }))
+}
+
+/// The settlement and transfer leg of an allocation contract's `allocation`.
+fn allocation_fact(cid: &str, arg: &Record) -> Result<AllocationFact, FactsError> {
+    let spec = record_field(arg, "allocation")?;
+    let settlement = record_field(spec, "settlement")?;
+    let leg = record_field(spec, "transferLeg")?;
+    let instrument = record_field(leg, "instrumentId")?;
+    Ok(AllocationFact {
+        contract_id: cid.to_string(),
+        settlement_ref_id: text_field(record_field(settlement, "settlementRef")?, "id")?.to_string(),
+        transfer_leg_id: text_field(spec, "transferLegId")?.to_string(),
+        sender: party_field(leg, "sender")?.to_string(),
+        receiver: party_field(leg, "receiver")?.to_string(),
+        instrument_admin: party_field(instrument, "admin")?.to_string(),
+        instrument_id: text_field(instrument, "id")?.to_string(),
+        amount: amount_field(leg, "amount")?,
+        executor: party_field(settlement, "executor")?.to_string(),
+        allocate_before_micros: timestamp_field(settlement, "allocateBefore")?,
+        settle_before_micros: timestamp_field(settlement, "settleBefore")?,
+    })
 }
 
 fn registry_offer(transfer: &Record, party: &str) -> Result<Option<ValueFlow>, FactsError> {
@@ -1032,6 +1087,13 @@ fn int_field(r: &Record, label: &str) -> Result<i64, FactsError> {
     }
 }
 
+fn timestamp_field(r: &Record, label: &str) -> Result<i64, FactsError> {
+    match field(r, label)?.sum.as_ref() {
+        Some(Sum::Timestamp(t)) => Ok(*t),
+        _ => Err(malformed(format!("{label} is not a Timestamp"))),
+    }
+}
+
 /// The package id of `id`, which must be 64 lowercase hex characters.
 fn package_id(id: &Identifier) -> Result<String, FactsError> {
     let pkg = id.package_id.as_str();
@@ -1258,8 +1320,20 @@ mod tests {
         with_cid(create(t, arg, &[DSO, sender]), cid)
     }
 
+    fn settlement(proposal: &str) -> Value {
+        let at = |t: i64| Value { sum: Some(Sum::Timestamp(t)) };
+        record(vec![
+            ("executor", party(X)),
+            ("settlementRef", record(vec![("id", text(proposal))])),
+            ("requestedAt", at(1)),
+            ("allocateBefore", at(2)),
+            ("settleBefore", at(3)),
+        ])
+    }
+
     fn allocation(cid: &str, lock: &str, sender: &str, receiver: &str, amount: &str) -> Create {
         let spec = record(vec![
+            ("settlement", settlement("p1")),
             ("transferLegId", text("leg0")),
             ("transferLeg", leg(sender, receiver, amount, DSO, "Amulet")),
         ]);
@@ -1486,20 +1560,56 @@ mod tests {
         let arg = record(vec![
             (
                 "allocation",
-                record(vec![("transferLeg", leg(P, Q, "9.0", REG, "TOK"))]),
+                record(vec![
+                    ("settlement", settlement("p2")),
+                    ("transferLegId", text("1")),
+                    ("transferLeg", leg(P, Q, "9.0", REG, "TOK")),
+                ]),
             ),
             ("lockedHoldingCid", contract_id("h1")),
             ("operator", party(REG)),
         ]);
         let t = ident("Utility.Registry.V0.Holding.Allocation", "DvpLegAllocation");
         let f = facts(&transfer_tx(vec![with_cid(
-            create(t, arg, &[REG, P]),
+            create(t.clone(), arg.clone(), &[REG, P]),
             "a2",
         )]));
         assert_eq!(
             f.outflows,
             vec![flow(Q, REG, "TOK", "9", FlowKind::Allocation)]
         );
+        assert_eq!(
+            f.allocations,
+            vec![AllocationFact {
+                contract_id: "a2".into(),
+                settlement_ref_id: "p2".into(),
+                transfer_leg_id: "1".into(),
+                sender: P.into(),
+                receiver: Q.into(),
+                instrument_admin: REG.into(),
+                instrument_id: "TOK".into(),
+                amount: dec("9"),
+                executor: X.into(),
+                allocate_before_micros: 2,
+                settle_before_micros: 3,
+            }]
+        );
+        // Every allocation is listed, and one without its settlement is malformed
+        let two = facts(&transfer_tx(vec![
+            with_cid(create(t.clone(), arg.clone(), &[REG, P]), "a2"),
+            allocation("a3", "lx", Q, P, "1.0"),
+        ]));
+        assert_eq!(two.allocations.len(), 2);
+        assert_eq!(two.allocations.get(1).map(|a| a.sender.as_str()), Some(Q));
+        let Some(Sum::Record(mut bare)) = arg.sum.clone() else { panic!("not a record") };
+        bare.fields.retain(|f| f.label != "allocation");
+        bare.fields.push(v2::RecordField {
+            label: "allocation".into(),
+            value: Some(record(vec![("transferLeg", leg(P, Q, "9.0", REG, "TOK"))])),
+        });
+        let unsettled = Value { sum: Some(Sum::Record(bare)) };
+        let p = transfer_tx(vec![with_cid(create(t, unsettled, &[REG, P]), "a4")]);
+        assert!(malformed_reason(&p).contains("settlement"), "{}", malformed_reason(&p));
         // an allocation of a leg the party receives moves nothing of its own
         assert!(
             facts(&transfer_tx(vec![allocation("a3", "lx", Q, P, "1.0")]))
@@ -2116,6 +2226,47 @@ mod tests {
                 "Splice.ExternalPartyConfigState:ExternalPartyConfigStateV2",
             ]
         );
+    }
+
+    #[test]
+    fn the_preapproval_and_user_service_requests_move_nothing() {
+        // each is one root create of the requesting party; the other side accepts it later
+        let request = |t: (&str, &str), arg: Value| {
+            let c = with_cid(create(ident(t.0, t.1), arg, &[P]), "q1");
+            facts(&prepared(&["0"], vec![create_node("0", c)], vec![], &[P]))
+        };
+        let proposal = record(vec![
+            ("receiver", party(P)),
+            ("provider", party(REG)),
+            ("expectedDso", optional(Some(party(DSO)))),
+        ]);
+        let user = record(vec![("operator", party(REG)), ("user", party(P))]);
+        for (t, arg) in [
+            (
+                (
+                    "Splice.Wallet.TransferPreapproval",
+                    "TransferPreapprovalProposal",
+                ),
+                proposal,
+            ),
+            ((USER_SERVICE.0, "UserServiceRequest"), user.clone()),
+        ] {
+            let f = request(t, arg);
+            assert!(f.unmodelled.is_empty() && f.outflows.is_empty(), "{f:?}");
+            assert!(f.roots.is_empty() && f.root_nodes == 1, "{f:?}");
+        }
+        // only the exact modules and entities are modelled
+        for t in [
+            ("Utility.Collateral.App.Service.User", "UserServiceRequest"),
+            (
+                "Splice.Wallet.TransferPreapproval",
+                "TransferPreapprovalProposalV2",
+            ),
+            ("Splice.AmuletRules", "TransferPreapprovalProposal"),
+        ] {
+            let f = request(t, user.clone());
+            assert_eq!(f.unmodelled, [format!("{}:{}", t.0, t.1)]);
+        }
     }
 
     #[test]

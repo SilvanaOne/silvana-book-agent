@@ -39,7 +39,8 @@ Linking is optional: an agent that was never linked behaves as before.
 - From the first link on, the agent checks every transaction against what it asked for, hashes
   every transaction locally, and refuses `--force`, `--no-reject` and the `sign` command.
 - These checks read contracts by template name, so they assume genuine packages. Only a policy
-  whose packages rule lists the vetted packages, instead of allowing any, enforces that.
+  whose packages rule lists the vetted packages, instead of allowing any, or a `[vetted_packages]`
+  selection in agent.toml, enforces that.
 
 ## Linking
 
@@ -56,8 +57,10 @@ in a terminal:
 refused, as it has no rpc yet. No email is sent: the account that owns the invite code has it.
 
 Only `AGT-<invite>` is sent for registration. Once the agent is onboarded, it shows the owner
-account and the controllers of the invite and asks you to type `link`. It then prints the party
-fingerprint: check it on the Agent page to confirm the agent.
+account and the controllers of the invite, then what to check on the Agent page: under Create
+agent, the invite's row shows the same party fingerprint, owner account and passkey fingerprint.
+It then asks you to type `link` and waits 15 min: this is the only chance to link with the invite.
+After the link it prints the party fingerprint again.
 
 The link part is used only when `onboard` registers the agent (not with `--party`, nor when the env
 file already records `PARTY_AGENT`), and only once you type `link`. Without a terminal nothing is
@@ -132,7 +135,7 @@ type the phrase it shows, such as `freeze agent-1 default policy`. `--yes` is ne
 ```
 
 `control show` also lists `PARTY_FEE` and `PARTY_PREPAID_TRAFFIC` as set in the agent's own
-environment, the `[control]` and `[vetted_packages]` settings, and the passkey relying-party ids
+environment, the `[control]`, `[vetted_packages]` and `[verify]` settings, and the passkey relying-party ids
 the agent accepts. When either party is unset, no payment is treated as a fee or a traffic purchase,
 so a linked agent refuses them (see [Platform parties](#platform-parties)).
 
@@ -162,8 +165,9 @@ Agent page show.
   template's package and the interface package of each exercise or fetch made through an interface
   (input contracts are not judged). A CC transfer, for one, also uses
   `splice-api-token-transfer-instruction-v1` and `splice-api-token-holding-v1` besides
-  `splice-amulet`. The agent refuses a direct command outside the rule with reason 19
-  (`package_not_allowed`).
+  `splice-amulet`. A linked agent checks the rule in force before every signature, a direct
+  command's or its own, and refuses a transaction outside it with `package_not_allowed` (reason 19
+  in a direct command's receipt).
 
 ### The agent's own polling
 
@@ -186,22 +190,46 @@ agent does not run burns yet. The agent re-reads its control log before each ste
 auto_execute_commands = false   # run pending direct commands without a prompt (default false)
 auto_accept_policies = true     # accept valid pending policies while running (default true)
 swap_max_deviation_bps = 100    # largest gap between a swap's price and the reference mid; 0 = off; at most 10000
+swap_reference_max_age_secs = 300 # oldest reference mid the guard takes, in seconds; 30 to 3600
 
 [vetted_packages]
 mode = "selected"               # or "all", with no packages key (the default)
 packages = [
   "<64 lowercase hex package id>", # name version
 ]
+
+[verify]
+mode = "default"                # or "observe" or "enforce"
 ```
 
-Both sections are optional and read strictly: an unknown key, or a value out of range, stops the
-agent with a message naming the section and the key. The running agent reads them only when it
-starts, so restart it after a change; each `control` command reads them when it runs. With
-`auto_accept_policies = false`, pending policies wait for `control policy accept`, as they do when
-the agent knows no env file to record the marker in. `[vetted_packages]` takes `all`, or `selected` with 1 to 256 different package ids; the
-Agent page's Packages tab copies the section. The agent logs it at startup but does not enforce it
-yet: what binds is the packages rule of the policy in force, which the agent checks before it signs
-the transaction of a direct command.
+The sections are optional and read strictly: an unknown key, a value out of range, or a key of
+`[control]`, `[vetted_packages]`, `[controller]` or `[verify]` placed at the top level of agent.toml,
+or below the header of another table such as `[liquidity_provider]` or `[[markets]]` (TOML adds a
+key to the table above it), stops the agent with a message naming the section, the key and where it
+is. The running agent reads them only when it starts, so restart it after a change; each `control`
+command reads them when it runs. With `auto_accept_policies = false`, pending policies wait for
+`control policy accept`, as they do when the agent knows no env file to record the marker in.
+
+`[vetted_packages]` takes `all`, or `selected` with 1 to 256 different package ids; the Agent page's
+Packages tab copies the section. With `selected`, every agent, linked or not, checks every
+transaction before it signs it: each template's package and the interface package of each exercise
+or fetch must be listed, or the transaction is refused unsigned with `package_not_allowed`, logged
+with the package's name and version when the agent knows them or the rpc lists them (it asks at
+most once a minute). A linked
+agent also checks the packages rule of the policy in force, so a transaction passes only when both
+allow it. With a selection, local or the policy's, the agent signs only when its own hash of the
+transaction matches the server's, so the bytes it checked are the bytes it signs; a hash that does
+not match or cannot be computed is refused unsigned with `package_not_allowed`. `all` checks
+nothing.
+
+`[verify]` sets how the verifier's newer checks act while the agent is not linked: `default` takes
+each operation's own setting (the newer checks of most operations observe for now), `observe` logs
+and counts what enforcing would refuse and signs as before, and `enforce` refuses. For an operation
+whose fields are checked, enforcing also refuses a transaction whose hash does not match or cannot
+be computed, where observing signs the server's hash and counts it, unless `[vetted_packages]`
+selects packages. A check that refused before refuses in every mode, the USDCx operations and
+accepting a DvP always need a matching hash, and a linked agent enforces everything whatever the
+setting.
 
 ## Direct commands
 
@@ -271,7 +299,7 @@ code.
 | 1407 | `content_refused` | The prepared transaction is not the one the command directs, so it was not signed |
 | 1408 | `window_closed` | A quote's signed window, or the command's validity, ended before the settle |
 | 1409 | `submit_failed` | The attempt stopped before its signature, or its transaction was not on the ledger 10 minutes after the command expired |
-| 1410 | `no_reference_price` | The price guard is on and no reference mid at most 60 seconds old was available |
+| 1410 | `no_reference_price` | The price guard is on and no reference mid at most `swap_reference_max_age_secs` old (300 seconds by default) was available |
 | 1411 | `price_deviation` | The price was worse than the reference mid by more than `swap_max_deviation_bps` |
 
 A `usdcx_burn` command is refused with 1407. When the quotes of a swap failed for different reasons,
@@ -402,3 +430,28 @@ agent_party = "<agent party id>"
   outcome. Without one it exits 3, even when the rpc reports the command expired or settled.
 - A scope instrument is `cc` or `ID@ADMIN`. A swap names its instruments by admin and id; the
   agent judges Canton Coin by its own DSO.
+
+## Capturing transactions for tests
+
+Set `SILVANA_CAPTURE_DIR` to a directory to keep a copy of each transaction the agent signs. Right
+before each signature the agent appends one JSON line to `<dir>/<YYYYMMDD>.jsonl` (the UTC day):
+
+- `kind`, `path` (`ledger` or `atomic`), `party`, `command_id` and `at` (the time);
+- `expectation`, what the agent expects the transaction to do, and `request`, the request it sent
+  (protobuf, base64, named by `request_type`), without its signature, a controller's proof or a
+  swap quote's signature;
+- `prepared_transaction`, the bytes exactly as the ledger service sent them (base64);
+- `server_hash_base64` and `server_hash_hex`, `hashing_scheme_version`, `computed_hash_hex` (null
+  when none was computed), `hash_check`, `coverage` and `fees_json`.
+
+The agent reads the variable once, at its first signature; unset or blank, nothing is written.
+Capturing never delays or refuses a signature: its own thread writes the lines, and a record that
+cannot be queued or written is dropped with one warning in the log. A day's file stops growing at
+1 GiB. The directory is created with mode 0700 and the files with 0600. The records hold none of
+the agent's keys, tokens or signatures, but they do hold party ids, amounts and contract ids, so
+keep them private.
+
+Every 10 minutes the agent also logs one `control survey since start:` line with, per operation,
+its counters (hash checks, coverage, stub hits, inspector warnings, `inspector_would_refuse`,
+`hash_would_refuse`) and the packages its transactions used, by name and
+version when the rpc lists them, else by id.

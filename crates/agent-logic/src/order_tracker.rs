@@ -18,7 +18,7 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::auth::verify_order_signature_with_public_key;
 use crate::signer::{AgentSigner, OrderToSign};
-use crate::state::{SavedSettlementOrder, SavedTrackedOrder, StrategyStarts};
+use crate::state::{AdoptedTerms, SavedSettlementOrder, SavedTrackedOrder, StrategyStarts};
 
 /// Tracked order with quantity accounting
 pub struct TrackedOrder {
@@ -105,6 +105,19 @@ pub struct SettlementOrderEntry {
     pub order_id: u64,
     pub quantity: Decimal,
     pub reserved: bool,
+    /// The terms adopted with the proposal; None until recorded.
+    pub terms: Option<AdoptedTerms>,
+}
+
+/// How a proposal compares with the terms recorded when it was adopted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermsCheck {
+    NotTracked,
+    /// Tracked without terms, as restored from an older state file.
+    Unrecorded,
+    Matches,
+    /// The named field differs from the recorded terms.
+    Differs(&'static str),
 }
 
 /// Most fills kept; the oldest are dropped first.
@@ -526,8 +539,24 @@ impl OrderTracker {
         );
         self.settlement_orders.insert(
             proposal_id.to_string(),
-            SettlementOrderEntry { order_id, quantity, reserved: false },
+            SettlementOrderEntry { order_id, quantity, reserved: false, terms: None },
         );
+    }
+
+    /// Records the terms adopted for a tracked proposal; terms already recorded are kept.
+    pub fn record_terms(&mut self, proposal_id: &str, proposal: &SettlementProposal) {
+        if let Some(entry) = self.settlement_orders.get_mut(proposal_id) {
+            entry.terms.get_or_insert_with(|| AdoptedTerms::of(proposal));
+        }
+    }
+
+    /// How `proposal` compares with the terms recorded for `proposal_id`.
+    pub fn terms_check(&self, proposal_id: &str, proposal: &SettlementProposal) -> TermsCheck {
+        match self.settlement_orders.get(proposal_id).map(|entry| entry.terms.as_ref()) {
+            None => TermsCheck::NotTracked,
+            Some(None) => TermsCheck::Unrecorded,
+            Some(Some(terms)) => terms.first_difference(proposal).map_or(TermsCheck::Matches, TermsCheck::Differs),
+        }
     }
 
     /// Reserve the order capacity for an adopted settlement — called on the
@@ -701,6 +730,7 @@ impl OrderTracker {
                 order_id: entry.order_id,
                 quantity: entry.quantity.to_string(),
                 reserved: entry.reserved,
+                terms: entry.terms.clone(),
             })
             .collect();
 
@@ -747,6 +777,7 @@ impl OrderTracker {
                     // entries all had pending_quantity applied (serde default
                     // = true preserves that accounting through the upgrade).
                     reserved: saved.reserved,
+                    terms: saved.terms,
                 },
             );
         }
@@ -1023,6 +1054,29 @@ mod tests {
 
         // Now 2.0 fits again (remaining = 3.0)
         assert!(matches!(tracker.verify_settlement(&proposal2, "our-party"), VerifyResult::Accepted { .. }));
+    }
+
+    #[test]
+    fn recorded_terms_are_kept_once_recorded() {
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { test_private_key() }).unwrap());
+        let adopted = make_proposal("our-party", "counterparty", "2.0", 42, 99);
+        let mut resent = adopted.clone();
+        resent.quote_quantity = format!("{}1", resent.quote_quantity);
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::NotTracked);
+        tracker.record_terms("proposal-1", &adopted);
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::NotTracked);
+
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::Unrecorded);
+        tracker.record_terms("proposal-1", &adopted);
+        tracker.record_terms("proposal-1", &resent);
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::Matches);
+        assert_eq!(tracker.terms_check("proposal-1", &resent), TermsCheck::Differs("quote_quantity"));
+
+        let (_, _, saved) = tracker.export_state();
+        let mut restored = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { test_private_key() }).unwrap());
+        restored.import_state(Vec::new(), saved);
+        assert_eq!(restored.terms_check("proposal-1", &resent), TermsCheck::Differs("quote_quantity"));
     }
 
     // Deferred reservation: recording the adoption decision must not consume
