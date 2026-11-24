@@ -1,0 +1,36 @@
+[package]
+name = "agent-controller"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "An Ed25519 controller of linked agents: sign-in, a locally verified log and signed submissions"
+
+[dependencies]
+agent-control = { path = "../agent-control" }
+orderbook-proto = { path = "../orderbook-proto" }
+chrono.workspace = true
+ed25519-dalek = { workspace = true }
+hex.workspace = true
+prost-types.workspace = true
+rand.workspace = true
+rust_decimal = { version = "1.36", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true }
+tonic = { workspace = true }
+zeroize = { workspace = true }
+# The fake rpc of the testkit.
+base64 = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
+
+[features]
+# A fake rpc and test agents, for this crate's tests and its users' tests.
+testkit = ["dep:base64", "dep:prost", "dep:tokio-stream"]
+
+[dev-dependencies]
+base64.workspace = true
+prost.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }

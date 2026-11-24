@@ -383,6 +383,7 @@ async fn tick(
                             ticket_ids: ticket_ids.clone(),
                         })),
                         request_signature: None,
+                        controller_command: None,
                     },
                     &expectation,
                     false,
@@ -627,6 +628,8 @@ async fn split_cc(
     let expectation = OperationExpectation::SplitCc {
         party: config.party_id.clone(),
         output_amounts: output_amounts.clone(),
+        amulet_cids: input_cids.to_vec(),
+        dso_party: crate::named_party(&config.dso_party),
     };
     let resp = client
         .submit_transaction(
@@ -637,6 +640,7 @@ async fn split_cc(
                     amulet_cids: input_cids.to_vec(),
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             &expectation,
             false,
@@ -680,6 +684,7 @@ async fn split_utility(
                     splits: split_specs,
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             &expectation,
             false,

@@ -38,6 +38,7 @@ use orderbook_proto::ledger::{
     PrepareTransactionRequest, TransactionOperation,
 };
 use tx_verifier::OperationExpectation;
+use tx_verifier::ExpectedDvpTerms;
 
 use tonic::transport::Channel;
 
@@ -149,6 +150,8 @@ enum PaymentRequest {
         proposal_id: String,
         dvp_cid: String,
         allocation_cc: Option<Decimal>,  // Some(amount) for CC, None for CIP-56
+        /// The agent's own record of the DvP, when its instruments resolved.
+        terms: Option<Box<ExpectedDvpTerms>>,
     },
 }
 
@@ -327,6 +330,7 @@ impl PaymentQueue {
         proposal_id: &str,
         dvp_cid: &str,
         allocation_cc: Option<Decimal>,
+        terms: Option<ExpectedDvpTerms>,
     ) -> Result<StepResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -337,6 +341,7 @@ impl PaymentQueue {
                     proposal_id: proposal_id.to_string(),
                     dvp_cid: dvp_cid.to_string(),
                     allocation_cc,
+                    terms: terms.map(Box::new),
                 },
                 response_tx,
             })
@@ -436,17 +441,7 @@ impl PaymentQueue {
             }
 
             // Update queue depth counters
-            {
-                let (mut alloc, mut fees) = (0u64, 0u64);
-                for item in heap.iter() {
-                    match &item.request {
-                        PaymentRequest::Allocate { .. } => alloc = alloc.saturating_add(1),
-                        PaymentRequest::PayFee { .. } => fees = fees.saturating_add(1),
-                    }
-                }
-                queued_allocations.store(alloc, AtomicOrdering::Relaxed);
-                queued_fees.store(fees, AtomicOrdering::Relaxed);
-            }
+            store_depth(&heap, &queued_allocations, &queued_fees);
 
             // Ensure shared channel is initialized before dispatching
             let channel = match shared.get(&config).await {
@@ -560,6 +555,8 @@ impl PaymentQueue {
             for item in deferred {
                 heap.push(item);
             }
+            // Otherwise dispatched items stay counted until new work arrives
+            store_depth(&heap, &queued_allocations, &queued_fees);
 
             // If nothing was dispatched and heap is non-empty, backoff before retrying
             if !dispatched_any && !heap.is_empty() {
@@ -589,6 +586,19 @@ impl PaymentQueue {
     }
 }
 
+
+/// Publish the allocation and fee counts still queued, for the heartbeat.
+fn store_depth(heap: &BinaryHeap<QueuedPayment>, allocations: &AtomicU64, fees: &AtomicU64) {
+    let (mut alloc, mut fee) = (0u64, 0u64);
+    for item in heap.iter() {
+        match &item.request {
+            PaymentRequest::Allocate { .. } => alloc = alloc.saturating_add(1),
+            PaymentRequest::PayFee { .. } => fee = fee.saturating_add(1),
+        }
+    }
+    allocations.store(alloc, AtomicOrdering::Relaxed);
+    fees.store(fee, AtomicOrdering::Relaxed);
+}
 
 // ============================================================================
 // Amulet selection helpers
@@ -891,9 +901,10 @@ impl WorkerJob {
         let QueuedPayment { request, response_tx, .. } = item;
         let work = async {
             match &request {
-                PaymentRequest::Allocate { proposal_id, dvp_cid, .. } => {
+                PaymentRequest::Allocate { proposal_id, dvp_cid, terms, .. } => {
+                    let expectation = allocate_expectation(&config, proposal_id, dvp_cid, terms.as_deref().cloned());
                     execute_allocate(
-                        channel, &config, proposal_id, dvp_cid, reservation, flags, &confirm_lock, &cache,
+                        channel, &config, expectation, reservation, flags, &confirm_lock, &cache,
                     )
                     .await
                 }
@@ -994,19 +1005,38 @@ async fn execute_pay_fee(
     }
 }
 
-/// Allocate with the amulets `reservation` holds; it is released if this ends
-/// before the submit does.
-#[allow(clippy::too_many_arguments)]
-async fn execute_allocate(
-    channel: Channel,
+/// What the verifier checks an allocation against: the agent's recorded terms and the
+/// local settlement operator, when set.
+fn allocate_expectation(
     config: &BaseConfig,
     proposal_id: &str,
     dvp_cid: &str,
+    terms: Option<ExpectedDvpTerms>,
+) -> OperationExpectation {
+    OperationExpectation::Allocate {
+        party: config.party_id.clone(),
+        proposal_id: proposal_id.to_string(),
+        dvp_cid: dvp_cid.to_string(),
+        terms,
+        settlement_operator: Some(config.settlement_operator.clone()).filter(|o| !o.trim().is_empty()),
+    }
+}
+
+/// Allocate with the amulets `reservation` holds; it is released if this ends
+/// before the submit does.
+async fn execute_allocate(
+    channel: Channel,
+    config: &BaseConfig,
+    expectation: OperationExpectation,
     reservation: ReservationGuard,
     flags: Flags,
     confirm_lock: &ConfirmLock,
     cache: &CcView,
 ) -> Result<StepResult> {
+    let OperationExpectation::Allocate { proposal_id, dvp_cid, .. } = &expectation else {
+        return Err(anyhow!("not an allocation"));
+    };
+    let (proposal_id, dvp_cid) = (proposal_id.clone(), dvp_cid.clone());
     let Flags { verbose, dry_run, force, confirm } = flags;
     if confirm && !dry_run {
         confirm_transaction(
@@ -1019,12 +1049,6 @@ async fn execute_allocate(
 
     let mut client = create_client_from_channel(channel, config)?;
 
-    let expectation = OperationExpectation::Allocate {
-        party: config.party_id.clone(),
-        proposal_id: proposal_id.to_string(),
-        dvp_cid: dvp_cid.to_string(),
-    };
-
     let result = client
         .submit_transaction(
             PrepareTransactionRequest {
@@ -1035,6 +1059,7 @@ async fn execute_allocate(
                     amulet_cids: reservation.cids().to_vec(),
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             &expectation,
             verbose,
@@ -1161,7 +1186,34 @@ mod scheduler_tests {
     }
 
     fn allocate(cc: Option<Decimal>) -> PaymentRequest {
-        PaymentRequest::Allocate { proposal_id: "p1".into(), dvp_cid: "d1".into(), allocation_cc: cc }
+        PaymentRequest::Allocate { proposal_id: "p1".into(), dvp_cid: "d1".into(), allocation_cc: cc, terms: None }
+    }
+
+    // The allocation is checked against the agent's own terms and the local operator
+    #[test]
+    fn the_allocate_expectation_carries_the_recorded_terms_and_the_operator() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.settlement_operator = "op::1220dd".into();
+        let quantity = |id: &str| tx_verifier::ExpectedQuantity {
+            instrument_admin: "reg::1220aa".into(),
+            instrument_id: id.into(),
+            amount: "1".into(),
+        };
+        let terms = ExpectedDvpTerms {
+            proposal_id: "p1".into(),
+            buyer: config.party_id.clone(),
+            seller: "seller::1220bb".into(),
+            delivery: quantity("TOK"),
+            payment: quantity("USD"),
+        };
+        let e = allocate_expectation(&config, "p1", "d1", Some(terms.clone()));
+        assert!(
+            matches!(&e, OperationExpectation::Allocate { terms: Some(t), settlement_operator: Some(o), .. } if *t == terms && o == "op::1220dd"),
+            "{e:?}"
+        );
+        config.settlement_operator = " ".into();
+        let e = allocate_expectation(&config, "p1", "d1", None);
+        assert!(matches!(&e, OperationExpectation::Allocate { terms: None, settlement_operator: None, .. }), "{e:?}");
     }
 
     fn queued(request: PaymentRequest) -> (QueuedPayment, oneshot::Receiver<PaymentResponse>) {
@@ -1469,6 +1521,20 @@ mod scheduler_tests {
         .unwrap()
     }
 
+    // The heartbeat kept showing a dispatched fee as queued until other work arrived
+    #[tokio::test]
+    async fn the_fee_count_drops_once_the_fee_is_dispatched() {
+        let fake = crate::test_util::FakeLedger::start(crate::test_util::Fake::Answer).await;
+        let shutdown = Shutdown::new();
+        let queue = queue_on(&fake, shutdown.clone());
+        let paid = tokio::time::timeout(Duration::from_secs(10), queue.submit_pay_fee("p1", "dvp")).await;
+        let depth = queue.queue_depth();
+        shutdown.signal();
+        fake.stop().await;
+        assert!(paid.is_ok(), "the fee is answered");
+        assert_eq!(depth, (0, 0));
+    }
+
     // An overload forecast does not hold back the fee, which is paid off-chain
     #[tokio::test]
     async fn an_overload_forecast_does_not_hold_back_a_fee() {
@@ -1496,7 +1562,7 @@ mod scheduler_tests {
         let shutdown = Shutdown::new();
         let queue = Arc::new(queue_on(&fake, shutdown.clone()));
         let waiting = Arc::clone(&queue);
-        let allocation = tokio::spawn(async move { waiting.submit_allocate("p0", "d0", Some(dec("10"))).await });
+        let allocation = tokio::spawn(async move { waiting.submit_allocate("p0", "d0", Some(dec("10")), None).await });
         let held = tokio::time::timeout(Duration::from_secs(5), async {
             while queue.queue_depth().0 < 1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;

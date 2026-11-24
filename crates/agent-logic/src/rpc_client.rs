@@ -323,15 +323,26 @@ impl OrderbookRpcClient {
     /// Get settlement status including next actions for buyer/seller
     ///
     /// Returns the full settlement status with per-step details and
-    /// server-computed NextAction for each party.
+    /// server-computed NextAction for each party. Asks for the multicall
+    /// accept; see [`Self::get_settlement_status_with`].
     pub async fn get_settlement_status(
         &mut self,
         settlement_id: &str,
     ) -> Result<GetSettlementStatusResponse> {
+        self.get_settlement_status_with(settlement_id, true).await
+    }
+
+    /// Get settlement status. `supports_multicall` is true only for a caller
+    /// that runs `NextAction::MulticallAccept` itself; otherwise steps come one at a time.
+    pub async fn get_settlement_status_with(
+        &mut self,
+        settlement_id: &str,
+        supports_multicall: bool,
+    ) -> Result<GetSettlementStatusResponse> {
         let request = GetSettlementStatusRequest {
             auth: None, // External parties use metadata auth
             settlement_id: settlement_id.to_string(),
-            supports_multicall: true,
+            supports_multicall,
         };
 
         transport::with_deadline(
@@ -476,12 +487,13 @@ mod tests {
             ("SubmitPreconfirmation", bounded(c.submit_preconfirmation("p", "s", "party", true)).await),
             ("CancelSettlement", bounded(c.cancel_settlement("p", "test")).await),
             ("GetSettlementStatus", bounded(c.get_settlement_status("s")).await),
+            ("GetSettlementStatus", bounded(c.get_settlement_status_with("s", false)).await),
         ];
         for (what, err) in errors {
             let expected = format!("{what} RPC failed (Unavailable): client deadline");
             assert!(err.starts_with(&expected), "{err}");
         }
-        wait_for("every call to reach the server", || calls.load(Ordering::SeqCst) == 8).await;
+        wait_for("every call to reach the server", || calls.load(Ordering::SeqCst) == 9).await;
     }
 
     #[tokio::test]

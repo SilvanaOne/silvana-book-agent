@@ -4,19 +4,21 @@
 //! settlement proposals against them. User orders (placed via frontend) are
 //! imported from the server on demand.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::Engine;
 use rust_decimal::Decimal;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use orderbook_proto::orderbook::{Order, SettlementProposal};
+use orderbook_proto::orderbook::{Order, OrderType, SettlementProposal};
+use rust_decimal::prelude::ToPrimitive;
 
-use crate::auth::{sign_order_data, verify_order_signature};
-use crate::state::{SavedSettlementOrder, SavedTrackedOrder};
+use crate::auth::verify_order_signature_with_public_key;
+use crate::signer::{AgentSigner, OrderToSign};
+use crate::state::{AdoptedTerms, SavedSettlementOrder, SavedTrackedOrder, StrategyStarts};
 
 /// Tracked order with quantity accounting
 pub struct TrackedOrder {
@@ -103,12 +105,57 @@ pub struct SettlementOrderEntry {
     pub order_id: u64,
     pub quantity: Decimal,
     pub reserved: bool,
+    /// The terms adopted with the proposal; None until recorded.
+    pub terms: Option<AdoptedTerms>,
+}
+
+/// How a proposal compares with the terms recorded when it was adopted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermsCheck {
+    NotTracked,
+    /// Tracked without terms, as restored from an older state file.
+    Unrecorded,
+    Matches,
+    /// The named field differs from the recorded terms.
+    Differs(&'static str),
+}
+
+/// Most fills kept; the oldest are dropped first.
+const FILLS_CAP: usize = 4096;
+
+/// One settled match of an agent order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fill {
+    pub seq: u64,
+    pub at: Instant,
+    pub order_id: u64,
+    pub market_id: String,
+    /// OrderType as i32
+    pub side: i32,
+    /// The order's limit: exact for our bids, a lower bound for our offers
+    pub price: Decimal,
+    pub quantity: Decimal,
+    /// The settlement this fill came from
+    pub proposal_id: String,
+}
+
+/// Open settlements and their matched, unsettled amounts in one market.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MarketActivity {
+    pub open_settlements: usize,
+    pub pending_bid_base: f64,
+    pub pending_bid_quote: f64,
+    pub pending_offer_base: f64,
+    pub pending_offer_quote: f64,
+    pub last_fill_at: Option<Instant>,
 }
 
 /// Order tracker with immutable start_time and Ed25519 key
 pub struct OrderTracker {
     start_time_ms: u64,
     private_key: crate::secret::Secret<32>,
+    /// The signer for `private_key`, resolved on first use.
+    signer: std::sync::OnceLock<AgentSigner>,
     orders: HashMap<u64, TrackedOrder>,
     /// Maps proposal_id → adoption record for active settlements
     settlement_orders: HashMap<String, SettlementOrderEntry>,
@@ -118,6 +165,11 @@ pub struct OrderTracker {
     submit_failed_at: HashMap<String, Instant>,
     /// Failed submits by the time they failed, oldest first
     failed_submits: VecDeque<(Instant, FailedSubmit)>,
+    /// Recent fills, oldest first, and the last sequence number given out
+    fills: VecDeque<Fill>,
+    fill_seq: u64,
+    /// Strategy start balances, saved with the state
+    strategy_starts: StrategyStarts,
     #[cfg(test)]
     fail_signing: bool,
 }
@@ -128,11 +180,15 @@ impl OrderTracker {
         Self {
             start_time_ms,
             private_key,
+            signer: std::sync::OnceLock::new(),
             orders: HashMap::new(),
             settlement_orders: HashMap::new(),
             placing: Arc::new(Mutex::new(HashMap::new())),
             submit_failed_at: HashMap::new(),
             failed_submits: VecDeque::new(),
+            fills: VecDeque::new(),
+            fill_seq: 0,
+            strategy_starts: StrategyStarts::default(),
             #[cfg(test)]
             fail_signing: false,
         }
@@ -254,19 +310,19 @@ impl OrderTracker {
 
         let nonce = crate::clock::now_millis();
 
-        // Canonical JSON with sorted keys (BTreeMap guarantees alphabetical order)
-        let mut fields = BTreeMap::new();
-        fields.insert("market_id", serde_json::Value::String(market_id.to_string()));
-        fields.insert("nonce", serde_json::json!(nonce));
-        fields.insert("order_type", serde_json::Value::String(order_type.to_string()));
-        fields.insert("placed_by", serde_json::Value::String("agent".to_string()));
-        fields.insert("price", serde_json::Value::String(price.to_string()));
-        fields.insert("quantity", serde_json::Value::String(quantity.to_string()));
-        let signed_data_bytes =
-            serde_json::to_vec(&fields).context("failed to serialize order for signing")?;
-        let signature = sign_order_data(&*self.private_key.expose()?, &signed_data_bytes);
+        // Canonical JSON with sorted keys, built and signed by the signer
+        let signed = self.signer()?.sign_order(&OrderToSign { market_id, order_type, price, quantity, nonce })?;
 
-        Ok((signature, signed_data_bytes, nonce))
+        Ok((signed.signature, signed.signed_data, nonce))
+    }
+
+    /// The signer for the agent key.
+    fn signer(&self) -> Result<&AgentSigner> {
+        if let Some(signer) = self.signer.get() {
+            return Ok(signer);
+        }
+        let signer = crate::signer::resolve(&self.private_key)?;
+        Ok(self.signer.get_or_init(|| signer))
     }
 
     /// Track an order placed by the agent
@@ -382,11 +438,11 @@ impl OrderTracker {
         }
 
         // Verify signature
-        let key = match self.private_key.expose() {
-            Ok(key) => key,
+        let signer = match self.signer() {
+            Ok(signer) => signer,
             Err(e) => return VerifyResult::Rejected { reason: format!("Order {order_id}: signing key unavailable: {e}") },
         };
-        if !verify_order_signature(&key, &tracked.signed_data, &tracked.signature) {
+        if !verify_order_signature_with_public_key(signer.verifying_key(), &tracked.signed_data, &tracked.signature) {
             return VerifyResult::Rejected {
                 reason: format!("Order {} has invalid signature", order_id),
             };
@@ -427,11 +483,11 @@ impl OrderTracker {
         };
 
         // Verify signature with our key
-        let key = match self.private_key.expose() {
-            Ok(key) => key,
+        let signer = match self.signer() {
+            Ok(signer) => signer,
             Err(e) => return VerifyResult::Rejected { reason: format!("Order {order_id}: signing key unavailable: {e}") },
         };
-        if !verify_order_signature(&key, &order.signed_data, &signature) {
+        if !verify_order_signature_with_public_key(signer.verifying_key(), &order.signed_data, &signature) {
             return VerifyResult::Rejected {
                 reason: format!("Order {} signature verification failed (not signed by our key)", order_id),
             };
@@ -483,8 +539,24 @@ impl OrderTracker {
         );
         self.settlement_orders.insert(
             proposal_id.to_string(),
-            SettlementOrderEntry { order_id, quantity, reserved: false },
+            SettlementOrderEntry { order_id, quantity, reserved: false, terms: None },
         );
+    }
+
+    /// Records the terms adopted for a tracked proposal; terms already recorded are kept.
+    pub fn record_terms(&mut self, proposal_id: &str, proposal: &SettlementProposal) {
+        if let Some(entry) = self.settlement_orders.get_mut(proposal_id) {
+            entry.terms.get_or_insert_with(|| AdoptedTerms::of(proposal));
+        }
+    }
+
+    /// How `proposal` compares with the terms recorded for `proposal_id`.
+    pub fn terms_check(&self, proposal_id: &str, proposal: &SettlementProposal) -> TermsCheck {
+        match self.settlement_orders.get(proposal_id).map(|entry| entry.terms.as_ref()) {
+            None => TermsCheck::NotTracked,
+            Some(None) => TermsCheck::Unrecorded,
+            Some(Some(terms)) => terms.first_difference(proposal).map_or(TermsCheck::Matches, TermsCheck::Differs),
+        }
     }
 
     /// Reserve the order capacity for an adopted settlement — called on the
@@ -544,8 +616,69 @@ impl OrderTracker {
                     "[{}] Order {} settled: {} (pending={}, settled={})",
                     proposal_id, entry.order_id, entry.quantity, order.pending_quantity, order.settled_quantity
                 );
+                let (market_id, side, price) = (order.market_id.clone(), order.order_type, order.price);
+                self.push_fill(entry.order_id, market_id, side, price, entry.quantity, proposal_id);
             }
         }
+    }
+
+    fn push_fill(&mut self, order_id: u64, market_id: String, side: i32, price: Decimal, quantity: Decimal, proposal_id: &str) {
+        self.fill_seq = self.fill_seq.saturating_add(1);
+        if self.fills.len() >= FILLS_CAP {
+            self.fills.pop_front();
+        }
+        let at = Instant::now();
+        let proposal_id = proposal_id.to_string();
+        self.fills.push_back(Fill { seq: self.fill_seq, at, order_id, market_id, side, price, quantity, proposal_id });
+    }
+
+    /// Whether an order was matched at all: settled, pending, or with a settlement under way.
+    pub(crate) fn order_matched(&self, order_id: u64) -> bool {
+        let traded = self
+            .orders
+            .get(&order_id)
+            .is_some_and(|o| o.settled_quantity > Decimal::ZERO || o.pending_quantity > Decimal::ZERO);
+        traded || self.settlement_orders.values().any(|e| e.order_id == order_id)
+    }
+
+    /// Fills with a sequence number above `seq`, oldest first.
+    pub fn fills_after(&self, seq: u64) -> Vec<Fill> {
+        self.fills.iter().filter(|f| f.seq > seq).cloned().collect()
+    }
+
+    /// Sequence number of the latest fill (0 before any).
+    pub fn last_fill_seq(&self) -> u64 {
+        self.fill_seq
+    }
+
+    pub(crate) fn strategy_starts(&self) -> &StrategyStarts {
+        &self.strategy_starts
+    }
+
+    pub(crate) fn strategy_starts_mut(&mut self) -> &mut StrategyStarts {
+        &mut self.strategy_starts
+    }
+
+    /// Open settlements of tracked orders in `market_id`, with their pending amounts.
+    pub fn market_activity(&self, market_id: &str) -> MarketActivity {
+        let mut activity = MarketActivity::default();
+        for entry in self.settlement_orders.values() {
+            let Some(order) = self.orders.get(&entry.order_id).filter(|o| o.market_id == market_id) else {
+                continue;
+            };
+            activity.open_settlements = activity.open_settlements.saturating_add(1);
+            let base = entry.quantity.to_f64().unwrap_or(0.0);
+            let quote = base * order.price.to_f64().unwrap_or(0.0);
+            if order.order_type == OrderType::Bid as i32 {
+                activity.pending_bid_base += base;
+                activity.pending_bid_quote += quote;
+            } else if order.order_type == OrderType::Offer as i32 {
+                activity.pending_offer_base += base;
+                activity.pending_offer_quote += quote;
+            }
+        }
+        activity.last_fill_at = self.fills.iter().rev().find(|f| f.market_id == market_id).map(|f| f.at);
+        activity
     }
 
     /// Mark settlement as failed — release pending quantity (if it was reserved)
@@ -597,6 +730,7 @@ impl OrderTracker {
                 order_id: entry.order_id,
                 quantity: entry.quantity.to_string(),
                 reserved: entry.reserved,
+                terms: entry.terms.clone(),
             })
             .collect();
 
@@ -643,6 +777,7 @@ impl OrderTracker {
                     // entries all had pending_quantity applied (serde default
                     // = true preserves that accounting through the upgrade).
                     reserved: saved.reserved,
+                    terms: saved.terms,
                 },
             );
         }
@@ -707,7 +842,7 @@ fn check_capacity(order: &TrackedOrder, order_id: u64, requested: &str) -> Verif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::sign_order_data;
+    use crate::auth::{sign_order_data, verify_order_signature};
     use orderbook_proto::orderbook::OrderType;
 
     fn test_private_key() -> [u8; 32] {
@@ -919,6 +1054,29 @@ mod tests {
 
         // Now 2.0 fits again (remaining = 3.0)
         assert!(matches!(tracker.verify_settlement(&proposal2, "our-party"), VerifyResult::Accepted { .. }));
+    }
+
+    #[test]
+    fn recorded_terms_are_kept_once_recorded() {
+        let mut tracker = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { test_private_key() }).unwrap());
+        let adopted = make_proposal("our-party", "counterparty", "2.0", 42, 99);
+        let mut resent = adopted.clone();
+        resent.quote_quantity = format!("{}1", resent.quote_quantity);
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::NotTracked);
+        tracker.record_terms("proposal-1", &adopted);
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::NotTracked);
+
+        tracker.record_settlement_order("proposal-1", 42, Decimal::from_str("2.0").unwrap());
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::Unrecorded);
+        tracker.record_terms("proposal-1", &adopted);
+        tracker.record_terms("proposal-1", &resent);
+        assert_eq!(tracker.terms_check("proposal-1", &adopted), TermsCheck::Matches);
+        assert_eq!(tracker.terms_check("proposal-1", &resent), TermsCheck::Differs("quote_quantity"));
+
+        let (_, _, saved) = tracker.export_state();
+        let mut restored = OrderTracker::new(1000, crate::secret::Secret::seal(&mut { test_private_key() }).unwrap());
+        restored.import_state(Vec::new(), saved);
+        assert_eq!(restored.terms_check("proposal-1", &resent), TermsCheck::Differs("quote_quantity"));
     }
 
     // Deferred reservation: recording the adoption decision must not consume
@@ -1300,5 +1458,74 @@ mod tests {
         let reason = rejected_reason(tracker.verify_and_import_order(&order, &proposal));
         assert!(reason.contains("signing key unavailable"), "{reason}");
         assert!(!tracker.orders.contains_key(&43));
+    }
+
+    // ---- fills ----
+
+    fn settle_one(tracker: &mut OrderTracker, proposal_id: &str, order_id: u64, quantity: &str) {
+        tracker.record_settlement_order(proposal_id, order_id, Decimal::from_str(quantity).unwrap());
+        tracker.try_reserve_pending(proposal_id).unwrap();
+    }
+
+    fn fills_tracker() -> OrderTracker {
+        let mut tracker = OrderTracker::new(0, crate::secret::Secret::seal(&mut [5u8; 32]).unwrap());
+        tracker.track_order(1, "HTEST-USDC", OrderType::Bid as i32, "0.0016", "10000", 1, "sig", b"d");
+        tracker.track_order(2, "HTEST-USDC", OrderType::Offer as i32, "0.0017", "10000", 2, "sig", b"d");
+        tracker.track_order(3, "CC-USDC", OrderType::Bid as i32, "0.15", "100", 3, "sig", b"d");
+        tracker
+    }
+
+    #[test]
+    fn each_settlement_records_one_fill_and_failures_none() {
+        let mut tracker = fills_tracker();
+        settle_one(&mut tracker, "p1", 1, "2500");
+        settle_one(&mut tracker, "p2", 2, "1000");
+        tracker.mark_settled("p1");
+        tracker.mark_settled("p1"); // a repeat finds no entry
+        tracker.mark_failed("p2");
+        tracker.record_settlement_order("p3", 3, Decimal::from_str("10").unwrap());
+        tracker.mark_settled("p3"); // never reserved
+        let fills = tracker.fills_after(0);
+        assert_eq!(fills.len(), 1);
+        let f = &fills[0];
+        assert_eq!((f.seq, f.order_id, f.market_id.as_str(), f.side), (1, 1, "HTEST-USDC", OrderType::Bid as i32));
+        assert_eq!((f.price, f.quantity), (Decimal::from_str("0.0016").unwrap(), Decimal::from_str("2500").unwrap()));
+        assert_eq!(tracker.last_fill_seq(), 1);
+        assert!(tracker.fills_after(1).is_empty());
+    }
+
+    #[test]
+    fn the_fill_ring_keeps_the_newest() {
+        let mut tracker = fills_tracker();
+        for n in 0..(FILLS_CAP + 10) {
+            let id = format!("p{n}");
+            settle_one(&mut tracker, &id, 1, "1");
+            tracker.mark_settled(&id);
+        }
+        let fills = tracker.fills_after(0);
+        assert_eq!(fills.len(), FILLS_CAP);
+        assert_eq!(fills.first().map(|f| f.seq), Some(11));
+        assert_eq!(tracker.last_fill_seq(), u64::try_from(FILLS_CAP + 10).unwrap());
+    }
+
+    #[test]
+    fn market_activity_sums_open_settlements_per_side() {
+        let mut tracker = fills_tracker();
+        assert_eq!(tracker.market_activity("HTEST-USDC"), MarketActivity::default());
+        settle_one(&mut tracker, "p1", 1, "2500");
+        settle_one(&mut tracker, "p2", 2, "1000");
+        tracker.record_settlement_order("p3", 2, Decimal::from_str("500").unwrap()); // adopted, unreserved
+        settle_one(&mut tracker, "p4", 3, "10");
+        let a = tracker.market_activity("HTEST-USDC");
+        assert_eq!(a.open_settlements, 3);
+        assert!((a.pending_bid_base - 2500.0).abs() < 1e-9 && (a.pending_bid_quote - 4.0).abs() < 1e-9);
+        assert!((a.pending_offer_base - 1500.0).abs() < 1e-9 && (a.pending_offer_quote - 2.55).abs() < 1e-9);
+        assert_eq!(a.last_fill_at, None);
+        tracker.mark_settled("p1");
+        let a = tracker.market_activity("HTEST-USDC");
+        assert_eq!(a.open_settlements, 2);
+        assert!(a.last_fill_at.is_some());
+        assert_eq!(tracker.market_activity("CC-USDC").open_settlements, 1);
+        assert_eq!(tracker.market_activity("CC-USDC").last_fill_at, None);
     }
 }

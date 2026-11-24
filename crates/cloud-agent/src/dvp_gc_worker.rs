@@ -715,6 +715,7 @@ async fn archive_one(
                     dvp_proposal_cid: item.cid.clone(),
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             OperationExpectation::CancelDvpProposal {
                 party: config.party_id.clone(),
@@ -729,6 +730,7 @@ async fn archive_one(
                     reason: REJECT_REASON.to_string(),
                 })),
                 request_signature: None,
+                controller_command: None,
             },
             OperationExpectation::RejectDvpProposal {
                 party: config.party_id.clone(),

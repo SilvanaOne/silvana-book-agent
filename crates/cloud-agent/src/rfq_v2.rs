@@ -38,7 +38,7 @@ use agent_logic::state::SavedPendingV2;
 use atomic_quote::envelope::{
     canonical_from_dvp, InstrumentIdJson, LpFeeJson, QuoteJson, ENVELOPE_VERSION,
 };
-use atomic_quote::{render_decimal, sign_quote_scalar, verify_quote, QuoteSide};
+use atomic_quote::{render_decimal, verify_quote, QuoteSide};
 use orderbook_proto::rfqv2::{
     AtomicAcsContract, AtomicDisclosedContract, AtomicFeeSpec, AtomicQuote, AtomicQuoteEnvelope,
     RfqConfirmReject, RfqConfirmRejectReason, RfqConfirmRequest,
@@ -212,7 +212,7 @@ pub struct RfqV2State {
     party_id: String,
     lp_name: String,
     synchronizer_id: String,
-    quote_key: agent_logic::config::AtomicQuoteKey,
+    quote_signer: agent_logic::signer::QuoteSigner,
     v2: RfqV2Config,
     /// rfq_v2-enabled markets only
     market_v2: HashMap<String, RfqV2MarketConfig>,
@@ -248,7 +248,7 @@ impl RfqV2State {
         party_id: String,
         lp_name: String,
         synchronizer_id: String,
-        quote_key: agent_logic::config::AtomicQuoteKey,
+        quote_signer: agent_logic::signer::QuoteSigner,
         v2: RfqV2Config,
         market_v2: HashMap<String, RfqV2MarketConfig>,
         market_instruments: HashMap<String, MarketInstruments>,
@@ -271,7 +271,7 @@ impl RfqV2State {
             party_id,
             lp_name,
             synchronizer_id,
-            quote_key,
+            quote_signer,
             v2,
             market_v2,
             market_instruments,
@@ -1122,7 +1122,16 @@ impl RfqV2State {
                 ));
             }
         };
-        let signed = self.quote_key.scalar().map_err(anyhow::Error::from).and_then(|k| sign_quote_scalar(&k, &canonical));
+        let intent = agent_logic::signer::QuoteIntent {
+            quote_id: &quote_id,
+            market_id: &market_id,
+            side: side.daml(),
+            base_amount: &base_amount_str,
+            quote_amount: &quote_amount_str,
+            user_party: &req.user_party,
+            lp_fee: settlement_fee.as_ref().map(|f| f.amount.as_str()),
+        };
+        let signed = self.quote_signer.authorize_and_sign(&intent, &canonical).await;
         let signature = match signed {
             Ok(s) => s,
             Err(e) => {
@@ -1629,11 +1638,13 @@ pub(crate) mod tests {
                 quote_is_cc: false,
             },
         );
+        let base = agent_logic::config::BaseConfig::test_minimal().unwrap();
+        let quote_signer = agent_logic::signer::resolve_quote(&quote_key, &base.private_key).unwrap();
         RfqV2State::new(
             "lp-party::1220test".to_string(),
             "LP Test".to_string(),
             "sync::test".to_string(),
-            quote_key,
+            quote_signer,
             v2,
             HashMap::new(),
             market_instruments,

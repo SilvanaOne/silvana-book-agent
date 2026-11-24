@@ -10,15 +10,23 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use orderbook_proto::orderbook::{Order, OrderType, SubmitOrderResponse};
+use orderbook_proto::orderbook::{Order, OrderType, SubmitOrderResponse, TimeInForce};
 use orderbook_proto::ledger::TokenBalance;
 
 use crate::client::OrderbookClient;
 use crate::config::{BaseConfig, MarketConfig, PriceLevel};
 use crate::net_position::NetPositionTracker;
-use crate::order_tracker::{FailedSubmit, OrderTracker, PlacementGuard};
+use crate::order_tracker::{FailedSubmit, MarketActivity, OrderTracker, PlacementGuard};
 use crate::pool_impact::{self, ImpactSide, PoolDepth};
 use crate::shutdown::Shutdown;
+use crate::state::{Held, StrategyStarts};
+use crate::strategy::book::{book_top, BookTop};
+use crate::strategy::gate::{GateInputs, Verdict};
+use crate::strategy::report::{format_report, ReportLine};
+use crate::strategy::{
+    sizing, BookNeed, CapState, Decide, Decision, Inventory, Ladder, MarketView, SettleCap, Start, StrategyRuntime,
+    StrategyState, TakeTif, Want, REPORT_EVERY,
+};
 
 /// Whether one grid side can be funded from the current balances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +194,18 @@ pub struct OrderManager {
     resume_from: usize,
     /// Orders whose cancel failed, per market; retried while still listed.
     pending_cancels: HashMap<String, HashSet<u64>>,
+    /// Bid ladder at the last placement, per market (offers: `last_shaped_offers`).
+    last_bids: HashMap<String, Vec<PriceLevel>>,
+    /// Server minimum order size per market, at the price it was fetched for.
+    min_base: HashMap<String, MinBase>,
+    /// Grid rungs (offer side, index) left out for the minimum order value, per market.
+    min_dropped: HashMap<String, HashSet<(bool, usize)>>,
+    /// Server timestamp (unix seconds) of the last price per market.
+    price_stamps: HashMap<String, i64>,
+    /// Markets run by a `[markets.strategy]` table, created on their first visit.
+    strategies: HashMap<String, StrategyRuntime>,
+    /// Fills and start balances of grid markets, for their report line.
+    grid_reports: HashMap<String, StrategyRuntime>,
     #[cfg(test)]
     stub_price: Option<f64>,
     #[cfg(test)]
@@ -200,7 +220,58 @@ pub struct OrderManager {
     stop_on_price: Option<Shutdown>,
     #[cfg(test)]
     fail_order_ref: bool,
+    #[cfg(test)]
+    stub_depth: Option<(orderbook_proto::orderbook::OrderbookDepth, orderbook_proto::orderbook::OrderbookDepth)>,
+    #[cfg(test)]
+    stub_min_base: Option<Option<f64>>,
+    #[cfg(test)]
+    stub_stamp: Option<i64>,
+    #[cfg(test)]
+    stub_refuse: Option<String>,
+    #[cfg(test)]
+    submit_log: Vec<(OrderType, String, String, TimeInForce)>,
+    #[cfg(test)]
+    stub_settlements: Option<Vec<orderbook_proto::orderbook::Settlement>>,
+    #[cfg(test)]
+    stub_decision: Option<Decision>,
 }
+
+/// Server minimum order size for a market, as last fetched.
+#[derive(Debug, Clone, Copy)]
+struct MinBase {
+    /// Least base quantity at `at_price`; None when the server gives none
+    qty: Option<f64>,
+    at_price: f64,
+    fetched: Instant,
+    warned_at: Option<Instant>,
+}
+
+impl MinBase {
+    /// Least order value in quote units with 1% headroom; 0 when unknown.
+    fn min_value(&self) -> f64 {
+        self.qty.map_or(0.0, |q| q * self.at_price * 1.01)
+    }
+}
+
+/// The minimum is fetched again after this long, or after a 2% price move.
+const MIN_BASE_REFRESH: Duration = Duration::from_secs(600);
+const MIN_BASE_MOVE: f64 = 0.02;
+/// After a failed lookup the minimum is retried this often.
+const MIN_BASE_RETRY: Duration = Duration::from_secs(60);
+/// Book levels fetched for a strategy.
+const BOOK_DEPTH: u32 = 20;
+/// A strategy side is re-quoted once its target moves this far (percent of the reference)...
+const REQUOTE_PCT: f64 = 0.02;
+/// ...or, once its orders are this old, by half a tick.
+const REQUOTE_AGE: Duration = Duration::from_secs(120);
+/// A grid rung left out for the minimum order value returns at this multiple of it.
+const MIN_READD: f64 = 1.05;
+/// A maker withdraws after this many cycles in a row without book depth.
+const DEPTH_FAILS_WITHDRAW: u32 = 6;
+/// A resting take still listed this long past its ttl is cancelled.
+const REST_GRACE: Duration = Duration::from_secs(5);
+/// A failed settlement-history lookup is tried again after this.
+const HISTORY_RETRY: Duration = Duration::from_secs(30);
 
 /// Shaped rungs below this fraction of their configured size are dropped, not
 /// placed. Overridable via `pool_impact.grid_min_rung_base`.
@@ -254,6 +325,12 @@ impl OrderManager {
             force_refresh: HashSet::new(),
             resume_from: 0,
             pending_cancels: HashMap::new(),
+            last_bids: HashMap::new(),
+            min_base: HashMap::new(),
+            min_dropped: HashMap::new(),
+            price_stamps: HashMap::new(),
+            strategies: HashMap::new(),
+            grid_reports: HashMap::new(),
             #[cfg(test)]
             stub_price: None,
             #[cfg(test)]
@@ -268,6 +345,20 @@ impl OrderManager {
             stop_on_price: None,
             #[cfg(test)]
             fail_order_ref: false,
+            #[cfg(test)]
+            stub_depth: None,
+            #[cfg(test)]
+            stub_min_base: None,
+            #[cfg(test)]
+            stub_stamp: None,
+            #[cfg(test)]
+            stub_refuse: None,
+            #[cfg(test)]
+            submit_log: Vec::new(),
+            #[cfg(test)]
+            stub_settlements: None,
+            #[cfg(test)]
+            stub_decision: None,
         }
     }
 
@@ -365,60 +456,7 @@ impl OrderManager {
         order_ref: Option<String>,
     ) -> Result<u64> {
         debug!("Placing bid: {} {} @ {}", quantity, market_id, price);
-
-        // Sign the order; the guard holds matching proposals until it is tracked
-        let (placement, (signature, signed_data, nonce)) = {
-            let tracker = self.tracker.lock().await;
-            let placement = tracker.begin_placement(market_id);
-            (placement, tracker.sign_order(market_id, "bid", price, quantity)?)
-        };
-
-        let response = match self.submit_signed(
-            market_id,
-            OrderType::Bid,
-            price,
-            quantity,
-            order_ref,
-            &signature,
-            &signed_data,
-            nonce,
-        ).await {
-            Ok(response) => response,
-            Err(e) => {
-                if submit_outcome_unknown(&e) {
-                    let submit = FailedSubmit {
-                        market_id: market_id.to_string(),
-                        order_type: OrderType::Bid as i32,
-                        price: price.to_string(),
-                        quantity: quantity.to_string(),
-                        nonce,
-                        signature,
-                        signed_data,
-                    };
-                    self.note_submit_failed(submit, placement).await;
-                } else {
-                    drop(placement);
-                }
-                return Err(e);
-            }
-        };
-
-        if response.success {
-            let order_id = response.order.as_ref().map(|o| o.order_id).unwrap_or(0);
-            debug!("Bid placed: order_id={}", order_id);
-
-            // Track the order
-            let mut tracker = self.tracker.lock().await;
-            tracker.track_order(
-                order_id, market_id, OrderType::Bid as i32,
-                price, quantity, nonce, &signature, &signed_data,
-            );
-            drop(placement);
-
-            Ok(order_id)
-        } else {
-            anyhow::bail!("Failed to place bid: {}", response.message)
-        }
+        self.place(market_id, OrderType::Bid, price, quantity, order_ref, TimeInForce::Gtc, None).await
     }
 
     /// Place an offer order (signed and tracked)
@@ -430,30 +468,71 @@ impl OrderManager {
         order_ref: Option<String>,
     ) -> Result<u64> {
         debug!("Placing offer: {} {} @ {}", quantity, market_id, price);
+        self.place(market_id, OrderType::Offer, price, quantity, order_ref, TimeInForce::Gtc, None).await
+    }
+
+    /// Place an immediate-or-cancel order, signed and tracked like the grid's.
+    pub async fn place_ioc(
+        &mut self,
+        market_id: &str,
+        side: OrderType,
+        price: &str,
+        quantity: &str,
+        order_ref: Option<String>,
+    ) -> Result<u64> {
+        debug!("Placing IOC {:?}: {} {} @ {}", side, quantity, market_id, price);
+        self.place(market_id, side, price, quantity, order_ref, TimeInForce::Ioc, None).await
+    }
+
+    /// Place an order that expires `ttl_secs` from now.
+    pub async fn place_gtd(
+        &mut self,
+        market_id: &str,
+        side: OrderType,
+        price: &str,
+        quantity: &str,
+        order_ref: Option<String>,
+        ttl_secs: u64,
+    ) -> Result<u64> {
+        debug!("Placing GTD {:?} ({}s): {} {} @ {}", side, ttl_secs, quantity, market_id, price);
+        let ttl = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
+        let expires_at = prost_types::Timestamp { seconds: crate::clock::now_secs_i64().saturating_add(ttl), nanos: 0 };
+        self.place(market_id, side, price, quantity, order_ref, TimeInForce::Gtd, Some(expires_at)).await
+    }
+
+    /// Sign, submit and track one order; the time in force is not signed.
+    #[allow(clippy::too_many_arguments)]
+    async fn place(
+        &mut self,
+        market_id: &str,
+        side: OrderType,
+        price: &str,
+        quantity: &str,
+        order_ref: Option<String>,
+        tif: TimeInForce,
+        expires_at: Option<prost_types::Timestamp>,
+    ) -> Result<u64> {
+        let label = if side == OrderType::Bid { "bid" } else { "offer" };
 
         // Sign the order; the guard holds matching proposals until it is tracked
         let (placement, (signature, signed_data, nonce)) = {
             let tracker = self.tracker.lock().await;
             let placement = tracker.begin_placement(market_id);
-            (placement, tracker.sign_order(market_id, "offer", price, quantity)?)
+            (placement, tracker.sign_order(market_id, label, price, quantity)?)
         };
 
-        let response = match self.submit_signed(
-            market_id,
-            OrderType::Offer,
-            price,
-            quantity,
-            order_ref,
-            &signature,
-            &signed_data,
-            nonce,
-        ).await {
+        let submitted = self
+            .submit_signed(market_id, side, price, quantity, order_ref, &signature, &signed_data, nonce, tif, expires_at)
+            .await;
+        let response = match submitted {
             Ok(response) => response,
             Err(e) => {
                 if submit_outcome_unknown(&e) {
+                    // May have been booked: a later withdraw must list the market again
+                    self.last_resting.remove(market_id);
                     let submit = FailedSubmit {
                         market_id: market_id.to_string(),
-                        order_type: OrderType::Offer as i32,
+                        order_type: side as i32,
                         price: price.to_string(),
                         quantity: quantity.to_string(),
                         nonce,
@@ -469,20 +548,22 @@ impl OrderManager {
         };
 
         if response.success {
+            // Something rests now, so the next withdraw lists the market
+            self.last_resting.remove(market_id);
             let order_id = response.order.as_ref().map(|o| o.order_id).unwrap_or(0);
-            debug!("Offer placed: order_id={}", order_id);
+            debug!("{} placed: order_id={}", if side == OrderType::Bid { "Bid" } else { "Offer" }, order_id);
 
             // Track the order
             let mut tracker = self.tracker.lock().await;
             tracker.track_order(
-                order_id, market_id, OrderType::Offer as i32,
+                order_id, market_id, side as i32,
                 price, quantity, nonce, &signature, &signed_data,
             );
             drop(placement);
 
             Ok(order_id)
         } else {
-            anyhow::bail!("Failed to place offer: {}", response.message)
+            anyhow::bail!("Failed to place {}: {}", label, response.message)
         }
     }
 
@@ -498,9 +579,17 @@ impl OrderManager {
         signature: &str,
         signed_data: &[u8],
         nonce: u64,
+        tif: TimeInForce,
+        expires_at: Option<prost_types::Timestamp>,
     ) -> Result<SubmitOrderResponse> {
         #[cfg(test)]
+        if let Some(message) = self.stub_refuse.clone() {
+            self.submit_log.push((side, price.to_string(), quantity.to_string(), tif));
+            return Ok(SubmitOrderResponse { success: false, message, ..Default::default() });
+        }
+        #[cfg(test)]
         if let Some(stub) = self.stub_submit.clone() {
+            self.submit_log.push((side, price.to_string(), quantity.to_string(), tif));
             return match stub {
                 Ok(order_id) => Ok(SubmitOrderResponse {
                     success: true,
@@ -511,7 +600,7 @@ impl OrderManager {
             };
         }
         self.client
-            .submit_order(
+            .submit_order_tif(
                 market_id,
                 side,
                 price.to_string(),
@@ -520,6 +609,8 @@ impl OrderManager {
                 Some(signature.to_string()),
                 signed_data.to_vec(),
                 nonce,
+                tif,
+                expires_at,
             )
             .await
     }
@@ -607,9 +698,21 @@ impl OrderManager {
             if let Some(stop) = &self.stop_on_price {
                 stop.signal();
             }
+            match self.stub_stamp {
+                Some(ts) => self.price_stamps.insert(market_id.to_string(), ts),
+                None => self.price_stamps.remove(market_id),
+            };
             return Ok(price);
         }
         let response = self.client.get_price(market_id).await?;
+        match response.timestamp.as_ref() {
+            Some(ts) => {
+                self.price_stamps.insert(market_id.to_string(), ts.seconds);
+            }
+            None => {
+                self.price_stamps.remove(market_id);
+            }
+        }
         match response.pool_depth.as_ref().and_then(PoolDepth::from_proto) {
             Some(d) => {
                 self.pool_depths.insert(market_id.to_string(), d);
@@ -645,6 +748,17 @@ impl OrderManager {
 
     /// The shaped offer ladder with its log inputs; None when shaping is unavailable.
     fn offer_shape(&self, market: &MarketConfig) -> Option<OfferShape> {
+        let (cfg, reserve, desk) = self.shape_inputs(market)?;
+        Some(OfferShape {
+            shaped: shape_offer_levels(&market.offer_levels, cfg, reserve, desk),
+            enabled: cfg.enabled,
+            desk,
+            reserve,
+        })
+    }
+
+    /// Impact config, pool base reserve and desk net that shape a market's offers.
+    fn shape_inputs<'m>(&self, market: &'m MarketConfig) -> Option<(&'m crate::config::PoolImpactConfig, f64, f64)> {
         let (Some(cfg), Some(depth), Some(tracker)) = (
             market.rfq.as_ref().and_then(|r| r.pool_impact.as_ref()),
             self.pool_depths.get(&market.market_id),
@@ -653,13 +767,7 @@ impl OrderManager {
             return None;
         };
         let base_token = market.market_id.split('-').next().unwrap_or("");
-        let desk = tracker.desk_net(base_token);
-        Some(OfferShape {
-            shaped: shape_offer_levels(&market.offer_levels, cfg, depth.base_reserve, desk),
-            enabled: cfg.enabled,
-            desk,
-            reserve: depth.base_reserve,
-        })
+        Some((cfg, depth.base_reserve, tracker.desk_net(base_token)))
     }
 
     /// Per-side funding for placing the grid (see [`grid_funding`]).
@@ -747,11 +855,28 @@ impl OrderManager {
         stop: &Shutdown,
         report: &mut CycleReport,
     ) -> Vec<u64> {
+        let bid_levels = &market.bid_levels;
+        self.execute_ladder(&market.market_id, mid_price, active_orders, bid_levels, offer_levels, plan, stop, report)
+            .await
+    }
+
+    /// [`Self::execute_plan`] for any ladder; each placed side becomes its shape baseline.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_ladder(
+        &mut self,
+        market_id: &str,
+        mid_price: f64,
+        active_orders: &[Order],
+        bid_levels: &[PriceLevel],
+        offer_levels: &[PriceLevel],
+        plan: (SideAction, SideAction),
+        stop: &Shutdown,
+        report: &mut CycleReport,
+    ) -> Vec<u64> {
         // The shutdown path withdraws the whole grid; not even the tick lookup runs
         if stop.is_shutting_down() {
             return Vec::new();
         }
-        let market_id = market.market_id.as_str();
         let (bid_action, offer_action) = plan;
         let tick = if bid_action == SideAction::Replace || offer_action == SideAction::Replace {
             self.get_tick_size(market_id).await
@@ -762,11 +887,12 @@ impl OrderManager {
 
         let offer_levels: &[PriceLevel] =
             if offer_action == SideAction::Replace { offer_levels } else { &[] };
-        let ops = grid_ops(&market.bid_levels, offer_levels, mid_price, tick, active_orders, plan);
+        let ops = grid_ops(bid_levels, offer_levels, mid_price, tick, active_orders, plan);
 
         let mut cancelled_ids: Vec<u64> = Vec::new();
         let mut failed_cancels: Vec<u64> = Vec::new();
         let mut offer_placed = false;
+        let mut bid_placed = false;
         let mut placed: Vec<String> = Vec::new(); // "bid #id@price" or "offer #id@price"
         for op in ops {
             // Checked between RPCs; the shutdown path withdraws the whole grid
@@ -796,6 +922,7 @@ impl OrderManager {
                     match result {
                         Ok(id) => {
                             offer_placed |= side == OrderType::Offer;
+                            bid_placed |= side == OrderType::Bid;
                             placed.push(format!("{label} #{id}@{price}"));
                         }
                         Err(e) => warn!("Failed to place {} at {}: {}", label, price, e),
@@ -805,7 +932,10 @@ impl OrderManager {
         }
         // The placed set is the shape trigger's baseline; an all-failed reshape keeps the old one
         if offer_placed {
-            self.last_shaped_offers.insert(market.market_id.clone(), offer_levels.to_vec());
+            self.last_shaped_offers.insert(market_id.to_string(), offer_levels.to_vec());
+        }
+        if bid_placed {
+            self.last_bids.insert(market_id.to_string(), bid_levels.to_vec());
         }
 
         report.placed = report.placed.saturating_add(count_u32(placed.len()));
@@ -911,8 +1041,18 @@ impl OrderManager {
         Ok(report)
     }
 
-    /// One market of a grid cycle.
+    /// One market of a grid cycle: the grid, or the market's strategy.
     async fn visit_market(&mut self, market: &MarketConfig, stop: &Shutdown, report: &mut CycleReport) {
+        if self.config.strategy_for(&market.market_id).is_grid() {
+            self.report_grid(market).await;
+            self.visit_grid(market, stop, report).await;
+        } else {
+            self.visit_strategy(market, stop, report).await;
+        }
+    }
+
+    /// One grid market.
+    async fn visit_grid(&mut self, market: &MarketConfig, stop: &Shutdown, report: &mut CycleReport) {
         let market_id = market.market_id.as_str();
         report.markets = report.markets.saturating_add(1);
 
@@ -947,6 +1087,14 @@ impl OrderManager {
         let Some(current_price) = self.fetch_grid_price(market_id).await else {
             return;
         };
+
+        // Rungs worth less than the server minimum would only be refused
+        if !stop.is_shutting_down() {
+            self.refresh_min_base(market_id, current_price).await;
+        }
+        let kept = self.rungs_above_min(market, current_price);
+        let market = kept.as_ref().unwrap_or(market);
+        let bid_expected = market.bid_levels.len();
 
         // 4. Funding at the fresh price, from the one SHAPED offer set uncross and placement use;
         // counting the raw ladder would read an omitted rung as "order missing" and churn.
@@ -1072,6 +1220,11 @@ impl OrderManager {
     /// Cancel whatever rests in a market without rungs. Once it is seen empty, it is
     /// listed again only every `UNFUNDED_PROBE`.
     async fn withdraw_unquoted(&mut self, market_id: &str, stop: &Shutdown, report: &mut CycleReport) {
+        self.withdraw_all(market_id, "no rungs configured", stop, report).await;
+    }
+
+    /// [`Self::withdraw_unquoted`] with the reason it logs.
+    async fn withdraw_all(&mut self, market_id: &str, why: &str, stop: &Shutdown, report: &mut CycleReport) {
         self.pending_cancels.remove(market_id);
         let now = Instant::now();
         let probe_age = self.last_probe.get(market_id).map(|t| now.saturating_duration_since(*t));
@@ -1088,7 +1241,7 @@ impl OrderManager {
             }
         };
         if !orders.is_empty() {
-            info!("Grid {}: no rungs configured; cancelling {} resting order(s)", market_id, orders.len());
+            info!("Grid {}: {}; cancelling {} resting order(s)", market_id, why, orders.len());
         }
         let mut all_cancelled = true;
         for order in &orders {
@@ -1173,6 +1326,796 @@ impl OrderManager {
     }
 }
 
+impl OrderManager {
+    /// Fetch the server minimum when due: every 10 min, after a 2% move, or a minute after a failure.
+    async fn refresh_min_base(&mut self, market_id: &str, price: f64) {
+        let now = Instant::now();
+        let warned_at = match self.min_base.get(market_id) {
+            Some(m) => {
+                let age = now.saturating_duration_since(m.fetched);
+                let due = match m.qty {
+                    Some(_) => age >= MIN_BASE_REFRESH || (price / m.at_price - 1.0).abs() > MIN_BASE_MOVE,
+                    None => age >= MIN_BASE_RETRY,
+                };
+                if !due {
+                    return;
+                }
+                m.warned_at
+            }
+            None => None,
+        };
+        let qty = self.fetch_min_base(market_id, price).await;
+        self.min_base.insert(market_id.to_string(), MinBase { qty, at_price: price, fetched: now, warned_at });
+    }
+
+    /// Least base quantity at `price`; None (no minimum) when the server gives none.
+    async fn fetch_min_base(&mut self, market_id: &str, price: f64) -> Option<f64> {
+        #[cfg(test)]
+        if let Some(stub) = self.stub_min_base {
+            return stub;
+        }
+        let price = rust_decimal::Decimal::from_f64_retain(price).map(|d| d.round_dp(10).to_string());
+        match self.client.get_min_order_value(market_id, price).await {
+            Ok(r) => r
+                .min_base_quantity
+                .and_then(|q| q.parse::<f64>().ok())
+                .filter(|q| q.is_finite() && *q > 0.0),
+            Err(e) => {
+                debug!("Market {} minimum order value unavailable ({}); using none", market_id, e);
+                None
+            }
+        }
+    }
+
+    /// Least order value in quote units for a market; 0 when unknown.
+    fn min_value(&self, market_id: &str) -> f64 {
+        self.min_base.get(market_id).map_or(0.0, MinBase::min_value)
+    }
+
+    /// The market without rungs worth less than the server minimum, offers judged as shaped;
+    /// a rung left out returns at `MIN_READD` times the minimum. None when every rung clears it.
+    fn rungs_above_min(&mut self, market: &MarketConfig, mid: f64) -> Option<MarketConfig> {
+        let market_id = market.market_id.as_str();
+        let floor = self.min_value(market_id);
+        if floor <= 0.0 {
+            self.min_dropped.remove(market_id);
+            return None;
+        }
+        let value = |l: &PriceLevel| l.quantity.parse::<f64>().map_or(0.0, |q| q * mid * (1.0 + l.delta_percent / 100.0));
+        let shape = self.shape_inputs(market);
+        let mut dropped: HashSet<(bool, usize)> = HashSet::new();
+        let was = self.min_dropped.get(market_id);
+        for (offer, levels) in [(false, &market.bid_levels), (true, &market.offer_levels)] {
+            for (i, level) in levels.iter().enumerate() {
+                // Shaping is per rung; a rung it drops entirely is left to it
+                let worth = match shape.filter(|_| offer) {
+                    Some((cfg, reserve, desk)) => shape_offer_levels(std::slice::from_ref(level), cfg, reserve, desk)
+                        .levels
+                        .first()
+                        .map_or(f64::INFINITY, value),
+                    None => value(level),
+                };
+                let out = was.is_some_and(|w| w.contains(&(offer, i)));
+                let clears = worth >= if out { floor * MIN_READD } else { floor };
+                if !clears {
+                    dropped.insert((offer, i));
+                }
+            }
+        }
+        if dropped.is_empty() {
+            self.min_dropped.remove(market_id);
+            return None;
+        }
+        let warn_now = self.min_base.get_mut(market_id).is_some_and(|m| rate_limit(&mut m.warned_at, FUNDING_WARN_EVERY));
+        if warn_now {
+            warn!(
+                "Grid {}: {} rung(s) below the minimum order value {:.2} are skipped",
+                market_id,
+                dropped.len(),
+                floor
+            );
+        }
+        let kept = |offer: bool, levels: &[PriceLevel]| -> Vec<PriceLevel> {
+            let mut out = Vec::with_capacity(levels.len());
+            for (i, level) in levels.iter().enumerate() {
+                if !dropped.contains(&(offer, i)) {
+                    out.push(level.clone());
+                }
+            }
+            out
+        };
+        let filtered = MarketConfig {
+            bid_levels: kept(false, &market.bid_levels),
+            offer_levels: kept(true, &market.offer_levels),
+            ..market.clone()
+        };
+        self.min_dropped.insert(market_id.to_string(), dropped);
+        Some(filtered)
+    }
+
+    /// One market run by its strategy; its runtime lives across cycles.
+    async fn visit_strategy(&mut self, market: &MarketConfig, stop: &Shutdown, report: &mut CycleReport) {
+        report.markets = report.markets.saturating_add(1);
+        let market_id = market.market_id.clone();
+        let mut rt = match self.strategies.remove(&market_id) {
+            Some(rt) => rt,
+            None => {
+                let config = self.config.strategy_for(&market_id).clone();
+                let fill_seq = self.tracker.lock().await.last_fill_seq();
+                let rt = StrategyRuntime::new(&config, &market_id, fill_seq, Instant::now());
+                if matches!(rt.state, StrategyState::Pending) {
+                    warn!(
+                        "Strategy {} [{}]: not available in this build yet; placing nothing",
+                        market_id, rt.kind
+                    );
+                } else {
+                    info!("Strategy {} [{}]: started", market_id, rt.kind);
+                }
+                rt
+            }
+        };
+        self.run_strategy(&market_id, &mut rt, stop, report).await;
+        self.strategies.insert(market_id, rt);
+    }
+
+    /// Price, guard, orders, gate, decide, act.
+    async fn run_strategy(
+        &mut self,
+        market_id: &str,
+        rt: &mut StrategyRuntime,
+        stop: &Shutdown,
+        report: &mut CycleReport,
+    ) {
+        let now = Instant::now();
+        let (fills, held) = {
+            let tracker = self.tracker.lock().await;
+            (tracker.fills_after(rt.fill_seq), tracker.market_activity(market_id))
+        };
+        rt.absorb(&fills, market_id);
+        rt.prune(now);
+        // Before the checks below, so a paused or waiting strategy still reports
+        let status = with_cap_note(rt.state.status(), &rt.cap, now);
+        self.report_market(market_id, rt, &held, now, &status);
+
+        // The settlements-per-hour cap pauses once, then stops
+        match rt.cap.check(&rt.recent, now) {
+            CapState::Running => {}
+            CapState::Paused { new } => {
+                if new {
+                    warn!("Strategy {} [{}]: settlements-per-hour cap hit; paused 15 min", market_id, rt.kind);
+                }
+                self.withdraw_all(market_id, "strategy paused", stop, report).await;
+                return;
+            }
+            CapState::Stopped { new } => {
+                if new {
+                    warn!("Strategy {} [{}]: settlements-per-hour cap hit again; stopped", market_id, rt.kind);
+                }
+                self.withdraw_all(market_id, "strategy stopped", stop, report).await;
+                return;
+            }
+        }
+
+        let Some(price) = self.fetch_grid_price(market_id).await else { return };
+        let maker = rt.state.is_maker();
+        let stamp = self.price_stamps.get(market_id).copied();
+        let age = stamp.map_or(Duration::ZERO, |ts| {
+            Duration::from_secs(u64::try_from(crate::clock::now_secs_i64().saturating_sub(ts)).unwrap_or(0))
+        });
+        log_ref_age(market_id, rt, price, stamp.map(|_| age));
+        if let Err(why) = rt.guard.check(price, age, now) {
+            // Quotes stay through a short staleness; a jump, a bound or a long one withdraws them
+            let withdraw = maker && why.withdraws();
+            if rate_limit(&mut rt.warned_at, FUNDING_WARN_EVERY) {
+                let then = if withdraw { "withdrawing quotes" } else if maker { "holding quotes" } else { "waiting" };
+                warn!("Strategy {} [{}]: reference {} not used ({:?}); {}", market_id, rt.kind, price, why, then);
+            }
+            if withdraw {
+                self.withdraw_all(market_id, "reference not usable", stop, report).await;
+            }
+            return;
+        }
+        if rt.last_reading != Some((price, stamp)) {
+            rt.last_reading = Some((price, stamp));
+            rt.state.observe(price, now);
+        }
+        if stop.is_shutting_down() {
+            return;
+        }
+        self.refresh_min_base(market_id, price).await;
+        if stop.is_shutting_down() {
+            return;
+        }
+        let orders = match self.get_active_orders(market_id).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Market {} order fetch failed ({}); skipping this market this cycle", market_id, e);
+                return;
+            }
+        };
+        let orders = self.retry_failed_cancels(market_id, orders, stop, report).await;
+        if stop.is_shutting_down() {
+            return;
+        }
+        if let Some(from) = rt.state.history_from() {
+            self.load_history(market_id, from, rt, now, stop).await;
+        }
+        let tick = self.get_tick_size(market_id).await;
+        let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
+        let (activity, inventory) = {
+            let mut tracker = self.tracker.lock().await;
+            let activity = tracker.market_activity(market_id);
+            let inventory = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, &activity);
+            if inventory.usable {
+                note_start(tracker.strategy_starts_mut(), market_id, rt, &inventory, price);
+            }
+            (activity, inventory)
+        };
+
+        // A taker keeps only its take in flight; anything else resting is withdrawn
+        if !maker {
+            self.cancel_leftovers(market_id, &orders, rt.gate.order_id(), stop, report).await;
+        }
+        let mut listed = rt.gate.order_id().is_some_and(|id| orders.iter().any(|o| o.order_id == id));
+        if let Some((id, until)) = rt.rest_until {
+            if rt.gate.order_id() != Some(id) {
+                rt.rest_until = None;
+            } else if !listed {
+                // A resting take left the book: a late match gets the usual time to show up
+                rt.rest_until = None;
+                rt.gate.restart_hold(now);
+            } else if now >= until && !stop.is_shutting_down() {
+                // One the server has not expired yet is cancelled here
+                match self.cancel_order(id).await {
+                    Ok(()) => {
+                        report.cancelled = report.cancelled.saturating_add(1);
+                        rt.rest_until = None;
+                        rt.gate.restart_hold(now);
+                        listed = false;
+                    }
+                    Err(e) => warn!("Market {}: failed to cancel expired take {}: {}", market_id, id, e),
+                }
+            }
+        }
+        let (verdict, resolved) = rt.gate.check(&GateInputs {
+            now,
+            listed,
+            open_settlements: activity.open_settlements,
+            balances_at: self.balances_set_at,
+            last_fill_at: activity.last_fill_at,
+            cooldown: rt.state.cooldown(),
+        });
+        let gone = match verdict {
+            Verdict::Stuck(take) => take.order_id,
+            _ => resolved.and_then(|take| take.order_id),
+        };
+        if let Some(id) = gone {
+            let matched = self.tracker.lock().await.order_matched(id);
+            rt.note_resolved(id, matched);
+        }
+        if let Verdict::Stuck(take) = verdict {
+            warn!("Strategy {} [{}]: take {:?} still listed after 15 min; released", market_id, rt.kind, take.order_id);
+            if let Some(id) = take.order_id {
+                self.tracker.lock().await.cancel_order(id);
+            }
+        }
+        let book = if maker {
+            match self.fetch_book(market_id, &orders, stop).await {
+                Some(b) => {
+                    rt.depth_fails = 0;
+                    Some(b)
+                }
+                None => {
+                    // Quotes stay through a short depth outage; after about 30 s they go
+                    if !stop.is_shutting_down() {
+                        rt.depth_fails = rt.depth_fails.saturating_add(1);
+                        if rt.depth_fails == DEPTH_FAILS_WITHDRAW {
+                            warn!("Strategy {} [{}]: no book depth for {} cycles; withdrawing quotes", market_id, rt.kind, rt.depth_fails);
+                        }
+                        if rt.depth_fails >= DEPTH_FAILS_WITHDRAW {
+                            self.withdraw_all(market_id, "book depth unavailable", stop, report).await;
+                        }
+                    }
+                    return;
+                }
+            }
+        } else if rt.state.book_need() == BookNeed::Always && verdict == Verdict::Open {
+            // A taker that reads the book to decide fetches it only when it may take
+            self.fetch_book(market_id, &orders, stop).await
+        } else {
+            None
+        };
+        let floor_value = self.min_value(market_id).max(sizing::SERVER_FLOOR_USD);
+        let lot_exp = sizing::lot_exp(price);
+        let view = MarketView {
+            now,
+            wall: crate::clock::now_utc(),
+            reference: price,
+            tick,
+            floor_value,
+            lot_exp,
+            inventory,
+            start_base: rt.start.map_or(inventory.base, |s| s.base),
+            book: book.as_ref(),
+            activity,
+            fills_last_hour: rt.recent.len(),
+            usd_last_hour: rt.usd_last_hour(),
+            can_take: verdict == Verdict::Open,
+        };
+        let decision = rt.state.decide(&view);
+        #[cfg(test)]
+        let decision = self.stub_decision.clone().unwrap_or(decision);
+        match decision {
+            Decision::Hold | Decision::Take(None) => {}
+            Decision::Rest(ladder) => {
+                let at_cap = activity.open_settlements >= rt.state.max_inflight();
+                self.apply_ladder(market_id, &ladder, price, tick, &orders, at_cap, rt, stop, report).await;
+            }
+            // One take at a time, whatever the strategy asks for
+            Decision::Take(Some(want)) if verdict == Verdict::Open => {
+                let take = TakeContext { price, tick, floor_value, lot_exp, inventory };
+                self.take(market_id, want, book, &orders, &take, rt, stop, report).await;
+            }
+            Decision::Take(Some(_)) => {
+                debug!("Strategy {} [{}]: take skipped, the gate is shut", market_id, rt.kind);
+            }
+        }
+    }
+
+    /// Both depth views, as the agents' best levels and the LP's prices.
+    async fn fetch_book(&mut self, market_id: &str, own: &[Order], stop: &Shutdown) -> Option<BookTop> {
+        if stop.is_shutting_down() {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some((full, lp)) = self.stub_depth.clone() {
+            return Some(book_top(&full, &lp, own));
+        }
+        let full = self.client.get_orderbook_depth(market_id, BOOK_DEPTH, false).await;
+        if stop.is_shutting_down() {
+            return None;
+        }
+        let lp = self.client.get_orderbook_depth(market_id, BOOK_DEPTH, true).await;
+        match (full, lp) {
+            (Ok(full), Ok(lp)) => Some(book_top(&full, &lp, own)),
+            (Err(e), _) | (_, Err(e)) => {
+                debug!("Market {} depth unavailable ({}); strategy skips this cycle", market_id, e);
+                None
+            }
+        }
+    }
+
+    /// Cancel resting orders with something left to match, except `keep`.
+    async fn cancel_leftovers(
+        &mut self,
+        market_id: &str,
+        orders: &[Order],
+        keep: Option<u64>,
+        stop: &Shutdown,
+        report: &mut CycleReport,
+    ) {
+        let open = |o: &&Order| o.remaining_quantity.parse::<f64>().map_or(true, |r| r > 0.0);
+        let ids: Vec<u64> = orders.iter().filter(open).map(|o| o.order_id).filter(|id| Some(*id) != keep).collect();
+        for order_id in ids {
+            if stop.is_shutting_down() {
+                break;
+            }
+            match self.cancel_order(order_id).await {
+                Ok(()) => report.cancelled = report.cancelled.saturating_add(1),
+                Err(e) => warn!("Market {}: failed to cancel order {}: {}", market_id, order_id, e),
+            }
+        }
+    }
+
+    /// Price and size a take against the book, then send it as IOC or GTD.
+    #[allow(clippy::too_many_arguments)]
+    async fn take(
+        &mut self,
+        market_id: &str,
+        want: Want,
+        book: Option<BookTop>,
+        orders: &[Order],
+        ctx: &TakeContext,
+        rt: &mut StrategyRuntime,
+        stop: &Shutdown,
+        report: &mut CycleReport,
+    ) {
+        let book = match book {
+            Some(b) => b,
+            None => match self.fetch_book(market_id, orders, stop).await {
+                Some(b) => b,
+                None => return,
+            },
+        };
+        let sized = match want.tif {
+            TakeTif::Ioc => sizing::size_take(&want, &book, &ctx.inventory, ctx.floor_value, ctx.price, ctx.lot_exp),
+            TakeTif::Gtd { .. } => {
+                sizing::price_rest(&want, &book, &ctx.inventory, ctx.floor_value, ctx.price, ctx.tick, ctx.lot_exp)
+            }
+        };
+        let order = match sized {
+            Ok(order) => order,
+            Err(why) => {
+                debug!("Strategy {} [{}]: no take this cycle ({:?})", market_id, rt.kind, why);
+                return;
+            }
+        };
+        if stop.is_shutting_down() {
+            return;
+        }
+        let Some(order_ref) = self.new_order_ref() else { return };
+        let quantity = order.quantity.to_string();
+        let now = Instant::now();
+        let (label, result) = match want.tif {
+            TakeTif::Ioc => ("IOC", self.place_ioc(market_id, order.side, &order.price, &quantity, Some(order_ref)).await),
+            TakeTif::Gtd { ttl_secs } => (
+                "GTD",
+                self.place_gtd(market_id, order.side, &order.price, &quantity, Some(order_ref), ttl_secs).await,
+            ),
+        };
+        let side = if order.side == OrderType::Bid { "buy" } else { "sell" };
+        match result {
+            Ok(id) => {
+                rt.gate.placed(id, now);
+                rt.note_take(id);
+                rt.rest_until = match want.tif {
+                    TakeTif::Gtd { ttl_secs } => {
+                        now.checked_add(Duration::from_secs(ttl_secs).saturating_add(REST_GRACE)).map(|t| (id, t))
+                    }
+                    TakeTif::Ioc => None,
+                };
+                report.placed = report.placed.saturating_add(1);
+                info!("Strategy {} [{}]: {} {} {} @ {} #{}", market_id, rt.kind, label, side, quantity, order.price, id);
+            }
+            // Only a transport status leaves the outcome open; a refusal or signing failure is definite
+            Err(e) if e.downcast_ref::<tonic::Status>().is_some() && submit_outcome_unknown(&e) => {
+                rt.gate.ambiguous(now);
+                warn!("Strategy {} [{}]: {} {} may have been booked ({:#})", market_id, rt.kind, label, side, e);
+            }
+            Err(e) => {
+                rt.gate.refused(now);
+                // A refusal is often the minimum order value: look it up again
+                self.min_base.remove(market_id);
+                if rate_limit(&mut rt.warned_at, FUNDING_WARN_EVERY) {
+                    warn!("Strategy {} [{}]: {} {} refused ({:#}); backing off", market_id, rt.kind, label, side, e);
+                }
+            }
+        }
+    }
+
+    /// Place a maker ladder with the grid's plan, uncross and execute steps.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_ladder(
+        &mut self,
+        market_id: &str,
+        ladder: &Ladder,
+        price: f64,
+        tick: f64,
+        orders: &[Order],
+        at_cap: bool,
+        rt: &mut StrategyRuntime,
+        stop: &Shutdown,
+        report: &mut CycleReport,
+    ) {
+        let now = Instant::now();
+        let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
+        let funding = ladder_funding(
+            &self.balances,
+            usable,
+            market_id,
+            Some(price),
+            &ladder.bids,
+            &ladder.offers,
+            self.config.fee_reserve_cc,
+        );
+        if funding.bid == Funding::Unknown && funding.offer == Funding::Unknown {
+            report.held_unknown = report.held_unknown.saturating_add(1);
+            return;
+        }
+        let resting = strategy_side_counts(orders, sizing::MIN_ORDER_USD);
+        let anchors = self.grid_anchors.get(market_id).copied().unwrap_or_default();
+        let restore = self.force_refresh.remove(market_id);
+        let tick_pct = if price > 0.0 { 50.0 * tick / price } else { 0.0 };
+        let side_moved = |anchor: Option<f64>, prev: Option<&Vec<PriceLevel>>, levels: &[PriceLevel], at: Option<Instant>, rests: usize| {
+            match (anchor, prev) {
+                (Some(anchor), Some(prev)) => {
+                    let old = at.is_some_and(|t| now.saturating_duration_since(t) >= REQUOTE_AGE);
+                    ladder_moved(anchor, prev, price, levels, if old { tick_pct } else { REQUOTE_PCT })
+                }
+                // Nothing of ours placed yet: whatever rests makes way for the ladder
+                _ => rests > 0,
+            }
+        };
+        let force_bid =
+            restore || side_moved(anchors.bid, self.last_bids.get(market_id), &ladder.bids, rt.bid_placed_at, resting.bids);
+        let force_offer = restore
+            || side_moved(anchors.offer, self.last_shaped_offers.get(market_id), &ladder.offers, rt.offer_placed_at, resting.offers);
+        let mut plan = plan_market(&PlanInput {
+            bid: funding.bid,
+            offer: funding.offer,
+            bid_expected: ladder.bids.len(),
+            offer_expected: ladder.offers.len(),
+            resting,
+            force_bid,
+            force_offer,
+            shape_changed: false,
+        });
+        let fundable = |f: Funding, expected: usize| f == Funding::Funded && expected > 0;
+        let one_sided = matches!(plan, (SideAction::Replace, SideAction::Keep) | (SideAction::Keep, SideAction::Replace));
+        if one_sided && !stop.is_shutting_down() {
+            let sides = (fundable(funding.bid, ladder.bids.len()), fundable(funding.offer, ladder.offers.len()));
+            plan = uncross(plan, &ladder.bids, &ladder.offers, price, tick, orders, sides);
+        }
+        // At the in-flight cap nothing new is placed; withdrawals still go ahead
+        if at_cap {
+            let hold = |a: SideAction| if a == SideAction::Replace { SideAction::Keep } else { a };
+            plan = (hold(plan.0), hold(plan.1));
+        }
+        let anchored = next_anchors(anchors, plan, resting, price);
+        if anchored != anchors {
+            self.grid_anchors.insert(market_id.to_string(), anchored);
+        }
+        if plan == (SideAction::Keep, SideAction::Keep) {
+            return;
+        }
+        info!(
+            "Strategy {} [{}] re-quoting: bids {}/{} {:?}, offers {}/{} {:?}",
+            market_id,
+            rt.kind,
+            resting.bids,
+            ladder.bids.len(),
+            plan.0,
+            resting.offers,
+            ladder.offers.len(),
+            plan.1
+        );
+        let failed = self
+            .execute_ladder(market_id, price, orders, &ladder.bids, &ladder.offers, plan, stop, report)
+            .await;
+        if !failed.is_empty() {
+            self.pending_cancels.entry(market_id.to_string()).or_default().extend(failed);
+        }
+        report.refreshed = report.refreshed.saturating_add(1);
+        for (action, placed_at, baseline) in [
+            (plan.0, &mut rt.bid_placed_at, &mut self.last_bids),
+            (plan.1, &mut rt.offer_placed_at, &mut self.last_shaped_offers),
+        ] {
+            match action {
+                SideAction::Replace => *placed_at = Some(now),
+                SideAction::Cancel => {
+                    *placed_at = None;
+                    baseline.remove(market_id);
+                }
+                SideAction::Keep => {}
+            }
+        }
+    }
+}
+
+impl OrderManager {
+    /// A strategy's own settlements since `from`; it places nothing until they load.
+    async fn load_history(
+        &mut self,
+        market_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        rt: &mut StrategyRuntime,
+        now: Instant,
+        stop: &Shutdown,
+    ) {
+        if stop.is_shutting_down() || rt.history_retry_at.is_some_and(|t| now < t) {
+            return;
+        }
+        match self.fetch_settlements(market_id, from).await {
+            Ok(settlements) => {
+                rt.history_retry_at = None;
+                rt.state.on_history(&settlements, &self.config.party_id);
+            }
+            Err(e) => {
+                rt.history_retry_at = now.checked_add(HISTORY_RETRY);
+                if rate_limit(&mut rt.warned_at, FUNDING_WARN_EVERY) {
+                    warn!("Strategy {} [{}]: settlement history unavailable ({:#}); not trading yet", market_id, rt.kind, e);
+                }
+            }
+        }
+    }
+
+    async fn fetch_settlements(
+        &mut self,
+        market_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<orderbook_proto::orderbook::Settlement>> {
+        #[cfg(test)]
+        if let Some(stub) = self.stub_settlements.clone() {
+            return Ok(stub);
+        }
+        let from_time = prost_types::Timestamp { seconds: from.timestamp(), nanos: 0 };
+        self.client.get_settlements(Some(market_id), Some(from_time)).await
+    }
+
+    /// A grid market's fills and start balances, kept for its report line; no RPC.
+    async fn report_grid(&mut self, market: &MarketConfig) {
+        let market_id = market.market_id.as_str();
+        let now = Instant::now();
+        let (fills, activity, seq) = {
+            let tracker = self.tracker.lock().await;
+            let seq = self.grid_reports.get(market_id).map_or_else(|| tracker.last_fill_seq(), |rt| rt.fill_seq);
+            (tracker.fills_after(seq), tracker.market_activity(market_id), seq)
+        };
+        let config = self.config.strategy_for(market_id).clone();
+        let mut rt = self.grid_reports.remove(market_id).unwrap_or_else(|| StrategyRuntime::new(&config, market_id, seq, now));
+        rt.absorb(&fills, market_id);
+        rt.prune(now);
+        if let Some(price) = self.last_seen_price.get(market_id).copied().filter(|_| rt.start.is_none()) {
+            let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
+            let inv = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, &activity);
+            if inv.usable {
+                rt.start = Some(Start { base: inv.base, quote: inv.quote, price });
+            }
+        }
+        let status = format!("rungs {} bid / {} offer", market.bid_levels.len(), market.offer_levels.len());
+        self.report_market(market_id, &mut rt, &activity, now, &status);
+        self.grid_reports.insert(market_id.to_string(), rt);
+    }
+
+    /// The report line every 5 min, valued at the last price seen.
+    fn report_market(&self, market_id: &str, rt: &mut StrategyRuntime, activity: &MarketActivity, now: Instant, status: &str) {
+        if now.saturating_duration_since(rt.last_report) < REPORT_EVERY {
+            return;
+        }
+        let Some(price) = self.last_seen_price.get(market_id).copied() else { return };
+        rt.last_report = now;
+        let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
+        let inv = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, activity);
+        info!(
+            "{}",
+            format_report(&ReportLine {
+                market_id,
+                kind: rt.kind,
+                base: inv.base,
+                quote: inv.quote,
+                price,
+                start: rt.start,
+                stats: rt.stats,
+                takes: rt.kind != "grid",
+                status,
+            })
+        );
+    }
+}
+
+/// Records the balances a strategy holds, and its start the first time.
+fn note_start(
+    starts: &mut StrategyStarts,
+    market_id: &str,
+    rt: &mut StrategyRuntime,
+    inventory: &Inventory,
+    price: f64,
+) {
+    let (kind, held) = (rt.kind, Held { base: inventory.base, quote: inventory.quote });
+    let start = *rt.start.get_or_insert_with(|| first_start(starts, market_id, kind, held, price));
+    starts.set(market_id, kind, start, held);
+}
+
+/// The start saved at the last stop, moved by what came in or went out meanwhile; else these balances.
+fn first_start(starts: &mut StrategyStarts, market_id: &str, kind: &str, held: Held, price: f64) -> Start {
+    match starts.take(market_id, kind, held, crate::clock::now_millis()) {
+        Some((s, shift)) if shift != Held::default() => {
+            warn!(
+                "Strategy {} [{}]: balances changed while stopped (base {:+.2}, quote {:+.2}); \
+                 start moved by as much (now base {:.2}, quote {:.2}), so only the position carries over",
+                market_id, kind, shift.base, shift.quote, s.base, s.quote
+            );
+            s
+        }
+        Some((s, _)) => {
+            info!(
+                "Strategy {} [{}]: start balances from the last stop (base {:.2}, quote {:.2})",
+                market_id, kind, s.base, s.quote
+            );
+            s
+        }
+        None => Start { base: held.base, quote: held.quote, price },
+    }
+}
+
+/// The strategy's status, led by the settlements cap when it holds the strategy.
+fn with_cap_note(status: String, cap: &SettleCap, now: Instant) -> String {
+    let note = if cap.strikes >= 2 {
+        "stopped by the settlements cap"
+    } else if cap.paused_until.is_some_and(|t| now < t) {
+        "paused by the settlements cap"
+    } else {
+        return status;
+    };
+    if status.is_empty() { note.to_string() } else { format!("{note}; {status}") }
+}
+
+/// The reference age at debug each cycle, and once at INFO when the strategy starts.
+fn log_ref_age(market_id: &str, rt: &mut StrategyRuntime, price: f64, age: Option<Duration>) {
+    let limit = rt.guard.max_age().as_secs();
+    let age = age.map_or_else(|| "has no server time".to_string(), |a| format!("is {}s old", a.as_secs()));
+    if rt.age_logged {
+        debug!("Strategy {} [{}]: reference {} {} (limit {}s)", market_id, rt.kind, price, age, limit);
+    } else {
+        rt.age_logged = true;
+        info!("Strategy {} [{}]: reference {} {} (limit {}s)", market_id, rt.kind, price, age, limit);
+    }
+}
+
+/// What a take is priced and sized with.
+struct TakeContext {
+    price: f64,
+    tick: f64,
+    floor_value: f64,
+    lot_exp: i32,
+    inventory: Inventory,
+}
+
+fn balance_of<'a>(balances: &'a [TokenBalance], token: &str) -> Option<&'a TokenBalance> {
+    balances.iter().find(|b| if token == "CC" { b.is_canton_coin } else { b.instrument_id == token })
+}
+
+fn amount(b: Option<&TokenBalance>, field: fn(&TokenBalance) -> &str) -> f64 {
+    b.and_then(|b| field(b).parse::<f64>().ok()).unwrap_or(0.0)
+}
+
+/// Balances of a BASE-QUOTE market with matched, unsettled amounts applied (pure);
+/// what is available leaves the CC fee reserve, as grid funding does.
+pub(crate) fn market_inventory(
+    balances: &[TokenBalance],
+    usable: bool,
+    market_id: &str,
+    fee_reserve_cc: f64,
+    activity: &MarketActivity,
+) -> Inventory {
+    let Some((base, quote)) = market_id.split_once('-').filter(|(_, q)| !q.contains('-')) else {
+        return Inventory::default();
+    };
+    let (b, q) = (balance_of(balances, base), balance_of(balances, quote));
+    let reserve = |token: &str| if token == "CC" { fee_reserve_cc } else { 0.0 };
+    Inventory {
+        base: amount(b, |t| &t.total_amount) + activity.pending_bid_base - activity.pending_offer_base,
+        quote: amount(q, |t| &t.total_amount) - activity.pending_bid_quote + activity.pending_offer_quote,
+        base_avail: (amount(b, |t| &t.unlocked_amount) - reserve(base)).max(0.0),
+        quote_avail: (amount(q, |t| &t.unlocked_amount) - reserve(quote)).max(0.0),
+        usable: usable && !balances.is_empty() && unlocked_cc(balances) >= fee_reserve_cc,
+    }
+}
+
+/// Resting orders per side for a strategy; `partial` marks an order with under
+/// `min_value` left (quote units), so its slot is refilled.
+pub(crate) fn strategy_side_counts(orders: &[Order], min_value: f64) -> SideCounts {
+    let mut counts = SideCounts::default();
+    for o in orders {
+        let left = o.remaining_quantity.parse::<f64>().ok().zip(o.price.parse::<f64>().ok()).map(|(r, p)| r * p);
+        let low = left.is_some_and(|v| v < min_value);
+        if o.order_type == OrderType::Bid as i32 {
+            counts.bids = counts.bids.saturating_add(1);
+            counts.bid_partial |= low;
+        } else if o.order_type == OrderType::Offer as i32 {
+            counts.offers = counts.offers.saturating_add(1);
+            counts.offer_partial |= low;
+        }
+    }
+    counts
+}
+
+/// Whether a ladder side moved past `threshold_pct` of `price` since it was placed at `anchor`,
+/// or a rung was added, dropped or resized.
+pub(crate) fn ladder_moved(anchor: f64, prev: &[PriceLevel], price: f64, now: &[PriceLevel], threshold_pct: f64) -> bool {
+    if prev.len() != now.len() || price.is_nan() || price <= 0.0 {
+        return true;
+    }
+    prev.iter().zip(now).any(|(a, b)| {
+        let placed = anchor * (1.0 + a.delta_percent / 100.0);
+        let target = price * (1.0 + b.delta_percent / 100.0);
+        let moved = ((target - placed) / price).abs() * 100.0 > threshold_pct;
+        let (qa, qb) = (a.quantity.parse::<f64>().unwrap_or(0.0), b.quantity.parse::<f64>().unwrap_or(0.0));
+        let resized = if qa > 0.0 { ((qb - qa) / qa).abs() > SHAPE_REFRESH_QTY_FRACTION } else { qa != qb };
+        moved || resized
+    })
+}
+
 /// The plan for one visited market, with what drove it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisitPlan {
@@ -1228,6 +2171,19 @@ pub(crate) fn grid_funding(
     offer_levels: &[PriceLevel],
     fee_reserve_cc: f64,
 ) -> GridFunding {
+    ladder_funding(balances, usable, &market.market_id, mid, &market.bid_levels, offer_levels, fee_reserve_cc)
+}
+
+/// [`grid_funding`] for any ladder.
+pub(crate) fn ladder_funding(
+    balances: &[TokenBalance],
+    usable: bool,
+    market_id: &str,
+    mid: Option<f64>,
+    bid_levels: &[PriceLevel],
+    offer_levels: &[PriceLevel],
+    fee_reserve_cc: f64,
+) -> GridFunding {
     let mut out = GridFunding {
         bid: Funding::Unknown,
         offer: Funding::Unknown,
@@ -1242,8 +2198,7 @@ pub(crate) fn grid_funding(
         out.why = Some(UnknownWhy::Aged);
         return out;
     }
-    let Some((base, quote)) = market
-        .market_id
+    let Some((base, quote)) = market_id
         .split_once('-')
         .filter(|(_, quote)| !quote.contains('-'))
     else {
@@ -1276,7 +2231,7 @@ pub(crate) fn grid_funding(
 
     // Total quote needed for bids (buying base with quote)
     if let Some(mid) = mid.filter(|m| m.is_finite() && *m > 0.0) {
-        out.bid_need = market.bid_levels.iter()
+        out.bid_need = bid_levels.iter()
             .map(|l| {
                 let qty: f64 = l.quantity.parse().unwrap_or(0.0);
                 qty * mid * (1.0 + l.delta_percent / 100.0)
@@ -3041,5 +3996,694 @@ mod grid_plan_tests {
         let v = om.plan_visit(&aaa, 99.5, &funding(Funded, Funded), 3, resting(3, 3));
         assert_eq!(v.anchors, SideAnchors::default());
         assert!(!v.force_bid && !v.force_offer);
+    }
+}
+
+#[cfg(test)]
+mod strategy_visit_tests {
+    use super::*;
+    use crate::config::{
+        ArbitrageConfig, MarketMakerConfig, MeanReversionConfig, RebalancerConfig, StrategyConfig, StrategyMode, TradeSide,
+        TwapConfig,
+    };
+    use crate::order_tracker::VerifyResult;
+    use crate::secret::Secret;
+    use crate::strategy::book::tests::{depth, lvl};
+    use orderbook_proto::orderbook::OrderbookDepth;
+
+    const ID: &str = "HTEST-USDC";
+
+    fn bare(id: &str) -> MarketConfig {
+        MarketConfig {
+            market_id: id.to_string(),
+            enabled: true,
+            base_order_size: None,
+            bid_levels: Vec::new(),
+            offer_levels: Vec::new(),
+            price_change_threshold_percent: 1.0,
+            rfq: None,
+        }
+    }
+
+    fn token(id: &str, amount: &str, cc: bool) -> TokenBalance {
+        TokenBalance {
+            instrument_id: id.to_string(),
+            total_amount: amount.to_string(),
+            unlocked_amount: amount.to_string(),
+            is_canton_coin: cc,
+            ..Default::default()
+        }
+    }
+
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn manager(url: String, markets: Vec<MarketConfig>, strategy: Option<StrategyConfig>) -> OrderManager {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = url;
+        if let (Some(s), Some(m)) = (strategy, markets.first()) {
+            config.strategies.insert(m.market_id.clone(), s);
+        }
+        config.markets = markets;
+        let client = OrderbookClient::lazy_for_tests(&config).unwrap();
+        let tracker = OrderTracker::new(0, Secret::seal(&mut [7u8; 32]).unwrap());
+        let mut om = OrderManager::new(config, client, Arc::new(Mutex::new(tracker)));
+        om.tick_sizes.insert(ID.to_string(), 1e-7);
+        om.stub_min_base = Some(None);
+        om.set_balances(vec![token("Amulet", "100", true), token("HTEST", "1250000", false), token("USDC", "2000", false)]);
+        om
+    }
+
+    fn strategy_manager(strategy: StrategyConfig) -> OrderManager {
+        manager(closed_port_url(), vec![bare(ID)], Some(strategy))
+    }
+
+    /// The LP at +-15 bps around 0.0016; `agent_bid` adds another agent's bid at 0.001599.
+    fn book(agent_bid: bool) -> (OrderbookDepth, OrderbookDepth) {
+        let lp = depth(vec![lvl("0.0015976", "10000", 1)], vec![lvl("0.0016024", "10000", 1)]);
+        let mut full = lp.clone();
+        if agent_bid {
+            full.bids.insert(0, lvl("0.0015990000", "30000", 1));
+        }
+        (full, lp)
+    }
+
+    fn resting(id: u64, side: OrderType, price: &str, remaining: &str) -> Order {
+        Order {
+            order_id: id,
+            market_id: ID.to_string(),
+            order_type: side as i32,
+            price: price.to_string(),
+            quantity: remaining.to_string(),
+            remaining_quantity: remaining.to_string(),
+            filled_quantity: "0".to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn visit(om: &mut OrderManager) -> CycleReport {
+        let market = bare(ID);
+        let (stop, mut report) = (Shutdown::new(), CycleReport::default());
+        let run = om.visit_market(&market, &stop, &mut report);
+        tokio::time::timeout(Duration::from_secs(10), run).await.unwrap();
+        report
+    }
+
+    fn back(om: &mut OrderManager, secs: u64) {
+        let rt = om.strategies.get_mut(ID).unwrap();
+        let earlier = |t: Instant| t.checked_sub(Duration::from_secs(secs)).unwrap();
+        if let Some(last) = rt.gate.last.as_mut() {
+            last.at = earlier(last.at);
+        }
+        rt.gate.last_placed_at = rt.gate.last_placed_at.map(earlier);
+    }
+
+    fn rebalancer() -> StrategyConfig {
+        StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.25), mode: StrategyMode::Taker, ..Default::default() })
+    }
+
+    fn market_maker() -> StrategyConfig {
+        StrategyConfig::MarketMaker(MarketMakerConfig::default())
+    }
+
+    /// The listing once every logged submit rests, with ids from 1.
+    fn placed(log: &[(OrderType, String, String, TimeInForce)]) -> Vec<Order> {
+        (1u64..).zip(log).map(|(id, (side, p, q, _))| resting(id, *side, p, q)).collect()
+    }
+
+    fn level(delta_percent: f64, quantity: &str) -> PriceLevel {
+        PriceLevel { delta_percent, quantity: quantity.to_string() }
+    }
+
+    // The maker places its two-level ladder once, then leaves it alone on an identical visit
+    #[tokio::test]
+    async fn a_market_maker_places_then_keeps_its_ladder() {
+        let mut om = strategy_manager(StrategyConfig::MarketMaker(MarketMakerConfig::default()));
+        om.stub_depth = Some(book(false));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        om.stub_cancels = Some(Vec::new());
+        let report = visit(&mut om).await;
+        assert_eq!(report.placed, 4);
+        let log = om.submit_log.clone();
+        assert!(log.iter().all(|(_, _, _, tif)| *tif == TimeInForce::Gtc));
+        let price = |p: &str| p.parse::<f64>().unwrap();
+        let bids: Vec<f64> = log.iter().filter(|e| e.0 == OrderType::Bid).map(|e| price(&e.1)).collect();
+        let offers: Vec<f64> = log.iter().filter(|e| e.0 == OrderType::Offer).map(|e| price(&e.1)).collect();
+        assert_eq!((bids.len(), offers.len()), (2, 2));
+        // Inside the LP on both sides
+        assert!(bids.iter().all(|b| *b < 0.0016) && bids.iter().any(|b| *b > 0.0015976), "{bids:?}");
+        assert!(offers.iter().all(|o| *o > 0.0016) && offers.iter().any(|o| *o < 0.0016024), "{offers:?}");
+
+        let book_now: Vec<Order> = (1u64..)
+            .zip(&log)
+            .map(|(id, (side, p, q, _))| resting(id, *side, p, q))
+            .collect();
+        om.stub_orders = Some(book_now);
+        let report = visit(&mut om).await;
+        assert_eq!((report.placed, report.cancelled, report.refreshed), (0, 0, 0));
+        assert_eq!(om.submit_log.len(), 4);
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[][..]));
+    }
+
+    // One IOC at exactly the agent bid, then nothing until the gate opens
+    #[tokio::test]
+    async fn a_take_sends_one_ioc_at_the_top_price_until_the_gate_opens() {
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        visit(&mut om).await;
+        let first = (OrderType::Offer, "0.0015990000".to_string(), "12500".to_string(), TimeInForce::Ioc);
+        assert_eq!(om.submit_log, vec![first.clone()]);
+
+        // Listed, then gone but young: no second take
+        om.stub_orders = Some(vec![resting(42, OrderType::Offer, "0.0015990000", "0")]);
+        visit(&mut om).await;
+        om.stub_orders = Some(Vec::new());
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+
+        // Past the 15 s hold and the 150 s cooldown, the gate opens again
+        back(&mut om, 151);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log, vec![first.clone(), first]);
+        assert_eq!(om.strategies.get(ID).map(|rt| rt.stats.takes), Some(2));
+    }
+
+    // A take asked for while the gate is shut is not sent; the gate itself decides
+    #[tokio::test]
+    async fn a_take_asked_for_while_the_gate_is_shut_sends_nothing() {
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+        let side = OrderType::Offer;
+        let want = Want { side, max_quantity: 12_500.0, max_deviation_percent: 0.15, tif: TakeTif::Ioc };
+        om.stub_decision = Some(Decision::Take(Some(want)));
+        om.stub_orders = Some(vec![resting(42, OrderType::Offer, "0.0015990000", "12500")]);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1, "the last take is still listed");
+        om.stub_orders = Some(Vec::new());
+        back(&mut om, 151);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 2, "sent once the gate opens");
+    }
+
+    // Start balances saved at a stop within 6 hours are kept; older ones are taken again
+    #[tokio::test]
+    async fn a_restart_keeps_start_balances_saved_within_six_hours() {
+        use crate::state::{SavedStrategyStart, STRATEGY_START_MAX_AGE_MS};
+        let in_band = StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.5), ..Default::default() });
+        let saved_start = Start { base: 1_000_000.0, quote: 2400.0, price: 0.0015 };
+        let fresh = Start { base: 1_250_000.0, quote: 2000.0, price: 0.0016 };
+        let held = Held { base: fresh.base, quote: fresh.quote };
+        let now = crate::clock::now_millis();
+        for (age_ms, expected) in [(3_600_000, saved_start), (STRATEGY_START_MAX_AGE_MS + 60_000, fresh)] {
+            let mut om = strategy_manager(in_band.clone());
+            let saved = SavedStrategyStart::new(ID, "rebalancer", saved_start, held, now - age_ms).unwrap();
+            om.tracker.lock().await.strategy_starts_mut().restore(&[saved], now);
+            om.stub_book(0.0016, Vec::new());
+            om.stub_cancels = Some(Vec::new());
+            visit(&mut om).await;
+            assert!(om.submit_log.is_empty());
+            assert_eq!(om.strategies.get(ID).and_then(|rt| rt.start), Some(expected));
+            // The next save keeps them, stamped with its own time
+            let out = om.tracker.lock().await.strategy_starts().export(now + 5);
+            let out: Vec<_> = out.iter().map(|s| (s.saved_at_ms, s.start_at(now + 5))).collect();
+            assert_eq!(out, [(now + 5, Some(expected))]);
+        }
+    }
+
+    // Funds moved while stopped move the restored start, with one warning; a file without
+    // the balances at the save keeps the start as saved
+    #[tokio::test]
+    async fn a_restart_after_a_withdrawal_keeps_the_position_not_the_old_base() {
+        use crate::state::SavedStrategyStart;
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let in_band = StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.5), ..Default::default() });
+        let saved_start = Start { base: 1_000_000.0, quote: 2400.0, price: 0.0015 };
+        // Long 500k at the stop; the restart finds 1.25M base and 2000 quote
+        let at_save = Held { base: 1_500_000.0, quote: 1650.0 };
+        let now = crate::clock::now_millis();
+        let saved = SavedStrategyStart::new(ID, "rebalancer", saved_start, at_save, now - 60_000).unwrap();
+        let older = SavedStrategyStart { base_at_save: None, quote_at_save: None, ..saved.clone() };
+        let moved = Start { base: 750_000.0, quote: 2750.0, price: 0.0015 };
+        for (entry, expected) in [(saved, moved), (older, saved_start)] {
+            let mut om = strategy_manager(in_band.clone());
+            om.tracker.lock().await.strategy_starts_mut().restore(&[entry], now);
+            om.stub_book(0.0016, Vec::new());
+            om.stub_cancels = Some(Vec::new());
+            visit(&mut om).await;
+            assert_eq!(om.strategies.get(ID).and_then(|rt| rt.start), Some(expected));
+            // The next save holds the balances of the last cycle
+            let out = om.tracker.lock().await.strategy_starts().export(now + 5);
+            let written = (out[0].base_at_save.as_deref(), out[0].quote_at_save.as_deref());
+            assert_eq!(written, (Some("1250000"), Some("2000")));
+        }
+        assert_eq!(1_250_000.0 - moved.base, at_save.base - saved_start.base, "the position, not the old base");
+        assert_eq!(logs.count("balances changed while stopped (base -250000.00, quote +350.00)"), 1);
+        assert_eq!(logs.count("start moved by as much (now base 750000.00, quote 2750.00)"), 1);
+        assert_eq!(logs.count("start balances from the last stop (base 1000000.00, quote 2400.00)"), 1);
+    }
+
+    // The IOC is signed and tracked like a grid order, so its match verifies
+    #[tokio::test]
+    async fn an_ioc_order_passes_settlement_verification() {
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        visit(&mut om).await;
+        let proposal = orderbook_proto::orderbook::SettlementProposal {
+            market_id: ID.to_string(),
+            buyer: "counterparty".to_string(),
+            seller: "our-party".to_string(),
+            base_quantity: "12500".to_string(),
+            order_match: Some(orderbook_proto::orderbook::OrderMatch { offer_order_id: 42, ..Default::default() }),
+            ..Default::default()
+        };
+        let verdict = om.tracker.lock().await.verify_settlement(&proposal, "our-party");
+        assert!(matches!(verdict, VerifyResult::Accepted { order_id: 42 }));
+    }
+
+    // A refusal backs off; an unknown outcome holds the gate for 120 s
+    #[tokio::test]
+    async fn refused_and_ambiguous_takes_close_the_gate() {
+        use tonic::Status;
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Err(Status::invalid_argument("below the minimum order value")));
+        visit(&mut om).await;
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1, "backing off");
+        assert!(om.strategies.get(ID).is_some_and(|rt| rt.gate.backoff_until.is_some()));
+
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Err(Status::unavailable("x")));
+        visit(&mut om).await;
+        back(&mut om, 20);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1, "held after an ambiguous submit");
+        back(&mut om, 200);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 2);
+    }
+
+    // A taker withdraws orders left from another kind, and keeps none of its own
+    #[tokio::test]
+    async fn a_taker_withdraws_leftover_orders() {
+        let in_band = StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.5), ..Default::default() });
+        let mut om = strategy_manager(in_band);
+        om.stub_book(0.0016, vec![resting(5, OrderType::Bid, "0.0015", "1000"), resting(6, OrderType::Offer, "0.0017", "0")]);
+        om.stub_cancels = Some(Vec::new());
+        om.stub_submit = Some(Ok(1));
+        visit(&mut om).await;
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[5u64][..]), "a matched-only order has nothing to cancel");
+        assert!(om.submit_log.is_empty());
+    }
+
+    // After shutdown the visit sends nothing; any RPC here would hang
+    #[tokio::test]
+    async fn a_strategy_visit_issues_no_rpc_after_shutdown() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let mut om = manager(url, vec![bare(ID)], Some(rebalancer()));
+        om.stub_min_base = None;
+        om.stub_price = Some(0.0016);
+        let stop = Shutdown::new();
+        om.stop_on_price = Some(stop.clone());
+        let mut report = CycleReport::default();
+        let market = bare(ID);
+        let run = om.visit_market(&market, &stop, &mut report);
+        assert!(tokio::time::timeout(Duration::from_secs(2), run).await.is_ok());
+        assert!(om.submit_log.is_empty());
+        drop(listener);
+    }
+
+    // Grid rungs worth less than the server minimum are not placed
+    #[tokio::test]
+    async fn grid_rungs_below_the_minimum_order_value_are_skipped() {
+        let level = |delta_percent: f64, quantity: &str| PriceLevel { delta_percent, quantity: quantity.to_string() };
+        let mut m = bare("AAA-USD");
+        m.bid_levels = vec![level(-0.5, "1"), level(-1.0, "2")];
+        m.offer_levels = vec![level(0.5, "1"), level(1.0, "2")];
+        let mut om = manager(closed_port_url(), vec![m.clone()], None);
+        om.set_balances(vec![token("Amulet", "100", true), token("AAA", "10", false), token("USD", "1000", false)]);
+        om.tick_sizes.insert("AAA-USD".to_string(), 0.01);
+        om.stub_min_base = Some(Some(1.5));
+        om.stub_book(100.0, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        let (stop, mut report) = (Shutdown::new(), CycleReport::default());
+        tokio::time::timeout(Duration::from_secs(10), om.visit_market(&m, &stop, &mut report)).await.unwrap();
+        // The minimum is looked up right after the price, so the first visit applies it
+        let quantities: Vec<&str> = om.submit_log.iter().map(|e| e.2.as_str()).collect();
+        assert_eq!(quantities, ["2", "2"], "{:?}", om.submit_log);
+        assert!(om.config.strategy_for("AAA-USD").is_grid());
+    }
+
+    // An offer shaped below the minimum is not placed, though its configured size clears it
+    #[tokio::test]
+    async fn grid_offers_shaped_below_the_minimum_order_value_are_skipped() {
+        let mut m = bare("AAA-USD");
+        m.bid_levels = vec![level(-0.5, "1")];
+        m.offer_levels = vec![level(0.5, "1"), level(1.0, "4")];
+        let rfq = "min_quantity = \"1\"\nmax_quantity = \"10\"\n[pool_impact]\nenabled = true\ngrid_offer_scale_base = 4.0\n";
+        m.rfq = Some(toml::from_str(rfq).unwrap());
+        let mut om = manager(closed_port_url(), vec![m.clone()], None);
+        om.set_balances(vec![token("Amulet", "100", true), token("AAA", "10", false), token("USD", "1000", false)]);
+        om.tick_sizes.insert("AAA-USD".to_string(), 0.01);
+        // A desk net of 3 against a scale of 4 shapes offers to a quarter
+        let path = std::env::temp_dir().join(format!("agent-logic-shape-{}.json", std::process::id()));
+        let nets = crate::net_position::NetPositionTracker::load_or_new(path, 24.0, Duration::from_secs(600));
+        nets.record_confirm("q1", Some("someone"), "AAA", 3.0);
+        om.set_net_positions(nets);
+        om.pool_depths.insert("AAA-USD".to_string(), PoolDepth { base_reserve: 1e9 });
+        om.stub_min_base = Some(Some(0.5));
+        om.stub_book(100.0, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        let (stop, mut report) = (Shutdown::new(), CycleReport::default());
+        tokio::time::timeout(Duration::from_secs(10), om.visit_market(&m, &stop, &mut report)).await.unwrap();
+        // $25 of the first offer is under the $50.50 floor; the second shapes to $101
+        let offers: Vec<f64> =
+            om.submit_log.iter().filter(|e| e.0 == OrderType::Offer).map(|e| e.2.parse::<f64>().unwrap()).collect();
+        assert_eq!(offers.len(), 1, "{:?}", om.submit_log);
+        assert!((offers[0] - 1.0).abs() < 1e-6, "{offers:?}");
+        assert_eq!(om.submit_log.iter().filter(|e| e.0 == OrderType::Bid).count(), 1);
+    }
+
+    // A rung left out for the minimum returns only 5% above it, so the side does not flap
+    #[tokio::test]
+    async fn a_grid_rung_near_the_minimum_returns_only_past_the_band() {
+        let mut m = bare("AAA-USD");
+        m.bid_levels = vec![level(0.0, "1"), level(-1.0, "2")];
+        let mut om = manager(closed_port_url(), vec![m.clone()], None);
+        let min = MinBase { qty: Some(1.0), at_price: 10.0, fetched: Instant::now(), warned_at: None };
+        om.min_base.insert("AAA-USD".to_string(), min);
+        let mut bids = |mid: f64| om.rungs_above_min(&m, mid).map_or(2, |k| k.bid_levels.len());
+        // The floor is 10.10 with its 1% headroom
+        assert_eq!(bids(10.2), 2);
+        assert_eq!(bids(10.0), 1, "under the floor");
+        assert_eq!(bids(10.3), 1, "above the floor, inside the band");
+        assert_eq!(bids(10.7), 2, "past the band");
+        assert_eq!(bids(10.15), 2, "kept down to the floor");
+    }
+
+    // A withdraw seen empty skips the listing for a minute, but not once something was placed
+    #[tokio::test]
+    async fn a_withdraw_after_a_placement_lists_the_market_again() {
+        let mut om = strategy_manager(market_maker());
+        om.stub_book(0.0016, Vec::new());
+        om.stub_cancels = Some(Vec::new());
+        om.stub_submit = Some(Ok(7));
+        let (stop, mut report) = (Shutdown::new(), CycleReport::default());
+        om.withdraw_all(ID, "test", &stop, &mut report).await;
+        assert_eq!(om.last_resting.get(ID), Some(&SideCounts::default()));
+        om.place_bid(ID, "0.0015", "10000", None).await.unwrap();
+        om.stub_orders = Some(vec![resting(7, OrderType::Bid, "0.0015", "10000")]);
+        om.withdraw_all(ID, "test", &stop, &mut report).await;
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[7u64][..]));
+        // A submit that may have been booked counts as a placement too
+        om.stub_submit = Some(Err(tonic::Status::unavailable("x")));
+        assert!(om.place_ioc(ID, OrderType::Bid, "0.0015", "10000", None).await.is_err());
+        assert!(!om.last_resting.contains_key(ID));
+    }
+
+    // A stale reading keeps a maker's quotes; stale for 5 min they are withdrawn
+    #[tokio::test]
+    async fn a_stale_reference_holds_maker_quotes_then_withdraws_them() {
+        let mut om = strategy_manager(market_maker());
+        om.stub_depth = Some(book(false));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        om.stub_cancels = Some(Vec::new());
+        let now = crate::clock::now_secs_i64();
+        // A served stamp under a minute old is normal
+        om.stub_stamp = Some(now - 50);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 4);
+        om.stub_orders = Some(placed(&om.submit_log));
+
+        om.stub_stamp = Some(now - 120);
+        let report = visit(&mut om).await;
+        assert_eq!((report.placed, report.cancelled), (0, 0), "held");
+        let rt = om.strategies.get_mut(ID).unwrap();
+        rt.guard.stale_since = rt.guard.stale_since.and_then(|t| t.checked_sub(Duration::from_secs(300)));
+        assert_eq!(visit(&mut om).await.cancelled, 4, "stale for 300 s by the clock");
+        assert_eq!(om.submit_log.len(), 4);
+
+        // Fresh again, the quotes return; a stamp 400 s old has been stale over 300 s
+        om.stub_stamp = Some(now);
+        om.stub_orders = Some(Vec::new());
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 8);
+        om.stub_orders = Some(placed(&om.submit_log[4..]));
+        om.stub_stamp = Some(now - 400);
+        assert_eq!(visit(&mut om).await.cancelled, 4, "stale for 310 s by the stamp");
+    }
+
+    // A taker sends nothing on a stale reading and takes once it is fresh
+    #[tokio::test]
+    async fn a_taker_waits_out_a_stale_reference() {
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        om.stub_cancels = Some(Vec::new());
+        om.stub_stamp = Some(crate::clock::now_secs_i64() - 400);
+        visit(&mut om).await;
+        assert!(om.submit_log.is_empty());
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[][..]));
+        om.stub_stamp = Some(crate::clock::now_secs_i64());
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+    }
+
+    // success=false and a signing failure are refusals; only a timeout status leaves it open
+    #[tokio::test]
+    async fn refused_or_unsigned_takes_back_off_and_only_a_timeout_holds() {
+        for refuse in [true, false] {
+            let mut om = strategy_manager(rebalancer());
+            om.stub_depth = Some(book(true));
+            om.stub_book(0.0016, Vec::new());
+            om.stub_submit = Some(Ok(42));
+            if refuse {
+                om.stub_refuse = Some("below the minimum order value".to_string());
+            } else {
+                om.tracker.lock().await.set_fail_signing(true);
+            }
+            visit(&mut om).await;
+            let rt = om.strategies.get(ID).unwrap();
+            assert!(rt.gate.backoff_until.is_some() && rt.gate.last.is_none(), "refuse={refuse}");
+            assert!(!om.min_base.contains_key(ID), "the minimum is looked up again");
+            assert_eq!(om.submit_log.len(), usize::from(refuse));
+        }
+        let mut om = strategy_manager(rebalancer());
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Err(tonic::Status::deadline_exceeded("client deadline exceeded")));
+        visit(&mut om).await;
+        let rt = om.strategies.get(ID).unwrap();
+        assert!(rt.gate.backoff_until.is_none() && rt.gate.last.is_some_and(|l| l.ambiguous));
+    }
+
+    // A placement-based cooldown used to pin a resting maker clip to a stale price
+    #[tokio::test]
+    async fn a_rebalancer_maker_reprices_its_clip_when_the_reference_moves() {
+        let maker = RebalancerConfig { target_share: Some(0.65), mode: StrategyMode::Maker, ..Default::default() };
+        let mut om = strategy_manager(StrategyConfig::Rebalancer(maker));
+        om.stub_depth = Some(book(false));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        om.stub_cancels = Some(Vec::new());
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+        let (side, price, quantity, _) = om.submit_log[0].clone();
+        // 40 bps lower, inside the jump guard: the clip is cancelled and placed again at once
+        om.stub_book(0.0015936, vec![resting(9, side, &price, &quantity)]);
+        visit(&mut om).await;
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[9u64][..]));
+        assert_eq!(om.submit_log.len(), 2);
+        assert_ne!(om.submit_log[1].1, price);
+    }
+
+    // With depth failing the maker keeps its quotes for five cycles and withdraws on the sixth
+    #[tokio::test]
+    async fn a_maker_withdraws_after_six_depth_failures() {
+        let mut om = strategy_manager(market_maker());
+        let quotes = vec![resting(1, OrderType::Bid, "0.0015984", "25100"), resting(2, OrderType::Offer, "0.0016016", "25000")];
+        om.stub_book(0.0016, quotes);
+        om.stub_cancels = Some(Vec::new());
+        om.stub_submit = Some(Ok(9));
+        for _ in 0..5 {
+            visit(&mut om).await;
+        }
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[][..]));
+        visit(&mut om).await;
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[1u64, 2][..]));
+        assert!(om.submit_log.is_empty());
+    }
+
+    // An arbitrage takes an agent offer 10 bps under the reference once it has watched it a minute
+    #[tokio::test]
+    async fn an_arbitrage_takes_an_agent_offer_through_the_reference() {
+        let mut om = strategy_manager(StrategyConfig::Arbitrage(ArbitrageConfig::default()));
+        let (mut full, lp) = book(false);
+        full.offers.insert(0, lvl("0.0015984000", "20000", 1));
+        om.stub_depth = Some((full, lp));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(77));
+        visit(&mut om).await;
+        assert!(om.submit_log.is_empty(), "a new reference is not judged stable yet");
+        if let StrategyState::Arbitrage(a) = &mut om.strategies.get_mut(ID).unwrap().state {
+            a.age(Duration::from_secs(61));
+        }
+        visit(&mut om).await;
+        // At exactly the agent offer, capped by its one order
+        let first = (OrderType::Bid, "0.0015984000".to_string(), "20000".to_string(), TimeInForce::Ioc);
+        assert_eq!(om.submit_log, vec![first.clone()]);
+        // Gone but young: nothing more; past the hold and the 10 s cooldown it takes again
+        om.stub_orders = Some(Vec::new());
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+        back(&mut om, 16);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log, vec![first.clone(), first]);
+        // The first take matched nothing, so it counts as empty
+        let stats = om.strategies.get(ID).map(|rt| (rt.stats.takes, rt.stats.takes_filled, rt.stats.takes_empty));
+        assert_eq!(stats, Some((2, 0, 1)));
+    }
+
+    // A mean-reversion maker rests one clip 4 bps inside, keeps it, and withdraws it back at its mean
+    #[tokio::test]
+    async fn a_mean_reversion_maker_rests_one_clip_and_withdraws_it_at_the_mean() {
+        let mr = MeanReversionConfig { mode: StrategyMode::Maker, ..Default::default() };
+        let mut om = strategy_manager(StrategyConfig::MeanReversion(mr));
+        om.stub_depth = Some(book(false));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        om.stub_cancels = Some(Vec::new());
+        visit(&mut om).await;
+        assert!(om.submit_log.is_empty(), "warming up");
+        let prime = |om: &mut OrderManager, mean: f64| {
+            let now = Instant::now();
+            if let StrategyState::MeanReversion(m) = &mut om.strategies.get_mut(ID).unwrap().state {
+                m.prime(mean, now.checked_sub(Duration::from_secs(700)).unwrap(), now);
+            }
+        };
+        // 37.5 bps over its mean: a $100 short, one $30 offer 4 bps over the reference
+        prime(&mut om, 0.0016 / 1.00375);
+        visit(&mut om).await;
+        let offer = (OrderType::Offer, "0.0016007000".to_string(), "18800".to_string(), TimeInForce::Gtc);
+        assert_eq!(om.submit_log, vec![offer]);
+        om.stub_orders = Some(placed(&om.submit_log));
+        let report = visit(&mut om).await;
+        assert_eq!((report.placed, report.cancelled), (0, 0), "kept");
+        prime(&mut om, 0.0016);
+        let report = visit(&mut om).await;
+        assert_eq!((report.placed, report.cancelled), (0, 1), "withdrawn");
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[1u64][..]));
+    }
+
+    // A twap with start_at waits for its history, rests a slice, cancels it past its ttl, then takes
+    #[tokio::test]
+    async fn a_twap_loads_its_history_then_rests_and_takes() {
+        let start = crate::clock::now_utc() - chrono::TimeDelta::seconds(60);
+        let twap = TwapConfig {
+            side: Some(TradeSide::Sell),
+            total_quantity: Some("250000".into()),
+            start_at: Some(start.to_rfc3339()),
+            seed: Some(5),
+            ..Default::default()
+        };
+        let mut om = strategy_manager(StrategyConfig::Twap(twap));
+        om.stub_depth = Some(book(true));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(31));
+        om.stub_cancels = Some(Vec::new());
+        // The lookup goes to a closed port: nothing is placed until it succeeds
+        visit(&mut om).await;
+        assert!(om.submit_log.is_empty());
+        assert!(om.strategies.get(ID).is_some_and(|rt| rt.history_retry_at.is_some()));
+        let earlier = orderbook_proto::orderbook::Settlement {
+            proposal_id: "p1".into(),
+            market_id: ID.into(),
+            buyer: "someone".into(),
+            seller: om.config.party_id.clone(),
+            base_quantity: "10000".into(),
+            ..Default::default()
+        };
+        om.stub_settlements = Some(vec![earlier]);
+        om.strategies.get_mut(ID).unwrap().history_retry_at = None;
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+        let (side, price, quantity, tif) = om.submit_log[0].clone();
+        assert_eq!((side, price.as_str(), tif), (OrderType::Offer, "0.0016023", TimeInForce::Gtd));
+        // Still listed past its ttl: cancelled here, and the slice takes the agent bid
+        om.stub_orders = Some(vec![resting(31, OrderType::Offer, &price, &quantity)]);
+        let rt = om.strategies.get_mut(ID).unwrap();
+        rt.rest_until = rt.rest_until.map(|(id, _)| (id, Instant::now()));
+        if let StrategyState::Twap(t) = &mut rt.state {
+            t.age(Duration::from_secs(61));
+        }
+        back(&mut om, 61);
+        visit(&mut om).await;
+        assert_eq!(om.stub_cancels.as_deref(), Some(&[31u64][..]));
+        // A match of the rest may still arrive: the take waits the usual 15 s
+        om.stub_orders = Some(Vec::new());
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 1);
+        back(&mut om, 16);
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 2);
+        let (side, price, _, tif) = om.submit_log[1].clone();
+        assert_eq!((side, price.as_str(), tif), (OrderType::Offer, "0.0015990000", TimeInForce::Ioc));
+        assert_eq!(om.strategies.get(ID).map(|rt| rt.stats.takes_empty), Some(1));
+    }
+
+    // The settlements cap withdraws the quotes when it pauses, and again when it stops
+    #[tokio::test]
+    async fn the_settlement_cap_withdraws_on_pause_and_on_stop() {
+        let mm = MarketMakerConfig { max_settlements_per_hour: 1, ..Default::default() };
+        let mut om = strategy_manager(StrategyConfig::MarketMaker(mm));
+        om.stub_depth = Some(book(false));
+        om.stub_book(0.0016, Vec::new());
+        om.stub_submit = Some(Ok(9));
+        om.stub_cancels = Some(Vec::new());
+        let fill = |om: &mut OrderManager, secs_ago: u64| {
+            let at = Instant::now().checked_sub(Duration::from_secs(secs_ago)).unwrap();
+            let fill = crate::strategy::RecentFill { at, side: OrderType::Bid, base: 1.0, quote: 1.0 };
+            om.strategies.get_mut(ID).unwrap().recent.push_back(fill);
+        };
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 4);
+        om.stub_orders = Some(placed(&om.submit_log));
+        fill(&mut om, 10);
+        let report = visit(&mut om).await;
+        assert_eq!((report.cancelled, report.placed), (4, 0), "paused");
+        assert!(om.strategies.get(ID).is_some_and(|rt| rt.cap.paused_until.is_some()));
+
+        // The pause runs out and the maker quotes again; a second hit stops it
+        om.stub_orders = Some(Vec::new());
+        om.strategies.get_mut(ID).unwrap().cap.paused_until = Instant::now().checked_sub(Duration::from_secs(1));
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 8);
+        om.stub_orders = Some(placed(&om.submit_log[4..]));
+        fill(&mut om, 0);
+        let report = visit(&mut om).await;
+        assert_eq!((report.cancelled, report.placed), (4, 0), "stopped");
+        assert!(om.strategies.get(ID).is_some_and(|rt| rt.cap.strikes == 2));
+        visit(&mut om).await;
+        assert_eq!(om.submit_log.len(), 8, "stays stopped");
     }
 }

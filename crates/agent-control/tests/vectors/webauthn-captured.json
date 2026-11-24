@@ -1,0 +1,35 @@
+{
+  "schema": "silvana.agent-control.webauthn-captured.v1",
+  "captures": [
+    {
+      "browser": "Chrome, macOS, synced passkey",
+      "spkiHex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004539a91bef0b22c1b9b1484fc69c7a4dccd01dd501796358e693e85f6242f068c29b4e4333f789dd9347f519f03ed5dbfdc09d10f65ad88b97f675d4e9f8407b8",
+      "rpId": "silvana.link",
+      "origin": "https://book-devnet.silvana.link",
+      "payload": "silvana.agent.control-key-check.v1\nnonce=cb9fb030296bd7d447929b4d4d7b855feeab81f1b0a31faa1681bb0eac88bfd6\n",
+      "authenticatorDataB64url": "nhvdka0MBoiIjNZupyg_Mgwts81bNz1EM_thgF1qRw0dAAAAAA",
+      "clientDataJsonB64url": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiTVlOSk9xUWp1VlN3VndfeTdzZG11ckhfMFg2QkRwOEk1X2kyOC1MUm4tUSIsIm9yaWdpbiI6Imh0dHBzOi8vYm9vay1kZXZuZXQuc2lsdmFuYS5saW5rIiwiY3Jvc3NPcmlnaW4iOmZhbHNlfQ",
+      "signatureB64url": "MEQCIHCxMYMnWzZwRL5-FvY_TrsWXrpr5nPF00Jag-TBwmKdAiB-woXvtUaT7uQpY_nEEF5pbNQ_Ylc7iDeoGv8MhE7Rgw",
+      "expect": "ok",
+      "backupEligible": true,
+      "backupState": true,
+      "signCount": 0,
+      "credentialIdB64url": "_Cd7bmEq8qfL1Tu2XOu_q9ZYLQc"
+    },
+    {
+      "browser": "Chrome, macOS, synced passkey",
+      "spkiHex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004539a91bef0b22c1b9b1484fc69c7a4dccd01dd501796358e693e85f6242f068c29b4e4333f789dd9347f519f03ed5dbfdc09d10f65ad88b97f675d4e9f8407b8",
+      "rpId": "silvana.link",
+      "origin": "https://book-devnet.silvana.link",
+      "payload": "silvana.agent.control-key-check.v1\nnonce=df8e611a46f01127d96fefd554b1b7cfd171e89272702d2a20546c09277316de\n",
+      "authenticatorDataB64url": "nhvdka0MBoiIjNZupyg_Mgwts81bNz1EM_thgF1qRw0dAAAAAA",
+      "clientDataJsonB64url": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoidzZyT2JyR284cmFMbFNhb1NhTFhPSTd6X0pkSGxxZU8yY3FoZTdFNU45YyIsIm9yaWdpbiI6Imh0dHBzOi8vYm9vay1kZXZuZXQuc2lsdmFuYS5saW5rIiwiY3Jvc3NPcmlnaW4iOmZhbHNlfQ",
+      "signatureB64url": "MEQCIHI1jb96HqutJaG51raByNcBuNgtFwwTisjQcoSpmryAAiASCEAoyJEn3FmfiLV0GTUlH-BQVet4npMDGv7Yg6kLmA",
+      "expect": "ok",
+      "backupEligible": true,
+      "backupState": true,
+      "signCount": 0,
+      "credentialIdB64url": "_Cd7bmEq8qfL1Tu2XOu_q9ZYLQc"
+    }
+  ]
+}

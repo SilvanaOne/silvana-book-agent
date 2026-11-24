@@ -16,6 +16,7 @@ pub mod client;
 pub mod clock;
 pub mod confirm;
 pub mod config;
+pub mod control_store;
 pub mod error_reporter;
 pub mod fees;
 pub mod forecast;
@@ -35,8 +36,10 @@ pub mod secret;
 pub mod settlement;
 pub mod shutdown;
 pub mod sign;
+pub mod signer;
 pub mod state;
 pub mod stdio;
+pub mod strategy;
 pub mod supervise;
 pub mod sync;
 #[cfg(test)]

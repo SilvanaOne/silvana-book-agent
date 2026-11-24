@@ -9,16 +9,19 @@ use indexmap::IndexMap;
 use orderbook_proto::{
     orderbook::{
         AcceptQuoteRequest, AcceptQuoteResponse, CancelOrderRequest, CancelOrderResponse,
-        GetInstrumentsRequest, GetMarketsRequest, GetOrdersRequest, GetRoundsDataRequest,
-        GetRoundsDataResponse, GetSettlementProposalsRequest, Instrument, Market, Order,
-        OrderStatus, OrderType, RequestQuotesRequest, RequestQuotesResponse, SettlementProposal,
+        GetInstrumentsRequest, GetMarketsRequest, GetMinOrderValueRequest,
+        GetMinOrderValueResponse, GetOrderbookDepthRequest, GetOrdersRequest, GetRoundsDataRequest,
+        GetRoundsDataResponse, GetSettlementProposalsRequest, GetSettlementsRequest, Instrument,
+        Market, Order, OrderStatus, OrderType, OrderbookDepth, RequestQuotesRequest,
+        RequestQuotesResponse, Settlement, SettlementProposal,
         SettlementStatus, SettlementUpdate, SubmitOrderRequest, SubmitOrderResponse,
         SubscribeSettlementsRequest, TimeInForce, orderbook_service_client::OrderbookServiceClient,
     },
     pricing::{GetPriceRequest, GetPriceResponse, pricing_service_client::PricingServiceClient},
     rfqv2::{
-        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, RequestQuotesV2Request,
-        RequestQuotesV2Response, RfqConfirmRejectReason, rfq_v2_service_client::RfqV2ServiceClient,
+        AcceptQuoteAtomicRequest, AcceptQuoteAtomicResponse, AtomicLpInfo,
+        GetAtomicLiquidityProvidersRequest, RequestQuotesV2Request, RequestQuotesV2Response,
+        RfqConfirmRejectReason, rfq_v2_service_client::RfqV2ServiceClient,
     },
 };
 use std::future::Future;
@@ -30,9 +33,8 @@ use tonic::Request;
 use tonic::transport::Channel;
 use tracing::debug;
 
-use crate::auth::{generate_jwt, generate_jwt_with_branch};
 use crate::config::BaseConfig;
-use crate::secret::Secret;
+use crate::signer::{AgentSigner, JwtRequest};
 use crate::transport::{self, ChannelOpts};
 use crate::{clock, sync};
 
@@ -45,13 +47,15 @@ const MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_INSTRUMENT_PAGES: usize = 100;
 /// Most pages one `get_pending_proposals` listing fetches.
 const MAX_PROPOSAL_PAGES: usize = 200;
+/// Most pages one `get_settlements` listing fetches.
+const MAX_SETTLEMENT_PAGES: usize = 100;
 
 /// External account authentication data
 #[derive(Clone)]
 struct ExternalAuthData {
     party_id: String,
     public_key_hex: String,
-    private_key: Secret<32>,
+    signer: AgentSigner,
     role: String,
     ttl_secs: u64,
     node_name: String,
@@ -99,23 +103,24 @@ impl OrderbookClient {
     /// Build the service clients over a channel.
     fn with_channel(channel: Channel, config: &BaseConfig) -> Result<Self> {
         // Generate initial JWT for interceptor
-        let jwt = generate_jwt_with_branch(
-            &config.party_id,
-            &config.role,
-            &*config.private_key.expose()?,
-            config.token_ttl_secs,
-            Some(config.node_name.as_str()),
-            config.venue_branch.as_deref(),
-        )?;
+        let signer = config.signer()?;
+        let (jwt, minted_head) = signer.sign_jwt_with_head(&JwtRequest {
+            sub: &config.party_id,
+            role: &config.role,
+            ttl_secs: config.token_ttl_secs,
+            node_name: Some(config.node_name.as_str()),
+            venue_branch: config.venue_branch.as_deref(),
+        })?;
 
         let now = clock::now_secs();
         let token_arc = Arc::new(RwLock::new(jwt));
+        let minted_head = Arc::new(RwLock::new(minted_head));
         let expires_at = Arc::new(RwLock::new(now.saturating_add(config.token_ttl_secs)));
 
         let auth_data = ExternalAuthData {
             party_id: config.party_id.clone(),
             public_key_hex: config.public_key_hex.clone(),
-            private_key: config.private_key.clone(),
+            signer,
             role: config.role.clone(),
             ttl_secs: config.token_ttl_secs,
             node_name: config.node_name.clone(),
@@ -125,6 +130,7 @@ impl OrderbookClient {
         let auth_interceptor = AuthInterceptor {
             token: token_arc.clone(),
             expires_at: expires_at.clone(),
+            minted_head,
             auth_data: auth_data.clone(),
         };
 
@@ -229,13 +235,44 @@ impl OrderbookClient {
         signed_data: Vec<u8>,
         nonce: u64,
     ) -> Result<SubmitOrderResponse> {
+        self.submit_order_tif(
+            market_id,
+            order_type,
+            price,
+            quantity,
+            trader_order_ref,
+            signature,
+            signed_data,
+            nonce,
+            TimeInForce::Gtc,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::submit_order`] with a time in force; `expires_at` is for GTD.
+    /// The time in force is not part of the signed order.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_order_tif(
+        &mut self,
+        market_id: &str,
+        order_type: OrderType,
+        price: String,
+        quantity: String,
+        trader_order_ref: Option<String>,
+        signature: Option<String>,
+        signed_data: Vec<u8>,
+        nonce: u64,
+        time_in_force: TimeInForce,
+        expires_at: Option<prost_types::Timestamp>,
+    ) -> Result<SubmitOrderResponse> {
         let request = Request::new(SubmitOrderRequest {
             market_id: market_id.to_string(),
             order_type: order_type as i32,
             price,
             quantity,
-            time_in_force: TimeInForce::Gtc as i32, // Good Till Cancel
-            expires_at: None,
+            time_in_force: time_in_force as i32,
+            expires_at,
             trader_order_ref,
             credentials: None,
             requirements: None,
@@ -254,6 +291,80 @@ impl OrderbookClient {
             .map_err(submit_order_error)?;
 
         Ok(response.into_inner())
+    }
+
+    /// Aggregated book levels; `only_liquidity_providers` keeps just LP orders.
+    pub async fn get_orderbook_depth(
+        &mut self,
+        market_id: &str,
+        depth: u32,
+        only_liquidity_providers: bool,
+    ) -> Result<OrderbookDepth> {
+        let request = Request::new(GetOrderbookDepthRequest {
+            market_id: market_id.to_string(),
+            depth: Some(depth),
+            only_liquidity_providers: Some(only_liquidity_providers),
+        });
+        let inner = within(self.deadline, self.orderbook_client.get_orderbook_depth(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_orderbook_depth failed: {}", e.message()))?
+            .into_inner();
+        if !inner.success {
+            anyhow::bail!("get_orderbook_depth failed: {}", inner.message);
+        }
+        Ok(inner.orderbook.unwrap_or_default())
+    }
+
+    /// Minimum order value, and the base quantity that clears it at `price`.
+    pub async fn get_min_order_value(
+        &mut self,
+        market_id: &str,
+        price: Option<String>,
+    ) -> Result<GetMinOrderValueResponse> {
+        let request = Request::new(GetMinOrderValueRequest {
+            market_id: Some(market_id.to_string()),
+            price,
+        });
+        let inner = within(self.deadline, self.orderbook_client.get_min_order_value(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_min_order_value failed: {}", e.message()))?
+            .into_inner();
+        if !inner.success {
+            anyhow::bail!("get_min_order_value failed: {}", inner.message);
+        }
+        Ok(inner)
+    }
+
+    /// Own completed settlements, paged; `from_time` bounds the listing.
+    pub async fn get_settlements(
+        &mut self,
+        market_id: Option<&str>,
+        from_time: Option<prost_types::Timestamp>,
+    ) -> Result<Vec<Settlement>> {
+        const PAGE_SIZE: u32 = 100;
+        let client = self.orderbook_client.clone();
+        let deadline = self.deadline;
+        let market_id = market_id.map(str::to_string);
+        collect_pages("get_settlements", MAX_SETTLEMENT_PAGES, move |offset| {
+            let mut client = client.clone();
+            let (market_id, from_time) = (market_id.clone(), from_time);
+            async move {
+                let request = Request::new(GetSettlementsRequest {
+                    market_id,
+                    from_time,
+                    to_time: None,
+                    limit: Some(PAGE_SIZE),
+                    offset: Some(offset),
+                });
+                let inner = within(deadline, client.get_settlements(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_settlements failed: {}", e.message()))?
+                    .into_inner();
+                let short = u32::try_from(inner.settlements.len()).is_ok_and(|n| n < PAGE_SIZE);
+                Ok(Page { total: inner.total, ends: short, items: inner.settlements })
+            }
+        })
+        .await
     }
 
     /// Cancel an existing order
@@ -352,13 +463,13 @@ impl OrderbookClient {
         let mut request = Request::new(SubscribeSettlementsRequest { market_id });
 
         // Add authorization header
-        let jwt = generate_jwt(
-            &self.auth_data.party_id,
-            &self.auth_data.role,
-            &*self.auth_data.private_key.expose()?,
-            self.auth_data.ttl_secs,
-            Some(self.auth_data.node_name.as_str()),
-        )?;
+        let jwt = self.auth_data.signer.sign_jwt(&JwtRequest {
+            sub: &self.auth_data.party_id,
+            role: &self.auth_data.role,
+            ttl_secs: self.auth_data.ttl_secs,
+            node_name: Some(self.auth_data.node_name.as_str()),
+            venue_branch: None,
+        })?;
         request.metadata_mut().insert(
             "authorization",
             format!("Bearer {}", jwt)
@@ -483,6 +594,15 @@ impl OrderbookClient {
         Ok(response.into_inner())
     }
 
+    /// The RFQ V2 liquidity providers connected now: name, party and markets.
+    pub async fn get_atomic_liquidity_providers(&mut self) -> Result<Vec<AtomicLpInfo>> {
+        let request = Request::new(GetAtomicLiquidityProvidersRequest {});
+        let response = within(self.deadline, self.rfqv2_client.get_atomic_liquidity_providers(request))
+            .await
+            .map_err(|e| anyhow::anyhow!("get_atomic_liquidity_providers failed: {}", e.message()))?;
+        Ok(response.into_inner().lps)
+    }
+
     /// Get the party ID for this client
     pub fn party_id(&self) -> &str {
         &self.auth_data.party_id
@@ -576,6 +696,8 @@ pub fn atomic_reject_reason_name(code: i32) -> &'static str {
 struct AuthInterceptor {
     token: Arc<RwLock<String>>,
     expires_at: Arc<RwLock<u64>>,
+    /// The control head the current token carries; a new head mints a new token.
+    minted_head: Arc<RwLock<Option<agent_control::HeadRef>>>,
     auth_data: ExternalAuthData,
 }
 
@@ -586,27 +708,27 @@ impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, tonic::Status> {
         let now = clock::now_secs();
         let expires_at = *sync::read(&self.expires_at);
+        let head_changed = self.auth_data.signer.guard().head() != *sync::read(&self.minted_head);
 
-        if now.saturating_add(REFRESH_BEFORE_EXPIRY_SECS) >= expires_at {
+        if head_changed || now.saturating_add(REFRESH_BEFORE_EXPIRY_SECS) >= expires_at {
             // On failure the previous token is kept
-            let refreshed = self.auth_data.private_key.expose().map_err(anyhow::Error::from).and_then(|key| {
-                generate_jwt_with_branch(
-                    &self.auth_data.party_id,
-                    &self.auth_data.role,
-                    &key,
-                    self.auth_data.ttl_secs,
-                    Some(self.auth_data.node_name.as_str()),
-                    self.auth_data.venue_branch.as_deref(),
-                )
+            let refreshed = self.auth_data.signer.sign_jwt_with_head(&JwtRequest {
+                sub: &self.auth_data.party_id,
+                role: &self.auth_data.role,
+                ttl_secs: self.auth_data.ttl_secs,
+                node_name: Some(self.auth_data.node_name.as_str()),
+                venue_branch: self.auth_data.venue_branch.as_deref(),
             });
             match refreshed {
-                Ok(new_jwt) => {
+                Ok((new_jwt, head)) => {
                     debug!(
-                        "JWT token refreshed (was expiring in {}s)",
-                        expires_at.saturating_sub(now)
+                        "JWT token refreshed (was expiring in {}s{})",
+                        expires_at.saturating_sub(now),
+                        if head_changed { ", control head changed" } else { "" }
                     );
                     *sync::write(&self.token) = new_jwt;
                     *sync::write(&self.expires_at) = now.saturating_add(self.auth_data.ttl_secs);
+                    *sync::write(&self.minted_head) = head;
                 }
                 Err(e) => {
                     tracing::error!("Failed to refresh JWT: {}", e);
@@ -628,6 +750,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::Secret;
 
     fn order(order_id: u64, filled: &str) -> Order {
         Order { order_id, filled_quantity: filled.to_string(), ..Default::default() }
@@ -642,6 +765,32 @@ mod tests {
         let connect = OrderbookClient::create_channel(&url, opts);
         let result = tokio::time::timeout(Duration::from_secs(10), connect).await;
         assert!(matches!(result, Ok(Err(_))), "the handshake bound should end the connect");
+        drop(listener);
+    }
+
+    // The strategy wrappers are bounded by the same client deadline
+    #[tokio::test]
+    async fn strategy_calls_on_a_silent_server_end_at_the_client_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.orderbook_grpc_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let channel = Channel::from_shared(config.orderbook_grpc_url.clone()).unwrap().connect_lazy();
+        let mut client = OrderbookClient::with_channel(channel, &config).unwrap();
+        client.deadline = Duration::from_millis(200);
+        let bound = Duration::from_secs(5);
+        let deadline_hit = |e: anyhow::Error| e.to_string().contains("client deadline");
+
+        let r = tokio::time::timeout(bound, client.get_orderbook_depth("CC-USDCx", 20, true)).await.unwrap();
+        assert!(deadline_hit(r.unwrap_err()));
+        let r = tokio::time::timeout(bound, client.get_min_order_value("CC-USDCx", Some("1".into()))).await.unwrap();
+        assert!(deadline_hit(r.unwrap_err()));
+        let r = tokio::time::timeout(bound, client.get_settlements(Some("CC-USDCx"), None)).await.unwrap();
+        assert!(deadline_hit(r.unwrap_err()));
+        let submit = client.submit_order_tif(
+            "CC-USDCx", OrderType::Bid, "1".into(), "1".into(), None, None, Vec::new(), 1, TimeInForce::Ioc, None,
+        );
+        let e = tokio::time::timeout(bound, submit).await.unwrap().unwrap_err();
+        assert!(e.to_string().contains("client deadline"), "{e}");
         drop(listener);
     }
 
@@ -733,14 +882,15 @@ mod tests {
         assert_eq!(out[0].filled_quantity, "0.5", "the Partial copy wins");
     }
 
-    fn interceptor(private_key: Secret<32>, expires_at: u64) -> AuthInterceptor {
+    fn interceptor(signer: AgentSigner, expires_at: u64) -> AuthInterceptor {
         AuthInterceptor {
             token: Arc::new(RwLock::new("previous".to_string())),
             expires_at: Arc::new(RwLock::new(expires_at)),
+            minted_head: Arc::new(RwLock::new(None)),
             auth_data: ExternalAuthData {
                 party_id: "party".to_string(),
                 public_key_hex: String::new(),
-                private_key,
+                signer,
                 role: "agent".to_string(),
                 ttl_secs: 3600,
                 node_name: "node".to_string(),
@@ -758,17 +908,55 @@ mod tests {
     // A key that cannot be opened keeps the previous token instead of panicking
     #[test]
     fn interceptor_keeps_the_previous_token_when_the_key_cannot_be_opened() {
-        let mut i = interceptor(Secret::corrupt_for_tests(), 0);
+        let mut i = interceptor(AgentSigner::corrupt_for_tests(), 0);
         assert_eq!(sent_token(&mut i), "Bearer previous");
         assert_eq!(*sync::read(&i.expires_at), 0, "the expiry is not advanced");
     }
 
     #[test]
     fn interceptor_refreshes_a_token_near_expiry() {
-        let mut i = interceptor(Secret::seal(&mut [3u8; 32]).unwrap(), 0);
+        let mut i = interceptor(crate::signer::resolve(&Secret::seal(&mut [3u8; 32]).unwrap()).unwrap(), 0);
         let token = sent_token(&mut i);
         assert!(token.starts_with("Bearer ") && token != "Bearer previous");
         assert!(*sync::read(&i.expires_at) > 0);
+    }
+
+    // Linked tokens carry the control head, so a new head must not wait for expiry
+    #[tokio::test]
+    async fn interceptor_re_mints_when_the_control_head_changes() {
+        use crate::control_store::ControlStore;
+        use crate::control_store::testing::{TestChain, party_for};
+        let seed = [0x5c; 32];
+        let party = party_for(seed, "agent-1").unwrap();
+        let mut bytes = [0u8; 8];
+        let _ = rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        let base = std::env::temp_dir().join(format!("client-remint-{}", hex::encode(bytes)));
+        let store = ControlStore::open(&base, agent_control::Network::Devnet, &party);
+        let chain = TestChain::build(seed, &party, agent_control::Network::Devnet, 2).unwrap();
+        let lock = store.lock().await.unwrap();
+        store.append(&lock, &chain.entries[..1], &[]).unwrap();
+        drop(lock);
+        let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let guard = std::sync::Arc::new(crate::signer::ControlGuard::load(store.clone(), public, None).unwrap());
+        crate::signer::install(guard.clone()).unwrap();
+        let signer = crate::signer::resolve(&Secret::seal(&mut { seed }).unwrap()).unwrap();
+        let mut i = interceptor(signer, u64::MAX);
+        i.auth_data.party_id = party.to_string();
+        let first = sent_token(&mut i);
+        assert_ne!(first, "Bearer previous", "no head was minted yet, so the head changed");
+        assert_eq!(sent_token(&mut i), first, "same head, far from expiry: kept");
+        let lock = store.lock().await.unwrap();
+        store.append(&lock, &chain.entries[1..], &[]).unwrap();
+        drop(lock);
+        guard.reload().await.unwrap();
+        let second = sent_token(&mut i);
+        assert_ne!(second, first);
+        let claims = second.trim_start_matches("Bearer ").split('.').nth(1).unwrap().to_string();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, claims).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["ctl_seq"], 2);
     }
 
     #[tokio::test]

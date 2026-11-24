@@ -37,16 +37,18 @@ Binary at `target/release/cloud-agent`.
 
 ### Onboard
 
-Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets initial CC + USDC balances. On success, it writes a `.env` (Canton party ID, private key, network parties, fee config) and a starter `agent.toml` (role, poll interval, empty `[[markets]]`) into the current directory. The command can be re-run; an existing party ID and key in `.env` are reused. A key passed with `--private-key` or entered at the prompt is not written to `.env`: later commands for that identity read it from `--private-key`, from `PARTY_AGENT_PRIVATE_KEY` in the environment, or from a terminal prompt.
+Self-service onboarding generates an Ed25519 keypair, registers on the waiting list, signs the Canton topology transaction, creates preapprovals, requests a `UserService`, and (on devnet) auto-faucets an initial balance of every token the ledger service advertises. On success, it writes a `.env` (Canton party ID, private key, network parties, fee and prepaid-traffic config) and, unless `agent.toml` already exists, the starter `agent.toml` served by the ledger service into the current directory. The command can be re-run; an existing party ID and key in `.env` are reused. A key passed with `--private-key` or entered at the prompt is not written to `.env`: later commands for that identity read it from `--private-key`, from `PARTY_AGENT_PRIVATE_KEY` in the environment, or from a terminal prompt.
+
+Check the starter `agent.toml` before running `agent`: a `[liquidity_provider]` section runs the agent as an LP (see [Run the agent](#run-the-agent-grid-trader-or-lp)). To use your own config, write `agent.toml` before onboarding; it is never overwritten.
 
 ```bash
 cloud-agent onboard \
+  --network devnet \
   --agent-name my-agent \
-  --email me@example.com \
   --invite-code INVITE1
 ```
 
-Default RPC is `https://orderbook-devnet.silvana.dev:443` — override with `--rpc`.
+`--network` picks the rpc: `mainnet` (the default) is `https://orderbook-mainnet.silvana.dev:443`, `devnet` is `https://orderbook-devnet.silvana.dev:443`. `testnet` is refused before anything is written, because it has no rpc yet. Onboarding also refuses an rpc whose agent configuration names another `CANTON_CHAIN` than the chosen network. No email is sent: it comes from the account that owns the invite code, and an older command that still passes `--email` works, with a notice that the flag is ignored.
 
 ### Faucet (devnet top-up)
 
@@ -54,6 +56,7 @@ Default RPC is `https://orderbook-devnet.silvana.dev:443` — override with `--r
 cloud-agent faucet get --token CC      # 10,000 CC
 cloud-agent faucet get --token USDC    # 1,000 USDC
 cloud-agent info balance
+cloud-agent info prepaid-traffic       # off-chain balance that settlement fees are paid from
 ```
 
 ### Buy CC via RFQ
@@ -70,13 +73,223 @@ cloud-agent buy --market CC-USDC --amount 15
 cloud-agent sell --market CC-USDC --amount 100
 ```
 
-### Run as LP / market-maker
+### Run the agent (grid trader or LP)
 
-Long-running mode: places grid orders on configured markets, responds to incoming RFQs, and settles DVPs end-to-end. Configured via `agent.toml` (see [Reference](#configuration) below).
+Long-running mode: places grid orders on configured markets, settles its order-book matches end-to-end and, as an LP, responds to incoming RFQs. Configured via `agent.toml` (see [Reference](#configuration) below).
 
 ```bash
 cloud-agent agent
 ```
+
+- **Grid trader** (no `[liquidity_provider]` section): settles each order-book match step by step, as DVP proposer or acceptor. It allocates once the counterparty's processing fees are confirmed.
+- **LP** (`[liquidity_provider]` present): also answers RFQs, and allocates last, once the counterparty's fees and allocation are confirmed. By default the order book does not match two connected LPs against each other.
+
+## Strategies
+
+Without further settings every market runs the grid described under [Grid Orders](#grid-orders). A `[markets.strategy]` table picks another strategy for that market; parameters left out keep their defaults:
+
+```toml
+[[markets]]
+market_id = "CC-USDC"
+
+[markets.strategy]
+kind = "market_maker"   # grid, market_maker, rebalancer, momentum, mean_reversion, noise_taker, twap, arbitrage
+half_spread_bps = 12
+```
+
+Rules:
+
+- A strategy other than `grid` cannot be combined with `bid_levels` / `offer_levels` on the same market; the agent refuses to start. `kind = "grid"` with levels is the same as having no table.
+- An unknown `kind` or parameter, or a value out of range, stops the agent at startup.
+- An agent that runs strategies must not have a `[liquidity_provider]` section: the order book does not match liquidity providers against each other, so such an agent would lose its main counterparty. The agent refuses to start. With `rfq_v2_only` the table is ignored.
+- A strategy decides once per cycle. It pauses while the reference price is stale, has jumped more than 1% from the last reading, or is within 1% of `ref_floor` / `ref_cap`.
+- Takers send immediate-or-cancel (IOC) orders at exactly the best price of another agent, and only when that price beats the liquidity provider's quote and lies within the strategy's slippage limit. A take is never larger than one order at that level, so it settles once, and no new take goes out while the last one is listed or settling.
+- Makers rest orders inside the liquidity provider's quotes and re-quote when their target moves more than 2 bps.
+- Takers, and the makers that rest a single order (`rebalancer`, `mean_reversion`), send nothing new while a settlement of theirs is open in that market; `max_inflight` limits only `market_maker`, and the other kinds accept it so configurations that set it still load.
+- Position limits and the report's change count from the balances at the strategy's start; these are saved at a stop and kept if the agent restarts within 6 hours with the same kind on that market, otherwise taken again from the first usable balances. Funds moved in or out while the agent was stopped move the kept start by the same amount, with a warning, so only the position carries over.
+- Orders are worth at least 12 quote units and use round lots; rungs below the server's minimum order value are skipped (the grid skips them too).
+- Every 5 minutes each enabled market, the grid included, logs one line: balances, value at the reference price, change since the start and against simply holding, takes (filled and empty), fills, and the strategy's own state.
+
+Parameters every strategy except `grid` accepts:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `max_settlements_per_hour` | 120 | Settlements in a rolling hour that pause the strategy for 15 min; a second hit stops it until a restart |
+| `ref_floor`, `ref_cap` | unset | Price bounds of the reference; readings within 1% of either are not traded on |
+| `ref_max_age_secs` | 90 | Age of the reference price after which it is stale; makers keep their quotes for up to 5 min of staleness |
+
+### `market_maker`
+
+Quotes a two-sided ladder around a fair price, `reference × (1 − skew × inventory ratio)`, where the ratio is the position since the start over `max_inventory_usd`. The first rung joins inside the liquidity provider's quote. The side that would grow the position shrinks, and is dropped at the limit. After a burst of fills the spread widens for 10 minutes.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `levels` | 2 | Rungs per side (1–5) |
+| `half_spread_bps` | 10 | Distance of the first rung from the fair price |
+| `level_step_bps` | 10 | Extra distance of each further rung |
+| `level_usd` | 40 | Value of the first rung |
+| `size_growth` | 1.5 | Size factor from one rung to the next |
+| `max_inventory_usd` | 300 | Position at which the growing side is dropped |
+| `skew_bps` | 15 | Fair-price shift at the position limit; below twice `half_spread_bps` |
+| `lp_inside` | true | Move the first rung inside the liquidity provider's quote |
+| `lp_improve_ticks` | 1 | Ticks inside that quote |
+| `min_edge_bps` | 3 | Least distance from the reference when moving inside |
+| `pull_jump_bps` | 30 | A reference move this large withdraws the ladder for 2 cycles |
+| `max_inflight` | 8 | Open settlements at which nothing new is placed |
+| `max_fills_per_hour` | 60 | Fills in an hour that widen the spread |
+| `throttle_spread_bps` | 40 | Half spread while widened |
+
+### `rebalancer`
+
+Keeps the base share of the portfolio value near `target_share`. It starts trading when the share is `band_enter` away and stops inside `band_exit`, either taking or resting one order near the reference.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `target_share` | required | Base share of the portfolio value to hold (0.05–0.95) |
+| `band_enter` | 0.02 | Share gap at which trading starts |
+| `band_exit` | 0.005 | Share gap at which it stops |
+| `mode` | `taker` | `taker` (IOC) or `maker` (one resting order) |
+| `clip_usd` | 20 | Value of one trade |
+| `cooldown_secs` | 150 | Least time between trades |
+| `maker_offset_bps` | 3 | Distance of the resting order from the reference |
+| `max_slip_bps` | 15 | Taker price limit from the reference |
+| `max_usd_per_hour` | 600 | Value traded per rolling hour |
+| `flip_cooldown_secs` | 900 | Wait after a fill before trading the other way |
+| `max_inflight` | 1 (taker), 2 (maker) | Accepted, but nothing new is sent while a settlement is open |
+
+### `momentum`
+
+Follows a crossover of a fast and a slow time-based EMA. A signal above `enter_bps` moves it from flat to a long target, one below `-enter_bps` to a short target; it returns to flat under `exit_bps`, never straight from long to short. It reaches its target in clips, holds each position for `min_hold_secs`, and caps how many positions it opens per hour. It does not trade until the averages have warmed up, also after a restart.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `fast_secs` | 180 | Fast EMA time constant |
+| `slow_secs` | 900 | Slow EMA time constant; at least 3 × `fast_secs` |
+| `enter_bps` | 12 | Signal that opens a position |
+| `exit_bps` | 4 | Signal under which a position closes; below `enter_bps` |
+| `max_position_usd` | 200 | Size of the long or short target |
+| `clip_usd` | 30 | Value of one take |
+| `clip_interval_secs` | 20 | Least time between takes |
+| `min_hold_secs` | 600 | Least time a position is held |
+| `max_flips_per_hour` | 3 | Positions opened per rolling hour |
+| `warmup_secs` | 600 | History needed before trading |
+| `max_slip_bps` | 15 | Price limit from the reference |
+| `max_inflight` | 2 | Accepted, but nothing new is sent while a settlement is open |
+
+### `mean_reversion`
+
+Fades moves away from an EMA: the target position grows from zero at `entry_bps` of deviation to `max_position_usd` at `full_bps`, against the move. A deviation beyond `stop_bps` is treated as a trend: it flattens and opens nothing new for `pause_after_stop_secs`. It rests one order near the reference or takes.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `ema_secs` | 1200 | EMA time constant |
+| `entry_bps` | 15 | Deviation where a position starts |
+| `full_bps` | 60 | Deviation where the position is full |
+| `stop_bps` | 150 | Deviation treated as a trend |
+| `max_position_usd` | 200 | Full position |
+| `mode` | `maker` | `maker` (one resting order) or `taker` (IOC) |
+| `maker_offset_bps` | 4 | Distance of the resting order from the reference |
+| `clip_usd` | 30 | Value of one order |
+| `warmup_secs` | 600 | History needed before trading |
+| `pause_after_stop_secs` | 900 | Pause after a stop |
+| `max_slip_bps` | 15 | Taker price limit from the reference |
+| `max_inflight` | 2 | Accepted, but nothing new is sent while a settlement is open |
+
+### `noise_taker`
+
+Trades at random times (exponential gaps, clamped to a quarter and four times the mean) and random sizes, leaning toward the side that brings its position back to the start. Some arrivals rest a short GTD order instead of taking, so that two takers can also trade with each other.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `mean_interval_secs` | 60 | Mean time between arrivals |
+| `clip_usd_min`, `clip_usd_max` | 15, 40 | Range of the trade value |
+| `inventory_bias` | 0.4 | Lean toward the reducing side |
+| `max_position_usd` | 250 | Past this only the reducing side trades |
+| `max_slip_bps` | 20 | Price limit from the reference |
+| `rest_probability` | 0.2 | Share of arrivals that rest a GTD order |
+| `rest_ttl_secs` | 45 | Life of that order |
+| `seed` | from the start time | Random seed; the seed is logged, so a run can be replayed |
+| `max_inflight` | 2 | Accepted, but nothing new is sent while a settlement is open |
+
+### `twap`
+
+Buys or sells `total_quantity` over `duration_secs` in jittered slices. Each slice aims for where the schedule stands at its end: it rests a GTD order one tick inside the best price for `passive_secs`, then takes within the slippage limit. Progress counts its own fills and pending settlements, so it never trades past the total. Any shortfall is logged at the end, 10 minutes after the schedule, instead of chasing the price. With `start_at`, a restarted agent first reads its own settlements since that time and keeps to the same schedule. Not allowed on a market with `[markets.rfq]` enabled.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `side` | required | `buy` or `sell` |
+| `total_quantity` | required | Base quantity, as a decimal string |
+| `start_at` | unset | RFC 3339 start time; makes a restart resume |
+| `start_delay_secs` | 300 | Start this long after launch when `start_at` is unset |
+| `duration_secs` | 4800 | Schedule length |
+| `slice_secs` | 240 | Mean time between slices |
+| `passive_secs` | 60 | How long each slice rests before taking; below `slice_secs` |
+| `max_slip_bps` | 15 | Taker price limit from the reference |
+| `max_catchup` | 2.0 | Most nominal slices one slice may carry when behind |
+| `time_jitter` | 0.2 | Random spread of the slice times |
+| `size_jitter` | 0.15 | Random spread of the slice sizes |
+| `seed` | from the start time | Random seed, logged |
+| `max_inflight` | 3 | Accepted, but nothing new is sent while a settlement is open |
+
+### `arbitrage`
+
+Takes the best agent offer priced at least `min_edge_bps` under the reference, or the best agent bid as far above it, while the reference is fresh and its readings over the last 2 minutes stay within `ref_stable_bps`. It watches the reference for a minute before its first take, and again after a gap of more than 2 minutes between readings; past half its position limit it only reduces.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `min_edge_bps` | 6 | Least distance of the agent price through the reference |
+| `clip_usd_max` | 100 | Largest take |
+| `max_position_usd` | 150 | Position limit |
+| `max_inflight` | 1 | Accepted, but nothing new is sent while a settlement is open |
+| `cooldown_secs` | 10 | Least time between takes |
+| `ref_max_age_secs` | 90 | Age of the reference price after which nothing is taken |
+| `ref_stable_bps` | 30 | Largest spread of the recent readings |
+
+### Example configurations
+
+A market maker:
+
+```toml
+role = "trader"
+auto_settle = true
+poll_interval_secs = 5
+
+[[markets]]
+market_id = "CC-USDC"
+enabled = true
+
+[markets.strategy]
+kind = "market_maker"
+levels = 3
+half_spread_bps = 15
+level_step_bps = 15
+level_usd = 60
+max_inventory_usd = 500
+skew_bps = 20
+```
+
+A taker, buying 2000 CC over an hour from a fixed start:
+
+```toml
+role = "trader"
+auto_settle = true
+poll_interval_secs = 5
+
+[[markets]]
+market_id = "CC-USDC"
+enabled = true
+
+[markets.strategy]
+kind = "twap"
+side = "buy"
+total_quantity = "2000"
+start_at = "2026-12-01T10:00:00Z"
+duration_secs = 3600
+slice_secs = 240
+max_slip_bps = 15
+```
+
+**Fees.** Each settlement costs each side a processing fee that is nearly fixed, whatever the trade's size. Trades of a few tens of quote units, as with the defaults above, therefore lose money by design: the defaults suit testing and activity, not profit. Size trades well above the fee before running a strategy for its returns.
 
 ## SDK — Build Your Own Agent
 
@@ -224,7 +437,7 @@ The `onboard` command performs 11 steps automatically:
 
 1. Load an Ed25519 key (from `--private-key`, a prompt, or `.env`) or generate one; only a generated key is written to `.env` as `PARTY_AGENT_PRIVATE_KEY`.
 2. Connect to the orderbook RPC (raw gRPC, no auth yet).
-3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`.
+3. Fetch server configuration (`GetAgentConfig`) → write `.env` and seed `agent.toml`; `PARTY_FEE` and `PARTY_PREPAID_TRAFFIC` are written only where none is set, and never replaced.
 4. Register on the waiting list (`RegisterAgent`, signed).
 5. Poll for `SIGNATURE_REQUIRED` status.
 6. Fetch and sign the Canton topology multihash.
@@ -232,15 +445,14 @@ The `onboard` command performs 11 steps automatically:
 8. Poll until `TOPOLOGY_CREATED`; write `PARTY_AGENT` to `.env`.
 9. Create Splice `TransferPreapproval` for CC (pending featured-app acceptance).
 10. Create one CIP-56 `TransferPreapproval` per non-DSO registry advertised by the ledger service (`ListFaucetInstruments`). Preapprovals are per registry **admin**, so instruments sharing a registry are covered by a single preapproval, and an admin you already hold one for is skipped.
-11. Request a `UserService` and (on devnet) auto-faucet CC + USDC.
+11. Request a `UserService`; on devnet, auto-faucet every advertised token and make the first prepaid-traffic top-up.
 
 Flags:
 
 | Flag                     | Description                                      |
 | ------------------------ | ------------------------------------------------ |
-| `--rpc <URL>`            | Orderbook gRPC endpoint (default devnet)         |
+| `--network <NETWORK>`    | `mainnet` (default) or `devnet`; `testnet` is refused, it has no rpc yet |
 | `--agent-name <NAME>`    | Display name (required)                          |
-| `--email <EMAIL>`        | Contact email (required)                         |
 | `--invite-code <CODE>`   | Waiting list invite code (required)              |
 | `--party <ID>`           | Skip the waiting list; prompts for the private key when none is configured |
 | `--private-key <B58>`    | Base58 Ed25519 private key for `--party` (optional in a terminal — prompted, input hidden) |
@@ -290,7 +502,9 @@ cloud-agent --quote-private-key <HEX> agent
 | `DSO`                            | DSO (Canton Coin admin) party ID                                       |         yes          |
 | `PARTY_SETTLEMENT_OPERATOR`      | Settlement operator party ID                                           |         yes          |
 | `PARTY_ORDERBOOK_FEE`            | Orderbook fee collection party                                         |         yes          |
-| `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`; a finite number)        |         yes          |
+| `PARTY_FEE`                      | Platform fee party: once linked, the agent pays fees, a swap quote's fee included, only to this party, and refuses them while it is unset (see [docs/control.md](docs/control.md#platform-parties)) | once, when unset |
+| `PARTY_PREPAID_TRAFFIC`          | Prepaid traffic party: once linked, the agent tops up prepaid traffic only to this party, and refuses top-ups while it is unset | once, when unset |
+| `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`; a finite number)        |          no          |
 | `MERGE_THRESHOLD`                | Merge worker triggers when selectable amulets exceed this count        |         yes          |
 | `MERGE_MAX_AMULETS`              | Max amulets merged per round (default: `100`)                          |         yes          |
 | `MERGE_POLL_INTERVAL_SEC`        | Merge worker poll interval in seconds (default: `600`; at least 1)     |         yes          |
@@ -300,7 +514,10 @@ cloud-agent --quote-private-key <HEX> agent
 | `MAX_ALLOCATION_WORKERS`         | Concurrent allocation payments, 1–256 (default `20` when unset)        |          no          |
 | `MAX_FEE_WORKERS`                | Concurrent fee payments, 1–256 (default `5` when unset)                |          no          |
 | `MAX_PAYMENT_WORKERS`            | Sets both payment pools at once, 1–256; overrides the two above        |          no          |
-| `AGENT_MAX_SETTLEMENTS`          | Max active settlements (default used when unset)                       |          no          |
+| `MIN_PREPAID_TRAFFIC_BALANCE_CC` | Auto top-up floor for the prepaid-traffic balance that settlement fees are paid from; the agent also tops up when the available prepaid balance (balance plus credit) is below the largest fee reserved for an in-flight settlement. Set together with `PREPAID_TRAFFIC_TOPUP_CC` | yes |
+| `PREPAID_TRAFFIC_TOPUP_CC`       | CC moved into the prepaid-traffic balance per top-up                   |         yes          |
+| `MAX_SETTLEMENT_RETRIES`         | Failed attempts of one settlement step before the agent abandons the settlement and, if it has not allocated yet, cancels it; permanent errors abandon at once (default `30`, about 28 min of backoff) | no |
+| `AGENT_MAX_PENDING_PER_COUNTERPARTY` | Open settlements allowed with one counterparty; further proposals are rejected (default `10`) | no |
 
 #### Sequencer congestion (advanced)
 
@@ -395,6 +612,26 @@ settle_before_secs = 1800
 - The mid-price poller, balance refresh, and the settlement subscription keep running. **V1 transition behavior:** an in-flight V1 DVP that still needs *this agent's* fee or allocation steps is **actively cancelled server-side on encounter** — reservations released and the counterparty notified within one poll cycle, instead of stranding until deadline expiry (without live V1-stream registration the server's fee gate would classify the agent as a regular user and the DVP could never complete). One this agent has already allocated for is left alone and can still settle via the operator. Leftover on-chain DvpProposals are reaped by the DvpProposal GC; the counterparty's already-paid fees are not refunded — still prefer flipping during a quiet V1 window.
 - Startup fails loudly unless `[liquidity_provider.rfq_v2].enabled = true` and at least one enabled market has `[markets.rfq.v2].enabled = true`; a failed RFQ V2 setup is also fatal in this mode (nothing left to quote). `--orders-only` conflicts with it.
 
+**`[control]` and `[vetted_packages]`** apply to an agent linked to controllers (see [docs/control.md](docs/control.md)); `[vetted_packages]` applies to every agent. Both are optional. They are read strictly: an unknown key, a value out of range, or one of their keys placed at the top level of agent.toml or below another table's header stops startup with a message naming the section and the key. The running agent logs both at startup and reads them only then, so restart it after a change; each `control` command reads them when it runs.
+
+```toml
+[control]
+auto_execute_commands = false   # run pending direct commands without a prompt (default false)
+auto_accept_policies = true     # accept valid pending policies without a prompt (default true)
+swap_max_deviation_bps = 100    # largest gap between a swap's price and the reference mid; 0 turns it off; at most 10000
+swap_reference_max_age_secs = 300 # oldest reference mid the guard takes, in seconds; 30 to 3600
+
+[vetted_packages]
+mode = "selected"               # or "all", with no packages key (the default)
+packages = [
+  "<64 lowercase hex package id>", # name version
+]
+```
+
+`selected` takes 1 to 256 different package ids. The Agent page's Packages tab copies this section for you. With `selected`, the agent checks every transaction before it signs it and refuses one that uses a package outside the list (`package_not_allowed`), and it signs only when its own hash of the transaction matches the server's, so the bytes it checked are the bytes it signs; `all` checks nothing. A linked agent also checks the packages rule of its signed policy before every signature, and the ledger service can refuse a transaction that uses a package outside it.
+
+An optional `[verify]` section sets `mode = "default"`, `"observe"` or `"enforce"`: how the verifier's newer checks act while the agent is not linked (see [docs/control.md](docs/control.md)). A linked agent enforces them all.
+
 ### Grid Orders
 
 When `agent` runs, it places limit orders on a grid of price levels around the current mid price.
@@ -463,8 +700,8 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `--orders-only`     | Disable settlement, only place/manage grid orders (conflicts with `rfq_v2_only = true`) |
 | `--no-restore`      | Skip loading previous state from `agent-state.json`          |
 | `--no-reject`       | Accept all proposals without RFQ-state verification          |
-| `--dry-run`         | Prepare and verify transactions without signing or executing |
-| `--force`           | Sign and execute even if verification fails                  |
+| `--dry-run`         | Prepare and verify transactions without signing or executing (not available for `agent`; `buy` and `sell` still accept real quotes) |
+| `--force`           | Sign and execute even if verification fails (never under a `[vetted_packages]` selection) |
 | `--confirm`         | Prompt for confirmation before signing each transaction; no answer within 120s, or 120s waiting behind another prompt, declines it |
 | `--verbose`         | Enable verbose logging                                       |
 | `--config <PATH>`   | Path to agent.toml (default: `agent.toml`)                   |
@@ -473,7 +710,7 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 
 | Command                                                                                       | Description                                             |
 | --------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `agent`                                                                                       | Long-running LP agent (grid + RFQ + settlement)         |
+| `agent`                                                                                       | Long-running agent (grid + settlement; RFQ as an LP)    |
 | `onboard`                                                                                     | Self-service onboarding                                 |
 | `generate-private-key`                                                                        | Generate a new Ed25519 keypair (no config needed)       |
 | `<command> --party <ID> --private-key <B58>`                                                  | Identity from flags instead of `.env` (either position) |
@@ -481,6 +718,7 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `info balance`                                                                                | Show token balances                                     |
 | `info party`                                                                                  | Show party ID, public key, node name                    |
 | `info network`                                                                                | Show DSO party, rates, mining rounds                    |
+| `info prepaid-traffic`                                                                        | Show the prepaid-traffic balance and credit limit       |
 | `info list [--template ID] [--count]`                                                         | List active contracts                                   |
 | `buy --market <ID> --amount <N>`                                                              | Buy via RFQ until filled                                |
 | `sell --market <ID> --amount <N>`                                                             | Sell via RFQ until filled                               |
@@ -506,6 +744,17 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `sign message --input <TEXT>`                                                                 | Sign a UTF-8 text message                               |
 | `sign binary --input <HEX>`                                                                   | Sign hex-encoded binary data                            |
 | `usdcx status` / `usdcx onboard` / `usdcx deposit` / `usdcx mint` / `usdcx burn` / `usdcx track` | USDCx bridge (see below)                             |
+| `control link --code <LNK-…>` / `control add` / `control remove` / `control capabilities`     | Link the agent with a link code, and change its controllers. The Agent page makes no link code for an existing agent yet: a new agent links during `onboard` with an `AGT-<invite>-<link>` code |
+| `control show [--offline] [--json]`                                                           | Controllers, pending changes, policy, log head, marker  |
+| `control policy show [--pending]` / `control policy accept [--hash <H>]`                      | Show the policy; accept a pending one                   |
+| `control commands` / `control execute --code CMD-<id>`                                        | List the pending direct commands; run one               |
+| `control sync` / `control restore` / `control discard-pending`                                | Keep the local control log and the rpc's copy in step   |
+| `controller keygen --dir <DIR>` / `controller sign --key <FILE> --network <NET> …`            | Ed25519 controller key: create it, sign a document (offline) |
+| `controller status` / `log` / `holdings` / `traffic` / `activity` / `ledger` / `packages` / `commands` | Read a linked agent with an Ed25519 controller key |
+| `controller policy show [--rules]` / `controller policy set …`                                | Show or sign the agent's policy                         |
+| `controller command transfer-cc` / `transfer-token` / `swap` / `show --code CMD-<id>`         | Sign a direct command, or follow one to its receipt     |
+
+The `control` and `controller` commands are described in [docs/control.md](docs/control.md).
 
 ### USDCx bridge (Ethereum USDC ⇄ Canton USDCx)
 

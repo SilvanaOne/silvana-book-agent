@@ -590,6 +590,7 @@ async fn mint_one(ctx: &mut Ctx, att: &DepositAttestation) -> Result<()> {
             deposit_attestation_cid: att.cid.clone(),
         })),
         request_signature: None,
+        controller_command: None,
     };
     let opts = SubmitOptions {
         max_retries: 3,

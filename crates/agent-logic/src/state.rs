@@ -8,15 +8,19 @@
 //! agent-side state needed for verification and deduplication.
 
 use anyhow::{anyhow, Result};
+use orderbook_proto::orderbook::SettlementProposal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use tracing::{error, info, warn};
 
 use crate::clock;
 use crate::liquidity::SavedTokenFlow;
+use crate::strategy::Start;
 
 /// Current state file format version
 const STATE_VERSION: u32 = 1;
@@ -58,6 +62,173 @@ pub struct SavedState {
     /// ACS refresh so a restarted LP never double-discloses them
     #[serde(default)]
     pub pending_v2_quotes: Vec<SavedPendingV2>,
+    /// Strategy start balances, reused by a restart within `STRATEGY_START_MAX_AGE_MS`
+    #[serde(default)]
+    pub strategy_starts: Vec<SavedStrategyStart>,
+}
+
+/// Saved strategy start balances older than this are taken again at startup.
+pub(crate) const STRATEGY_START_MAX_AGE_MS: u64 = 6 * 3600 * 1000;
+
+/// A strategy market's balances and reference price when the strategy started
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedStrategyStart {
+    pub market_id: String,
+    /// The strategy kind they were taken for
+    pub kind: String,
+    /// Decimal strings
+    pub base: String,
+    pub quote: String,
+    pub price: String,
+    /// Base and quote held at the save, as decimal strings; absent in older files
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_at_save: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_at_save: Option<String>,
+    /// When they were saved, in ms since the epoch
+    pub saved_at_ms: u64,
+}
+
+/// Base and quote a strategy market holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Held {
+    pub base: f64,
+    pub quote: f64,
+}
+
+/// Why saved start balances are not used.
+#[derive(Debug, PartialEq)]
+enum Unused {
+    Expired,
+    Unreadable,
+}
+
+/// An amount to 12 places, so the string always reads back; None outside the decimal range.
+fn amount_string(v: f64) -> Option<String> {
+    Decimal::from_f64(v).map(|d| d.round_dp(12).normalize().to_string())
+}
+
+/// A price to 15 significant digits, so a tiny one keeps its digits.
+fn price_string(v: f64) -> Option<String> {
+    Decimal::from_f64(v).and_then(|d| d.round_sf(15)).map(|d| d.normalize().to_string())
+}
+
+/// `now - then`, or 0 within float noise of the larger.
+fn moved(now: f64, then: f64) -> f64 {
+    let d = now - then;
+    if d.abs() > 1e-9 * now.abs().max(then.abs()).max(1.0) {
+        d
+    } else {
+        0.0
+    }
+}
+
+impl SavedStrategyStart {
+    /// None unless every value is finite and within the decimal range.
+    pub(crate) fn new(market_id: &str, kind: &str, start: Start, held: Held, saved_at_ms: u64) -> Option<Self> {
+        Some(Self {
+            market_id: market_id.to_string(),
+            kind: kind.to_string(),
+            base: amount_string(start.base)?,
+            quote: amount_string(start.quote)?,
+            price: price_string(start.price)?,
+            base_at_save: Some(amount_string(held.base)?),
+            quote_at_save: Some(amount_string(held.quote)?),
+            saved_at_ms,
+        })
+    }
+
+    /// The balances, if saved no longer ago than the limit and readable.
+    pub(crate) fn start_at(&self, now_ms: u64) -> Option<Start> {
+        self.read(now_ms).ok().map(|(start, _)| start)
+    }
+
+    /// The start and the balances held at the save (None in an older file).
+    fn read(&self, now_ms: u64) -> Result<(Start, Option<Held>), Unused> {
+        if now_ms.saturating_sub(self.saved_at_ms) > STRATEGY_START_MAX_AGE_MS {
+            return Err(Unused::Expired);
+        }
+        self.parse().ok_or(Unused::Unreadable)
+    }
+
+    fn parse(&self) -> Option<(Start, Option<Held>)> {
+        let value = |s: &str| Decimal::from_str_exact(s).ok().and_then(|d| d.to_f64()).filter(|v| v.is_finite());
+        let start = Start { base: value(&self.base)?, quote: value(&self.quote)?, price: value(&self.price)? };
+        let held = match (self.base_at_save.as_deref(), self.quote_at_save.as_deref()) {
+            (None, None) => None,
+            (Some(base), Some(quote)) => Some(Held { base: value(base)?, quote: value(quote)? }),
+            _ => return None,
+        };
+        Some((start, held))
+    }
+}
+
+/// A start in use, and the balances its strategy last held.
+#[derive(Debug)]
+struct LiveStart {
+    kind: String,
+    start: Start,
+    held: Held,
+}
+
+/// Strategy start balances in use by this process, and restored ones not yet taken.
+#[derive(Debug, Default)]
+pub(crate) struct StrategyStarts {
+    live: BTreeMap<String, LiveStart>,
+    restored: BTreeMap<String, SavedStrategyStart>,
+}
+
+impl StrategyStarts {
+    /// Keeps the saved start balances still usable at `now_ms`; an unreadable one is logged.
+    pub(crate) fn restore(&mut self, saved: &[SavedStrategyStart], now_ms: u64) {
+        self.restored.clear();
+        for s in saved {
+            let (market, kind) = (&s.market_id, &s.kind);
+            match s.read(now_ms) {
+                Ok(_) => {
+                    self.restored.insert(market.clone(), s.clone());
+                }
+                Err(Unused::Expired) => info!("Strategy {} [{}]: saved start balances older than 6 h", market, kind),
+                Err(Unused::Unreadable) => {
+                    warn!("Strategy {} [{}]: saved start balances unreadable; taken again", market, kind)
+                }
+            }
+        }
+    }
+
+    /// A market's restored start, once, if taken for the same kind, moved by what came in or
+    /// went out while stopped (`held` against the balances at the save); also returns that move.
+    pub(crate) fn take(&mut self, market_id: &str, kind: &str, held: Held, now_ms: u64) -> Option<(Start, Held)> {
+        let saved = self.restored.remove(market_id).filter(|s| s.kind == kind)?;
+        let (start, at_save) = saved.read(now_ms).ok()?;
+        let shift = match at_save {
+            Some(a) => Held { base: moved(held.base, a.base), quote: moved(held.quote, a.quote) },
+            // An older file has no balances at the save: the start stays as saved
+            None => Held::default(),
+        };
+        Some((Start { base: start.base + shift.base, quote: start.quote + shift.quote, price: start.price }, shift))
+    }
+
+    /// The start a strategy of this process counts from, and the balances it holds now.
+    pub(crate) fn set(&mut self, market_id: &str, kind: &str, start: Start, held: Held) {
+        self.restored.remove(market_id);
+        match self.live.get_mut(market_id) {
+            Some(live) if live.kind == kind => {
+                live.start = start;
+                live.held = held;
+            }
+            _ => {
+                self.live.insert(market_id.to_string(), LiveStart { kind: kind.to_string(), start, held });
+            }
+        }
+    }
+
+    /// What a save at `now_ms` keeps: those in use stamped now, restored ones as they were.
+    pub(crate) fn export(&self, now_ms: u64) -> Vec<SavedStrategyStart> {
+        let live = self.live.iter().filter_map(|(m, l)| SavedStrategyStart::new(m, &l.kind, l.start, l.held, now_ms));
+        let restored = self.restored.values().filter(|s| s.start_at(now_ms).is_some()).cloned();
+        live.chain(restored).collect()
+    }
 }
 
 /// Serializable RFQ V2 SettlementTicket pool entry
@@ -114,10 +285,67 @@ pub struct SavedSettlementOrder {
     /// reservation and always had pending_quantity applied at adoption.
     #[serde(default = "default_reserved")]
     pub reserved: bool,
+    /// The terms adopted with the proposal; absent in older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms: Option<AdoptedTerms>,
 }
 
 fn default_reserved() -> bool {
     true
+}
+
+/// What the agent adopted for a settlement: both parties and both legs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptedTerms {
+    pub buyer: String,
+    pub seller: String,
+    pub base_instrument: String,
+    pub base_quantity: String,
+    pub quote_instrument: String,
+    pub quote_quantity: String,
+}
+
+impl AdoptedTerms {
+    pub fn of(proposal: &SettlementProposal) -> Self {
+        Self {
+            buyer: proposal.buyer.clone(),
+            seller: proposal.seller.clone(),
+            base_instrument: proposal.base_instrument.clone(),
+            base_quantity: proposal.base_quantity.clone(),
+            quote_instrument: proposal.quote_instrument.clone(),
+            quote_quantity: proposal.quote_quantity.clone(),
+        }
+    }
+
+    /// The first field of `proposal` that differs from these terms; quantities compare by value.
+    pub fn first_difference(&self, proposal: &SettlementProposal) -> Option<&'static str> {
+        let texts = [
+            ("buyer", &self.buyer, &proposal.buyer),
+            ("seller", &self.seller, &proposal.seller),
+            ("base_instrument", &self.base_instrument, &proposal.base_instrument),
+            ("quote_instrument", &self.quote_instrument, &proposal.quote_instrument),
+        ];
+        let amounts = [
+            ("base_quantity", &self.base_quantity, &proposal.base_quantity),
+            ("quote_quantity", &self.quote_quantity, &proposal.quote_quantity),
+        ];
+        texts
+            .into_iter()
+            .find(|(_, adopted, now)| adopted != now)
+            .or_else(|| amounts.into_iter().find(|(_, adopted, now)| !same_amount(adopted, now)))
+            .map(|(field, _, _)| field)
+    }
+}
+
+/// Equal text, or two plain decimals of the same exact value.
+fn same_amount(a: &str, b: &str) -> bool {
+    let exact = |s: &str| {
+        s.bytes()
+            .all(|c| c.is_ascii_digit() || c == b'.' || c == b'-')
+            .then(|| Decimal::from_str_exact(s).ok())
+            .flatten()
+    };
+    a == b || matches!((exact(a), exact(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Serializable mirror of `AcceptedRfqTrade` from runner.rs
@@ -191,6 +419,7 @@ impl SavedState {
             flow_tracker: Vec::new(),
             atomic_tickets: Vec::new(),
             pending_v2_quotes: Vec::new(),
+            strategy_starts: Vec::new(),
         }
     }
 }
@@ -465,6 +694,7 @@ mod tests {
             order_id: 42,
             quantity: "1.0".to_string(),
             reserved: true,
+            terms: None,
         });
         state.accepted_rfq_trades.push(SavedAcceptedRfqTrade {
             proposal_id: "rfq-1".to_string(),
@@ -563,6 +793,135 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // A restart used to count a strategy's position from the balances it found, buying it twice
+    #[test]
+    fn strategy_start_balances_round_trip_and_expire_after_six_hours() {
+        let dir = TestDir::new("strategy-starts");
+        let path = dir.0.join("agent-state.json");
+        let now = 1_700_000_000_000u64;
+        let start = Start { base: 1_250_000.0, quote: 1480.5, price: 0.0015 };
+        let held = Held { base: 1_300_000.0, quote: 1405.5 };
+        let mut live = StrategyStarts::default();
+        live.set("HTEST-USDC", "momentum", start, held);
+        let mut state = SavedState::new("party".to_string(), 1);
+        state.strategy_starts = live.export(now);
+        save_state(&path, &state).unwrap();
+        let loaded = load_state(&path).unwrap().strategy_starts;
+        assert_eq!(loaded, state.strategy_starts);
+        assert_eq!((loaded.len(), loaded[0].saved_at_ms, loaded[0].base.as_str()), (1, now, "1250000"));
+        let at_save = (loaded[0].base_at_save.as_deref(), loaded[0].quote_at_save.as_deref());
+        assert_eq!(at_save, (Some("1300000"), Some("1405.5")));
+
+        // An hour later the same kind takes them, once; another kind starts afresh
+        let hour = now + 3_600_000;
+        let mut restored = StrategyStarts::default();
+        restored.restore(&loaded, hour);
+        assert_eq!(restored.take("HTEST-USDC", "twap", held, hour), None);
+        restored.restore(&loaded, hour);
+        assert_eq!(restored.take("HTEST-USDC", "momentum", held, hour), Some((start, Held::default())));
+        assert_eq!(restored.take("HTEST-USDC", "momentum", held, hour), None);
+        // Six hours after the save they still count; a millisecond later they do not
+        let six = now + STRATEGY_START_MAX_AGE_MS;
+        assert_eq!(loaded[0].start_at(six), Some(start));
+        restored.restore(&loaded, six + 1);
+        assert_eq!(restored.take("HTEST-USDC", "momentum", held, six + 1), None);
+        // Restored but not taken, they keep their save time, so they still expire
+        restored.restore(&loaded, hour);
+        assert_eq!(restored.export(hour + 5), loaded);
+        assert!(restored.export(six + 1).is_empty());
+        // Taken into use, the next save stamps them anew with the balances last held
+        let later = Held { base: 1_200_000.0, quote: 1480.5 };
+        restored.set("HTEST-USDC", "momentum", start, later);
+        let out = restored.export(six + 1);
+        assert_eq!((out[0].saved_at_ms, out[0].base_at_save.as_deref()), (six + 1, Some("1200000")));
+        // A value that is not finite is never written
+        assert!(SavedStrategyStart::new("M", "momentum", Start { base: f64::NAN, ..start }, held, now).is_none());
+        let inf = Held { quote: f64::INFINITY, ..held };
+        assert!(SavedStrategyStart::new("M", "momentum", start, inf, now).is_none());
+
+        // A state file written before these existed loads with none
+        let mut old = serde_json::to_value(SavedState::new("party".to_string(), 1)).unwrap();
+        assert!(old.as_object_mut().unwrap().remove("strategy_starts").is_some());
+        std::fs::write(&path, old.to_string()).unwrap();
+        assert!(load_state_strict(&path).unwrap().unwrap().strategy_starts.is_empty());
+        assert!(load_state(&path).unwrap().strategy_starts.is_empty());
+    }
+
+    // Funds moved while stopped used to count as a position change, so the strategy traded them back
+    #[test]
+    fn a_restart_after_a_withdrawal_keeps_the_position_not_the_old_base() {
+        let (now, hour) = (1_700_000_000_000u64, 1_700_003_600_000u64);
+        let start = Start { base: 1_000_000.0, quote: 2400.0, price: 0.0015 };
+        // Long 500k, bought for 750, at the stop
+        let at_save = Held { base: 1_500_000.0, quote: 1650.0 };
+        let mut live = StrategyStarts::default();
+        live.set("HTEST-USDC", "momentum", start, at_save);
+        let saved = live.export(now);
+        // While stopped, 400k base went out and 100 quote came in
+        let held = Held { base: 1_100_000.0, quote: 1750.0 };
+        let mut restored = StrategyStarts::default();
+        restored.restore(&saved, hour);
+        let (moved_start, shift) = restored.take("HTEST-USDC", "momentum", held, hour).unwrap();
+        assert_eq!(shift, Held { base: -400_000.0, quote: 100.0 });
+        assert_eq!(moved_start, Start { base: 600_000.0, quote: 2500.0, price: 0.0015 });
+        assert_eq!(held.base - moved_start.base, 500_000.0, "the position, not 100k against the old base");
+        assert_eq!(held.quote - moved_start.quote, at_save.quote - start.quote);
+
+        // A file without the balances at the save keeps the start as saved
+        let old: Vec<_> =
+            saved.iter().map(|s| SavedStrategyStart { base_at_save: None, quote_at_save: None, ..s.clone() }).collect();
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("at_save"), "{json}");
+        let old: Vec<SavedStrategyStart> = serde_json::from_str(&json).unwrap();
+        restored.restore(&old, hour);
+        assert_eq!(restored.take("HTEST-USDC", "momentum", held, hour), Some((start, Held::default())));
+    }
+
+    // A near-zero residual used to be written as a string with more places than a decimal holds
+    #[test]
+    fn a_near_zero_residual_and_a_tiny_price_read_back() {
+        let residual = 1.4210854715202004e-14;
+        assert!(Decimal::from_str_exact(&residual.to_string()).is_err());
+        let now = 1_700_000_000_000u64;
+        let start = Start { base: 1_250_000.0, quote: residual, price: 1.23456789e-12 };
+        let held = Held { base: 1_250_000.0, quote: -residual };
+        let saved = SavedStrategyStart::new("M", "momentum", start, held, now).unwrap();
+        assert_eq!((saved.quote.as_str(), saved.price.as_str()), ("0", "0.00000000000123456789"));
+        assert_eq!(saved.quote_at_save.as_deref(), Some("0"));
+        let back: Vec<SavedStrategyStart> = serde_json::from_str(&serde_json::to_string(&[saved]).unwrap()).unwrap();
+        let mut restored = StrategyStarts::default();
+        restored.restore(&back, now + 1);
+        let expected = Start { quote: 0.0, ..start };
+        assert_eq!(restored.take("M", "momentum", held, now + 1), Some((expected, Held::default())));
+    }
+
+    // An entry that does not read back is dropped with a warning; the others are kept
+    #[test]
+    fn an_unreadable_saved_start_is_dropped_with_a_warning() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let now = 1_700_000_000_000u64;
+        let start = Start { base: 1_250_000.0, quote: 1480.5, price: 0.0015 };
+        let held = Held { base: 1_250_000.0, quote: 1480.5 };
+        let good = SavedStrategyStart::new("A-USDC", "momentum", start, held, now).unwrap();
+        // As the earlier writer stored a residual
+        let quote = 1.4210854715202004e-14f64.to_string();
+        let bad = SavedStrategyStart { market_id: "B-USDC".to_string(), quote, ..good.clone() };
+        let half = SavedStrategyStart { market_id: "C-USDC".to_string(), quote_at_save: None, ..good.clone() };
+        let old = now - STRATEGY_START_MAX_AGE_MS - 1;
+        let expired = SavedStrategyStart { market_id: "D-USDC".to_string(), saved_at_ms: old, ..good.clone() };
+        let mut restored = StrategyStarts::default();
+        restored.restore(&[good, bad, half, expired], now);
+        assert_eq!(restored.take("A-USDC", "momentum", held, now), Some((start, Held::default())));
+        for market in ["B-USDC", "C-USDC", "D-USDC"] {
+            assert_eq!(restored.take(market, "momentum", held, now), None, "{market}");
+        }
+        assert_eq!(logs.count("saved start balances unreadable"), 2);
+        assert_eq!(logs.count("Strategy B-USDC [momentum]: saved start balances unreadable; taken again"), 1);
+        assert_eq!(logs.count("Strategy C-USDC [momentum]: saved start balances unreadable"), 1);
+        assert_eq!(logs.count("D-USDC"), 0, "an expired one is no warning");
     }
 
     #[test]
@@ -717,6 +1076,7 @@ mod tests {
             order_id: 2,
             quantity: "0.5".to_string(),
             reserved: true,
+            terms: None,
         });
 
         // Completed proposals: 1500 items (should be capped to 1000)
@@ -809,17 +1169,59 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.reserved);
+        assert_eq!(legacy.terms, None);
 
         // New unreserved entry round-trips as false
-        let entry = SavedSettlementOrder {
+        let mut entry = SavedSettlementOrder {
             proposal_id: "p2".to_string(),
             order_id: 7,
             quantity: "1.5".to_string(),
             reserved: false,
+            terms: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("terms"), "{json}");
         let back: SavedSettlementOrder = serde_json::from_str(&json).unwrap();
         assert!(!back.reserved);
         assert_eq!(back.order_id, 7);
+
+        let proposal = SettlementProposal {
+            buyer: "b".to_string(),
+            seller: "s".to_string(),
+            base_quantity: "1".to_string(),
+            quote_quantity: "2".to_string(),
+            ..Default::default()
+        };
+        entry.terms = Some(AdoptedTerms::of(&proposal));
+        let back: SavedSettlementOrder = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(back.terms, entry.terms);
+    }
+
+    #[test]
+    fn adopted_terms_compare_quantities_by_value() {
+        let adopted = SettlementProposal {
+            buyer: "b".to_string(),
+            seller: "s".to_string(),
+            base_instrument: "BASE".to_string(),
+            base_quantity: "1".to_string(),
+            quote_instrument: "QUOTE".to_string(),
+            quote_quantity: "2".to_string(),
+            ..Default::default()
+        };
+        let terms = AdoptedTerms::of(&adopted);
+        assert_eq!(terms.first_difference(&adopted), None);
+        let resent = |change: fn(&mut SettlementProposal)| {
+            let mut p = adopted.clone();
+            change(&mut p);
+            terms.first_difference(&p)
+        };
+        assert_eq!(resent(|p| p.quote_quantity = "2.000".to_string()), None);
+        assert_eq!(resent(|p| p.quote_quantity = "3".to_string()), Some("quote_quantity"));
+        assert_eq!(resent(|p| p.quote_quantity = "2e0".to_string()), Some("quote_quantity"));
+        assert_eq!(resent(|p| p.base_quantity = "1.0000000000000000000000000000001".to_string()), Some("base_quantity"));
+        assert_eq!(resent(|p| p.buyer = "x".to_string()), Some("buyer"));
+        assert_eq!(resent(|p| p.seller = "x".to_string()), Some("seller"));
+        assert_eq!(resent(|p| p.base_instrument = "X".to_string()), Some("base_instrument"));
+        assert_eq!(resent(|p| p.quote_instrument = "X".to_string()), Some("quote_instrument"));
     }
 }

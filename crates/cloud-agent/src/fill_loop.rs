@@ -36,6 +36,7 @@ use agent_logic::clock;
 use agent_logic::num::Px;
 use orderbook_proto::settlement::{DvpStepStatusEnum, GetSettlementStatusResponse, SettlementStage};
 use orderbook_proto::SettlementProposalMessage;
+use tx_verifier::{ExpectedDvpTerms, ExpectedQuantity};
 
 use crate::accept_settle::{MulticallSettler, SettleOutcomeUnknown};
 use crate::ledger_client::{within, DAppProviderClient};
@@ -158,13 +159,7 @@ fn direction_name(direction: FillDirection) -> &'static str {
 
 /// A fresh orderbook-rpc token; the loop can outlive any single one.
 fn rpc_token(config: &BaseConfig) -> Result<String> {
-    agent_logic::auth::generate_jwt(
-        &config.party_id,
-        &config.role,
-        &*config.private_key.expose()?,
-        config.token_ttl_secs,
-        Some(config.node_name.as_str()),
-    )
+    config.jwt()
 }
 
 /// Where the fill state is saved between runs.
@@ -831,7 +826,7 @@ pub async fn run_fill_loop(
             })
             .collect();
 
-        let (rfq_id, best_quote_id, best_price, best_qty) = if let Some(best) =
+        let (rfq_id, best_quote_id, best_price, best_qty, best_quote_qty) = if let Some(best) =
             pick_best_quote_opt(&acceptable_quotes, params.direction)
         {
             (
@@ -839,6 +834,7 @@ pub async fn run_fill_loop(
                 best.quote_id.clone(),
                 best.price.clone(),
                 best.quantity.clone(),
+                best.quote_quantity.clone(),
             )
         } else {
             // Try adapted RFQ if LPs returned size hints
@@ -904,6 +900,7 @@ pub async fn run_fill_loop(
                     best.quote_id.clone(),
                     best.price.clone(),
                     best.quantity.clone(),
+                    best.quote_quantity.clone(),
                 )
             } else {
                 warn!(
@@ -974,11 +971,17 @@ pub async fn run_fill_loop(
         let fees = within("settlement fee lookup", FEE_FETCH_BUDGET, fee_lookup)
             .await
             .map_err(|e| format!("Failed to fetch settlement fees for {}: {}", proposal_id, e));
-        let Some((dvp_fee_cc, alloc_fee_cc, dvp_fee_usd, alloc_fee_usd)) =
+        let Some((dvp_fee_cc, alloc_fee_cc, dvp_fee_usd, alloc_fee_usd, proposal)) =
             post_accept_step(fees, round, interval, &fill_shutdown, &shutdown_flag).await
         else {
             continue;
         };
+        // Without recorded terms the verifier only warns, and a linked agent refuses.
+        let instruments = (base_instrument.as_str(), quote_instrument.as_str());
+        let quantities = (best_qty.as_str(), best_quote_qty.as_str());
+        let terms = accepted_terms(&config, params.direction, instruments, quantities, &proposal_id, &proposal)
+            .map_err(|e| warn!("[round {}] DvP terms of {} not recorded: {:#}", round, proposal_id, e))
+            .ok();
 
         let qty: f64 = best_qty.parse().unwrap_or(0.0);
         // 3. Submit the single multicall: Accept + Allocate + fees + traffic.
@@ -1002,6 +1005,7 @@ pub async fn run_fill_loop(
                 &alloc_fee_usd,
                 &allocation_instrument,
                 allocation_cc,
+                terms,
             )
         })
         .await;
@@ -1329,13 +1333,8 @@ async fn monitor_settlement_progress(
         warn!("[round {}] Could not connect RPC for progress monitoring {}", round, proposal_id);
         return;
     };
-    if let Ok(key) = config.private_key.expose() {
-        if let Ok(jwt) = agent_logic::auth::generate_jwt(
-            &config.party_id, &config.role, &key,
-            config.token_ttl_secs, Some(config.node_name.as_str()),
-        ) {
-            rpc.set_jwt(jwt);
-        }
+    if let Ok(jwt) = config.jwt() {
+        rpc.set_jwt(jwt);
     }
 
     let deadline = clock::deadline_after(Duration::from_secs(300));
@@ -1440,8 +1439,8 @@ async fn fetch_settlement_fees(
     ledger: &mut DAppProviderClient,
     proposal_id: &str,
     direction: FillDirection,
-) -> Result<(String, String, String, String)> {
-    let (dvp_usd_str, alloc_usd_str) = proposal_fees_usd(rpc, mint, proposal_id, direction).await?;
+) -> Result<(String, String, String, String, SettlementProposalMessage)> {
+    let (dvp_usd_str, alloc_usd_str, proposal) = proposal_fees_usd(rpc, mint, proposal_id, direction).await?;
 
     let dvp_usd = Decimal::from_str(&dvp_usd_str)
         .with_context(|| format!("invalid dvp fee decimal '{}'", dvp_usd_str))?;
@@ -1483,17 +1482,53 @@ async fn fetch_settlement_fees(
         wire_amount(alloc_cc),
         dvp_usd_str,
         alloc_usd_str,
+        proposal,
     ))
 }
 
-/// The taker side's (dvp, allocation) processing fees in USD from the proposal;
-/// every read carries a token minted for it.
+/// The DvP terms of the accepted quote: the agent on its own side, the proposal's other
+/// party, the market's instruments as recorded terms resolve them, and the quote's
+/// (base, quote) quantities.
+fn accepted_terms(
+    config: &BaseConfig,
+    direction: FillDirection,
+    (base, quote): (&str, &str),
+    (base_quantity, quote_quantity): (&str, &str),
+    proposal_id: &str,
+    proposal: &SettlementProposalMessage,
+) -> Result<ExpectedDvpTerms> {
+    let me = config.party_id.clone();
+    let (buyer, seller) = match direction {
+        FillDirection::Buy => (me, proposal.seller_party.clone()),
+        FillDirection::Sell => (proposal.buyer_party.clone(), me),
+    };
+    let (delivery_id, delivery_admin) = config.try_resolve_instrument(base)?;
+    let (payment_id, payment_admin) = config.try_resolve_instrument(quote)?;
+    Ok(ExpectedDvpTerms {
+        proposal_id: proposal_id.to_string(),
+        buyer,
+        seller,
+        delivery: ExpectedQuantity {
+            instrument_admin: delivery_admin,
+            instrument_id: delivery_id,
+            amount: base_quantity.to_string(),
+        },
+        payment: ExpectedQuantity {
+            instrument_admin: payment_admin,
+            instrument_id: payment_id,
+            amount: quote_quantity.to_string(),
+        },
+    })
+}
+
+/// The taker side's (dvp, allocation) processing fees in USD from the proposal, and
+/// the proposal; every read carries a token minted for it.
 async fn proposal_fees_usd<S: TokenSource + ProposalSource>(
     rpc: &mut S,
     mint: impl FnMut() -> Result<String>,
     proposal_id: &str,
     direction: FillDirection,
-) -> Result<(String, String)> {
+) -> Result<(String, String, SettlementProposalMessage)> {
     let mut rpc = Reauth { inner: rpc, mint };
     // Retry a few times — the proposal row may take a moment to appear after accept_quote.
     let mut attempt = 0u32;
@@ -1501,13 +1536,13 @@ async fn proposal_fees_usd<S: TokenSource + ProposalSource>(
         match rpc.settlement_proposal(proposal_id).await? {
             Some(p) => {
                 let (dvp, alloc) = match direction {
-                    FillDirection::Buy => (p.dvp_processing_fee_buyer, p.allocation_processing_fee_buyer),
-                    FillDirection::Sell => (p.dvp_processing_fee_seller, p.allocation_processing_fee_seller),
+                    FillDirection::Buy => (&p.dvp_processing_fee_buyer, &p.allocation_processing_fee_buyer),
+                    FillDirection::Sell => (&p.dvp_processing_fee_seller, &p.allocation_processing_fee_seller),
                 };
                 // Normalise empty strings to "0.0".
-                let dvp = if dvp.trim().is_empty() { "0.0".to_string() } else { dvp };
-                let alloc = if alloc.trim().is_empty() { "0.0".to_string() } else { alloc };
-                return Ok((dvp, alloc));
+                let dvp = if dvp.trim().is_empty() { "0.0".to_string() } else { dvp.clone() };
+                let alloc = if alloc.trim().is_empty() { "0.0".to_string() } else { alloc.clone() };
+                return Ok((dvp, alloc, p));
             }
             None => {
                 attempt = attempt.saturating_add(1);
@@ -2520,8 +2555,8 @@ mod tests {
             Ok(format!("t{minted}"))
         };
         for _ in 0..2 {
-            let fees = proposal_fees_usd(&mut log, &mut mint, "p1", FillDirection::Buy).await.unwrap();
-            assert_eq!(fees, ("0.1".to_string(), "0.2".to_string()));
+            let (dvp, alloc, _) = proposal_fees_usd(&mut log, &mut mint, "p1", FillDirection::Buy).await.unwrap();
+            assert_eq!((dvp, alloc), ("0.1".to_string(), "0.2".to_string()));
         }
         assert_eq!(log.seen, ["t1", "t2"]);
 
@@ -2530,6 +2565,54 @@ mod tests {
         let err = proposal_fees_usd(&mut log, failing, "p1", FillDirection::Buy).await.unwrap_err();
         assert!(format!("{err:#}").contains("no key"), "{err:#}");
         assert!(log.seen.is_empty(), "nothing is read without a fresh token");
+    }
+
+    // The multicall's DvP terms used to be the transaction's own, matched only by proposal id
+    #[test]
+    fn the_v1_multicall_records_the_accepted_quote() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.party_id = "agent::1220aa".to_string();
+        config.dso_party = "dso::1220dd".to_string();
+        config.populate_instruments_from_rpc(vec![
+            orderbook_proto::orderbook::Instrument {
+                instrument_id: "CC".to_string(),
+                symbol: "CC".to_string(),
+                registry: Some("dso::1220dd".to_string()),
+                ..Default::default()
+            },
+            orderbook_proto::orderbook::Instrument {
+                instrument_id: "TOK".to_string(),
+                symbol: "TOK".to_string(),
+                registry: Some("reg::1220cc".to_string()),
+                ..Default::default()
+            },
+        ]);
+        // Only the other party is taken from the proposal; the agent's own side is its own.
+        let proposal = SettlementProposalMessage {
+            proposal_id: "p1".into(),
+            buyer_party: "lp::1220bb".into(),
+            seller_party: "lp::1220bb".into(),
+            ..Default::default()
+        };
+        let quantity = |admin: &str, id: &str, amount: &str| ExpectedQuantity {
+            instrument_admin: admin.into(),
+            instrument_id: id.into(),
+            amount: amount.into(),
+        };
+        let buy = accepted_terms(&config, FillDirection::Buy, ("TOK", "CC"), ("10", "20"), "p1", &proposal).unwrap();
+        assert_eq!(
+            buy,
+            ExpectedDvpTerms {
+                proposal_id: "p1".into(),
+                buyer: "agent::1220aa".into(),
+                seller: "lp::1220bb".into(),
+                delivery: quantity("reg::1220cc", "TOK", "10"),
+                payment: quantity("dso::1220dd", "Amulet", "20"),
+            }
+        );
+        let sell = accepted_terms(&config, FillDirection::Sell, ("TOK", "CC"), ("10", "20"), "p1", &proposal).unwrap();
+        assert_eq!((sell.buyer.as_str(), sell.seller.as_str()), ("lp::1220bb", "agent::1220aa"));
+        assert!(accepted_terms(&config, FillDirection::Buy, ("UNLISTED", "CC"), ("10", "20"), "p1", &proposal).is_err());
     }
 
     // The reconcile reads used to carry the loop's first token, long expired by then

@@ -18,11 +18,12 @@ use cloud_agent::{
     run_subscription, run_transfer, run_sign, run_user_service, run_faucet,
     run_lock, run_atomic, run_generate_private_key, run_onboard, read_env_value,
     run_atomic_keygen, run_info_network_anonymous, run_info_party_from_env,
-    run_sign_standalone,
+    run_sign_standalone, OnboardTarget, EMAIL_IGNORED,
     fill_loop,
     config,
     usdcx::{UsdcxCommands, UsdcxOptions},
 };
+use cloud_agent::control::{ControlCommands, ControllerCommands, ControllerOptions};
 
 // ============================================================================
 // CLI
@@ -30,7 +31,7 @@ use cloud_agent::{
 
 #[derive(Parser)]
 #[command(name = "cloud-agent")]
-#[command(about = "Orderbook cloud agent\n\nGet started:\n  ./cloud-agent onboard --agent-name your-agent-name --email your-email")]
+#[command(about = "Orderbook cloud agent\n\nGet started:\n  ./cloud-agent onboard --network mainnet --agent-name your-agent-name --invite-code your-invite-code")]
 struct Cli {
     /// Path to agent configuration file
     #[arg(short, long, default_value = "agent.toml")]
@@ -206,21 +207,37 @@ enum Commands {
         #[arg(long = "fee-token")]
         fee_token: Vec<String>,
     },
+    /// Agent control: link controllers, change them, show the control log
+    Control {
+        /// Base directory of the control stores (default: ~/.silvana-agent)
+        #[arg(long, env = "SILVANA_CONTROL_DIR")]
+        control_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        command: ControlCommands,
+    },
+    /// A local Ed25519 controller key: generate it, sign documents with it (no config needed)
+    Controller {
+        #[command(subcommand)]
+        command: ControllerCommands,
+    },
     /// Generate a new Ed25519 private key (no config needed)
     GeneratePrivateKey,
     /// Self-service onboarding: generate keys, register, sign topology, complete ledger setup
     ///
-    /// Usage: ./cloud-agent onboard --agent-name your-agent-name --email your-email --invite-code your-invite-code
+    /// Usage: ./cloud-agent onboard --network mainnet --agent-name your-agent-name --invite-code your-invite-code
     Onboard {
-        /// Orderbook gRPC URL (optional, default: devnet)
-        #[arg(long, default_value = "https://orderbook-devnet.silvana.dev:443")]
-        rpc: String,
+        /// The network to join: mainnet (default) or devnet; testnet has no rpc yet
+        #[arg(long, value_parser = ["mainnet", "devnet", "testnet"])]
+        network: Option<String>,
+        /// Orderbook gRPC URL of another endpoint, instead of --network
+        #[arg(long, hide = true, conflicts_with = "network")]
+        rpc: Option<String>,
         /// Agent display name (required)
         #[arg(long)]
         agent_name: String,
-        /// Contact email (required)
-        #[arg(long)]
-        email: String,
+        /// Kept only for an invite code no account owns; otherwise that account's email is used
+        #[arg(long, hide = true)]
+        email: Option<String>,
         /// Invite code — required, for waiting list registration
         #[arg(long, required = true)]
         invite_code: String,
@@ -288,7 +305,7 @@ fn main() -> Result<()> {
     match prepare(cli)? {
         Some(job) => match run_on_runtime(job.run(), SHUTDOWN_GRACE) {
             // Something was or may have been submitted and is not finished.
-            Err(e) if cloud_agent::usdcx::is_pending(&e) => {
+            Err(e) if cloud_agent::usdcx::is_pending(&e) || cloud_agent::control::controller::is_pending(&e) => {
                 agent_logic::errln!("Error: {e:#}");
                 std::process::exit(3);
             }
@@ -374,16 +391,17 @@ struct Flags {
 enum Job {
     Onboard(Box<OnboardArgs>),
     NetworkInfo { grpc_url: String },
+    Controller(Box<ControllerCommands>, ControllerOptions),
     Command(Box<ConfiguredCommand>),
 }
 
 struct OnboardArgs {
-    rpc: String,
+    target: OnboardTarget,
     party: Option<String>,
     key: Option<Zeroizing<String>>,
     invite_code: String,
     agent_name: String,
-    email: String,
+    email: Option<String>,
     env_file: PathBuf,
     poll_interval: u64,
 }
@@ -396,16 +414,19 @@ struct ConfiguredCommand {
     quote_for_atomic: Option<Zeroizing<String>>,
     /// The Ethereum key typed for `usdcx deposit` (never stored).
     eth_key: Option<Zeroizing<String>>,
+    /// The env file in use, where the control marker is recorded.
+    env_file: Option<PathBuf>,
 }
 
 impl Job {
     async fn run(self) -> Result<()> {
         match self {
             Job::Onboard(args) => {
-                let OnboardArgs { rpc, party, key, invite_code, agent_name, email, env_file, poll_interval } = *args;
-                run_onboard(rpc, party, key, invite_code, agent_name, email, env_file, poll_interval).await
+                let OnboardArgs { target, party, key, invite_code, agent_name, email, env_file, poll_interval } = *args;
+                run_onboard(target, party, key, invite_code, agent_name, email, env_file, poll_interval).await
             }
             Job::NetworkInfo { grpc_url } => network_info_within(&grpc_url, NETWORK_INFO_BUDGET).await,
+            Job::Controller(command, options) => cloud_agent::control::run_controller(*command, options).await,
             Job::Command(command) => run_configured(*command).await,
         }
     }
@@ -428,13 +449,44 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
         force: cli.force,
         confirm: cli.confirm,
     };
+    // Before the registry load, so a refused dry run makes no connection
+    if flags.dry_run && matches!(cli.command, Commands::Agent { .. }) {
+        anyhow::bail!(cloud_agent::AGENT_DRY_RUN_REFUSAL);
+    }
 
     // Handle commands that don't need config first
     if let Commands::GeneratePrivateKey = &cli.command {
         return run_generate_private_key().map(|()| None);
     }
+    if let Commands::Controller { command } = cli.command {
+        // Controller mode never loads an agent key or the agent's config.
+        let given = [
+            ("--party", top_party.is_some()),
+            ("--private-key", top_key.is_some()),
+            ("--quote-private-key", top_quote.is_some()),
+            ("--force", flags.force),
+            ("--confirm", flags.confirm),
+        ];
+        if let Some((flag, _)) = given.iter().find(|(_, set)| *set) {
+            bail!("{flag} does not apply to `controller`: it signs with its own key and never with the agent's");
+        }
+        let options = ControllerOptions {
+            config: cli.config,
+            dry_run: flags.dry_run,
+            local_party: std::env::var("PARTY_AGENT").ok().filter(|p| !p.trim().is_empty()),
+            chain: std::env::var("CANTON_CHAIN").ok().filter(|c| !c.trim().is_empty()),
+            wait: Default::default(),
+        };
+        scrub_private_key_env();
+        return Ok(Some(Job::Controller(Box::new(command), options)));
+    }
 
-    if let Commands::Onboard { rpc, party, private_key, invite_code, agent_name, email, poll_interval } = cli.command {
+    if let Commands::Onboard { network, rpc, party, private_key, invite_code, agent_name, email, poll_interval } = cli.command {
+        // Before the key prompt: a refused network writes nothing.
+        let target = OnboardTarget::resolve(network.as_deref(), rpc)?;
+        if email.is_some() {
+            agent_logic::errln!("{EMAIL_IGNORED}");
+        }
         let env_file = cli.env_file.unwrap_or_else(|| PathBuf::from(".env"));
         let party = party.or(top_party);
         let mut key = private_key.and_then(nonblank).map(Zeroizing::new).or(top_key);
@@ -450,12 +502,12 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
             };
         }
         return Ok(Some(Job::Onboard(Box::new(OnboardArgs {
-            rpc,
+            target,
             party,
             key,
             invite_code,
             agent_name,
-            email,
+            email: email.and_then(nonblank),
             env_file,
             poll_interval,
         }))));
@@ -511,6 +563,10 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
     }
 
     let overrides = resolve_key_overrides(top_party, top_key, top_quote)?;
+    let env_file = match &cli.env_file {
+        Some(path) => Some(path.clone()),
+        None => cloud_agent::env::find_dotenv()?,
+    };
 
     let base_config = if needs_agent_toml {
         if !cli.config.exists() {
@@ -549,6 +605,7 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
         flags,
         quote_for_atomic,
         eth_key,
+        env_file,
     }))))
 }
 
@@ -560,10 +617,16 @@ fn scrub_private_key_env() {
 }
 
 async fn run_configured(job: ConfiguredCommand) -> Result<()> {
-    let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic, eth_key } = job;
+    let ConfiguredCommand { config: mut base_config, command, flags, quote_for_atomic, eth_key, env_file } = job;
 
     // Checks that need no network fail before any registry wait
     preflight(&base_config, &command)?;
+
+    // A linked agent refuses to run on a missing, stale or forked control log; control
+    // commands open the store themselves (restore must work while it is missing).
+    if let Some(opts) = attach_options(&command, flags) {
+        cloud_agent::control::attach(&base_config, opts).await?;
+    }
 
     // Instrument registry (CC → Amulet + DSO, USDC → registry, …) from orderbook-rpc;
     // `registry_need` decides whether a failure stops the command or is only logged.
@@ -577,7 +640,20 @@ async fn run_configured(job: ConfiguredCommand) -> Result<()> {
     // Idempotent; a no-op for commands that never report.
     agent_logic::error_reporter::init_from_config(&base_config);
 
-    dispatch(base_config, command, flags, quote_for_atomic, eth_key).await
+    dispatch(base_config, command, flags, quote_for_atomic, eth_key, env_file).await
+}
+
+/// How a configured command attaches to the control log; `None` for the control commands.
+fn attach_options(command: &Commands, flags: Flags) -> Option<cloud_agent::control::AttachOptions> {
+    use cloud_agent::control::{AttachOptions, Purpose};
+    match command {
+        Commands::Control { .. } => None,
+        Commands::Agent { no_reject, .. } => {
+            Some(AttachOptions { purpose: Purpose::Agent, force: flags.force, no_reject: *no_reject })
+        }
+        Commands::Sign { .. } => Some(AttachOptions { purpose: Purpose::Sign, force: flags.force, no_reject: false }),
+        _ => Some(AttachOptions { purpose: Purpose::Other, force: flags.force, no_reject: false }),
+    }
 }
 
 /// [`populate_instruments`] bounded by `budget`; an elapsed fetch leaves `config` as it was.
@@ -606,6 +682,8 @@ enum RegistryNeed {
     Required(Duration),
     /// One bounded attempt; an instrument it lacks fails where it is used.
     BestEffort,
+    /// No attempt: the command never reads the registry.
+    Skip,
 }
 
 /// Commands that settle trades or put registry admins on the ledger require the registry.
@@ -638,8 +716,11 @@ fn registry_need(command: &Commands) -> RegistryNeed {
         | Commands::Faucet { .. }
         | Commands::Lock { .. }
         | Commands::Usdcx { .. }
+        | Commands::Controller { .. }
         | Commands::GeneratePrivateKey
         | Commands::Onboard { .. } => RegistryNeed::BestEffort,
+        // `control show --offline` must make no connection
+        Commands::Control { .. } => RegistryNeed::Skip,
     }
 }
 
@@ -659,11 +740,15 @@ async fn load_registry(
     need: RegistryNeed,
     backoff: Backoff,
 ) -> Result<()> {
-    let RegistryNeed::Required(budget) = need else {
-        if let Err(e) = populate_instruments_within(config, INSTRUMENTS_BUDGET).await {
-            tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
+    let budget = match need {
+        RegistryNeed::Required(budget) => budget,
+        RegistryNeed::Skip => return Ok(()),
+        RegistryNeed::BestEffort => {
+            if let Err(e) = populate_instruments_within(config, INSTRUMENTS_BUDGET).await {
+                tracing::warn!("Failed to populate instrument registry from RPC: {:#}", e);
+            }
+            return Ok(());
         }
-        return Ok(());
     };
     let base = config.clone();
     let loaded = retry_within(
@@ -754,6 +839,7 @@ async fn dispatch(
     flags: Flags,
     quote_for_atomic: Option<Zeroizing<String>>,
     eth_key: Option<Zeroizing<String>>,
+    env_file: Option<PathBuf>,
 ) -> Result<()> {
     let Flags { verbose, dry_run, force, confirm } = flags;
     match command {
@@ -764,7 +850,7 @@ async fn dispatch(
             no_reject,
         } => {
             let version_info = version_info();
-            run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm, Some(&version_info)).await
+            run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm, Some(&version_info), env_file).await
         }
         Commands::Info { command } => run_info(base_config, command).await,
         Commands::Preapproval { command } => run_preapproval(base_config, command, verbose, dry_run, force, confirm).await,
@@ -785,7 +871,11 @@ async fn dispatch(
         Commands::Sell { market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token } => {
             run_fill(base_config, fill_loop::FillDirection::Sell, market, amount, price_limit, min_settlement, max_settlement, interval, atomic, fee_token, verbose, dry_run, force, confirm).await
         }
-        Commands::GeneratePrivateKey | Commands::Onboard { .. } => {
+        Commands::Control { control_dir, command } => {
+            let options = cloud_agent::control::ControlOptions { control_dir, env_file, dry_run };
+            cloud_agent::control::run_control(base_config, options, command).await
+        }
+        Commands::GeneratePrivateKey | Commands::Onboard { .. } | Commands::Controller { .. } => {
             bail!("internal: command dispatched before config load")
         }
     }
@@ -1432,17 +1522,19 @@ mod tests {
     #[tokio::test]
     async fn early_commands_are_refused_by_dispatch() {
         let onboard = Commands::Onboard {
-            rpc: String::new(),
+            network: None,
+            rpc: None,
             agent_name: String::new(),
-            email: String::new(),
+            email: None,
             invite_code: String::new(),
             party: None,
             private_key: None,
             poll_interval: 10,
         };
-        for command in [Commands::GeneratePrivateKey, onboard] {
+        let controller = Commands::Controller { command: ControllerCommands::Keygen { dir: PathBuf::from("k") } };
+        for command in [Commands::GeneratePrivateKey, onboard, controller] {
             let config = BaseConfig::test_minimal().unwrap();
-            let err = dispatch(config, command, Flags::default(), None, None).await.unwrap_err();
+            let err = dispatch(config, command, Flags::default(), None, None, None).await.unwrap_err();
             assert!(format!("{err:#}").contains("dispatched before config load"), "{err:#}");
         }
     }
@@ -1459,9 +1551,83 @@ mod tests {
         Cli::try_parse_from(std::iter::once("cloud-agent").chain(args.iter().copied()))
     }
 
+    // A dry-run agent used to place real orders before any settlement step ran dry
+    #[test]
+    fn a_dry_run_agent_is_refused_before_any_setup() {
+        for args in [["--dry-run", "agent"], ["agent", "--dry-run"]] {
+            let err = prepare(parse(&args).unwrap()).err().unwrap();
+            assert_eq!(err.to_string(), cloud_agent::AGENT_DRY_RUN_REFUSAL, "{args:?}");
+        }
+    }
+
     #[test]
     fn the_cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn control_commands_parse_and_force_never_takes_yes() {
+        let link = parse(&["control", "link", "--code", "LNK-ABC"]).unwrap();
+        assert!(matches!(link.command, Commands::Control { command: ControlCommands::Link { .. }, .. }));
+        assert!(parse(&["control", "remove", "Key 1", "--force", "--yes"]).is_err());
+        assert!(parse(&["control", "capabilities", "Key 1", "read", "--force", "--yes"]).is_err());
+        assert!(parse(&["control", "remove", "Key 1", "--force"]).is_ok());
+        assert!(parse(&["control", "add", "--ed25519", "00"]).is_err(), "--label and --capabilities are required");
+        assert!(parse(&["control", "add", "--code", "LNK-A", "--ed25519", "00", "--label", "x", "--capabilities", "read"]).is_err());
+        for args in [
+            vec!["control", "show", "--json", "--offline"],
+            vec!["control", "policy", "show", "--pending"],
+            vec!["control", "restore"],
+            vec!["control", "sync"],
+            vec!["control", "discard-pending"],
+            vec!["controller", "keygen", "--dir", "/tmp/k"],
+            vec!["controller", "sign", "--key", "k", "--payload", "abc", "--network", "devnet"],
+        ] {
+            assert!(parse(&args).is_ok(), "{args:?}");
+        }
+        assert!(parse(&["controller", "sign", "--key", "k", "--network", "devnet"]).is_err(), "a document is required");
+        let offline = parse(&["control", "show", "--offline"]).unwrap().command;
+        assert_eq!(registry_need(&offline), RegistryNeed::Skip, "no registry connection for control commands");
+    }
+
+    #[test]
+    fn controller_mode_refuses_the_agent_flags() {
+        for args in [
+            vec!["controller", "status", "--party", "agent-1::1220"],
+            vec!["--private-key", "x", "controller", "status"],
+            vec!["controller", "status", "--force"],
+            vec!["controller", "policy", "set", "--pause", "--confirm"],
+            vec!["--quote-private-key", "x", "controller", "log"],
+        ] {
+            let err = prepare(parse(&args).unwrap()).err().unwrap();
+            assert!(err.to_string().contains("does not apply to `controller`"), "{args:?}: {err}");
+        }
+        for args in [
+            vec!["controller", "status", "--agent", "x", "--json"],
+            vec!["--dry-run", "controller", "policy", "set", "--pause"],
+            vec!["controller", "command", "show", "--code", "CMD-x", "--wait"],
+            vec![
+                "controller", "command", "swap", "--sell-admin", "a", "--sell-id", "b", "--sell-amount", "1",
+                "--buy-admin", "c", "--buy-id", "d", "--min-receive", "1",
+            ],
+        ] {
+            assert!(parse(&args).is_ok(), "{args:?}");
+        }
+        assert!(parse(&["controller", "command", "transfer-cc", "--to", "x", "--amount", "1", "--yes"]).is_err());
+        assert!(prepare(parse(&["controller", "keygen", "--dir", "/tmp/k"]).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn configured_commands_attach_except_the_control_commands() {
+        use cloud_agent::control::Purpose;
+        let flags = Flags { force: true, ..Flags::default() };
+        let control = parse(&["control", "sync"]).unwrap().command;
+        assert!(attach_options(&control, flags).is_none());
+        let agent = parse(&["agent", "--no-reject"]).unwrap().command;
+        let opts = attach_options(&agent, flags).unwrap();
+        assert!(opts.purpose == Purpose::Agent && opts.no_reject && opts.force);
+        let info = parse(&["info", "balance"]).unwrap().command;
+        assert_eq!(attach_options(&info, Flags::default()).unwrap().purpose, Purpose::Other);
     }
 
     fn refused(args: &[&str]) -> bool {
@@ -1505,14 +1671,63 @@ mod tests {
 
     #[test]
     fn onboard_poll_interval_is_bounded() {
-        let args = |n: &'static str| {
-            ["onboard", "--agent-name", "a", "--email", "e", "--invite-code", "i", "--poll-interval", n]
-        };
+        let args = |n: &'static str| ["onboard", "--agent-name", "a", "--invite-code", "i", "--poll-interval", n];
         assert!(refused(&args("0")));
         assert!(refused(&args("3601")));
         assert!(parse(&args("1")).is_ok());
         assert!(parse(&args("3600")).is_ok());
-        let default = parse(&["onboard", "--agent-name", "a", "--email", "e", "--invite-code", "i"]).unwrap();
+        let default = parse(&["onboard", "--agent-name", "a", "--invite-code", "i"]).unwrap();
         assert!(matches!(default.command, Commands::Onboard { poll_interval: 10, .. }));
+    }
+
+    fn onboard_target(args: &[&str]) -> Result<OnboardTarget> {
+        let mut all = vec!["onboard", "--agent-name", "a", "--invite-code", "i"];
+        all.extend_from_slice(args);
+        match parse(&all)?.command {
+            Commands::Onboard { network, rpc, .. } => OnboardTarget::resolve(network.as_deref(), rpc),
+            _ => bail!("not onboard"),
+        }
+    }
+
+    #[test]
+    fn onboard_picks_the_rpc_of_its_network_and_mainnet_by_default() {
+        let mainnet = onboard_target(&[]).unwrap();
+        assert_eq!((mainnet.rpc.as_str(), mainnet.network.as_deref()), (cloud_agent::MAINNET_RPC_URL, Some("mainnet")));
+        assert_eq!(mainnet.rpc, "https://orderbook-mainnet.silvana.dev:443");
+        let devnet = onboard_target(&["--network", "devnet"]).unwrap();
+        assert_eq!((devnet.rpc.as_str(), devnet.network.as_deref()), ("https://orderbook-devnet.silvana.dev:443", Some("devnet")));
+        assert_eq!(onboard_target(&["--network", "testnet"]).unwrap_err().to_string(), "testnet has no rpc yet");
+        let kind = |args: &[&str]| parse(args).err().map(|e| e.kind());
+        let local = kind(&["onboard", "--agent-name", "a", "--invite-code", "i", "--network", "local"]);
+        assert_eq!(local, Some(clap::error::ErrorKind::InvalidValue));
+        // The hidden --rpc still names another endpoint, but never together with --network.
+        let other = onboard_target(&["--rpc", "http://127.0.0.1:50051"]).unwrap();
+        assert_eq!((other.rpc.as_str(), other.network), ("http://127.0.0.1:50051", None));
+        let both = kind(&["onboard", "--agent-name", "a", "--invite-code", "i", "--network", "devnet", "--rpc", "http://x"]);
+        assert_eq!(both, Some(clap::error::ErrorKind::ArgumentConflict));
+    }
+
+    #[test]
+    fn testnet_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!("onboard-testnet-{}", std::process::id()));
+        let env_file = dir.join(".env");
+        let env_text = env_file.to_string_lossy().into_owned();
+        let cli = parse(&["--env-file", &env_text, "onboard", "--network", "testnet", "--agent-name", "a", "--invite-code", "i"]).unwrap();
+        let err = prepare(cli).err().unwrap();
+        assert_eq!(err.to_string(), "testnet has no rpc yet");
+        assert!(!dir.exists() && !env_file.exists(), "nothing is written");
+    }
+
+    #[test]
+    fn email_is_hidden_and_ignored() {
+        let cli = parse(&["onboard", "--agent-name", "a", "--email", "e@x", "--invite-code", "i"]).unwrap();
+        assert!(matches!(cli.command, Commands::Onboard { email: Some(_), .. }), "an old command still parses");
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--email") && help.contains("--network"), "{help}");
+        let mut command = Cli::command();
+        let onboard = command.find_subcommand_mut("onboard").unwrap().render_long_help().to_string();
+        assert!(!onboard.contains("--email") && !onboard.contains("--rpc"), "{onboard}");
+        assert!(onboard.contains("--network") && onboard.contains("testnet has no rpc yet"), "{onboard}");
+        assert!(cloud_agent::EMAIL_IGNORED.contains("the email comes from the account that owns the invite code"));
     }
 }

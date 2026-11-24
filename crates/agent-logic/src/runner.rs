@@ -822,10 +822,13 @@ async fn snapshot_state<B: SettlementBackend + 'static>(
     lock_limit: Duration,
 ) -> SavedState {
     // Export order tracker state
-    let (saved_start_time, saved_orders, saved_settlement_orders) =
+    let (saved_start_time, saved_orders, saved_settlement_orders, saved_strategy_starts) =
         match lock_within(tracker, lock_limit, "order tracker").await {
-            Some(t) => t.export_state(),
-            None => (start_time_ms, Vec::new(), Vec::new()),
+            Some(t) => {
+                let (start, orders, settlement_orders) = t.export_state();
+                (start, orders, settlement_orders, t.strategy_starts().export(clock::now_millis()))
+            }
+            None => (start_time_ms, Vec::new(), Vec::new(), Vec::new()),
         };
 
     // Build saved state
@@ -834,6 +837,7 @@ async fn snapshot_state<B: SettlementBackend + 'static>(
     saved.rejected_proposals = executor.rejected_proposals().iter().cloned().collect();
     saved.orders = saved_orders;
     saved.settlement_orders = saved_settlement_orders;
+    saved.strategy_starts = saved_strategy_starts;
 
     // Save accepted RFQ trades
     if let Some(ref accepted) = options.accepted_rfq_trades {
@@ -1003,6 +1007,7 @@ where
     if let Some(ref saved) = restored_state {
         let mut t = tracker.lock().await;
         t.import_state(saved.orders.clone(), saved.settlement_orders.clone());
+        t.strategy_starts_mut().restore(&saved.strategy_starts, clock::now_millis());
     }
 
     // Create settlement executor with shared tracker
@@ -2914,16 +2919,16 @@ mod loop_tests {
         async fn pay_fee(&self, _: &str, _: &str) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }
-        async fn propose_dvp(&self, _: &str) -> Result<crate::settlement::StepResult> {
+        async fn propose_dvp(&self, _: &orderbook_proto::orderbook::SettlementProposal) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }
         async fn accept_dvp(
-            &self, _: &str, _: &str, _: &str, _: &str, _: &str, _: &str,
+            &self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str,
         ) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }
         async fn allocate(
-            &self, _: &str, _: &str, _: Option<rust_decimal::Decimal>,
+            &self, _: &orderbook_proto::orderbook::SettlementProposal, _: &str, _: Option<rust_decimal::Decimal>,
         ) -> Result<crate::settlement::StepResult> {
             anyhow::bail!("unused")
         }

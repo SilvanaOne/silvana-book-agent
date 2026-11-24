@@ -8,6 +8,8 @@ members = [
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
+    "crates/agent-control",
+    "crates/agent-controller",
     "examples/buy_cc",
 ]
 default-members = [
@@ -18,10 +20,12 @@ default-members = [
     "crates/orderbook-proto",
     "crates/tx-verifier",
     "crates/message-signing",
+    "crates/agent-control",
+    "crates/agent-controller",
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 authors = ["DFST"]
 license = "Apache-2.0"

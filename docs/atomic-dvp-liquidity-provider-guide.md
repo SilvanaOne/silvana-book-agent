@@ -80,11 +80,12 @@ current folder, and you run it by typing `./cloud-agent`.
 
 ## A2. Onboard — create your account and private key
 
-Run one command (use your own name and email). devnet is the default and its invite code is the
-public `INVITE1`, so the command below works as‑is. It's safe to re‑run if anything goes wrong.
+Run one command (use your own agent name). `--network devnet` picks devnet, and its invite code is
+the public `INVITE1`, so the command below works as‑is. It's safe to re‑run if anything goes wrong.
+No email is needed: it comes from the account that owns the invite code.
 
 ```bash
-./cloud-agent onboard --agent-name my-lp --email me@example.com --invite-code INVITE1
+./cloud-agent onboard --network devnet --agent-name my-lp --invite-code INVITE1
 ```
 
 This can take a minute or two — it waits for the network to set up your account (you'll see it
@@ -400,12 +401,15 @@ every network. If you already downloaded it, you can reuse it (just work in this
 
 ## B2. Onboard on mainnet
 
-Same command as devnet, plus `--rpc https://orderbook-mainnet.silvana.dev:443` at the end to pick
-the mainnet network:
+Same command as devnet, with `--network mainnet` (also the default when `--network` is left out)
+and your own invite code:
 
 ```bash
-./cloud-agent onboard --agent-name my-lp --email me@example.com --invite-code YOUR_INVITE_CODE --rpc https://orderbook-mainnet.silvana.dev:443
+./cloud-agent onboard --network mainnet --agent-name my-lp --invite-code YOUR_INVITE_CODE
 ```
+
+Onboarding stops before writing the server's settings if that rpc serves another network than the
+one you chose. `--network testnet` is refused: testnet has no rpc yet.
 
 As before, this creates your `.env` and starter `agent.toml`. Optional check:
 `./cloud-agent info party`
@@ -710,6 +714,25 @@ transactions automatically, both by `atomic setup` and by the runtime split work
 > Merely omitting `bid_levels` / `offer_levels` — the old recipe — removed the grid but the
 > agent still quoted RFQ V1.
 
+### `[control]` and `[vetted_packages]` (agents linked to controllers)
+
+Both sections are optional and only matter once the agent is linked to its owner's controllers
+(see [control.md](control.md)). They are read strictly: an unknown key or a value out of range
+stops startup with a message naming the section and the key. Both are logged at startup and read
+only then: restart a running agent after a change.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `control.auto_execute_commands` | `false` | Run pending direct commands without a prompt; otherwise they wait for `cloud-agent control execute` |
+| `control.auto_accept_policies` | `true` | Accept valid pending policies while the agent runs; otherwise they wait for `cloud-agent control policy accept` |
+| `control.swap_max_deviation_bps` | `100` | Largest gap between a swap command's price and the agent's reference mid, 0–10000; `0` turns the guard off |
+| `vetted_packages.mode` | `"all"` | `"all"` (no `packages` key), or `"selected"` |
+| `vetted_packages.packages` | — | With `"selected"`: 1 to 256 different package ids, 64 lowercase hex characters each |
+
+A controller change, and a policy that widens packages or command scopes, takes effect 1 hour after
+the agent signs it on devnet and 24 hours after on mainnet; a narrower policy applies at once. The
+agent does not enforce `[vetted_packages]` yet: the packages rule of its signed policy does.
+
 ---
 
 # Troubleshooting
@@ -764,8 +787,8 @@ curl -LO https://github.com/SilvanaOne/silvana-book-agent/releases/latest/downlo
 tar -xzf cloud-agent-macos-silicon.tar.gz
 chmod +x cloud-agent
 
-# 2. Onboard   (devnet code INVITE1 shown; mainnet: use your own code + --rpc https://orderbook-mainnet.silvana.dev:443)
-./cloud-agent onboard --agent-name my-lp --email me@example.com --invite-code INVITE1
+# 2. Onboard   (devnet code INVITE1 shown; mainnet: --network mainnet and your own code)
+./cloud-agent onboard --network devnet --agent-name my-lp --invite-code INVITE1
 
 # 3. Atomic DVP quote key → paste ATOMIC_QUOTE_PRIVATE_KEY into .env
 ./cloud-agent atomic keygen

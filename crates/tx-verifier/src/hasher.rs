@@ -5,7 +5,8 @@
 //!   Layer 2: metadata_hash = SHA-256(purpose || encoding_version || act_as || ... || input_contracts)
 //!   Layer 3: final_hash = SHA-256(purpose || 0x02 || transaction_hash || metadata_hash)
 //!
-//! On error, returns `[0u8; 32]` sentinel so the caller falls back to the server hash.
+//! `try_compute_hash` returns an error when no hash can be computed;
+//! `compute_hash` returns the `[0u8; 32]` sentinel instead.
 
 use std::collections::{HashMap, HashSet};
 
@@ -750,23 +751,44 @@ pub fn compute_hash(
     prepared_transaction_bytes: &[u8],
     hashing_scheme_version: &str,
 ) -> Result<[u8; 32]> {
-    let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
-        .context("Failed to decode PreparedTransaction")?;
-
-    match compute_final_hash(&prepared, hashing_scheme_version) {
-        Ok(hash) => {
-            debug!(
-                "TX HASH computed: {} (scheme={})",
-                hex::encode(hash),
-                hashing_scheme_version
-            );
-            Ok(hash)
-        }
+    match decode_and_hash(prepared_transaction_bytes, hashing_scheme_version)? {
+        Ok(hash) => Ok(hash),
         Err(e) => {
             error!("TX HASH computation failed: {:#}", e);
             Ok([0u8; 32]) // sentinel → caller falls back to server hash
         }
     }
+}
+
+/// Compute the transaction hash from `PreparedTransaction` bytes, or an error
+/// when the bytes do not decode or no non-zero hash can be computed.
+pub fn try_compute_hash(
+    prepared_transaction_bytes: &[u8],
+    hashing_scheme_version: &str,
+) -> Result<[u8; 32]> {
+    let hash = decode_and_hash(prepared_transaction_bytes, hashing_scheme_version)??;
+    if hash == [0u8; 32] {
+        bail!("the computed transaction hash is all zero");
+    }
+    Ok(hash)
+}
+
+/// The outer error is a decode failure, the inner one a hash computation failure.
+pub(crate) fn decode_and_hash(
+    prepared_transaction_bytes: &[u8],
+    hashing_scheme_version: &str,
+) -> Result<Result<[u8; 32]>> {
+    let prepared = PreparedTransaction::decode(prepared_transaction_bytes)
+        .context("Failed to decode PreparedTransaction")?;
+    Ok(
+        compute_final_hash(&prepared, hashing_scheme_version).inspect(|hash| {
+            debug!(
+                "TX HASH computed: {} (scheme={})",
+                hex::encode(hash),
+                hashing_scheme_version
+            );
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -970,5 +992,46 @@ mod tests {
         c.contract_id = "€".repeat(30);
         let p = prepared(&["0"], vec![create_node("0", c)], vec![], &["p"]);
         assert_eq!(hash(&p), SENTINEL);
+    }
+
+    #[test]
+    fn try_compute_hash_errors_where_compute_hash_returned_the_sentinel() {
+        let mut bad_cid = create(ident("M", "T"), boolean(true), &["p"]);
+        bad_cid.contract_id = "€".repeat(30);
+        let unseeded = exercise_node("0", exercise("C", &["p"], vec![]));
+        let failing = [
+            prepared(&["0"], vec![exercise_node("0", exercise("C", &["p"], ids(&["0"])))], vec![seed(0, 0)], &["p"]),
+            prepared(
+                &["0"],
+                vec![exercise_node("0", exercise("C", &["p"], ids(&["1"]))), rollback_node("1", ids(&["0"]))],
+                vec![seed(0, 0)],
+                &["p"],
+            ),
+            prepared(
+                &["0"],
+                vec![exercise_node("0", exercise("C", &["p"], ids(&["1", "1"]))), leaf("1")],
+                vec![seed(0, 1)],
+                &["p"],
+            ),
+            prepared(&["0", "0"], vec![leaf("0")], vec![], &["p"]),
+            prepared(&["0"], vec![unseeded.clone()], vec![], &["p"]),
+            prepared(&["0"], vec![create_node("0", bad_cid)], vec![], &["p"]),
+            prepared(&["0"], vec![leaf("1")], vec![], &["p"]),
+            chain(MAX_NODE_DEPTH + 1),
+        ];
+        for (i, p) in failing.iter().enumerate() {
+            let bytes = encode(p);
+            assert_eq!(compute_hash(&bytes, "V2").unwrap(), SENTINEL, "case {i}");
+            assert!(try_compute_hash(&bytes, "V2").is_err(), "case {i}");
+        }
+
+        let seeded = encode(&prepared(&["0"], vec![unseeded], vec![seed(0, 1)], &["p"]));
+        let h = try_compute_hash(&seeded, "V2").unwrap();
+        assert_ne!(h, SENTINEL);
+        assert_eq!(compute_hash(&seeded, "V2").unwrap(), h);
+
+        // undecodable bytes are an error for both
+        assert!(compute_hash(&[0xff], "V2").is_err());
+        assert!(try_compute_hash(&[0xff], "V2").is_err());
     }
 }

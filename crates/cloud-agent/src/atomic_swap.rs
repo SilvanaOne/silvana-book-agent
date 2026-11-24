@@ -27,22 +27,23 @@ use agent_logic::confirm::ConfirmLock;
 use agent_logic::supervise;
 use atomic_quote::envelope::{pre_submit_check, AcsContractJson, QuoteEnvelope, QuoteJson};
 use orderbook_proto::ledger::{
-    prepare_transaction_request::Params as V1Params, PreapprovalInfo, PrepareTransactionRequest,
-    RequestPreapprovalParams, TransactionOperation,
+    prepare_transaction_request::Params as V1Params, ControllerCommand, PreapprovalInfo,
+    PrepareTransactionRequest, RequestPreapprovalParams, TransactionOperation,
 };
 use orderbook_proto::rfqv2::{
     prepare_atomic_transaction_request::Params as AtomicParams, AtomicDvpSettleParams,
     AtomicQuoteEnvelope, ExecuteAtomicTransactionResponse as AtomicExecuteResponse,
     PrepareAtomicTransactionRequest,
 };
-use tx_verifier::OperationExpectation;
+use tx_verifier::{ExpectedFee, OperationExpectation};
 
 use crate::fill_loop::{FillDirection, MarkerNotSaved};
 use crate::holdings_cache::{
     instrument_key, CachedHolding, HoldingsCache, CC_INSTRUMENT, TEMPLATE_AMULET, TEMPLATE_HOLDING,
 };
 use crate::ledger_client::{
-    self, is_ambiguous_execute_error, within, AtomicProviderClient, DAppProviderClient,
+    self, is_ambiguous_execute_error, within, AtomicProviderClient, DAppProviderClient, PreSign,
+    PreSignContext,
 };
 
 /// H14 safety margin: the signed window must exceed this at pre-check time
@@ -291,18 +292,14 @@ pub async fn ensure_receiver_preapproval(
         "Creating receiver preapproval for {} (admin {}, operator {})",
         on_chain_id, admin, operator
     );
-    let expectation = OperationExpectation::RequestPreapproval {
-        party: config.party_id.clone(),
-    };
-    let request = PrepareTransactionRequest {
-        operation: TransactionOperation::RequestPreapproval as i32,
-        params: Some(V1Params::RequestPreapproval(RequestPreapprovalParams {
+    let (expectation, request) = preapproval_submission(
+        &config.party_id,
+        RequestPreapprovalParams {
             instrument_admin: admin.clone(),
             instrument_allowances: vec![],
             operator,
-        })),
-        request_signature: None,
-    };
+        },
+    );
     // The submit runs in its own task; past its wait the ledger state decides
     let mut submitter = client.clone();
     let submit = supervise::try_spawn("receiver preapproval", async move {
@@ -343,6 +340,25 @@ pub async fn ensure_receiver_preapproval(
     bail!("receiver preapproval submission {lost}, and no preapproval for admin {admin} is visible yet")
 }
 
+/// The preapproval request of `party` and its expectation, both from the same `params`.
+fn preapproval_submission(
+    party: &str,
+    params: RequestPreapprovalParams,
+) -> (OperationExpectation, PrepareTransactionRequest) {
+    let expectation = OperationExpectation::RequestPreapproval {
+        party: party.to_string(),
+        operator: Some(params.operator.clone()),
+        instrument_admin: Some(params.instrument_admin.clone()),
+    };
+    let request = PrepareTransactionRequest {
+        operation: TransactionOperation::RequestPreapproval as i32,
+        params: Some(V1Params::RequestPreapproval(params)),
+        request_signature: None,
+        controller_command: None,
+    };
+    (expectation, request)
+}
+
 /// Whether a full (no allowance list) preapproval for `admin` exists.
 fn preapproval_present(existing: &[PreapprovalInfo], admin: &str) -> bool {
     existing
@@ -366,6 +382,87 @@ type SubmitFlags = (bool, bool, bool);
 
 /// The client handed back by a finished submit, with its result.
 type SubmitEnd = (AtomicProviderClient, Result<AtomicExecuteResponse>);
+
+/// Own inputs a directed settle may use (the protocol bound).
+const MAX_DIRECTED_INPUTS: usize = 100;
+
+/// A round up to its submit: checked, its own inputs selected and reserved, its request built.
+struct Staged {
+    env: QuoteEnvelope,
+    req: PrepareAtomicTransactionRequest,
+    expectation: OperationExpectation,
+    own_cids: Vec<String>,
+    client_slot: Option<AtomicProviderClient>,
+    valid_until_micros: i64,
+    base_amount: Decimal,
+}
+
+/// What a directed settle carries beyond its envelope.
+pub struct DirectedSettle<'a> {
+    /// The command it executes.
+    pub command: &'a agent_control::Command,
+    /// The command's bytes and proof, sent with the request.
+    pub controller_command: ControllerCommand,
+    /// The signed window must end by the command's expiry.
+    pub expires_at_micros: i64,
+}
+
+/// The round of a directed settle at its submit.
+pub struct DirectedRound<'a> {
+    pub quote_id: &'a str,
+    pub own_cids: &'a [String],
+    pub valid_until_micros: i64,
+    /// The venue the request settles on.
+    pub venue_cid: &'a str,
+    pub expectation: &'a OperationExpectation,
+    /// The request's params, as the content check reads them.
+    pub params: Option<&'a AtomicParams>,
+}
+
+/// A directed settle's hook: the round, and the prepared transaction about to be signed.
+pub type DirectedBind<'a> =
+    &'a mut (dyn FnMut(&DirectedRound<'_>, &PreSignContext<'_>) -> Result<()> + Send);
+
+/// What records a directed round right before its submit.
+pub type DirectedBefore<'a> = &'a mut (dyn FnMut(&DirectedRound<'_>) -> Result<()> + Send);
+
+/// How a directed settle ended.
+#[derive(Debug)]
+pub enum DirectedOutcome {
+    /// Nothing was submitted, for this reason; another quote may be taken.
+    NotSubmitted(String),
+    /// The one submission's result; `signed` when its hook allowed the signature.
+    Submitted {
+        signed: bool,
+        result: Result<Result<AtomicExecuteResponse>, tokio::time::error::Elapsed>,
+    },
+}
+
+/// The one submission of a directed settle.
+#[allow(clippy::double_must_use)]
+#[async_trait::async_trait]
+pub trait DirectedSubmit: Send {
+    async fn submit_directed(
+        &mut self,
+        req: PrepareAtomicTransactionRequest,
+        expectation: &OperationExpectation,
+        command: &agent_control::Command,
+        bind: PreSign<'_>,
+    ) -> Result<AtomicExecuteResponse>;
+}
+
+#[async_trait::async_trait]
+impl DirectedSubmit for AtomicProviderClient {
+    async fn submit_directed(
+        &mut self,
+        req: PrepareAtomicTransactionRequest,
+        expectation: &OperationExpectation,
+        command: &agent_control::Command,
+        bind: PreSign<'_>,
+    ) -> Result<AtomicExecuteResponse> {
+        self.submit_atomic_directed(req, expectation, command, bind).await
+    }
+}
 
 /// A submit with no result: still running past its wait, or its task failed.
 /// Either way it may have executed.
@@ -516,6 +613,69 @@ impl AtomicSwapper {
             .await
     }
 
+    /// The one settle of a directed swap, never re-prepared: the usual checks, a window ending
+    /// by the command's expiry, and `bind` run right before the only signature.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn settle_envelope_directed(
+        &self,
+        envelope: &AtomicQuoteEnvelope,
+        accepted: &orderbook_proto::rfqv2::AtomicQuoteInfo,
+        direction: FillDirection,
+        directed: &DirectedSettle<'_>,
+        submitter: &mut dyn DirectedSubmit,
+        before_submit: DirectedBefore<'_>,
+        bind: DirectedBind<'_>,
+    ) -> Result<DirectedOutcome> {
+        if self.dry_run || self.force || self.confirm {
+            bail!("a directed settle runs without --dry-run, --force or --confirm");
+        }
+        let signed_until = envelope.quote.as_ref().map(|q| q.valid_until_micros);
+        if signed_until.is_none_or(|until| until > directed.expires_at_micros) {
+            return Ok(DirectedOutcome::NotSubmitted(format!(
+                "the signed window ends at {signed_until:?} µs, after the command expires ({} µs)",
+                directed.expires_at_micros
+            )));
+        }
+        let staged = match self.stage(envelope, accepted, direction, MAX_DIRECTED_INPUTS).await? {
+            Ok(staged) => staged,
+            Err(SwapOutcome::Requote { reason }) => return Ok(DirectedOutcome::NotSubmitted(reason)),
+            Err(_) => bail!("the round of quote {} ended before its submit", accepted.quote_id),
+        };
+        let Staged { env, mut req, expectation, own_cids, valid_until_micros, .. } = *staged;
+        req.controller_command = Some(directed.controller_command.clone());
+        let params = req.params.clone();
+        let round = DirectedRound {
+            quote_id: &env.quote.quote_id,
+            own_cids: &own_cids,
+            valid_until_micros,
+            venue_cid: &env.dvp.contract_id,
+            expectation: &expectation,
+            params: params.as_ref(),
+        };
+        if let Err(e) = before_submit(&round) {
+            self.cache.release_reservations(&own_cids).await;
+            return Err(e);
+        }
+        let mut passed = false;
+        let result = {
+            let mut hook = |pc: &PreSignContext<'_>| -> Result<()> {
+                bind(&round, pc)?;
+                passed = true;
+                Ok(())
+            };
+            let wait = submit_wait(valid_until_micros, clock::now_micros_i64());
+            let submit = submitter.submit_directed(req, &expectation, directed.command, &mut hook);
+            tokio::time::timeout(wait, submit).await
+        };
+        match &result {
+            Ok(Ok(resp)) if passed && resp.success => self.cache.mark_consumed(&own_cids, &resp.update_id).await,
+            // Signed or about to be: the inputs stay reserved until the window ends.
+            _ if passed => {}
+            _ => self.cache.release_reservations(&own_cids).await,
+        }
+        Ok(DirectedOutcome::Submitted { signed: passed, result })
+    }
+
     /// [`Self::settle_envelope_marked`] with the submit and its wait supplied.
     async fn settle_envelope_with<X, F, W>(
         &self,
@@ -531,319 +691,11 @@ impl AtomicSwapper {
         F: std::future::Future<Output = SubmitEnd> + Send + 'static,
         W: Fn(i64, i64) -> Duration,
     {
-        // ---- H14 PRECHECK ----------------------------------------------
-        let env = envelope_from_proto(envelope)?;
-        let now_micros = clock::now_micros_i64();
-        if let Err(e) = pre_submit_check(
-            &env,
-            &self.config.party_id,
-            &self.config.synchronizer_id,
-            now_micros,
-            PRECHECK_VALIDITY_MARGIN_MICROS,
-        ) {
-            // Nothing reserved yet — reject the quote and let the caller
-            // move on to the next quote/LP.
-            return Ok(SwapOutcome::Requote {
-                reason: format!("H14 pre-check failed: {e:#}"),
-            });
-        }
-        let valid_until_micros: i64 = env.quote.valid_until_micros.parse()?;
-        if let Some(reason) = validity_too_far(valid_until_micros, now_micros) {
-            // Refused before anything is reserved, never clamped
-            return Ok(SwapOutcome::Requote { reason });
-        }
-
-        let venue = |ptr: &str| -> Result<String> {
-            env.dvp
-                .payload
-                .pointer(ptr)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("AtomicDVP venue payload missing {ptr}"))
+        let staged = match self.stage(envelope, accepted, direction, max_input_holdings).await? {
+            Ok(staged) => staged,
+            Err(outcome) => return Ok(outcome),
         };
-        let lp_party = venue("/lp")?;
-        if lp_party != accepted.lp_party_id {
-            return Ok(SwapOutcome::Requote {
-                reason: format!(
-                    "H14: venue lp {} does not match the quoted LP {}",
-                    lp_party, accepted.lp_party_id
-                ),
-            });
-        }
-        // Amounts must equal the accepted indicative quote (decimal compare —
-        // the LP must not re-price at confirm).
-        let base_amount = Decimal::from_str(&env.quote.base_amount)
-            .with_context(|| format!("invalid base_amount '{}'", env.quote.base_amount))?;
-        let quote_amount = Decimal::from_str(&env.quote.quote_amount)
-            .with_context(|| format!("invalid quote_amount '{}'", env.quote.quote_amount))?;
-        let accepted_base = Decimal::from_str(&accepted.quantity)
-            .with_context(|| format!("invalid accepted quantity '{}'", accepted.quantity))?;
-        let accepted_quote = Decimal::from_str(&accepted.quote_quantity)
-            .with_context(|| format!("invalid accepted quote_quantity '{}'", accepted.quote_quantity))?;
-        if base_amount != accepted_base || quote_amount != accepted_quote {
-            return Ok(SwapOutcome::Requote {
-                reason: format!(
-                    "H14: signed amounts ({}, {}) differ from accepted quote ({}, {})",
-                    base_amount, quote_amount, accepted_base, accepted_quote
-                ),
-            });
-        }
-        let expected_side = match direction {
-            FillDirection::Buy => "Buy",
-            FillDirection::Sell => "Sell",
-        };
-        if env.quote.side != expected_side {
-            return Ok(SwapOutcome::Requote {
-                reason: format!("H14: quote side {} != {}", env.quote.side, expected_side),
-            });
-        }
-        // Fee consent (design §14 D21): the SIGNED lpFees must equal the fee
-        // displayed on the accepted quote — neither the LP nor the relay can
-        // raise the fee after display.
-        let signed_fees = envelope
-            .quote
-            .as_ref()
-            .map(|q| q.lp_fees.clone())
-            .unwrap_or_default();
-        let displayed_fees: Vec<_> = accepted.settlement_fee.iter().cloned().collect();
-        if signed_fees != displayed_fees {
-            return Ok(SwapOutcome::Requote {
-                reason: format!(
-                    "signed lpFees {:?} differ from the displayed settlement fee {:?}",
-                    signed_fees, displayed_fees
-                ),
-            });
-        }
-
-        // ---- SELECT own holdings (sending leg) --------------------------
-        // User Buy ⇒ user pays quote leg; Sell ⇒ user pays base leg.
-        let (pay_admin, pay_id, amount_needed) = match direction {
-            FillDirection::Buy => (
-                venue("/quoteInstrumentId/admin")?,
-                venue("/quoteInstrumentId/id")?,
-                quote_amount,
-            ),
-            FillDirection::Sell => (
-                venue("/baseInstrumentId/admin")?,
-                venue("/baseInstrumentId/id")?,
-                base_amount,
-            ),
-        };
-        let is_cc = pay_id == "Amulet";
-        let pay_key = if is_cc {
-            CC_INSTRUMENT.to_string()
-        } else {
-            instrument_key(&pay_admin, &pay_id)
-        };
-        // Fee funding (design §14 D21, generalized for fee-token selection):
-        // fees ride the ONE user-side pool — coverage must be GUARANTEED, not
-        // incidental. Per fee instrument: CC targets fee × 1.02 + 1 CC (amulet
-        // sender-fee headroom, the dvp CLI margin); utility tokens (USDC…)
-        // transfer one-step via the receiver's preapproval with no
-        // token-denominated sender fee, so the exact amount suffices.
-        let mut fee_totals: Vec<((String, String), Decimal)> = Vec::new();
-        for f in &signed_fees {
-            let Ok(a) = Decimal::from_str(&f.amount) else {
-                continue;
-            };
-            let key = (f.instrument_admin.clone(), f.instrument_id.clone());
-            match fee_totals.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, total)) => {
-                    let Some(sum) = total.checked_add(a) else {
-                        return Ok(SwapOutcome::Requote {
-                            reason: format!("settlement fee total in {} is out of range", key.1),
-                        });
-                    };
-                    *total = sum;
-                }
-                None => fee_totals.push((key, a)),
-            }
-        }
-        // `None` when the funding target is out of range
-        let fee_target = |id: &str, total: Decimal| -> Option<Decimal> {
-            if id == "Amulet" {
-                total.checked_mul(Decimal::new(102, 2))?.checked_add(Decimal::ONE)
-            } else {
-                Some(total)
-            }
-        };
-        // CC is unique by id "Amulet"; utility instruments match on admin+id.
-        let fee_matches = |admin: &str, id: &str, other_admin: &str, other_id: &str| {
-            id == other_id && (id == "Amulet" || admin == other_admin)
-        };
-
-        // What the user RECEIVES (proceeds can fund a same-instrument fee).
-        let (receive_admin, receive_id) = match direction {
-            FillDirection::Buy => (
-                venue("/baseInstrumentId/admin")?,
-                venue("/baseInstrumentId/id")?,
-            ),
-            FillDirection::Sell => (
-                venue("/quoteInstrumentId/admin")?,
-                venue("/quoteInstrumentId/id")?,
-            ),
-        };
-        let receive_amount = match direction {
-            FillDirection::Buy => base_amount,
-            FillDirection::Sell => quote_amount,
-        };
-
-        let max_inputs = max_input_holdings.min(100);
-        // When a fee is denominated in the PAY leg's instrument, the leg
-        // selection itself must also cover it (leg change alone can be
-        // arbitrarily small).
-        let select_target = fee_totals
-            .iter()
-            .filter(|((admin, id), _)| fee_matches(admin, id, &pay_admin, &pay_id))
-            .try_fold(amount_needed, |acc, ((_, id), total)| acc.checked_add(fee_target(id, *total)?));
-        let Some(select_target) = select_target else {
-            return Ok(SwapOutcome::Requote {
-                reason: format!("amount plus settlement fee in {pay_key} is out of range"),
-            });
-        };
-        // Selection is backfill-aware ([`Self::select_leg_with_backfill`]):
-        // immediate try, then an on-demand blob backfill for the cold-cache
-        // case, then the bounded passive re-poll. The client opened for the
-        // backfill is reused for the fee leg and the submit loop.
-        let mut client_slot: Option<AtomicProviderClient> = None;
-        let picks = self
-            .select_leg_with_backfill(
-                &mut client_slot,
-                &pay_key,
-                select_target,
-                max_inputs,
-                is_cc,
-                valid_until_micros,
-            )
-            .await;
-        let Some(mut picks) = picks else {
-            return Ok(SwapOutcome::Requote {
-                reason: format!(
-                    "own holdings selection failed for {} (need {}; {})",
-                    pay_key,
-                    select_target,
-                    self.selection_failure_detail(&pay_key, select_target).await
-                ),
-            });
-        };
-        // Fees in OTHER instruments: covered by same-instrument proceeds when
-        // large enough, else add dedicated funding cids to the pool.
-        for ((admin, id), total) in &fee_totals {
-            if fee_matches(admin, id, &pay_admin, &pay_id) {
-                continue; // already inside select_target
-            }
-            let Some(target) = fee_target(id, *total) else {
-                return Ok(SwapOutcome::Requote {
-                    reason: format!("{id} settlement fee target is out of range"),
-                });
-            };
-            if target <= Decimal::ZERO {
-                continue;
-            }
-            if fee_matches(admin, id, &receive_admin, &receive_id) && receive_amount >= target {
-                continue; // proceeds fund the fee
-            }
-            let fee_key = if id == "Amulet" {
-                CC_INSTRUMENT.to_string()
-            } else {
-                instrument_key(admin, id)
-            };
-            let slots = max_inputs.saturating_sub(picks.len()).max(1);
-            // Same backfill-aware selection as the pay leg — fee cids are
-            // blob-pending just as often (the shared pool's change outputs),
-            // and the passive-wait deadline recomputes off valid_until so the
-            // window shrinks by whatever the pay leg already used.
-            let fee_picks = self
-                .select_leg_with_backfill(
-                    &mut client_slot,
-                    &fee_key,
-                    target,
-                    slots,
-                    id == "Amulet",
-                    valid_until_micros,
-                )
-                .await;
-            let Some(fee_picks) = fee_picks else {
-                return Ok(SwapOutcome::Requote {
-                    reason: format!(
-                        "{id} fee-funding selection failed (need {target} {id} for the settlement fee; {})",
-                        self.selection_failure_detail(&fee_key, target).await
-                    ),
-                });
-            };
-            picks.extend(fee_picks);
-        }
-        let own_cids: Vec<String> = picks.iter().map(|h| h.contract_id.clone()).collect();
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for h in &picks {
-            let count = counts.entry(h.instrument.as_str()).or_default();
-            *count = count.saturating_add(1);
-        }
-        debug!(quote = %env.quote.quote_id, pool = ?counts, "own input holdings by instrument");
-
-        // Fresh timestamp: now_micros is from the pre-check, and the bounded
-        // selection re-poll may have slept since — anchoring on it would
-        // extend the reservation past valid_until + grace by the waited time.
-        let expires_at =
-            reservation_expiry(Instant::now(), valid_until_micros, clock::now_micros_i64());
-        let Some(expires_at) = expires_at else {
-            return Ok(SwapOutcome::Requote {
-                reason: format!("reservation window of quote {} is out of range", env.quote.quote_id),
-            });
-        };
-        if !self
-            .cache
-            .reserve_v2(&own_cids, &env.quote.quote_id, expires_at)
-            .await
-        {
-            return Ok(SwapOutcome::Requote {
-                reason: "own holdings reservation raced".to_string(),
-            });
-        }
-
-        // ---- PREPARE params straight from the envelope -------------------
-        let params = AtomicDvpSettleParams {
-            venue_cid: env.dvp.contract_id.clone(),
-            quote: envelope.quote.clone(),
-            quote_signature_der_hex: envelope.quote_signature.clone(),
-            canonical_message: envelope.canonical_message.clone(),
-            lp_party: lp_party.clone(),
-            pair_name: venue("/pairName")?,
-            base_instrument_id: venue("/baseInstrumentId/id")?,
-            base_instrument_admin: venue("/baseInstrumentId/admin")?,
-            quote_instrument_id: venue("/quoteInstrumentId/id")?,
-            quote_instrument_admin: venue("/quoteInstrumentId/admin")?,
-            quote_public_key_spki_hex: venue("/quotePublicKey")?,
-            ticket_cid: env.ticket.as_ref().map(|t| t.contract_id.clone()),
-            lp_input_holding_cids: envelope.lp_input_holding_cids.clone(),
-            envelope_disclosures: envelope.disclosed.clone(),
-            user_input_holding_cids: own_cids.clone(),
-            synchronizer_id: self.config.synchronizer_id.clone(),
-            lp_fees: signed_fees.clone(),
-        };
-        let expectation = OperationExpectation::AtomicDvpSettle {
-            user_party: self.config.party_id.clone(),
-            venue_cid: params.venue_cid.clone(),
-            template_id: env.dvp.template_id.clone(),
-            quote_id: env.quote.quote_id.clone(),
-            ticket_id: env.quote.ticket_id.clone(),
-            ticket_cid: params.ticket_cid.clone(),
-            side: env.quote.side.clone(),
-            base_amount: env.quote.base_amount.clone(),
-            quote_amount: env.quote.quote_amount.clone(),
-            lp_party,
-            base_instrument_id: params.base_instrument_id.clone(),
-            base_instrument_admin: params.base_instrument_admin.clone(),
-            quote_instrument_id: params.quote_instrument_id.clone(),
-            quote_instrument_admin: params.quote_instrument_admin.clone(),
-            valid_until_micros,
-            lp_input_holding_cids: params.lp_input_holding_cids.clone(),
-            user_input_holding_cids: own_cids.clone(),
-        };
-        let req = PrepareAtomicTransactionRequest {
-            params: Some(AtomicParams::AtomicDvpSettle(params)),
-            request_signature: None,
-        };
+        let Staged { env, req, expectation, own_cids, mut client_slot, valid_until_micros, base_amount } = *staged;
 
         if self.confirm && !self.dry_run {
             if let Err(e) = agent_logic::confirm::confirm_transaction(
@@ -1050,6 +902,335 @@ impl AtomicSwapper {
                 }
             }
         }
+    }
+
+    /// The H14 pre-check, the own-input selection and reservation, and the request, up to
+    /// its submit; `Err` is the outcome of a round that ends before it.
+    async fn stage(
+        &self,
+        envelope: &AtomicQuoteEnvelope,
+        accepted: &orderbook_proto::rfqv2::AtomicQuoteInfo,
+        direction: FillDirection,
+        max_input_holdings: usize,
+    ) -> Result<Result<Box<Staged>, SwapOutcome>> {
+        // ---- H14 PRECHECK ----------------------------------------------
+        let env = envelope_from_proto(envelope)?;
+        let now_micros = clock::now_micros_i64();
+        if let Err(e) = pre_submit_check(
+            &env,
+            &self.config.party_id,
+            &self.config.synchronizer_id,
+            now_micros,
+            PRECHECK_VALIDITY_MARGIN_MICROS,
+        ) {
+            // Nothing reserved yet — reject the quote and let the caller
+            // move on to the next quote/LP.
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!("H14 pre-check failed: {e:#}"),
+            }));
+        }
+        let valid_until_micros: i64 = env.quote.valid_until_micros.parse()?;
+        if let Some(reason) = validity_too_far(valid_until_micros, now_micros) {
+            // Refused before anything is reserved, never clamped
+            return Ok(Err(SwapOutcome::Requote { reason }));
+        }
+
+        let venue = |ptr: &str| -> Result<String> {
+            env.dvp
+                .payload
+                .pointer(ptr)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("AtomicDVP venue payload missing {ptr}"))
+        };
+        let lp_party = venue("/lp")?;
+        if lp_party != accepted.lp_party_id {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!(
+                    "H14: venue lp {} does not match the quoted LP {}",
+                    lp_party, accepted.lp_party_id
+                ),
+            }));
+        }
+        // Amounts must equal the accepted indicative quote (decimal compare —
+        // the LP must not re-price at confirm).
+        let base_amount = Decimal::from_str(&env.quote.base_amount)
+            .with_context(|| format!("invalid base_amount '{}'", env.quote.base_amount))?;
+        let quote_amount = Decimal::from_str(&env.quote.quote_amount)
+            .with_context(|| format!("invalid quote_amount '{}'", env.quote.quote_amount))?;
+        let accepted_base = Decimal::from_str(&accepted.quantity)
+            .with_context(|| format!("invalid accepted quantity '{}'", accepted.quantity))?;
+        let accepted_quote = Decimal::from_str(&accepted.quote_quantity)
+            .with_context(|| format!("invalid accepted quote_quantity '{}'", accepted.quote_quantity))?;
+        if base_amount != accepted_base || quote_amount != accepted_quote {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!(
+                    "H14: signed amounts ({}, {}) differ from accepted quote ({}, {})",
+                    base_amount, quote_amount, accepted_base, accepted_quote
+                ),
+            }));
+        }
+        let expected_side = match direction {
+            FillDirection::Buy => "Buy",
+            FillDirection::Sell => "Sell",
+        };
+        if env.quote.side != expected_side {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!("H14: quote side {} != {}", env.quote.side, expected_side),
+            }));
+        }
+        // Fee consent (design §14 D21): the SIGNED lpFees must equal the fee
+        // displayed on the accepted quote — neither the LP nor the relay can
+        // raise the fee after display.
+        let signed_fees = envelope
+            .quote
+            .as_ref()
+            .map(|q| q.lp_fees.clone())
+            .unwrap_or_default();
+        let displayed_fees: Vec<_> = accepted.settlement_fee.iter().cloned().collect();
+        if signed_fees != displayed_fees {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!(
+                    "signed lpFees {:?} differ from the displayed settlement fee {:?}",
+                    signed_fees, displayed_fees
+                ),
+            }));
+        }
+
+        // ---- SELECT own holdings (sending leg) --------------------------
+        // User Buy ⇒ user pays quote leg; Sell ⇒ user pays base leg.
+        let (pay_admin, pay_id, amount_needed) = match direction {
+            FillDirection::Buy => (
+                venue("/quoteInstrumentId/admin")?,
+                venue("/quoteInstrumentId/id")?,
+                quote_amount,
+            ),
+            FillDirection::Sell => (
+                venue("/baseInstrumentId/admin")?,
+                venue("/baseInstrumentId/id")?,
+                base_amount,
+            ),
+        };
+        let is_cc = pay_id == "Amulet";
+        let pay_key = if is_cc {
+            CC_INSTRUMENT.to_string()
+        } else {
+            instrument_key(&pay_admin, &pay_id)
+        };
+        // Fee funding (design §14 D21, generalized for fee-token selection):
+        // fees ride the ONE user-side pool — coverage must be GUARANTEED, not
+        // incidental. Per fee instrument: CC targets fee × 1.02 + 1 CC (amulet
+        // sender-fee headroom, the dvp CLI margin); utility tokens (USDC…)
+        // transfer one-step via the receiver's preapproval with no
+        // token-denominated sender fee, so the exact amount suffices.
+        let mut fee_totals: Vec<((String, String), Decimal)> = Vec::new();
+        for f in &signed_fees {
+            let Ok(a) = Decimal::from_str(&f.amount) else {
+                continue;
+            };
+            let key = (f.instrument_admin.clone(), f.instrument_id.clone());
+            match fee_totals.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, total)) => {
+                    let Some(sum) = total.checked_add(a) else {
+                        return Ok(Err(SwapOutcome::Requote {
+                            reason: format!("settlement fee total in {} is out of range", key.1),
+                        }));
+                    };
+                    *total = sum;
+                }
+                None => fee_totals.push((key, a)),
+            }
+        }
+        // `None` when the funding target is out of range
+        let fee_target = |id: &str, total: Decimal| -> Option<Decimal> {
+            if id == "Amulet" {
+                total.checked_mul(Decimal::new(102, 2))?.checked_add(Decimal::ONE)
+            } else {
+                Some(total)
+            }
+        };
+        // CC is unique by id "Amulet"; utility instruments match on admin+id.
+        let fee_matches = |admin: &str, id: &str, other_admin: &str, other_id: &str| {
+            id == other_id && (id == "Amulet" || admin == other_admin)
+        };
+
+        // What the user RECEIVES (proceeds can fund a same-instrument fee).
+        let (receive_admin, receive_id) = match direction {
+            FillDirection::Buy => (
+                venue("/baseInstrumentId/admin")?,
+                venue("/baseInstrumentId/id")?,
+            ),
+            FillDirection::Sell => (
+                venue("/quoteInstrumentId/admin")?,
+                venue("/quoteInstrumentId/id")?,
+            ),
+        };
+        let receive_amount = match direction {
+            FillDirection::Buy => base_amount,
+            FillDirection::Sell => quote_amount,
+        };
+
+        let max_inputs = max_input_holdings.min(100);
+        // When a fee is denominated in the PAY leg's instrument, the leg
+        // selection itself must also cover it (leg change alone can be
+        // arbitrarily small).
+        let select_target = fee_totals
+            .iter()
+            .filter(|((admin, id), _)| fee_matches(admin, id, &pay_admin, &pay_id))
+            .try_fold(amount_needed, |acc, ((_, id), total)| acc.checked_add(fee_target(id, *total)?));
+        let Some(select_target) = select_target else {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!("amount plus settlement fee in {pay_key} is out of range"),
+            }));
+        };
+        // Selection is backfill-aware ([`Self::select_leg_with_backfill`]):
+        // immediate try, then an on-demand blob backfill for the cold-cache
+        // case, then the bounded passive re-poll. The client opened for the
+        // backfill is reused for the fee leg and the submit loop.
+        let mut client_slot: Option<AtomicProviderClient> = None;
+        let picks = self
+            .select_leg_with_backfill(
+                &mut client_slot,
+                &pay_key,
+                select_target,
+                max_inputs,
+                is_cc,
+                valid_until_micros,
+            )
+            .await;
+        let Some(mut picks) = picks else {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!(
+                    "own holdings selection failed for {} (need {}; {})",
+                    pay_key,
+                    select_target,
+                    self.selection_failure_detail(&pay_key, select_target).await
+                ),
+            }));
+        };
+        // Fees in OTHER instruments: covered by same-instrument proceeds when
+        // large enough, else add dedicated funding cids to the pool.
+        for ((admin, id), total) in &fee_totals {
+            if fee_matches(admin, id, &pay_admin, &pay_id) {
+                continue; // already inside select_target
+            }
+            let Some(target) = fee_target(id, *total) else {
+                return Ok(Err(SwapOutcome::Requote {
+                    reason: format!("{id} settlement fee target is out of range"),
+                }));
+            };
+            if target <= Decimal::ZERO {
+                continue;
+            }
+            if fee_matches(admin, id, &receive_admin, &receive_id) && receive_amount >= target {
+                continue; // proceeds fund the fee
+            }
+            let fee_key = if id == "Amulet" {
+                CC_INSTRUMENT.to_string()
+            } else {
+                instrument_key(admin, id)
+            };
+            let slots = max_inputs.saturating_sub(picks.len()).max(1);
+            // Same backfill-aware selection as the pay leg — fee cids are
+            // blob-pending just as often (the shared pool's change outputs),
+            // and the passive-wait deadline recomputes off valid_until so the
+            // window shrinks by whatever the pay leg already used.
+            let fee_picks = self
+                .select_leg_with_backfill(
+                    &mut client_slot,
+                    &fee_key,
+                    target,
+                    slots,
+                    id == "Amulet",
+                    valid_until_micros,
+                )
+                .await;
+            let Some(fee_picks) = fee_picks else {
+                return Ok(Err(SwapOutcome::Requote {
+                    reason: format!(
+                        "{id} fee-funding selection failed (need {target} {id} for the settlement fee; {})",
+                        self.selection_failure_detail(&fee_key, target).await
+                    ),
+                }));
+            };
+            picks.extend(fee_picks);
+        }
+        let own_cids: Vec<String> = picks.iter().map(|h| h.contract_id.clone()).collect();
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for h in &picks {
+            let count = counts.entry(h.instrument.as_str()).or_default();
+            *count = count.saturating_add(1);
+        }
+        debug!(quote = %env.quote.quote_id, pool = ?counts, "own input holdings by instrument");
+
+        // Fresh timestamp: now_micros is from the pre-check, and the bounded
+        // selection re-poll may have slept since — anchoring on it would
+        // extend the reservation past valid_until + grace by the waited time.
+        let expires_at =
+            reservation_expiry(Instant::now(), valid_until_micros, clock::now_micros_i64());
+        let Some(expires_at) = expires_at else {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: format!("reservation window of quote {} is out of range", env.quote.quote_id),
+            }));
+        };
+        if !self
+            .cache
+            .reserve_v2(&own_cids, &env.quote.quote_id, expires_at)
+            .await
+        {
+            return Ok(Err(SwapOutcome::Requote {
+                reason: "own holdings reservation raced".to_string(),
+            }));
+        }
+
+        // ---- PREPARE params straight from the envelope -------------------
+        let params = AtomicDvpSettleParams {
+            venue_cid: env.dvp.contract_id.clone(),
+            quote: envelope.quote.clone(),
+            quote_signature_der_hex: envelope.quote_signature.clone(),
+            canonical_message: envelope.canonical_message.clone(),
+            lp_party: lp_party.clone(),
+            pair_name: venue("/pairName")?,
+            base_instrument_id: venue("/baseInstrumentId/id")?,
+            base_instrument_admin: venue("/baseInstrumentId/admin")?,
+            quote_instrument_id: venue("/quoteInstrumentId/id")?,
+            quote_instrument_admin: venue("/quoteInstrumentId/admin")?,
+            quote_public_key_spki_hex: venue("/quotePublicKey")?,
+            ticket_cid: env.ticket.as_ref().map(|t| t.contract_id.clone()),
+            lp_input_holding_cids: envelope.lp_input_holding_cids.clone(),
+            envelope_disclosures: envelope.disclosed.clone(),
+            user_input_holding_cids: own_cids.clone(),
+            synchronizer_id: self.config.synchronizer_id.clone(),
+            lp_fees: signed_fees.clone(),
+        };
+        let expectation = OperationExpectation::AtomicDvpSettle {
+            user_party: self.config.party_id.clone(),
+            venue_cid: params.venue_cid.clone(),
+            template_id: env.dvp.template_id.clone(),
+            quote_id: env.quote.quote_id.clone(),
+            ticket_id: env.quote.ticket_id.clone(),
+            ticket_cid: params.ticket_cid.clone(),
+            side: env.quote.side.clone(),
+            base_amount: env.quote.base_amount.clone(),
+            quote_amount: env.quote.quote_amount.clone(),
+            lp_party,
+            base_instrument_id: params.base_instrument_id.clone(),
+            base_instrument_admin: params.base_instrument_admin.clone(),
+            quote_instrument_id: params.quote_instrument_id.clone(),
+            quote_instrument_admin: params.quote_instrument_admin.clone(),
+            valid_until_micros,
+            lp_input_holding_cids: params.lp_input_holding_cids.clone(),
+            user_input_holding_cids: own_cids.clone(),
+            expected_fees: expected_fees(&signed_fees),
+            fee_party: self.config.party_fee.clone(),
+        };
+        let req = PrepareAtomicTransactionRequest {
+            params: Some(AtomicParams::AtomicDvpSettle(params)),
+            request_signature: None,
+            controller_command: None,
+        };
+
+        Ok(Ok(Box::new(Staged { env, req, expectation, own_cids, client_slot, valid_until_micros, base_amount })))
     }
 
     /// RECONCILIATION GATE for a submit without a result: commit status comes
@@ -1416,6 +1597,19 @@ impl AtomicSwapper {
     }
 }
 
+/// The signed fees of a quote, as the verifier checks the settle against them.
+pub(crate) fn expected_fees(signed: &[orderbook_proto::rfqv2::AtomicFeeSpec]) -> Vec<ExpectedFee> {
+    signed
+        .iter()
+        .map(|f| ExpectedFee {
+            receiver: f.receiver.clone(),
+            instrument_admin: f.instrument_admin.clone(),
+            instrument_id: f.instrument_id.clone(),
+            amount: f.amount.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1667,27 @@ mod tests {
         assert!(!is_deterministic_prepare_rejection(
             "PrepareAtomicTransaction RPC failed (Unavailable): transport error"
         ));
+    }
+
+    #[test]
+    fn the_preapproval_expectation_names_the_requested_operator_and_admin() {
+        let params = RequestPreapprovalParams {
+            instrument_admin: "registry::1220aa".into(),
+            instrument_allowances: vec![],
+            operator: "operator::1220bb".into(),
+        };
+        let (expectation, request) = preapproval_submission("me::1220cc", params.clone());
+        assert_eq!(request.operation, TransactionOperation::RequestPreapproval as i32);
+        let Some(V1Params::RequestPreapproval(sent)) = request.params else {
+            panic!("not a preapproval request");
+        };
+        assert_eq!(sent, params);
+        let OperationExpectation::RequestPreapproval { party, operator, instrument_admin } = expectation else {
+            panic!("not a preapproval expectation");
+        };
+        assert_eq!(party, "me::1220cc");
+        assert_eq!(operator.as_deref(), Some(sent.operator.as_str()));
+        assert_eq!(instrument_admin.as_deref(), Some(sent.instrument_admin.as_str()));
     }
 }
 
@@ -1541,6 +1756,21 @@ mod settle_tests {
             ..Default::default()
         };
         (env, accepted)
+    }
+
+    // The settle is checked against exactly the quote's signed fees
+    #[test]
+    fn the_expected_fees_are_the_signed_fees() {
+        let signed = vec![fee("dso::1220aa", "Amulet", "1.5"), fee("dso::1220aa", "Amulet", "0.25")];
+        let expected = super::expected_fees(&signed);
+        assert_eq!(expected.len(), 2);
+        for (e, f) in expected.iter().zip(&signed) {
+            assert_eq!(
+                (&e.receiver, &e.instrument_admin, &e.instrument_id, &e.amount),
+                (&f.receiver, &f.instrument_admin, &f.instrument_id, &f.amount)
+            );
+        }
+        assert!(super::expected_fees(&[]).is_empty());
     }
 
     fn fee(admin: &str, id: &str, amount: &str) -> AtomicFeeSpec {

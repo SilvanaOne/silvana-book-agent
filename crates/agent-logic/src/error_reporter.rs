@@ -119,13 +119,13 @@ pub fn init_from_config(config: &crate::config::BaseConfig) {
     init(
         url,
         Arc::new(move || {
-            crate::auth::generate_jwt(
-                &party_id,
-                &role,
-                &*private_key.expose()?,
-                token_ttl_secs,
-                Some(node_name.as_str()),
-            )
+            crate::signer::resolve(&private_key)?.sign_jwt(&crate::signer::JwtRequest {
+                sub: &party_id,
+                role: &role,
+                ttl_secs: token_ttl_secs,
+                node_name: Some(node_name.as_str()),
+                venue_branch: None,
+            })
         }),
     );
 }
