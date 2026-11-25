@@ -56,7 +56,7 @@ impl Decide for NoiseTaker {
         let (u_side, u_size, u_rest) = (self.rng.next_f64(), self.rng.next_f64(), self.rng.next_f64());
         let c = &self.cfg;
         let r = v.reference;
-        let ratio = (v.inventory.base - v.start_base) * r / c.max_position_usd;
+        let ratio = (v.inventory.base - v.start_base) * r / v.in_quote(c.max_position_usd);
         let at_cap = v.activity.open_settlements >= self.max_inflight();
         if !v.can_take || at_cap || !v.inventory.usable || r.is_nan() || r <= 0.0 {
             self.skipped = self.skipped.saturating_add(1);
@@ -71,9 +71,9 @@ impl Decide for NoiseTaker {
         } else {
             OrderType::Offer
         };
-        let usd = c.clip_usd_min + u_size * (c.clip_usd_max - c.clip_usd_min);
+        let clip = v.in_quote(c.clip_usd_min + u_size * (c.clip_usd_max - c.clip_usd_min));
         let tif = if u_rest < c.rest_probability { TakeTif::Gtd { ttl_secs: c.rest_ttl_secs } } else { TakeTif::Ioc };
-        Decision::Take(Some(Want { side, max_quantity: usd / r, max_deviation_percent: c.max_slip_bps / 100.0, tif }))
+        Decision::Take(Some(Want { side, max_quantity: clip / r, max_deviation_percent: c.max_slip_bps / 100.0, tif }))
     }
 
     fn status(&self) -> String {
@@ -83,7 +83,7 @@ impl Decide for NoiseTaker {
 
 #[cfg(test)]
 mod tests {
-    use super::super::maker::tests::view;
+    use super::super::maker::tests::{cc_flat_base, cc_view, view, CC_USD};
     use super::*;
 
     fn run(seed: u64, steps: usize) -> Vec<Decision> {
@@ -115,6 +115,25 @@ mod tests {
         let rests = takes.iter().filter(|w| matches!(w.tif, TakeTif::Gtd { ttl_secs: 45 })).count();
         assert!(rests > 0 && rests < takes.len(), "{rests} of {}", takes.len());
         assert!(takes.iter().any(|w| w.side == OrderType::Bid) && takes.iter().any(|w| w.side == OrderType::Offer));
+    }
+
+    #[test]
+    fn cc_quoted_clips_are_usd() {
+        let cfg = NoiseTakerConfig { seed: Some(8), ..Default::default() };
+        let mut nt = NoiseTaker::new(cfg, "TUSDT-CC");
+        let base = cc_flat_base();
+        let mut v = cc_view(None, base, base);
+        let t0 = v.now;
+        let mut takes = 0;
+        for i in 0..400u64 {
+            v.now = t0 + Duration::from_secs(5 * i);
+            if let Decision::Take(Some(w)) = nt.decide(&v) {
+                takes += 1;
+                let usd = w.max_quantity * 13.4 * CC_USD;
+                assert!((15.0 - 1e-9..=40.0 + 1e-9).contains(&usd), "{usd}");
+            }
+        }
+        assert!(takes > 10, "{takes}");
     }
 
     #[test]

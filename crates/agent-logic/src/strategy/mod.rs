@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use orderbook_proto::orderbook::{OrderType, Settlement};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 use crate::config::{CommonParams, PriceLevel, StrategyConfig};
 use crate::order_tracker::{Fill, MarketActivity};
@@ -68,11 +69,47 @@ pub(crate) struct MarketView<'a> {
     pub start_base: f64,
     pub book: Option<&'a BookTop>,
     pub activity: MarketActivity,
-    /// Own fills in this market over the last hour, and their quote value
+    /// Own fills in this market over the last hour, and their value in quote units
     pub fills_last_hour: usize,
     pub usd_last_hour: f64,
     /// The take gate is open
     pub can_take: bool,
+    /// USD value of one quote unit; strategy amounts named `_usd` are converted with it
+    pub quote_usd: f64,
+}
+
+impl MarketView<'_> {
+    /// A USD amount in quote units.
+    pub(crate) fn in_quote(&self, usd: f64) -> f64 {
+        usd / self.quote_usd
+    }
+}
+
+/// Quotes worth one USD a unit, matched regardless of case.
+const USD_STABLES: [&str; 6] = ["USD", "USDC", "USDCx", "TUSDT", "tf-usdt", "USD8"];
+
+/// What one unit of a market's quote is worth in USD.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum QuoteUsd {
+    Rate(f64),
+    /// CC, while its rate is not known yet
+    Pending,
+    /// No USD rate for this quote
+    Unpriced,
+}
+
+/// The quote of a BASE-QUOTE market: a USD stable is worth 1, CC its live rate.
+pub(crate) fn quote_usd(market_id: &str, cc_token_id: Option<&str>, cc_usd: Option<f64>) -> QuoteUsd {
+    let quote = market_id.split_once('-').map_or("", |(_, q)| q);
+    if USD_STABLES.iter().any(|s| s.eq_ignore_ascii_case(quote)) {
+        return QuoteUsd::Rate(1.0);
+    }
+    let is_cc = quote.eq_ignore_ascii_case("CC") || cc_token_id.is_some_and(|id| !id.is_empty() && id.eq_ignore_ascii_case(quote));
+    match cc_usd.filter(|r| r.is_finite() && *r > 0.0) {
+        Some(rate) if is_cc => QuoteUsd::Rate(rate),
+        None if is_cc => QuoteUsd::Pending,
+        _ => QuoteUsd::Unpriced,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,11 +135,25 @@ pub(crate) struct Want {
     pub tif: TakeTif,
 }
 
-/// A maker's target: rungs as percent from the reference, with base quantities.
+/// A maker's target: rungs at exact prices, each with its percent from the reference and base quantity.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Ladder {
-    pub bids: Vec<PriceLevel>,
-    pub offers: Vec<PriceLevel>,
+    pub bids: Vec<Rung>,
+    pub offers: Vec<Rung>,
+}
+
+/// One rung and the exact price it was decided at, on the tick grid of that cycle.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Rung {
+    pub level: PriceLevel,
+    pub price: Decimal,
+}
+
+impl Rung {
+    /// The levels of these rungs.
+    pub(crate) fn levels(rungs: &[Rung]) -> Vec<PriceLevel> {
+        rungs.iter().map(|r| r.level.clone()).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -437,6 +488,10 @@ pub(crate) struct StrategyRuntime {
     pub rest_until: Option<(u64, Instant)>,
     /// When a failed settlement-history lookup is tried again
     pub history_retry_at: Option<Instant>,
+    /// The quote without a USD rate was reported
+    pub quote_refused: bool,
+    /// Takes may hit the liquidity provider's best level
+    pub take_lp: bool,
 }
 
 impl StrategyRuntime {
@@ -462,6 +517,8 @@ impl StrategyRuntime {
             age_logged: false,
             rest_until: None,
             history_retry_at: None,
+            quote_refused: false,
+            take_lp: common.is_some_and(|c| c.take_lp),
         }
     }
 
@@ -561,6 +618,7 @@ mod tests {
             ref_floor: Some(0.0014),
             ref_cap: Some(0.0056),
             ref_max_age_secs: Some(20),
+            take_lp: false,
         };
         let mut g = RefGuard::new(Some(common));
         assert_eq!(g.max_age(), secs(20));
@@ -572,6 +630,21 @@ mod tests {
 
     fn recent(at: Instant) -> RecentFill {
         RecentFill { at, side: OrderType::Bid, base: 1.0, quote: 1.0 }
+    }
+
+    #[test]
+    fn quotes_are_worth_one_usd_their_cc_rate_or_nothing() {
+        let rate = |id: &str, cc: Option<&str>, usd: Option<f64>| quote_usd(id, cc, usd);
+        for id in ["cETH-TUSDT", "HTEST-USDC", "CC-USDCx", "CC-usdcx", "X-tf-usdt", "X-USD8", "AAA-USD"] {
+            assert_eq!(rate(id, None, None), QuoteUsd::Rate(1.0), "{id}");
+        }
+        assert_eq!(rate("TUSDT-CC", None, Some(0.0746)), QuoteUsd::Rate(0.0746));
+        assert_eq!(rate("TUSDT-CC", Some("CC"), None), QuoteUsd::Pending);
+        assert_eq!(rate("TUSDT-CC", None, Some(0.0)), QuoteUsd::Pending);
+        assert_eq!(rate("TUSDT-Amulet", Some("Amulet"), Some(0.07)), QuoteUsd::Rate(0.07));
+        for id in ["HECTO-cETH", "TUSDT-Amulet", "USDC", "CC-"] {
+            assert_eq!(rate(id, None, Some(0.07)), QuoteUsd::Unpriced, "{id}");
+        }
     }
 
     #[test]

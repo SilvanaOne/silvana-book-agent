@@ -24,8 +24,8 @@ use crate::strategy::book::{book_top, BookTop};
 use crate::strategy::gate::{GateInputs, Verdict};
 use crate::strategy::report::{format_report, ReportLine};
 use crate::strategy::{
-    sizing, BookNeed, CapState, Decide, Decision, Inventory, Ladder, MarketView, SettleCap, Start, StrategyRuntime,
-    StrategyState, TakeTif, Want, REPORT_EVERY,
+    quote_usd, sizing, BookNeed, CapState, Decide, Decision, Inventory, Ladder, MarketView, QuoteUsd, Rung, SettleCap,
+    Start, StrategyRuntime, StrategyState, TakeTif, Want, REPORT_EVERY,
 };
 
 /// Whether one grid side can be funded from the current balances.
@@ -207,6 +207,8 @@ pub struct OrderManager {
     fee_headroom: FeeHeadroom,
     /// One fill's fee need per market where a fee was seen; others use the headroom's own.
     fill_needs: HashMap<String, f64>,
+    /// CC/USD rate for strategy amounts on CC-quoted markets; None while unknown.
+    cc_usd_rate: Option<f64>,
     /// Rate limit for the missing-order-id warning.
     order_ref_warned_at: Option<Instant>,
     /// Last valid price per market, so the park check can size bids without an RPC.
@@ -350,6 +352,7 @@ impl OrderManager {
             fee_warned_at: None,
             fee_headroom: FeeHeadroom::Wallet,
             fill_needs: HashMap::new(),
+            cc_usd_rate: None,
             order_ref_warned_at: None,
             last_seen_price: HashMap::new(),
             last_resting: HashMap::new(),
@@ -474,6 +477,11 @@ impl OrderManager {
     pub fn set_fee_capacity(&mut self, capacity: Option<f64>, per_fill: f64, by_market: HashMap<String, f64>) {
         self.fee_headroom = FeeHeadroom::Capacity { capacity, per_fill };
         self.fill_needs = by_market;
+    }
+
+    /// The CC/USD rate that strategy amounts on CC-quoted markets are converted with.
+    pub fn set_cc_usd_rate(&mut self, rate: Option<f64>) {
+        self.cc_usd_rate = rate.filter(|r| r.is_finite() && *r > 0.0);
     }
 
     /// The fee prerequisite for one market.
@@ -906,38 +914,42 @@ impl OrderManager {
         stop: &Shutdown,
         report: &mut CycleReport,
     ) -> Vec<u64> {
-        let bid_levels = &market.bid_levels;
-        self.execute_ladder(&market.market_id, mid_price, active_orders, bid_levels, offer_levels, plan, stop, report)
-            .await
-    }
-
-    /// [`Self::execute_plan`] for any ladder; each placed side becomes its shape baseline.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_ladder(
-        &mut self,
-        market_id: &str,
-        mid_price: f64,
-        active_orders: &[Order],
-        bid_levels: &[PriceLevel],
-        offer_levels: &[PriceLevel],
-        plan: (SideAction, SideAction),
-        stop: &Shutdown,
-        report: &mut CycleReport,
-    ) -> Vec<u64> {
         // The shutdown path withdraws the whole grid; not even the tick lookup runs
         if stop.is_shutting_down() {
             return Vec::new();
         }
-        let (bid_action, offer_action) = plan;
-        let tick = if bid_action == SideAction::Replace || offer_action == SideAction::Replace {
-            self.get_tick_size(market_id).await
+        let tick = if plan.0 == SideAction::Replace || plan.1 == SideAction::Replace {
+            self.get_tick_size(&market.market_id).await
         } else {
             0.0
         };
+        let bid_levels = &market.bid_levels;
+        self.execute_ladder(&market.market_id, mid_price, tick, active_orders, bid_levels, offer_levels, plan, stop, report)
+            .await
+    }
+
+    /// [`Self::execute_plan`] for any ladder at a given tick; each placed side becomes its
+    /// shape baseline.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_ladder<R: LadderRung>(
+        &mut self,
+        market_id: &str,
+        mid_price: f64,
+        tick: f64,
+        active_orders: &[Order],
+        bid_levels: &[R],
+        offer_levels: &[R],
+        plan: (SideAction, SideAction),
+        stop: &Shutdown,
+        report: &mut CycleReport,
+    ) -> Vec<u64> {
+        if stop.is_shutting_down() {
+            return Vec::new();
+        }
+        let (_, offer_action) = plan;
         debug!("Refreshing grid for {} (cancel→place): mid={}, tick={}", market_id, mid_price, tick);
 
-        let offer_levels: &[PriceLevel] =
-            if offer_action == SideAction::Replace { offer_levels } else { &[] };
+        let offer_levels: &[R] = if offer_action == SideAction::Replace { offer_levels } else { &[] };
         let ops = grid_ops(bid_levels, offer_levels, mid_price, tick, active_orders, plan);
 
         let mut cancelled_ids: Vec<u64> = Vec::new();
@@ -982,11 +994,12 @@ impl OrderManager {
             }
         }
         // The placed set is the shape trigger's baseline; an all-failed reshape keeps the old one
+        let baseline = |rungs: &[R]| rungs.iter().map(|r| r.level().clone()).collect::<Vec<PriceLevel>>();
         if offer_placed {
-            self.last_shaped_offers.insert(market_id.to_string(), offer_levels.to_vec());
+            self.last_shaped_offers.insert(market_id.to_string(), baseline(offer_levels));
         }
         if bid_placed {
-            self.last_bids.insert(market_id.to_string(), bid_levels.to_vec());
+            self.last_bids.insert(market_id.to_string(), baseline(bid_levels));
         }
 
         report.placed = report.placed.saturating_add(count_u32(placed.len()));
@@ -1573,6 +1586,7 @@ impl OrderManager {
         if stop.is_shutting_down() {
             return;
         }
+        let Some(quote_usd) = self.strategy_quote_usd(market_id, rt) else { return };
         self.refresh_min_base(market_id, price).await;
         if stop.is_shutting_down() {
             return;
@@ -1676,7 +1690,7 @@ impl OrderManager {
         } else {
             None
         };
-        let floor_value = self.min_value(market_id).max(sizing::SERVER_FLOOR_USD);
+        let floor_value = self.min_value(market_id).max(sizing::SERVER_FLOOR_USD / quote_usd);
         let lot_exp = sizing::lot_exp(price);
         let view = MarketView {
             now,
@@ -1692,6 +1706,7 @@ impl OrderManager {
             fills_last_hour: rt.recent.len(),
             usd_last_hour: rt.usd_last_hour(),
             can_take: verdict == Verdict::Open,
+            quote_usd,
         };
         let decision = rt.state.decide(&view);
         #[cfg(test)]
@@ -1700,7 +1715,8 @@ impl OrderManager {
             Decision::Hold | Decision::Take(None) => {}
             Decision::Rest(ladder) => {
                 let at_cap = activity.open_settlements >= rt.state.max_inflight();
-                self.apply_ladder(market_id, &ladder, price, tick, &orders, at_cap, rt, stop, report).await;
+                let min_order = sizing::MIN_ORDER_USD / quote_usd;
+                self.apply_ladder(market_id, &ladder, price, tick, min_order, &orders, at_cap, rt, stop, report).await;
             }
             // One take at a time, whatever the strategy asks for
             Decision::Take(Some(want)) if verdict == Verdict::Open => {
@@ -1709,6 +1725,29 @@ impl OrderManager {
             }
             Decision::Take(Some(_)) => {
                 debug!("Strategy {} [{}]: take skipped, the gate is shut", market_id, rt.kind);
+            }
+        }
+    }
+
+    /// USD value of one quote unit; None holds the strategy this cycle, with a warning.
+    fn strategy_quote_usd(&self, market_id: &str, rt: &mut StrategyRuntime) -> Option<f64> {
+        match quote_usd(market_id, self.config.cc_token_id.as_deref(), self.cc_usd_rate) {
+            QuoteUsd::Rate(rate) => Some(rate),
+            QuoteUsd::Pending => {
+                if rate_limit(&mut rt.warned_at, FUNDING_WARN_EVERY) {
+                    warn!("Strategy {} [{}]: CC/USD rate not known yet; holding", market_id, rt.kind);
+                }
+                None
+            }
+            QuoteUsd::Unpriced => {
+                if !rt.quote_refused {
+                    rt.quote_refused = true;
+                    warn!(
+                        "Strategy {} [{}]: refused, its quote has no USD rate (amounts are in USD; quote in a USD stable or CC); holding",
+                        market_id, rt.kind
+                    );
+                }
+                None
             }
         }
     }
@@ -1779,7 +1818,9 @@ impl OrderManager {
             },
         };
         let sized = match want.tif {
-            TakeTif::Ioc => sizing::size_take(&want, &book, &ctx.inventory, ctx.floor_value, ctx.price, ctx.lot_exp),
+            TakeTif::Ioc => {
+                sizing::size_take(&want, &book, &ctx.inventory, ctx.floor_value, ctx.price, ctx.lot_exp, rt.take_lp)
+            }
             TakeTif::Gtd { .. } => {
                 sizing::price_rest(&want, &book, &ctx.inventory, ctx.floor_value, ctx.price, ctx.tick, ctx.lot_exp)
             }
@@ -1834,7 +1875,8 @@ impl OrderManager {
         }
     }
 
-    /// Place a maker ladder with the grid's plan, uncross and execute steps.
+    /// Place a maker ladder with the grid's plan, uncross and execute steps; its rungs go
+    /// at the prices they were decided at, with `tick` the tick of that decision.
     #[allow(clippy::too_many_arguments)]
     async fn apply_ladder(
         &mut self,
@@ -1842,6 +1884,7 @@ impl OrderManager {
         ladder: &Ladder,
         price: f64,
         tick: f64,
+        min_order: f64,
         orders: &[Order],
         at_cap: bool,
         rt: &mut StrategyRuntime,
@@ -1850,13 +1893,14 @@ impl OrderManager {
     ) {
         let now = Instant::now();
         let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
+        let (bid_levels, offer_levels) = (Rung::levels(&ladder.bids), Rung::levels(&ladder.offers));
         let funding = ladder_funding(
             &self.balances,
             usable,
             market_id,
             Some(price),
-            &ladder.bids,
-            &ladder.offers,
+            &bid_levels,
+            &offer_levels,
             self.config.fee_reserve_cc,
             self.headroom_for(market_id),
         );
@@ -1864,7 +1908,7 @@ impl OrderManager {
             report.held_unknown = report.held_unknown.saturating_add(1);
             return;
         }
-        let resting = strategy_side_counts(orders, sizing::MIN_ORDER_USD);
+        let resting = strategy_side_counts(orders, min_order);
         let anchors = self.grid_anchors.get(market_id).copied().unwrap_or_default();
         let restore = self.force_refresh.remove(market_id);
         let tick_pct = if price > 0.0 { 50.0 * tick / price } else { 0.0 };
@@ -1879,9 +1923,9 @@ impl OrderManager {
             }
         };
         let force_bid =
-            restore || side_moved(anchors.bid, self.last_bids.get(market_id), &ladder.bids, rt.bid_placed_at, resting.bids);
+            restore || side_moved(anchors.bid, self.last_bids.get(market_id), &bid_levels, rt.bid_placed_at, resting.bids);
         let force_offer = restore
-            || side_moved(anchors.offer, self.last_shaped_offers.get(market_id), &ladder.offers, rt.offer_placed_at, resting.offers);
+            || side_moved(anchors.offer, self.last_shaped_offers.get(market_id), &offer_levels, rt.offer_placed_at, resting.offers);
         let mut plan = plan_market(&PlanInput {
             bid: funding.bid,
             offer: funding.offer,
@@ -1922,7 +1966,7 @@ impl OrderManager {
             plan.1
         );
         let failed = self
-            .execute_ladder(market_id, price, orders, &ladder.bids, &ladder.offers, plan, stop, report)
+            .execute_ladder(market_id, price, tick, orders, &ladder.bids, &ladder.offers, plan, stop, report)
             .await;
         if !failed.is_empty() {
             self.pending_cancels.entry(market_id.to_string()).or_default().extend(failed);
@@ -2376,15 +2420,45 @@ pub(crate) fn next_anchors(
 /// Price of a new rung as placed: bids round down to the tick, offers up.
 fn rung_price(side: OrderType, mid: f64, delta_percent: f64, tick: f64) -> String {
     let steps = mid * (1.0 + delta_percent / 100.0) / tick;
-    let price = if side == OrderType::Bid { steps.floor() } else { steps.ceil() } * tick;
+    let price = sizing::whole_steps(steps, side == OrderType::Offer) * tick;
     format!("{price:.10}")
+}
+
+/// A rung as placed: a grid level is priced from its delta, a strategy rung at the
+/// exact price it was decided at.
+pub(crate) trait LadderRung {
+    fn level(&self) -> &PriceLevel;
+    /// The price placed around `mid` on the `tick` grid.
+    fn placed_price(&self, side: OrderType, mid: f64, tick: f64) -> String;
+}
+
+impl LadderRung for PriceLevel {
+    fn level(&self) -> &PriceLevel {
+        self
+    }
+
+    fn placed_price(&self, side: OrderType, mid: f64, tick: f64) -> String {
+        rung_price(side, mid, self.delta_percent, tick)
+    }
+}
+
+impl LadderRung for Rung {
+    fn level(&self) -> &PriceLevel {
+        &self.level
+    }
+
+    fn placed_price(&self, _side: OrderType, _mid: f64, _tick: f64) -> String {
+        let mut price = self.price;
+        price.rescale(10);
+        price.to_string()
+    }
 }
 
 /// Ops for a market plan: Cancel sides withdrawn first; Replace sides re-placed tightest
 /// first, each paired with a cancel from its own side; Keep sides untouched.
-pub(crate) fn grid_ops(
-    bid_levels: &[PriceLevel],
-    offer_levels: &[PriceLevel],
+pub(crate) fn grid_ops<R: LadderRung>(
+    bid_levels: &[R],
+    offer_levels: &[R],
     mid: f64,
     tick: f64,
     orders: &[Order],
@@ -2394,14 +2468,14 @@ pub(crate) fn grid_ops(
     // New orders as (abs_delta, side, price, quantity), tightest spread first
     let mut new_orders: Vec<(f64, OrderType, String, String)> = Vec::new();
     if bid_action == SideAction::Replace {
-        for level in bid_levels {
-            let price = rung_price(OrderType::Bid, mid, level.delta_percent, tick);
+        for rung in bid_levels {
+            let (price, level) = (rung.placed_price(OrderType::Bid, mid, tick), rung.level());
             new_orders.push((level.delta_percent.abs(), OrderType::Bid, price, level.quantity.clone()));
         }
     }
     if offer_action == SideAction::Replace {
-        for level in offer_levels {
-            let price = rung_price(OrderType::Offer, mid, level.delta_percent, tick);
+        for rung in offer_levels {
+            let (price, level) = (rung.placed_price(OrderType::Offer, mid, tick), rung.level());
             new_orders.push((level.delta_percent.abs(), OrderType::Offer, price, level.quantity.clone()));
         }
     }
@@ -2435,10 +2509,10 @@ pub(crate) fn grid_ops(
 
 /// A one-sided refresh whose tightest new rung would reach the kept side's best resting
 /// order also refreshes the kept side (`fundable` per side), or withdraws it if unfundable.
-pub(crate) fn uncross(
+pub(crate) fn uncross<R: LadderRung>(
     plan: (SideAction, SideAction),
-    bid_levels: &[PriceLevel],
-    offer_levels: &[PriceLevel],
+    bid_levels: &[R],
+    offer_levels: &[R],
     mid: f64,
     tick: f64,
     orders: &[Order],
@@ -2465,10 +2539,10 @@ pub(crate) fn uncross(
 }
 
 /// Tightest new rung on one side (highest bid, lowest offer) as [`grid_ops`] prices it.
-fn tightest_new(levels: &[PriceLevel], side: OrderType, mid: f64, tick: f64) -> Option<f64> {
+fn tightest_new<R: LadderRung>(levels: &[R], side: OrderType, mid: f64, tick: f64) -> Option<f64> {
     let prices = levels
         .iter()
-        .filter_map(|l| rung_price(side, mid, l.delta_percent, tick).parse::<f64>().ok());
+        .filter_map(|l| l.placed_price(side, mid, tick).parse::<f64>().ok());
     if side == OrderType::Bid { prices.reduce(f64::max) } else { prices.reduce(f64::min) }
 }
 
@@ -4224,6 +4298,113 @@ mod strategy_visit_tests {
 
     fn level(delta_percent: f64, quantity: &str) -> PriceLevel {
         PriceLevel { delta_percent, quantity: quantity.to_string() }
+    }
+
+    async fn visit_id(om: &mut OrderManager, id: &str) {
+        let (stop, mut report, market) = (Shutdown::new(), CycleReport::default(), bare(id));
+        let run = om.visit_market(&market, &stop, &mut report);
+        tokio::time::timeout(Duration::from_secs(10), run).await.unwrap();
+    }
+
+    // A CC-quoted strategy holds until the CC/USD rate is known, then sizes in USD
+    #[tokio::test]
+    async fn a_cc_quoted_strategy_waits_for_the_cc_rate() {
+        const CC_ID: &str = "HTEST-CC";
+        let mut om = manager(closed_port_url(), vec![bare(CC_ID)], Some(rebalancer()));
+        om.tick_sizes.insert(CC_ID.to_string(), 1e-7);
+        om.stub_depth = Some((depth(vec![lvl("0.0214", "30000", 1)], Vec::new()), OrderbookDepth::default()));
+        om.stub_book(0.0214, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        visit_id(&mut om, CC_ID).await;
+        assert!(om.submit_log.is_empty(), "no CC/USD rate yet");
+        om.set_cc_usd_rate(Some(0.0746));
+        visit_id(&mut om, CC_ID).await;
+        // A $20 clip is about 268 CC: 12520 HTEST at 0.0214
+        let sell = (OrderType::Offer, "0.0214".to_string(), "12520".to_string(), TimeInForce::Ioc);
+        assert_eq!(om.submit_log, vec![sell]);
+    }
+
+    // A rate taken earlier stops counting once the LM's copy is past its age bound
+    #[tokio::test]
+    async fn a_cc_quoted_strategy_holds_once_the_cc_rate_is_old() {
+        use crate::grid_task::GridCycle;
+        use crate::liquidity::{LiquidityManager, CC_USD_RATE_MAX_AGE};
+        use rust_decimal::prelude::ToPrimitive;
+        const CC_ID: &str = "HTEST-CC";
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_usd_rate(rust_decimal::Decimal::new(746, 4)).await;
+        let old = Instant::now().checked_add(CC_USD_RATE_MAX_AGE + Duration::from_secs(1)).unwrap();
+        let mut om = manager(closed_port_url(), vec![bare(CC_ID)], Some(rebalancer()));
+        om.tick_sizes.insert(CC_ID.to_string(), 1e-7);
+        om.stub_depth = Some((depth(vec![lvl("0.0214", "30000", 1)], Vec::new()), OrderbookDepth::default()));
+        om.stub_book(0.0214, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        om.apply_cc_usd_rate(Some(0.0746));
+        om.apply_cc_usd_rate(lm.cc_usd_rate_at(old).await.and_then(|r| r.to_f64()));
+        visit_id(&mut om, CC_ID).await;
+        assert!(om.submit_log.is_empty(), "an old rate is no rate");
+        om.apply_cc_usd_rate(lm.cc_usd_rate().await.and_then(|r| r.to_f64()));
+        visit_id(&mut om, CC_ID).await;
+        assert_eq!(om.submit_log.len(), 1);
+    }
+
+    // With take_lp a taker hits the LP's best level when no agent quotes better; without it, nothing
+    #[tokio::test]
+    async fn a_taker_with_take_lp_takes_the_lp_level() {
+        // The LP bids 15 bps under the reference, inside a 20 bps slippage limit
+        let taker = |take_lp| {
+            let c = RebalancerConfig { target_share: Some(0.25), max_slip_bps: 20.0, take_lp, ..Default::default() };
+            StrategyConfig::Rebalancer(c)
+        };
+        for (take_lp, expect) in [(false, Vec::new()), (true, vec![("0.0015976", "10000")])] {
+            let mut om = strategy_manager(taker(take_lp));
+            om.stub_depth = Some(book(false));
+            om.stub_book(0.0016, Vec::new());
+            om.stub_submit = Some(Ok(42));
+            visit(&mut om).await;
+            let sent: Vec<(&str, &str)> = om.submit_log.iter().map(|(_, p, q, _)| (p.as_str(), q.as_str())).collect();
+            assert_eq!(sent, expect);
+            assert!(om.submit_log.iter().all(|(side, _, _, tif)| *side == OrderType::Offer && *tif == TimeInForce::Ioc));
+        }
+    }
+
+    // A quote without any USD rate is refused once and never trades
+    #[tokio::test]
+    async fn a_strategy_on_a_quote_without_a_usd_rate_holds() {
+        const ID2: &str = "HTEST-cETH";
+        let mut om = manager(closed_port_url(), vec![bare(ID2)], Some(rebalancer()));
+        om.stub_depth = Some((depth(vec![lvl("0.0000006", "30000", 1)], Vec::new()), OrderbookDepth::default()));
+        om.stub_book(0.0000006, Vec::new());
+        om.stub_submit = Some(Ok(42));
+        om.set_cc_usd_rate(Some(0.0746));
+        visit_id(&mut om, ID2).await;
+        visit_id(&mut om, ID2).await;
+        assert!(om.submit_log.is_empty());
+        assert!(om.strategies.get(ID2).is_some_and(|rt| rt.quote_refused));
+    }
+
+    // A ladder decided at one tick is placed at its own prices, whatever a later tick lookup says
+    #[tokio::test]
+    async fn a_ladder_keeps_its_prices_when_a_later_tick_lookup_differs() {
+        use crate::strategy::maker::{tests::{lp_book, view}, MarketMaker};
+        let book = lp_book(0.0016);
+        // Decided at the 1e-8 fallback; the cache has learned 1e-10 since
+        let mut v = view(Some(&book), 1_250_000.0, 1_250_000.0);
+        v.tick = 1e-8;
+        let Decision::Rest(ladder) = MarketMaker::new(MarketMakerConfig::default()).decide(&v) else { panic!("a ladder") };
+        let mut om = strategy_manager(market_maker());
+        om.tick_sizes.insert(ID.to_string(), 1e-10);
+        om.stub_submit = Some(Ok(9));
+        let mut rt = StrategyRuntime::new(&market_maker(), ID, 0, Instant::now());
+        let (stop, mut report) = (Shutdown::new(), CycleReport::default());
+        let run = om.apply_ladder(ID, &ladder, 0.0016, 1e-8, 12.0, &[], false, &mut rt, &stop, &mut report);
+        tokio::time::timeout(Duration::from_secs(10), run).await.unwrap();
+        let prices: Vec<f64> = om.submit_log.iter().map(|(_, p, _, _)| p.parse().unwrap()).collect();
+        assert_eq!(prices.len(), 4, "{:?}", om.submit_log);
+        // Within 25 bps of the reference, not a hundredth of it
+        assert!(prices.iter().all(|p| (p / 0.0016 - 1.0).abs() < 0.0025), "{prices:?}");
+        let bids = om.submit_log.iter().filter(|(side, ..)| *side == OrderType::Bid);
+        assert!(bids.map(|(_, p, _, _)| p.parse::<f64>().unwrap()).all(|p| p < 0.0016024), "under the LP offer");
     }
 
     // The maker places its two-level ladder once, then leaves it alone on an identical visit

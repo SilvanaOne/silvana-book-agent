@@ -67,6 +67,7 @@ impl Agent {
             chain: Some("devnet".into()),
             marker: marker.map(|head| ControlMarker { network: Network::Devnet, head }.to_string()),
             party: Some(self.config.party_id.clone()),
+            agent_dir: Some(self.base.clone()),
         }
     }
 

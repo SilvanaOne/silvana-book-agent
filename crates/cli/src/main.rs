@@ -50,8 +50,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "HEX")]
     quote_private_key: Option<String>,
 
-    /// Path to env file to load (default: search for `.env` in CWD and parents).
-    /// An explicit --env-file overrides variables already set in the environment.
+    /// Path to env file to load (default: search for `.env` in CWD and parents); its directory is the
+    /// agent folder, which holds the agent's state. An explicit --env-file overrides set variables.
     #[arg(long, global = true, value_name = "PATH")]
     env_file: Option<PathBuf>,
 
@@ -142,7 +142,7 @@ enum Commands {
         /// mainnet or testnet (default: the network of SYNCHRONIZER_ID)
         #[arg(long)]
         network: Option<String>,
-        /// Directory of the local USDCx state (default: ~/.silvana-agent/usdcx)
+        /// Directory of the local USDCx state (default: <agent folder>/usdcx)
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Do not ask for confirmations
@@ -209,7 +209,7 @@ enum Commands {
     },
     /// Agent control: link controllers, change them, show the control log
     Control {
-        /// Base directory of the control stores (default: ~/.silvana-agent)
+        /// Folder that holds the control store, control/ (default: the agent folder, where the env file is)
         #[arg(long, env = "SILVANA_CONTROL_DIR")]
         control_dir: Option<PathBuf>,
         #[command(subcommand)]
@@ -292,7 +292,9 @@ const STTY_WAIT: Duration = Duration::from_secs(2);
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Env changes happen here, while the process is still single-threaded.
-    load_env_file(cli.env_file.as_deref(), matches!(cli.command, Commands::Onboard { .. }))?;
+    let onboarding = matches!(cli.command, Commands::Onboard { .. });
+    load_env_file(cli.env_file.as_deref(), onboarding)?;
+    agent_logic::agent_dir::set(agent_folder(cli.env_file.as_deref(), onboarding)?)?;
 
     // Initialize logging (LOG_DESTINATION=console|file)
     agent_logic::logging::init_logging(
@@ -376,6 +378,17 @@ fn load_env_file(path: Option<&Path>, onboarding: bool) -> Result<()> {
     // SAFETY: first thing in main; no runtime or other thread has started yet
     let applied = unsafe { cloud_agent::env::apply_env_file(&body, overwrite) };
     applied.with_context(|| format!("Failed to load env file {}", file.display()))
+}
+
+/// The agent folder: the directory of the env file in use (`--env-file`, onboard's `.env`,
+/// else the one the search finds), else the current directory.
+fn agent_folder(env_file: Option<&Path>, onboarding: bool) -> Result<PathBuf> {
+    let file = match env_file {
+        Some(path) => Some(path.to_path_buf()),
+        None if onboarding => Some(PathBuf::from(".env")),
+        None => cloud_agent::env::find_dotenv()?,
+    };
+    agent_logic::agent_dir::of_env_file(file.as_deref())
 }
 
 /// Global flags passed through to the command.
@@ -1687,6 +1700,19 @@ mod tests {
             Commands::Onboard { network, rpc, .. } => OnboardTarget::resolve(network.as_deref(), rpc),
             _ => bail!("not onboard"),
         }
+    }
+
+    #[test]
+    fn the_agent_folder_is_the_env_files_directory_else_the_current_one() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join("agent-folder-probe");
+        assert_eq!(agent_folder(Some(&dir.join(".env")), false).unwrap(), dir);
+        assert_eq!(agent_folder(Some(Path::new("sub/agent.env")), true).unwrap(), cwd.join("sub"));
+        // onboard writes ./.env when no --env-file is given
+        assert_eq!(agent_folder(None, true).unwrap(), cwd);
+        let found = cloud_agent::env::find_dotenv().unwrap();
+        let expected = found.as_deref().and_then(Path::parent).map_or(cwd, Path::to_path_buf);
+        assert_eq!(agent_folder(None, false).unwrap(), expected);
     }
 
     #[test]

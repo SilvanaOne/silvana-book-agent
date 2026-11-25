@@ -234,6 +234,14 @@ fn multicall_capable(proposal: &SettlementProposal) -> bool {
     proposal.origin == "rfq"
 }
 
+/// The party that creates the proposal's DvpProposal: unset or empty means the buyer.
+fn dvp_proposer(proposal: &SettlementProposal) -> &str {
+    match proposal.dvp_proposer_party.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => &proposal.buyer,
+    }
+}
+
 /// A fee step waits while the DVP request is reported but not yet on-chain;
 /// a status without the request step keeps the old behaviour.
 fn fee_waits_for_dvp(action: NextAction, status: &GetSettlementStatusResponse) -> bool {
@@ -1152,6 +1160,13 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
             return Ok(());
         }
 
+        // Another client of this party runs this RFQ trade as taker: neither reject nor adopt it
+        if self.is_untracked_rfq_taker(&proposal).await {
+            info!("[{}] RFQ proposal as taker is not tracked by this agent; ignoring it", proposal_id);
+            self.rejected_proposals.insert(proposal_id);
+            return Ok(());
+        }
+
         // rfq_v2_only: never adopt V1 settlements — every proposal reaching
         // this pipeline is V1 by construction (RFQ V2 / AtomicDVP settles
         // atomically and never creates settlement proposals). Actively abort
@@ -1468,6 +1483,23 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
         }
 
         Ok(())
+    }
+
+    /// An RFQ proposal this party takes but did not propose, which this agent has not adopted.
+    async fn is_untracked_rfq_taker(&self, proposal: &SettlementProposal) -> bool {
+        if proposal.origin != "rfq"
+            || proposal.order_match.is_some()
+            || dvp_proposer(proposal) == self.config.party_id
+        {
+            return false;
+        }
+        if self.tracker.lock().await.has_settlement_order(&proposal.proposal_id) {
+            return false;
+        }
+        match &self.accepted_rfq_trades {
+            Some(accepted) => !accepted.lock().await.contains_key(&proposal.proposal_id),
+            None => true,
+        }
     }
 
     /// Keep a held proposal out of poll re-feeds: `HOLD_INITIAL`, doubling up to `HOLD_MAX`.
@@ -3066,11 +3098,12 @@ async fn advance_single<B: SettlementBackend>(
         },
     };
 
-    let my_action = if state.is_buyer {
-        NextAction::try_from(status.buyer_next_action).unwrap_or(NextAction::None)
-    } else {
-        NextAction::try_from(status.seller_next_action).unwrap_or(NextAction::None)
-    };
+    let raw_action = if state.is_buyer { status.buyer_next_action } else { status.seller_next_action };
+    // An action this build does not know waits; the deadline check below still ends a stuck one
+    let my_action = NextAction::try_from(raw_action).unwrap_or_else(|_| {
+        warn!("[{}] Unknown next action {}; waiting", proposal_id, raw_action);
+        NextAction::Wait
+    });
 
     // Abandon any still-in-flight proposal that has blown past its settlement
     // deadline (or its allocation deadline while allocation is still pending),
@@ -6293,5 +6326,156 @@ mod tests {
             exec.apply_result(AdvanceResult::Wait { proposal_id: "p1".to_string() }).await;
         }
         assert_eq!(logs.count("Still waiting on the counterparty"), 1);
+    }
+
+    /// The path of the preconfirmation a reject sends.
+    const PRECONFIRMATION: &str = "/silvana.settlement.v1.SettlementService/SubmitPreconfirmation";
+
+    /// An executor whose server records the path of each call made to it.
+    async fn executor_recording(
+        mut config: BaseConfig,
+    ) -> (
+        SettlementExecutor<MockBackend>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.orderbook_grpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = StatusServer {
+            statuses: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            calls: calls.clone(),
+            multicall: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let serve = tonic::transport::Server::builder()
+            .add_service(server)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
+        let serving = try_spawn("status server", serve).expect("a test runtime");
+        let exec = SettlementExecutor::new(&config, empty_tracker(), MockBackend).unwrap();
+        (exec, calls, serving)
+    }
+
+    /// An RFQ proposal where `buyer` buys from `seller`; `proposer` creates its DvpProposal.
+    fn rfq_proposal(pid: &str, buyer: &str, seller: &str, proposer: Option<&str>) -> SettlementProposal {
+        let mut p = test_proposal(pid);
+        p.origin = "rfq".to_string();
+        p.buyer = buyer.to_string();
+        p.seller = seller.to_string();
+        p.dvp_proposer_party = proposer.map(str::to_string);
+        p
+    }
+
+    // A reject here ended the RFQ trade another client of this party runs as taker
+    #[tokio::test]
+    async fn an_untracked_rfq_proposal_as_taker_is_ignored_not_rejected() {
+        let lp = "lp::1220aa";
+        for setup in ["plain", "rfq_v2_only", "shutting down"] {
+            let mut config = BaseConfig::test_minimal().unwrap();
+            config.rfq_v2_only = setup == "rfq_v2_only";
+            let me = config.party_id.clone();
+            let (mut exec, calls, serving) = executor_recording(config).await;
+            if setup == "shutting down" {
+                exec.set_shutting_down();
+            }
+            // Taker selling, taker buying, and an unset proposer (the buyer proposes)
+            for p in [
+                rfq_proposal("p1", lp, &me, Some(lp)),
+                rfq_proposal("p2", &me, lp, Some(lp)),
+                rfq_proposal("p3", lp, &me, None),
+            ] {
+                let pid = p.proposal_id.clone();
+                for _ in 0..2 {
+                    exec.handle_settlement_update(created_update(p.clone())).await.unwrap();
+                }
+                assert!(!exec.active_settlements.contains_key(&pid), "{setup}: {pid} adopted");
+                assert!(!exec.tracker.lock().await.has_settlement_order(&pid), "{setup}: {pid} recorded");
+                assert!(exec.rejected_proposals.contains(&pid), "{setup}: {pid} is not remembered");
+            }
+            serving.abort();
+            let calls = sync::lock(&calls).clone();
+            assert!(calls.is_empty(), "{setup}: {calls:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_rfq_proposal_this_party_makes_without_its_quote_is_rejected() {
+        let config = BaseConfig::test_minimal().unwrap();
+        let me = config.party_id.clone();
+        let taker = "taker::1220bb";
+        let (mut exec, calls, serving) = executor_recording(config).await;
+        // This party proposes as the seller, and as the buyer when the proposer is unset
+        for p in [rfq_proposal("p1", taker, &me, Some(&me)), rfq_proposal("p2", &me, taker, None)] {
+            exec.handle_settlement_update(created_update(p)).await.unwrap();
+        }
+        serving.abort();
+        let calls = sync::lock(&calls).clone();
+        assert_eq!(calls, [PRECONFIRMATION, PRECONFIRMATION]);
+        assert!(exec.rejected_proposals.contains("p1") && exec.rejected_proposals.contains("p2"));
+        assert!(exec.active_settlements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_rfq_proposal_as_taker_this_agent_tracks_is_still_adopted() {
+        let config = BaseConfig::test_minimal().unwrap();
+        let me = config.party_id.clone();
+        let lp = "lp::1220aa";
+        let (mut exec, calls, serving) = executor_recording(config).await;
+        let accepted = rfq_proposal("p1", &me, lp, Some(lp));
+        let trade = AcceptedRfqTrade {
+            proposal_id: "p1".to_string(),
+            market_id: accepted.market_id.clone(),
+            price: accepted.settlement_price.clone(),
+            base_quantity: accepted.base_quantity.clone(),
+            quote_quantity: accepted.quote_quantity.clone(),
+        };
+        exec.set_accepted_rfq_trades(Arc::new(Mutex::new(HashMap::from([("p1".to_string(), trade)]))));
+        // Adopted before a restart
+        let restored = rfq_proposal("p2", lp, &me, Some(lp));
+        exec.tracker.lock().await.record_settlement_order("p2", 0, Decimal::ONE);
+        for p in [accepted, restored] {
+            exec.handle_settlement_update(created_update(p)).await.unwrap();
+        }
+        serving.abort();
+        let calls = sync::lock(&calls).clone();
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(exec.active_settlements.contains_key("p1") && exec.active_settlements.contains_key("p2"));
+    }
+
+    #[tokio::test]
+    async fn an_rfq_proposal_this_party_quoted_and_proposes_is_adopted() {
+        let config = BaseConfig::test_minimal().unwrap();
+        let me = config.party_id.clone();
+        let taker = "taker::1220bb";
+        let (mut exec, calls, serving) = executor_recording(config).await;
+        // This party quoted both trades and proposes them, as the seller and as the buyer
+        let trades = [rfq_proposal("p1", taker, &me, Some(&me)), rfq_proposal("p2", &me, taker, Some(&me))];
+        let quotes = trades.iter().map(|p| QuotedTrade {
+            market_id: p.market_id.clone(),
+            price: p.settlement_price.clone(),
+            base_quantity: p.base_quantity.clone(),
+            quote_quantity: p.quote_quantity.clone(),
+        });
+        exec.set_quoted_rfq_trades(Arc::new(Mutex::new(quotes.collect())));
+        for p in trades {
+            exec.handle_settlement_update(created_update(p)).await.unwrap();
+        }
+        serving.abort();
+        let calls = sync::lock(&calls).clone();
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(exec.active_settlements.contains_key("p1") && exec.active_settlements.contains_key("p2"));
+        assert!(exec.rejected_proposals.is_empty());
+    }
+
+    // An action this build does not know used to end the settlement as failed
+    #[tokio::test]
+    async fn an_unknown_next_action_waits() {
+        let mut unknown = Vec::new();
+        varint(SELLER_NEXT << 3, &mut unknown);
+        varint(99, &mut unknown);
+        let state = SettlementState::new(test_proposal("p1"), false);
+        let run = advance_against(vec![unknown], registry_config(), RecordingBackend::default(), state, false).await;
+        assert!(matches!(run.result, AdvanceResult::Wait { .. }), "the unknown action did not wait");
+        assert!(run.backend.is_empty(), "{:?}", run.backend);
+        assert!(!run.reserved);
     }
 }

@@ -8,8 +8,8 @@ use tracing::warn;
 
 use super::ema::Ema;
 use super::maker::{make_price, rung_delta};
-use super::sizing::{order_qty, MIN_ORDER_USD};
-use super::{bps, BookNeed, Decide, Decision, Ladder, MarketView, TakeTif, Want};
+use super::sizing::{order_qty, ticks_price, MIN_ORDER_USD};
+use super::{bps, BookNeed, Decide, Decision, Ladder, MarketView, Rung, TakeTif, Want};
 use crate::config::{MeanReversionConfig, PriceLevel, StrategyMode};
 
 /// Target position as a share of the limit, from the deviation in bps; in eighths,
@@ -78,12 +78,13 @@ impl MeanReversion {
         let paused = self.paused_until.is_some_and(|t| v.now < t);
         let target_usd = if paused { 0.0 } else { target_share(dev, c.entry_bps, c.full_bps) * c.max_position_usd };
         self.last = Some((dev, target_usd));
-        let gap = v.start_base + target_usd / r - v.inventory.base;
-        if gap.abs() * r < MIN_ORDER_USD {
+        let gap = v.start_base + v.in_quote(target_usd) / r - v.inventory.base;
+        let min_order = v.in_quote(MIN_ORDER_USD);
+        if gap.abs() * r < min_order {
             return self.idle();
         }
         let side = if gap > 0.0 { OrderType::Bid } else { OrderType::Offer };
-        let usd = (gap.abs() * r).min(c.clip_usd);
+        let clip = (gap.abs() * r).min(v.in_quote(c.clip_usd));
         match c.mode {
             StrategyMode::Taker => {
                 if !v.can_take || v.activity.open_settlements >= self.max_inflight() {
@@ -91,7 +92,7 @@ impl MeanReversion {
                 }
                 Decision::Take(Some(Want {
                     side,
-                    max_quantity: usd / r,
+                    max_quantity: clip / r,
                     max_deviation_percent: c.max_slip_bps / 100.0,
                     tif: TakeTif::Ioc,
                 }))
@@ -111,11 +112,14 @@ impl MeanReversion {
                 // Through an agent quote only when the order brings the position back
                 let (base, start) = (v.inventory.base, v.start_base);
                 let reducing = if side == OrderType::Bid { base < start } else { base > start };
-                let price = make_price(side, aim, book, v.tick, reducing);
-                let Some(qty) = order_qty(usd, price, v.floor_value, v.lot_exp) else { return self.idle() };
+                let Some(n) = make_price(side, aim, book, v.tick, reducing) else { return self.idle() };
+                let Some(exact) = ticks_price(n, v.tick) else { return self.idle() };
+                let price = n as f64 * v.tick;
+                let Some(qty) = order_qty(clip, min_order, price, v.floor_value, v.lot_exp) else { return self.idle() };
                 let qf = qty.to_f64().unwrap_or(f64::INFINITY);
                 let delta = rung_delta(side, price, v.tick, r);
-                let rung = vec![PriceLevel { delta_percent: delta, quantity: qty.to_string() }];
+                let level = PriceLevel { delta_percent: delta, quantity: qty.to_string() };
+                let rung = vec![Rung { level, price: exact }];
                 if side == OrderType::Bid {
                     if qf * r * (1.0 + delta / 100.0) > v.inventory.quote_avail {
                         return self.idle();
@@ -270,9 +274,10 @@ mod tests {
         let Decision::Rest(ladder) = m.decide(&v) else { panic!() };
         assert!(ladder.offers.is_empty() && ladder.bids.len() == 1, "{ladder:?}");
         // 4 bps under 0.0016 is 0.00159936, on the tick grid 0.0015993
-        let price = 0.0016 * (1.0 + ladder.bids[0].delta_percent / 100.0);
+        let price = 0.0016 * (1.0 + ladder.bids[0].level.delta_percent / 100.0);
         assert!(((price / 1e-7).floor() * 1e-7 - 0.0015993).abs() < 1e-12, "{price}");
-        assert_eq!(ladder.bids[0].quantity, "18800");
+        assert_eq!(ladder.bids[0].price.normalize().to_string(), "0.0015993");
+        assert_eq!(ladder.bids[0].level.quantity, "18800");
         // Settling: the clip stays as it is
         let mut wait = view(Some(&book), 1e6, 1e6);
         wait.can_take = false;
@@ -320,7 +325,7 @@ mod tests {
             at_dev(&mut m, 37.5, v.now);
             match m.decide(&v) {
                 Decision::Rest(l) if l.bids.is_empty() && l.offers.len() == 1 => {
-                    (0.0016 * (1.0 + l.offers[0].delta_percent / 100.0) / 1e-7).ceil() * 1e-7
+                    (0.0016 * (1.0 + l.offers[0].level.delta_percent / 100.0) / 1e-7).ceil() * 1e-7
                 }
                 other => panic!("{other:?}"),
             }

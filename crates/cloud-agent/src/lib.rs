@@ -3937,7 +3937,7 @@ async fn after_registration(
     evidence: &agent_logic::control_store::RegisterEvidence,
     commitment: Option<agent_control::Commitment>,
 ) -> Result<()> {
-    use agent_logic::control_store::{ChainNetwork, ControlEnv, ControlStore, MARKER_ENV};
+    use agent_logic::control_store::{ChainNetwork, ControlEnv};
     let config = match onboarding_control_config(env_file, rpc, key, &|name| std::env::var_os(name)) {
         Ok(config) => config,
         Err(e) if commitment.is_none() => {
@@ -3956,15 +3956,8 @@ async fn after_registration(
     };
     let party = agent_control::PartyId::parse(&config.party_id)
         .map_err(|_| anyhow::anyhow!("PARTY_AGENT={} is not a party id control accepts", config.party_id))?;
-    let process = ControlEnv::from_process();
-    let env = ControlEnv {
-        chain: config.canton_chain.clone(),
-        marker: read_env_value(env_file, MARKER_ENV).or(process.marker.clone()),
-        party: Some(config.party_id.clone()),
-        ..process
-    };
-    let store = ControlStore::open(&env.base()?, network, &party);
-    store.write_evidence(evidence)?;
+    let env = onboarding_control_env(env_file, &config, ControlEnv::from_process())?;
+    let store = keep_evidence(&env, network, &party, evidence)?;
     println!("Registration evidence kept in {}", store.dir().display());
     let Some(commitment) = commitment else {
         return Ok(());
@@ -3982,9 +3975,59 @@ async fn after_registration(
         .map_err(|e| e.context("the agent is onboarded, but linking it to its owner failed; see `cloud-agent control show`"))
 }
 
+/// The control settings of onboarding: the agent folder is the env file's directory.
+fn onboarding_control_env(
+    env_file: &std::path::Path,
+    config: &BaseConfig,
+    process: agent_logic::control_store::ControlEnv,
+) -> Result<agent_logic::control_store::ControlEnv> {
+    Ok(agent_logic::control_store::ControlEnv {
+        chain: config.canton_chain.clone(),
+        marker: read_env_value(env_file, agent_logic::control_store::MARKER_ENV).or(process.marker.clone()),
+        party: Some(config.party_id.clone()),
+        agent_dir: Some(agent_logic::agent_dir::of_env_file(Some(env_file))?),
+        ..process
+    })
+}
+
+/// Writes the registration evidence into the agent's control store, which it creates.
+fn keep_evidence(
+    env: &agent_logic::control_store::ControlEnv,
+    network: agent_control::Network,
+    party: &agent_control::PartyId,
+    evidence: &agent_logic::control_store::RegisterEvidence,
+) -> Result<agent_logic::control_store::ControlStore> {
+    let store = agent_logic::control_store::ControlStore::locate(env, network, party)?;
+    store.write_evidence(evidence)?;
+    Ok(store)
+}
+
 #[cfg(test)]
 mod onboarding_invite_tests {
     use super::*;
+
+    #[test]
+    fn onboarding_creates_the_store_in_the_agent_folder() {
+        let dir = std::env::temp_dir().join(format!("onboard-store-{}", agent_logic::clock::now_micros_i64()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join(".env");
+        let party = agent_logic::control_store::testing::party_for([0x4e; 32], "agent-1").unwrap();
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.party_id = party.to_string();
+        config.canton_chain = Some("devnet".into());
+        let env = onboarding_control_env(&env_file, &config, agent_logic::control_store::ControlEnv::default()).unwrap();
+        let evidence = agent_logic::control_store::RegisterEvidence {
+            public_key_hex: "00".into(),
+            invite_code: INVITE.into(),
+            canonical_b64: "Y2Fu".into(),
+            signature_b64: "c2ln".into(),
+            recorded_at: 5,
+        };
+        let store = keep_evidence(&env, agent_control::Network::Devnet, &party, &evidence).unwrap();
+        assert_eq!(store.dir(), dir.join("control"));
+        assert_eq!(store.read_evidence().unwrap(), Some(evidence));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const INVITE: &str = "AGT-A4DQOBYHA4DQOBYHA4DQOBYHA4";
     const WITH_COMMITMENT: &str = "AGT-A4DQOBYHA4DQOBYHA4DQOBYHA4-7PDLYHDL3UPMASYI2D7E4FRQJA";

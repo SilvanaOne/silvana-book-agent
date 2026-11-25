@@ -212,11 +212,11 @@ pub struct BaseConfig {
     /// opened (no V1 LP registration/quotes) and grid/limit orders are never
     /// placed. The startup cancel-all still runs (clears any existing grid).
     /// In-flight V1 settlements still needing this agent's steps are ACTIVELY
-    /// CANCELLED on encounter (see `abort_v1_settlement`) — they could never
-    /// complete anyway, since the server's fee gate keys "agent" off live
-    /// V1-stream registration; ones this agent already allocated for are left
-    /// to settle via the operator. Already-paid counterparty fees are not
-    /// refunded — still prefer flipping during a quiet V1 window.
+    /// CANCELLED on encounter (see `abort_v1_settlement`), as this mode takes
+    /// no V1 steps; ones this agent already allocated for are left to settle
+    /// via the operator, and an RFQ trade another client of this party takes
+    /// is left alone. Already-paid counterparty fees are not refunded — still
+    /// prefer flipping during a quiet V1 window.
     /// Env override: RFQ_V2_ONLY (LP-gated).
     pub rfq_v2_only: bool,
 

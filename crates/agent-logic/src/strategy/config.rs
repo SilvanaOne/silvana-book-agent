@@ -52,6 +52,8 @@ pub struct CommonParams {
     pub ref_cap: Option<f64>,
     /// Seconds a reference reading stays usable; unset means 90
     pub ref_max_age_secs: Option<u64>,
+    /// Takers may take the liquidity provider's best level
+    pub take_lp: bool,
 }
 
 const DEFAULT_MAX_SETTLEMENTS_PER_HOUR: u32 = 120;
@@ -120,6 +122,8 @@ pub struct RebalancerConfig {
     pub flip_cooldown_secs: u64,
     /// Default 1 for a taker, 2 for a maker.
     pub max_inflight: Option<u32>,
+    /// Also take the liquidity provider's best level when it is the best price
+    pub take_lp: bool,
     pub max_settlements_per_hour: u32,
     pub ref_floor: Option<f64>,
     pub ref_cap: Option<f64>,
@@ -140,6 +144,7 @@ impl Default for RebalancerConfig {
             max_usd_per_hour: 600.0,
             flip_cooldown_secs: 900,
             max_inflight: None,
+            take_lp: false,
             max_settlements_per_hour: DEFAULT_MAX_SETTLEMENTS_PER_HOUR,
             ref_floor: None,
             ref_cap: None,
@@ -172,6 +177,8 @@ pub struct MomentumConfig {
     pub warmup_secs: u64,
     pub max_slip_bps: f64,
     pub max_inflight: u32,
+    /// Also take the liquidity provider's best level when it is the best price
+    pub take_lp: bool,
     pub max_settlements_per_hour: u32,
     pub ref_floor: Option<f64>,
     pub ref_cap: Option<f64>,
@@ -193,6 +200,7 @@ impl Default for MomentumConfig {
             warmup_secs: 600,
             max_slip_bps: 15.0,
             max_inflight: 2,
+            take_lp: false,
             max_settlements_per_hour: DEFAULT_MAX_SETTLEMENTS_PER_HOUR,
             ref_floor: None,
             ref_cap: None,
@@ -216,6 +224,8 @@ pub struct MeanReversionConfig {
     pub pause_after_stop_secs: u64,
     pub max_slip_bps: f64,
     pub max_inflight: u32,
+    /// Also take the liquidity provider's best level when it is the best price
+    pub take_lp: bool,
     pub max_settlements_per_hour: u32,
     pub ref_floor: Option<f64>,
     pub ref_cap: Option<f64>,
@@ -237,6 +247,7 @@ impl Default for MeanReversionConfig {
             pause_after_stop_secs: 900,
             max_slip_bps: 15.0,
             max_inflight: 2,
+            take_lp: false,
             max_settlements_per_hour: DEFAULT_MAX_SETTLEMENTS_PER_HOUR,
             ref_floor: None,
             ref_cap: None,
@@ -259,6 +270,8 @@ pub struct NoiseTakerConfig {
     /// Fixed seed for a replayable run; unset seeds from the start time.
     pub seed: Option<u64>,
     pub max_inflight: u32,
+    /// Also take the liquidity provider's best level when it is the best price
+    pub take_lp: bool,
     pub max_settlements_per_hour: u32,
     pub ref_floor: Option<f64>,
     pub ref_cap: Option<f64>,
@@ -278,6 +291,7 @@ impl Default for NoiseTakerConfig {
             rest_ttl_secs: 45,
             seed: None,
             max_inflight: 2,
+            take_lp: false,
             max_settlements_per_hour: DEFAULT_MAX_SETTLEMENTS_PER_HOUR,
             ref_floor: None,
             ref_cap: None,
@@ -305,6 +319,8 @@ pub struct TwapConfig {
     pub size_jitter: f64,
     pub max_inflight: u32,
     pub seed: Option<u64>,
+    /// Also take the liquidity provider's best level when it is the best price
+    pub take_lp: bool,
     pub max_settlements_per_hour: u32,
     pub ref_floor: Option<f64>,
     pub ref_cap: Option<f64>,
@@ -327,6 +343,7 @@ impl Default for TwapConfig {
             size_jitter: 0.15,
             max_inflight: 3,
             seed: None,
+            take_lp: false,
             max_settlements_per_hour: DEFAULT_MAX_SETTLEMENTS_PER_HOUR,
             ref_floor: None,
             ref_cap: None,
@@ -345,6 +362,8 @@ pub struct ArbitrageConfig {
     pub cooldown_secs: u64,
     pub ref_max_age_secs: u64,
     pub ref_stable_bps: f64,
+    /// Also take the liquidity provider's best level when it is the best price
+    pub take_lp: bool,
     pub max_settlements_per_hour: u32,
     pub ref_floor: Option<f64>,
     pub ref_cap: Option<f64>,
@@ -361,6 +380,7 @@ impl Default for ArbitrageConfig {
             // The served stamp is often up to a minute old; stability is the tighter guard
             ref_max_age_secs: 90,
             ref_stable_bps: 30.0,
+            take_lp: false,
             max_settlements_per_hour: DEFAULT_MAX_SETTLEMENTS_PER_HOUR,
             ref_floor: None,
             ref_cap: None,
@@ -373,14 +393,15 @@ pub(crate) static GRID: StrategyConfig = StrategyConfig::Grid(GridParams {});
 
 macro_rules! common_of {
     ($c:expr) => {
-        common_of!($c, $c.ref_max_age_secs)
+        common_of!($c, $c.ref_max_age_secs, $c.take_lp)
     };
-    ($c:expr, $age:expr) => {
+    ($c:expr, $age:expr, $take_lp:expr) => {
         CommonParams {
             max_settlements_per_hour: $c.max_settlements_per_hour,
             ref_floor: $c.ref_floor,
             ref_cap: $c.ref_cap,
             ref_max_age_secs: $age,
+            take_lp: $take_lp,
         }
     };
 }
@@ -408,13 +429,14 @@ impl StrategyConfig {
     pub fn common(&self) -> Option<CommonParams> {
         match self {
             Self::Grid(_) => None,
-            Self::MarketMaker(c) => Some(common_of!(c)),
+            // A maker never takes
+            Self::MarketMaker(c) => Some(common_of!(c, c.ref_max_age_secs, false)),
             Self::Rebalancer(c) => Some(common_of!(c)),
             Self::Momentum(c) => Some(common_of!(c)),
             Self::MeanReversion(c) => Some(common_of!(c)),
             Self::NoiseTaker(c) => Some(common_of!(c)),
             Self::Twap(c) => Some(common_of!(c)),
-            Self::Arbitrage(c) => Some(common_of!(c, Some(c.ref_max_age_secs))),
+            Self::Arbitrage(c) => Some(common_of!(c, Some(c.ref_max_age_secs), c.take_lp)),
         }
     }
 }
@@ -535,6 +557,12 @@ fn validate_one(check: &Check<'_>, market: &MarketConfig, strategy: &StrategyCon
             config.liquidity_provider.is_none(),
             "cannot run on an agent with [liquidity_provider]",
         )?;
+        // Amounts named `_usd` are converted to the quote at its USD rate
+        let quote = market.market_id.split_once('-').map_or("", |(_, q)| q);
+        check.rule(
+            super::quote_usd(&market.market_id, config.cc_token_id.as_deref(), None) != super::QuoteUsd::Unpriced,
+            format_args!("needs a quote with a USD rate (a USD stable or CC); '{quote}' has no USD rate"),
+        )?;
     }
     if let Some(common) = strategy.common() {
         check.common(common)?;
@@ -593,8 +621,12 @@ fn validate_rebalancer(k: &Check<'_>, c: &RebalancerConfig) -> Result<()> {
     k.range("max_slip_bps", c.max_slip_bps, 0.1, 500.0)?;
     k.range("max_usd_per_hour", c.max_usd_per_hour, 12.0, 1_000_000.0)?;
     k.int("flip_cooldown_secs", c.flip_cooldown_secs, 0, 86_400)?;
+    k.rule(!(c.take_lp && c.mode == StrategyMode::Maker), TAKE_LP_NEEDS_TAKER)?;
     k.int("max_inflight", c.inflight_cap().into(), 1, 10)
 }
+
+/// A maker mode only rests orders, so it never takes.
+const TAKE_LP_NEEDS_TAKER: &str = "take_lp applies only with mode = \"taker\"";
 
 fn validate_momentum(k: &Check<'_>, c: &MomentumConfig) -> Result<()> {
     k.int("fast_secs", c.fast_secs, 30, 1800)?;
@@ -631,6 +663,7 @@ fn validate_mean_reversion(k: &Check<'_>, c: &MeanReversionConfig) -> Result<()>
     k.int("warmup_secs", c.warmup_secs, 0, 86_400)?;
     k.int("pause_after_stop_secs", c.pause_after_stop_secs, 0, 86_400)?;
     k.range("max_slip_bps", c.max_slip_bps, 0.1, 500.0)?;
+    k.rule(!(c.take_lp && c.mode == StrategyMode::Maker), TAKE_LP_NEEDS_TAKER)?;
     k.int("max_inflight", c.max_inflight.into(), 1, 10)
 }
 
@@ -928,6 +961,59 @@ mod tests {
             assert!(e.contains(needle), "{kind}: {e}");
             assert!(e.starts_with("Market HTEST-USDC: [markets.strategy]"), "{e}");
         }
+    }
+
+    #[test]
+    fn take_lp_is_a_strict_boolean_for_takers_only() {
+        let table = |kind: &str, extra: &str| {
+            parse(&format!("[[markets]]\nmarket_id = \"A-USD\"\n[markets.strategy]\nkind = \"{kind}\"\n{extra}\n"))
+        };
+        for kind in ["rebalancer", "momentum", "mean_reversion", "noise_taker", "twap", "arbitrage"] {
+            let map = table(kind, "take_lp = true").unwrap();
+            assert_eq!(map["A-USD"].common().map(|c| c.take_lp), Some(true), "{kind}");
+            let map = table(kind, "").unwrap();
+            assert_eq!(map["A-USD"].common().map(|c| c.take_lp), Some(false), "{kind}");
+            assert!(table(kind, "take_lp = \"yes\"").is_err(), "{kind}");
+        }
+        // A maker never takes, so it has no such parameter
+        let e = format!("{:#}", table("market_maker", "take_lp = true").unwrap_err());
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
+    // A rebalancer or mean_reversion in maker mode only rests orders, so take_lp would do nothing
+    #[test]
+    fn take_lp_needs_the_taker_mode() {
+        let rb = |mode| {
+            StrategyConfig::Rebalancer(RebalancerConfig { target_share: Some(0.25), mode, take_lp: true, ..Default::default() })
+        };
+        let mr = |mode| StrategyConfig::MeanReversion(MeanReversionConfig { mode, take_lp: true, ..Default::default() });
+        for strategy in [rb(StrategyMode::Maker), mr(StrategyMode::Maker)] {
+            let e = err(validate(strategy));
+            assert!(e.contains("take_lp applies only with mode = \"taker\""), "{e}");
+        }
+        validate(rb(StrategyMode::Taker)).unwrap();
+        validate(mr(StrategyMode::Taker)).unwrap();
+        // mean_reversion is a maker unless told otherwise
+        let table = |extra: &str| {
+            let head = "[[markets]]\nmarket_id = \"HTEST-USDC\"\n[markets.strategy]\nkind = \"mean_reversion\"\n";
+            parse(&format!("{head}take_lp = true\n{extra}")).unwrap()["HTEST-USDC"].clone()
+        };
+        assert!(err(validate(table(""))).contains("take_lp applies only"));
+        validate(table("mode = \"taker\"\n")).unwrap();
+    }
+
+    #[test]
+    fn a_strategy_needs_a_quote_with_a_usd_rate() {
+        let noise = || StrategyConfig::NoiseTaker(NoiseTakerConfig::default());
+        for id in ["HECTO-cETH", "TUSDT-HECTO"] {
+            let e = err(validate_with(market(id), noise()));
+            assert!(e.contains("no USD rate"), "{e}");
+        }
+        for id in ["TUSDT-CC", "cETH-TUSDT", "CC-USDCx", "X-usd8", "HTEST-USDC", "A-tf-usdt"] {
+            validate_with(market(id), noise()).unwrap();
+        }
+        // The grid has no USD amounts
+        validate_with(market("HECTO-cETH"), StrategyConfig::Grid(GridParams {})).unwrap();
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub(super) fn inspect_accept_dvp(
                 observed.extend(terms_findings("AcceptDvp", prepared_transaction_bytes, acceptor, proposal_id, terms));
             }
         }
+        observed.extend(accept_deadline_findings(&prepared, dvp_proposal_cid));
     }
     Ok(result)
 }
@@ -297,9 +298,22 @@ fn requested_at_micros(prepared: &PreparedTransaction, cid: &str) -> Option<i64>
 /// The allocation's deadlines: it is allocated before it settles, and it settles within
 /// [`MAX_SETTLE_WINDOW_MICROS`] of its request and of this transaction's preparation.
 fn deadline_findings(op: &str, prepared: &PreparedTransaction, allocation: &AllocationFact) -> Vec<String> {
+    let requested_at = requested_at_micros(prepared, &allocation.contract_id);
+    let (allocate_before, settle_before) = (allocation.allocate_before_micros, allocation.settle_before_micros);
+    window_findings(op, prepared, allocate_before, settle_before, requested_at, "the allocation's requestedAt")
+}
+
+/// The rule of [`deadline_findings`] for deadlines requested at `requested_at`, named `request`.
+fn window_findings(
+    op: &str,
+    prepared: &PreparedTransaction,
+    allocate_before: i64,
+    settle_before: i64,
+    requested_at: Option<i64>,
+    request: &str,
+) -> Vec<String> {
     let mut found = Vec::new();
-    let settle_before = allocation.settle_before_micros;
-    if allocation.allocate_before_micros > settle_before {
+    if allocate_before > settle_before {
         found.push(format!("{op}: the allocation deadline is after the settlement deadline"));
     }
     let prepared_at = prepared
@@ -307,10 +321,10 @@ fn deadline_findings(op: &str, prepared: &PreparedTransaction, allocation: &Allo
         .as_ref()
         .and_then(|m| i64::try_from(m.preparation_time).ok())
         .filter(|t| *t > 0);
-    let starts = [("request", requested_at_micros(prepared, &allocation.contract_id)), ("preparation", prepared_at)];
+    let starts = [("request", requested_at), ("preparation", prepared_at)];
     for (what, start) in starts {
         match start.map(|t| settle_before.checked_sub(t)) {
-            None if what == "request" => found.push(format!("{op}: the allocation's requestedAt is unreadable")),
+            None if what == "request" => found.push(format!("{op}: {request} is unreadable")),
             None => {}
             Some(window) if window.is_none_or(|w| w > MAX_SETTLE_WINDOW_MICROS) => {
                 found.push(format!("{op}: the settlement deadline is more than 72 h after the {what}"));
@@ -319,6 +333,28 @@ fn deadline_findings(op: &str, prepared: &PreparedTransaction, allocation: &Allo
         }
     }
     found
+}
+
+/// The deadlines of the accepted DvpProposal `cid`, by the rule its allocations must meet;
+/// its createdAt is their requestedAt.
+fn accept_deadline_findings(prepared: &PreparedTransaction, cid: &str) -> Vec<String> {
+    let op = "AcceptDvp";
+    let terms = prepared
+        .metadata
+        .as_ref()
+        .and_then(|m| dvp_proposal_input(m, cid).ok())
+        .and_then(|c| c.argument.as_ref())
+        .and_then(as_record)
+        .and_then(|r| get_record_field(r, "terms"))
+        .and_then(as_record);
+    let at = |label: &str| match terms.and_then(|t| get_record_field(t, label)).and_then(|v| v.sum.as_ref()) {
+        Some(Sum::Timestamp(t)) => Some(*t),
+        _ => None,
+    };
+    let (Some(allocate_before), Some(settle_before)) = (at("allocateBefore"), at("settleBefore")) else {
+        return vec![format!("{op}: the DvP deadlines are unreadable")];
+    };
+    window_findings(op, prepared, allocate_before, settle_before, at("createdAt"), "the DvP's createdAt")
 }
 
 /// The agent alone allocates the one leg its recorded terms give it, for this
@@ -1504,8 +1540,23 @@ mod tests {
         terms_id: String,
         deliveries: Value,
         payments: Value,
+        /// The terms' createdAt, allocateBefore and settleBefore; `None` leaves one out.
+        deadlines: [Option<i64>; 3],
         /// Further nodes listed under the root.
         extra_children: Vec<Node>,
+    }
+
+    /// When the fixture's DvP terms were created, in microseconds since the epoch.
+    const CREATED: i64 = 1_764_000_000_000_000;
+    const HOUR: i64 = 3_600_000_000;
+
+    /// Deadlines `allocate` and `settle` hours after [`CREATED`].
+    fn hours(allocate: i64, settle: i64) -> [Option<i64>; 3] {
+        [Some(CREATED), Some(CREATED + allocate * HOUR), Some(CREATED + settle * HOUR)]
+    }
+
+    fn timestamp(micros: i64) -> Value {
+        Value { sum: Some(Sum::Timestamp(micros)) }
     }
 
     impl AcceptTx {
@@ -1516,6 +1567,7 @@ mod tests {
                 terms_id: "prop".into(),
                 deliveries: list(vec![iq("D", Q, "1.0")]),
                 payments: list(vec![iq("Q", Q, "2.5")]),
+                deadlines: hours(6, 12),
                 extra_children: vec![],
             }
         }
@@ -1534,11 +1586,15 @@ mod tests {
             accept.template_id = Some(ident(DVP_MODULE, "DvpProposal"));
             accept.contract_id = self.cid.clone();
             accept.chosen_value = Some(record(vec![]));
-            let terms = record(vec![
+            let mut fields = vec![
                 ("id", text(&self.terms_id)),
                 ("deliveries", self.deliveries),
                 ("payments", self.payments),
-            ]);
+            ];
+            for (label, at) in ["createdAt", "allocateBefore", "settleBefore"].into_iter().zip(self.deadlines) {
+                fields.extend(at.map(|t| (label, timestamp(t))));
+            }
+            let terms = record(fields);
             let dvp = create(
                 ident(DVP_MODULE, "Dvp"),
                 record(vec![("terms", terms.clone())]),
@@ -2246,5 +2302,42 @@ mod tests {
         assert!(!r.accepted);
         assert_eq!(r.summary, "AcceptDvp: expected 1 root, got 2");
         assert_eq!(r.rejection_reason.as_deref(), Some("Expected 1 root node, got 2"));
+    }
+
+    /// The full verification of an accept of DvP terms with `deadlines`, prepared a minute after their creation.
+    fn verified_accept(deadlines: [Option<i64>; 3]) -> crate::VerificationResult {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let cid = "00a1";
+        let exp = accept_expectation([cid, "1", "2.5", "D", Q, "Q", Q]);
+        let mut p = AcceptTx { deadlines, ..AcceptTx::new(cid) }.build();
+        p.metadata.as_mut().unwrap().preparation_time = u64::try_from(CREATED + HOUR / 60).unwrap();
+        let bytes = encode(&p);
+        let computed = crate::hasher::compute_hash(&bytes, "V2").unwrap();
+        crate::verify_and_hash(&bytes, &BASE64.encode(computed), "V2", &exp, false).unwrap()
+    }
+
+    #[test]
+    fn accept_dvp_takes_the_web_and_sdk_deadlines() {
+        for (proposer, allocate, settle) in [("web", 24, 48), ("sdk", 6, 12), ("longest", 71, 72)] {
+            let r = verified_accept(hours(allocate, settle));
+            assert!(r.accepted, "{proposer}: {:?}", r.rejection_reason);
+            assert!(r.would_refuse.is_empty(), "{proposer}: {:?}", r.would_refuse);
+        }
+    }
+
+    // The agent accepted these, then refused to allocate for them
+    #[test]
+    fn accept_dvp_refuses_deadlines_an_allocation_is_refused_for() {
+        let [created, allocate, settle] = hours(6, 12);
+        for (deadlines, why) in [
+            (hours(24, 73), "AcceptDvp: the settlement deadline is more than 72 h after the request"),
+            (hours(12, 6), "AcceptDvp: the allocation deadline is after the settlement deadline"),
+            ([None, allocate, settle], "AcceptDvp: the DvP's createdAt is unreadable"),
+            ([created, allocate, None], "AcceptDvp: the DvP deadlines are unreadable"),
+        ] {
+            let r = verified_accept(deadlines);
+            assert!(!r.accepted, "accepted: {why}");
+            assert_eq!(r.rejection_reason.as_deref(), Some(why));
+        }
     }
 }

@@ -4,7 +4,7 @@ use orderbook_proto::orderbook::{Order, OrderType, OrderbookDepth, OrderbookLeve
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
-/// Best agent level on one side; `price_str` is the server's exact price.
+/// Best level on one side; `price_str` is the server's exact price.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Level {
     pub price: f64,
@@ -17,19 +17,20 @@ pub(crate) struct Level {
 pub(crate) struct BookTop {
     pub agent_bid: Option<Level>,
     pub agent_ask: Option<Level>,
-    pub lp_bid: Option<f64>,
-    pub lp_ask: Option<f64>,
+    /// The LP's best level: its whole depth and order count at that price
+    pub lp_bid: Option<Level>,
+    pub lp_ask: Option<Level>,
 }
 
 impl BookTop {
     /// Best bid of anyone but us.
     pub(crate) fn best_bid(&self) -> Option<f64> {
-        max_opt(self.agent_bid.as_ref().map(|l| l.price), self.lp_bid)
+        max_opt(self.agent_bid.as_ref().map(|l| l.price), self.lp_bid.as_ref().map(|l| l.price))
     }
 
     /// Best offer of anyone but us.
     pub(crate) fn best_ask(&self) -> Option<f64> {
-        min_opt(self.agent_ask.as_ref().map(|l| l.price), self.lp_ask)
+        min_opt(self.agent_ask.as_ref().map(|l| l.price), self.lp_ask.as_ref().map(|l| l.price))
     }
 }
 
@@ -68,8 +69,8 @@ pub(crate) fn book_top(full: &OrderbookDepth, lp: &OrderbookDepth, own: &[Order]
     BookTop {
         agent_bid: best_agent(&full.bids, &lp.bids, own, OrderType::Bid),
         agent_ask: best_agent(&full.offers, &lp.offers, own, OrderType::Offer),
-        lp_bid: best_price(&lp.bids, OrderType::Bid),
-        lp_ask: best_price(&lp.offers, OrderType::Offer),
+        lp_bid: best_lp(&lp.bids, OrderType::Bid),
+        lp_ask: best_lp(&lp.offers, OrderType::Offer),
     }
 }
 
@@ -77,15 +78,23 @@ fn better(side: OrderType, a: Decimal, b: Decimal) -> bool {
     if side == OrderType::Bid { a > b } else { a < b }
 }
 
-fn best_price(levels: &[OrderbookLevel], side: OrderType) -> Option<f64> {
-    let mut best: Option<Decimal> = None;
+/// The LP's best price; levels listed twice at one price are added up.
+fn best_lp(levels: &[OrderbookLevel], side: OrderType) -> Option<Level> {
+    let mut best: Option<(Decimal, &str)> = None;
     for l in levels {
         let (Some(p), Some(q)) = (dec(&l.price), dec(&l.total_quantity)) else { continue };
-        if q > Decimal::ZERO && best.is_none_or(|b| better(side, p, b)) {
-            best = Some(p);
+        if q > Decimal::ZERO && best.is_none_or(|(b, _)| better(side, p, b)) {
+            best = Some((p, l.price.as_str()));
         }
     }
-    best.and_then(|p| p.to_f64())
+    let (price, price_str) = best?;
+    let (qty, count) = levels
+        .iter()
+        .filter(|l| dec(&l.price) == Some(price))
+        .fold((Decimal::ZERO, 0u32), |(q, c), l| {
+            (q.saturating_add(dec(&l.total_quantity).unwrap_or(Decimal::ZERO)), c.saturating_add(l.order_count))
+        });
+    Some(Level { price: price.to_f64()?, price_str: price_str.to_string(), qty: qty.to_f64()?, count: count.max(1) })
 }
 
 fn best_agent(full: &[OrderbookLevel], lp: &[OrderbookLevel], own: &[Order], side: OrderType) -> Option<Level> {
@@ -149,7 +158,8 @@ pub(crate) mod tests {
         let top = book_top(&full, &lp, &[own(OrderType::Bid, "0.0016", "20000")]);
         assert_eq!(top.agent_bid.as_ref().map(|l| (l.price_str.as_str(), l.qty, l.count)), Some(("0.0015990", 10000.0, 1)));
         assert_eq!(top.agent_ask.as_ref().map(|l| (l.price_str.as_str(), l.qty, l.count)), Some(("0.0016100000", 20000.0, 2)));
-        assert_eq!((top.lp_bid, top.lp_ask), (Some(0.0016), Some(0.00162)));
+        let lp_top = |l: &Option<Level>| l.as_ref().map(|l| (l.price_str.clone(), l.qty, l.count));
+        assert_eq!((lp_top(&top.lp_bid), lp_top(&top.lp_ask)), (Some(("0.0016".into(), 10000.0, 1)), Some(("0.00162".into(), 10000.0, 1))));
 
         // Without our order, another agent rests 20000 at the top beside the LP
         let top = book_top(&full, &lp, &[]);
@@ -160,8 +170,13 @@ pub(crate) mod tests {
         assert_eq!((top.agent_bid, top.agent_ask), (None, None));
         let top = book_top(&full, &depth(Vec::new(), Vec::new()), &[own(OrderType::Offer, "0.00161", "20000")]);
         assert_eq!(top.agent_ask.as_ref().map(|l| l.price), Some(0.00162));
-        assert_eq!((top.lp_bid, top.lp_ask), (None, None));
+        assert_eq!((top.lp_bid.as_ref(), top.lp_ask.as_ref()), (None, None));
         assert_eq!((top.best_bid(), top.best_ask()), (Some(0.0016), Some(0.00162)));
+
+        // The LP's depth at its best price, two orders listed apart
+        let lp = depth(vec![lvl("0.0016", "4000", 1), lvl("0.0016000", "6000", 2), lvl("0.0015", "1", 1)], Vec::new());
+        let top = book_top(&full, &lp, &[]);
+        assert_eq!(top.lp_bid.map(|l| (l.price, l.qty, l.count)), Some((0.0016, 10000.0, 3)));
 
         // Junk levels are ignored; an unsorted book still gives the best level
         let full = depth(vec![lvl("x", "1", 1), lvl("0.9", "1", 1), lvl("1.1", "1", 1)], Vec::new());

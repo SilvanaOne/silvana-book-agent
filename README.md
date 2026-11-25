@@ -103,11 +103,12 @@ Rules:
 - An unknown `kind` or parameter, or a value out of range, stops the agent at startup.
 - An agent that runs strategies must not have a `[liquidity_provider]` section: the order book does not match liquidity providers against each other, so such an agent would lose its main counterparty. The agent refuses to start. With `rfq_v2_only` the table is ignored.
 - A strategy decides once per cycle. It pauses while the reference price is stale, has jumped more than 1% from the last reading, or is within 1% of `ref_floor` / `ref_cap`.
-- Takers send immediate-or-cancel (IOC) orders at exactly the best price of another agent, and only when that price beats the liquidity provider's quote and lies within the strategy's slippage limit. A take is never larger than one order at that level, so it settles once, and no new take goes out while the last one is listed or settling.
+- Takers send immediate-or-cancel (IOC) orders at exactly the best price of another agent, and only when that price beats the liquidity provider's quote and lies within the strategy's slippage limit. A take is never larger than one order at that level, so it settles once, and no new take goes out while the last one is listed or settling. With `take_lp = true` a taker may also take the liquidity provider's best level when it is the best price; an agent level at the same price comes first. The same slippage limit applies, and such a take is at most one of the provider's orders at that level and never below the server's minimum order value.
 - Makers rest orders inside the liquidity provider's quotes and re-quote when their target moves more than 2 bps.
 - Takers, and the makers that rest a single order (`rebalancer`, `mean_reversion`), send nothing new while a settlement of theirs is open in that market; `max_inflight` limits only `market_maker`, and the other kinds accept it so configurations that set it still load.
 - Position limits and the report's change count from the balances at the strategy's start; these are saved at a stop and kept if the agent restarts within 6 hours with the same kind on that market, otherwise taken again from the first usable balances. Funds moved in or out while the agent was stopped move the kept start by the same amount, with a warning, so only the position carries over.
-- Orders are worth at least 12 quote units and use round lots; rungs below the server's minimum order value are skipped (the grid skips them too).
+- Amounts named `_usd` are in US dollars. They are converted to the market's quote at its USD rate: 1 for a USD stablecoin quote (USDC, USDCx, TUSDT, USD8), the live CC/USD rate for a CC quote. A CC-quoted strategy waits while that rate is unknown or more than 30 minutes old. A strategy on a market quoted in anything else is refused at startup.
+- Orders are worth at least $12 and use round lots; rungs below the server's minimum order value are skipped (the grid skips them too).
 - Every 5 minutes each enabled market, the grid included, logs one line: balances, value at the reference price, change since the start and against simply holding, takes (filled and empty), fills, and the strategy's own state.
 
 Parameters every strategy except `grid` accepts:
@@ -117,6 +118,7 @@ Parameters every strategy except `grid` accepts:
 | `max_settlements_per_hour` | 120 | Settlements in a rolling hour that pause the strategy for 15 min; a second hit stops it until a restart |
 | `ref_floor`, `ref_cap` | unset | Price bounds of the reference; readings within 1% of either are not traded on |
 | `ref_max_age_secs` | 90 | Age of the reference price after which it is stale; makers keep their quotes for up to 5 min of staleness |
+| `take_lp` | false | Takes may also hit the liquidity provider's best level (see the rules above). Every kind except `market_maker`; `rebalancer` and `mean_reversion` only with `mode = "taker"` |
 
 ### `market_maker`
 
@@ -289,7 +291,7 @@ slice_secs = 240
 max_slip_bps = 15
 ```
 
-**Fees.** Each settlement costs each side a processing fee that is nearly fixed, whatever the trade's size. Trades of a few tens of quote units, as with the defaults above, therefore lose money by design: the defaults suit testing and activity, not profit. Size trades well above the fee before running a strategy for its returns.
+**Fees.** Each settlement costs each side a processing fee that is nearly fixed, whatever the trade's size. Trades of a few tens of dollars, as with the defaults above, therefore lose money by design: the defaults suit testing and activity, not profit. Size trades well above the fee before running a strategy for its returns.
 
 ## SDK — Build Your Own Agent
 
@@ -463,14 +465,24 @@ Flags:
 
 `.env` and `agent.toml` are both created by `cloud-agent onboard` — you typically don't write them from scratch. The tables below describe each field so you can tune an existing config.
 
-Every command accepts a global `--env-file <PATH>` flag to load a specific env file instead of the default `.env` lookup — useful for running several agents (one env file per identity) that share a single `agent.toml`:
+Every command accepts a global `--env-file <PATH>` flag to load a specific env file instead of the default `.env` lookup — useful for running several agents (one folder and env file per identity) that share a single `agent.toml`:
 
 ```bash
-cloud-agent --env-file agent1.env -c agent.toml info balance
-cloud-agent --env-file agent2.env -c agent.toml agent
+cloud-agent --env-file agent1/.env -c agent.toml info balance
+cloud-agent --env-file agent2/.env -c agent.toml agent
 ```
 
 An explicit `--env-file` overrides variables already set in the shell. Without the flag, `.env` is searched for in the current directory and its parents, and already-set shell variables win.
+
+**The agent folder.** The directory of the env file in use (the current directory when there is none) is the agent's folder, and the agent keeps its local state there:
+
+| Path | Contents |
+|---|---|
+| `.env` | the key, the settings and the control marker `AGENT_CONTROL_HEAD` |
+| `control/` | the control store of a linked agent: its log, head, pending entry, policies, evidence, commands, counters and locks (see [docs/control.md](docs/control.md#where-the-state-lives)) |
+| `usdcx/<network>/<party>/` | the `usdcx` burn and deposit logs |
+
+Give each agent its own folder, and back up, copy or move the **whole folder**: the marker in `.env` and the store in `control/` must stay together, or a linked agent refuses to start. `cloud-agent control show` prints the store's path. `SILVANA_CONTROL_DIR` (or `control --control-dir`) names another folder to hold `control/`. Earlier versions kept this state in `~/.silvana-agent`; the agent moves its own part of it into the agent folder once, checks the copy, and leaves the old folder unchanged (see [docs/control.md](docs/control.md#moving-from-silvana-agent)). Agents that shared one folder with one env file each (`agent1.env`, `agent2.env`) need a folder each before their first start with this version.
 
 #### Identity flags
 
@@ -774,7 +786,7 @@ The `usdcx` commands move USDC between Ethereum and Canton through Circle's xRes
 | `usdcx offboard [--reason <TEXT>]` | End the bridge agreement |
 | `usdcx track [--eth-tx <0x…>] [--wait]` | Continue open withdrawals and deposits; `--eth-tx` registers a deposit sent from a wallet |
 
-Options: `--network mainnet|testnet` (default: the network of `SYNCHRONIZER_ID`), `--state-dir <DIR>` (default `~/.silvana-agent/usdcx`), `--yes` (no confirmations), and the global `--dry-run` (prepare and verify only).
+Options: `--network mainnet|testnet` (default: the network of `SYNCHRONIZER_ID`), `--state-dir <DIR>` (default `<agent folder>/usdcx`), `--yes` (no confirmations), and the global `--dry-run` (prepare and verify only).
 
 - **Never send a plain USDC transfer to the xReserve address**: it carries no Canton recipient and does not reach Canton. Deposit only on the network's Ethereum chain (chain id 1 on MainNet).
 - **Withdrawals are guarded locally.** `burn` prints its request id before anything is sent and records every signature in `<state-dir>/<network>/<party>/burns.json` before making it. If a run is interrupted or its outcome is unclear, continue with `usdcx track` or `usdcx burn --request-id <the printed id>` with the same amount and destination — never by starting a new withdrawal: a new one is refused while an earlier one may still commit.

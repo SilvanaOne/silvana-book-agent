@@ -200,6 +200,7 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
         let _ = writeln!(out, "Owner:        account {owner}");
     }
     let _ = writeln!(out, "Marker:       {}", marker.as_deref().unwrap_or("unset"));
+    let _ = writeln!(out, "Store:        {}", ctx.store.dir().display());
     if let Some(p) = pending {
         let status = match p.status {
             PendingStatus::Uploading => "signed, awaiting the rpc (run `cloud-agent control sync`)".to_string(),

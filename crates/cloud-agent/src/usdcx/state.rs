@@ -12,12 +12,13 @@
 
 #![cfg_attr(not(test), allow(renamed_and_removed_lints), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice, clippy::unchecked_duration_subtraction, clippy::arithmetic_side_effects, clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro, clippy::disallowed_methods), warn(renamed_and_removed_lints))]
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -31,12 +32,39 @@ pub const DEPOSITS_FILE: &str = "deposits.json";
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(250);
 
-/// The default base directory, `$HOME/.silvana-agent/usdcx`.
-pub fn default_base() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow!("HOME is not set: pass --state-dir"))?;
-    Ok(PathBuf::from(home).join(".silvana-agent").join("usdcx"))
+/// The state's folder inside the agent folder.
+pub const STATE_DIR: &str = "usdcx";
+
+/// The default base directory, `<agent folder>/usdcx`.
+pub fn default_base(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(STATE_DIR)
+}
+
+/// Where earlier versions kept the state: `$HOME/.silvana-agent/usdcx`.
+pub fn legacy_base(home: Option<&OsStr>) -> Option<PathBuf> {
+    home.filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".silvana-agent").join(STATE_DIR))
+}
+
+/// The party directory under `base`, after the one-time move of this party's state from
+/// `legacy_base`; that base keeps one folder per network and party, so only this one moves.
+pub fn settle_party_dir(
+    base: &Path,
+    legacy_base: Option<&Path>,
+    network: &str,
+    party: &str,
+) -> Result<PathBuf> {
+    let dir = party_dir(base, network, party);
+    if let Some(legacy) = legacy_base.map(|b| party_dir(b, network, party)) {
+        let verify = |copy: &Path| -> Result<()> {
+            BurnLog::load(copy)?;
+            DepositLog::load(copy)?;
+            Ok(())
+        };
+        let locks = ["burns.json.lock", "deposits.json.lock"];
+        agent_logic::agent_dir::move_once("USDCx state", &legacy, &dir, &locks, &verify)?;
+    }
+    Ok(dir)
 }
 
 /// The directory of one party's state on one network.
@@ -562,6 +590,64 @@ mod tests {
         assert_eq!(back.get("r1").unwrap().status, BurnStatus::Signed);
         assert!(DepositLog::load(&dir).unwrap().deposits.is_empty());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_state_lives_in_the_agent_folder_and_moves_only_this_partys_state() {
+        let root = std::env::temp_dir().join(format!("usdcx-move-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let folder = root.join("agent");
+        assert_eq!(default_base(&folder), folder.join("usdcx"));
+        assert_eq!(
+            legacy_base(Some(OsStr::new("/h"))),
+            Some(PathBuf::from("/h/.silvana-agent/usdcx"))
+        );
+        assert_eq!(legacy_base(None), None);
+        let legacy = root.join("home/.silvana-agent/usdcx");
+        let mut log = BurnLog::default();
+        log.record_signature(&sig("r1", &cids(&["h1"]), "c1"))
+            .unwrap();
+        log.save(&party_dir(&legacy, "mainnet", "tester::1220ab"))
+            .unwrap();
+        log.save(&party_dir(&legacy, "mainnet", "other::1220cd"))
+            .unwrap();
+        let before = fs::read(party_dir(&legacy, "mainnet", "tester::1220ab").join(BURNS_FILE)).unwrap();
+        let base = default_base(&folder);
+        let dir = settle_party_dir(&base, Some(&legacy), "mainnet", "tester::1220ab").unwrap();
+        assert_eq!(dir, party_dir(&base, "mainnet", "tester::1220ab"));
+        assert_eq!(BurnLog::load(&dir).unwrap().get("r1").unwrap().status, BurnStatus::Signed);
+        assert!(!base.join("mainnet").join("other__1220cd").exists(), "only this party's state");
+        assert_eq!(fs::read(party_dir(&legacy, "mainnet", "tester::1220ab").join(BURNS_FILE)).unwrap(), before);
+        // Moved once; later runs use it. A state not moved from the old one is refused.
+        assert_eq!(settle_party_dir(&base, Some(&legacy), "mainnet", "tester::1220ab").unwrap(), dir);
+        fs::create_dir_all(party_dir(&root.join("b"), "mainnet", "other::1220cd")).unwrap();
+        let err = settle_party_dir(&root.join("b"), Some(&legacy), "mainnet", "other::1220cd").unwrap_err();
+        assert!(format!("{err:#}").contains(&*legacy.to_string_lossy()), "{err:#}");
+        // A copy that does not load is refused and removed.
+        fs::create_dir_all(party_dir(&legacy, "mainnet", "bad::1220ef")).unwrap();
+        fs::write(party_dir(&legacy, "mainnet", "bad::1220ef").join(BURNS_FILE), b"x").unwrap();
+        assert!(settle_party_dir(&base, Some(&legacy), "mainnet", "bad::1220ef").is_err());
+        assert!(!party_dir(&base, "mainnet", "bad::1220ef").exists());
+        assert!(!base.join("mainnet").join("bad__1220ef.migrating").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_agent_folder_holding_the_old_state_uses_it_in_place() {
+        let root = std::env::temp_dir().join(format!("usdcx-in-place-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let legacy = root.join("home/.silvana-agent/usdcx");
+        let mut log = BurnLog::default();
+        log.record_signature(&sig("r1", &cids(&["h1"]), "c1"))
+            .unwrap();
+        log.save(&party_dir(&legacy, "mainnet", "tester::1220ab"))
+            .unwrap();
+        let base = default_base(&root.join("home/.silvana-agent"));
+        assert_eq!(base, legacy);
+        let dir = settle_party_dir(&base, Some(&legacy), "mainnet", "tester::1220ab").unwrap();
+        assert_eq!(dir, party_dir(&legacy, "mainnet", "tester::1220ab"));
+        assert!(!fs::exists(dir.join(agent_logic::agent_dir::MOVED_FROM_FILE)).unwrap());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

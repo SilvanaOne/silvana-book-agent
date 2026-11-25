@@ -856,6 +856,7 @@ impl TestAgent {
             chain: Some("devnet".into()),
             marker: self.marker(),
             party: Some(self.config.party_id.clone()),
+            agent_dir: Some(self.base.clone()),
         }
     }
 
@@ -1175,9 +1176,12 @@ mod tests {
             assert!(out.contains(needle), "{needle}: {out}");
         }
         assert!(out.contains("swap_max_deviation_bps=100 swap_reference_max_age_secs=300;"), "{out}");
+        let store_line = format!("Store:        {}", agent.base.join("control").display());
+        assert!(out.contains(&store_line), "the store path is shown: {out}");
         let (result, out) = agent.run(ControlCommands::Show { json: true, offline: true }, &[]).await;
         result.unwrap();
         let view: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(view["storeDir"], agent.base.join("control").display().to_string());
         assert_eq!(view["settings"]["swapReferenceMaxAgeSecs"], 300);
         assert_eq!(view["partyFingerprint"], fingerprint.as_str());
         assert_eq!(view["head"]["seq"], 2);

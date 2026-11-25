@@ -603,7 +603,7 @@ impl ControlContext {
         };
         let party = PartyId::parse(&config.party_id)
             .map_err(|_| anyhow!("PARTY_AGENT={} is not a party id control accepts", config.party_id))?;
-        let store = ControlStore::open(&env.base()?, network, &party);
+        let store = ControlStore::locate(env, network, &party)?;
         Ok((network, party, store))
     }
 
@@ -645,10 +645,11 @@ impl ControlContext {
     }
 
     /// The context of `restore`: the marker is checked against the rpc's log, not the local store.
+    /// A store an earlier version kept is moved without the marker rule: restore checks it.
     pub fn open_for_restore(config: BaseConfig, env: &ControlEnv, env_file: Option<PathBuf>) -> Result<Self> {
         let env = control_env(&config, env.clone());
-        Self::parts(&config, &env)?;
         let unmarked = ControlEnv { marker: None, ..env.clone() };
+        Self::parts(&config, &unmarked)?;
         let signer = agent_logic::signer::resolve_with(&config.private_key, &unmarked)
             .context("the local control store cannot be loaded; move it aside, then restore")?;
         let guard = Arc::clone(signer.guard());
@@ -788,7 +789,7 @@ pub enum PolicyCommands {
 /// Where a control command runs.
 #[derive(Clone, Debug, Default)]
 pub struct ControlOptions {
-    /// Overrides SILVANA_CONTROL_DIR.
+    /// Overrides SILVANA_CONTROL_DIR: the folder that holds `control/` instead of the agent folder.
     pub control_dir: Option<PathBuf>,
     /// The agent's env file, for the marker.
     pub env_file: Option<PathBuf>,

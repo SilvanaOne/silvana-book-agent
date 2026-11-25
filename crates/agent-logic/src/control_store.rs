@@ -19,8 +19,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Overrides the base directory of every control store.
+/// Overrides the folder that holds `control/`; by default it is the agent folder.
 pub const CONTROL_DIR_ENV: &str = "SILVANA_CONTROL_DIR";
+/// The control store's folder inside the agent folder.
+pub const CONTROL_DIR: &str = "control";
+/// Where earlier versions kept every store: `$HOME/<this>/<network>/<party>/control`.
+pub const LEGACY_BASE_DIR: &str = ".silvana-agent";
 /// The linked marker in the agent's env file: `<network>:<seq>:<hash>`.
 pub const MARKER_ENV: &str = "AGENT_CONTROL_HEAD";
 /// The network of the agent, `devnet` or `mainnet` for control.
@@ -58,15 +62,21 @@ const COMMANDS_BUDGET_BYTES: usize = 16_777_216;
 /// How long past its expiry a record may go early to keep commands.json in its budget.
 const EARLY_PRUNE_SECS: i64 = 3_600;
 
-/// The base directory: `SILVANA_CONTROL_DIR`, else `$HOME/.silvana-agent`.
-pub fn base_dir(control_dir: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
+/// The folder that holds `control/`: `SILVANA_CONTROL_DIR`, else the agent folder.
+pub fn base_dir(control_dir: Option<&OsStr>, agent_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = control_dir.filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    let home = home
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow!("HOME is not set: set {CONTROL_DIR_ENV}"))?;
-    Ok(PathBuf::from(home).join(".silvana-agent"))
+    agent_dir
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("the agent folder is unknown: set {CONTROL_DIR_ENV}"))
+}
+
+/// The base of the stores earlier versions kept: `$HOME/.silvana-agent`.
+pub fn legacy_base_dir(home: Option<&OsStr>) -> Option<PathBuf> {
+    home.filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(LEGACY_BASE_DIR))
 }
 
 /// What `CANTON_CHAIN` names for control.
@@ -153,11 +163,14 @@ impl fmt::Display for ControlMarker {
 #[derive(Clone, Debug, Default)]
 pub struct ControlEnv {
     pub control_dir: Option<OsString>,
+    /// `HOME`, for the stores earlier versions kept under it.
     pub home: Option<OsString>,
     pub chain: Option<String>,
     pub marker: Option<String>,
     /// `PARTY_AGENT`: the party whose key the marker belongs to.
     pub party: Option<String>,
+    /// The agent folder: the directory of the env file in use, else the current one.
+    pub agent_dir: Option<PathBuf>,
 }
 
 impl ControlEnv {
@@ -169,11 +182,40 @@ impl ControlEnv {
             chain: text(CHAIN_ENV),
             marker: text(MARKER_ENV),
             party: text("PARTY_AGENT"),
+            agent_dir: crate::agent_dir::current(),
         }
     }
 
+    /// The folder that holds `control/`.
     pub fn base(&self) -> Result<PathBuf> {
-        base_dir(self.control_dir.as_deref(), self.home.as_deref())
+        base_dir(self.control_dir.as_deref(), self.agent_dir.as_deref())
+    }
+
+    /// The base of the stores earlier versions kept, if `HOME` is set.
+    pub fn legacy_base(&self) -> Option<PathBuf> {
+        legacy_base_dir(self.home.as_deref())
+    }
+
+    /// Where an earlier version kept the store of `party` on `network`.
+    pub fn legacy_store_dir(&self, network: Network, party: &PartyId) -> Option<PathBuf> {
+        self.legacy_base().map(|base| legacy_dir(&base, network, party))
+    }
+
+    /// The marker, when it belongs to `party`: always, unless `PARTY_AGENT` names another key.
+    fn marker_for(&self, party: &PartyId) -> Result<Option<ControlMarker>> {
+        let covered = match self
+            .party
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            None => true,
+            Some(named) => match PartyId::parse(named) {
+                Ok(named) => named.namespace() == party.namespace(),
+                Err(_) => true,
+            },
+        };
+        if covered { self.marker() } else { Ok(None) }
     }
 
     /// The marker; blank is unset, anything malformed is an error.
@@ -217,6 +259,13 @@ fn file_component(party: &str) -> String {
             }
         })
         .collect()
+}
+
+/// `<base>/<network>/<party>/control`: where earlier versions kept a store.
+fn legacy_dir(base: &Path, network: Network, party: &PartyId) -> PathBuf {
+    base.join(network.as_str())
+        .join(file_component(party.as_str()))
+        .join(CONTROL_DIR)
 }
 
 /// An exclusive lock on one lock file of a control directory, released on drop.
@@ -932,20 +981,84 @@ pub struct ControlStore {
 }
 
 impl ControlStore {
-    /// `<base>/<network>/<party>/control`.
+    /// `<base>/control`; nothing is read.
     pub fn open(base: &Path, network: Network, party: &PartyId) -> Self {
         Self {
-            dir: base
-                .join(network.as_str())
-                .join(file_component(party.as_str()))
-                .join("control"),
+            dir: base.join(CONTROL_DIR),
             network,
             party: party.clone(),
         }
     }
 
-    /// The one stored party under `base/<network>` whose namespace is `public_key`'s.
+    /// The store of `party` in the folder of `env`, after the one-time move of the copy an
+    /// earlier version kept; a store of another party or network is refused.
+    pub fn locate(env: &ControlEnv, network: Network, party: &PartyId) -> Result<Self> {
+        let store = Self::open(&env.base()?, network, party);
+        store.check_owner()?;
+        if let Some(legacy) = env.legacy_store_dir(network, party) {
+            let marker = env.marker_for(party)?;
+            store.move_from(&legacy, marker.as_ref())?;
+        }
+        store.check_owner()?;
+        Ok(store)
+    }
+
+    /// [`Self::locate`] for the store of `public_key` when its party is not known.
+    pub fn locate_for_key(
+        env: &ControlEnv,
+        network: Network,
+        public_key: &[u8; 32],
+    ) -> Result<Option<Self>> {
+        let party = match Self::find(&env.base()?, network, public_key)? {
+            Some(store) => store.party,
+            None => {
+                let legacy = match env.legacy_base() {
+                    Some(base) => Self::find_legacy(&base, network, public_key)?,
+                    None => None,
+                };
+                match legacy {
+                    Some(store) => store.party,
+                    None => return Ok(None),
+                }
+            }
+        };
+        Self::locate(env, network, &party).map(Some)
+    }
+
+    /// The store in `base/control` when it is `public_key`'s; another key's store is
+    /// none of this key's, and this key's store for another network is refused.
     pub fn find(base: &Path, network: Network, public_key: &[u8; 32]) -> Result<Option<Self>> {
+        let dir = base.join(CONTROL_DIR);
+        let Some((stored_network, party)) = stored_identity(&dir)? else {
+            return Ok(None);
+        };
+        if party.namespace() != namespace_for_key(public_key) {
+            return Ok(None);
+        }
+        ensure!(
+            stored_network == network.as_str(),
+            "the control store in {} is for {stored_network}, not {network}",
+            dir.display()
+        );
+        Ok(Some(Self {
+            dir,
+            network,
+            party,
+        }))
+    }
+
+    /// The party the store in `base/control` names, on any network.
+    pub fn stored_party_in(base: &Path) -> Result<Option<PartyId>> {
+        Ok(stored_identity(&base.join(CONTROL_DIR))?.map(|(_, party)| party))
+    }
+
+    /// Where an earlier version kept the store of `public_key`: the one stored party under
+    /// `base/<network>` whose namespace is the key's.
+    pub fn find_legacy(
+        base: &Path,
+        network: Network,
+        public_key: &[u8; 32],
+    ) -> Result<Option<Self>> {
         let root = base.join(network.as_str());
         let suffix = format!("__{}", namespace_for_key(public_key));
         let listing = match fs::read_dir(&root) {
@@ -960,8 +1073,8 @@ impl ControlStore {
             let Some(name) = name.to_str().filter(|n| n.ends_with(&suffix)) else {
                 continue;
             };
-            let dir = item.path().join("control");
-            let Some(party) = stored_party(&dir)? else {
+            let dir = item.path().join(CONTROL_DIR);
+            let Some((_, party)) = stored_identity(&dir)? else {
                 continue;
             };
             ensure!(
@@ -985,6 +1098,76 @@ impl ControlStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Refuses files that name another party or network than this store's.
+    fn check_owner(&self) -> Result<()> {
+        if let Some((network, party)) = stored_identity(&self.dir)? {
+            ensure!(
+                party == self.party,
+                "the control store in {} belongs to {party}, not to this agent ({}): this \
+                 folder holds another agent's control files; give each agent its own folder",
+                self.dir.display(),
+                self.party
+            );
+            ensure!(
+                network == self.network.as_str(),
+                "the control store in {} is for {network}, but this agent runs on {}",
+                self.dir.display(),
+                self.network
+            );
+        }
+        Ok(())
+    }
+
+    /// The one-time move of `legacy` here; the copy must pass [`Self::verify_moved`].
+    fn move_from(&self, legacy: &Path, marker: Option<&ControlMarker>) -> Result<bool> {
+        let verify = |copy: &Path| {
+            let store = Self {
+                dir: copy.to_path_buf(),
+                network: self.network,
+                party: self.party.clone(),
+            };
+            store.verify_moved(marker)
+        };
+        crate::agent_dir::move_once(
+            "control store",
+            legacy,
+            &self.dir,
+            &[CONTROL_LOCK, COUNTERS_LOCK],
+            &verify,
+        )
+    }
+
+    /// The startup checks (chain, head, pending, policies, replay); with the marker set the
+    /// log's head must be the marker's, neither behind nor ahead.
+    fn verify_moved(&self, marker: Option<&ControlMarker>) -> Result<()> {
+        let contents = self.read(false)?;
+        let log = match &contents.log {
+            Some((log, documents)) => {
+                replay(log, documents).map_err(|e| {
+                    anyhow!(
+                        "the control log does not replay at seq {}: {}",
+                        e.seq,
+                        e.code_name()
+                    )
+                })?;
+                Some(log)
+            }
+            None => None,
+        };
+        if let Some(marker) = marker {
+            let log = log.ok_or_else(|| {
+                anyhow!("it holds no control log, but {MARKER_ENV}={marker} is set")
+            })?;
+            marker.check(log)?;
+            ensure!(
+                log.head() == marker.head,
+                "its control log (head seq {}) is ahead of the linked marker {MARKER_ENV}={marker}",
+                log.head().seq
+            );
+        }
+        Ok(())
     }
 
     pub fn network(&self) -> Network {
@@ -1479,8 +1662,15 @@ impl ControlStore {
         }
     }
 
-    /// Keeps what RegisterAgent sent.
+    /// Keeps what RegisterAgent sent; another key's evidence is never replaced.
     pub fn write_evidence(&self, evidence: &RegisterEvidence) -> Result<()> {
+        if let Some(kept) = self.read_evidence()? {
+            ensure!(
+                kept.public_key_hex == evidence.public_key_hex,
+                "{} holds the registration evidence of another key: give each agent its own folder",
+                self.dir.join(EVIDENCE_DIR).display()
+            );
+        }
         save_json(
             &self.dir.join(EVIDENCE_DIR).join(REGISTER_EVIDENCE_FILE),
             evidence,
@@ -1510,18 +1700,19 @@ fn pending_refusal(pending: &PendingRecord) -> String {
     }
 }
 
-/// The party a control directory's files name, if it has any.
-fn stored_party(dir: &Path) -> Result<Option<PartyId>> {
-    let party = if let Some(head) = read_json::<HeadFile>(&dir.join(HEAD_FILE))? {
-        Some(head.agent_party)
+/// The network and party a control directory's files name, if it has any.
+fn stored_identity(dir: &Path) -> Result<Option<(String, PartyId)>> {
+    let found = if let Some(head) = read_json::<HeadFile>(&dir.join(HEAD_FILE))? {
+        Some((head.network, head.agent_party))
     } else if let Some(log) = read_json::<LogFile>(&dir.join(LOG_FILE))? {
-        Some(log.agent_party)
+        Some((log.network, log.agent_party))
     } else {
-        read_json::<PendingFile>(&dir.join(PENDING_FILE))?.map(|p| p.agent_party)
+        read_json::<PendingFile>(&dir.join(PENDING_FILE))?.map(|p| (p.network, p.agent_party))
     };
-    party
-        .map(|p| {
-            PartyId::parse(&p)
+    found
+        .map(|(network, party)| {
+            PartyId::parse(&party)
+                .map(|party| (network, party))
                 .map_err(|_| anyhow!("{} names an invalid party", dir.display()))
         })
         .transpose()
@@ -1599,7 +1790,7 @@ enum FileMode {
 static TEMP_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The file a write to `path` replaces: the target of a symlink, else `path` itself.
-fn write_target(path: &Path) -> Result<PathBuf> {
+pub(crate) fn write_target(path: &Path) -> Result<PathBuf> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)
             .with_context(|| format!("{} is a symlink to a missing file", path.display())),
@@ -2311,8 +2502,11 @@ mod tests {
             let lock = store.lock().await.unwrap();
             store.append(&lock, &chain.entries, &[]).unwrap();
         });
+        assert_eq!(store.dir(), base.join(CONTROL_DIR));
         assert_eq!(ControlStore::find(&base, Network::Devnet, &key).unwrap(), Some(store.clone()));
-        assert!(ControlStore::find(&base, Network::Mainnet, &key).unwrap().is_none());
+        // One folder holds one agent: its store for another network is refused.
+        let err = ControlStore::find(&base, Network::Mainnet, &key).unwrap_err().to_string();
+        assert!(err.contains("is for devnet, not mainnet"), "{err}");
         let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
         assert!(ControlStore::find(&base, Network::Devnet, &other).unwrap().is_none());
         let evidence = RegisterEvidence {
@@ -2323,6 +2517,10 @@ mod tests {
             recorded_at: 5,
         };
         store.write_evidence(&evidence).unwrap();
+        assert_eq!(store.read_evidence().unwrap(), Some(evidence.clone()));
+        // A second agent in the same folder cannot replace it.
+        let foreign = RegisterEvidence { public_key_hex: hex::encode(other), ..evidence.clone() };
+        assert!(store.write_evidence(&foreign).unwrap_err().to_string().contains("another key"));
         assert_eq!(store.read_evidence().unwrap(), Some(evidence));
         let _ = fs::remove_dir_all(&base);
     }
@@ -2362,8 +2560,200 @@ mod tests {
         assert!(env.marker_covers(&key) && !env.marker_covers(&other));
         assert!(ControlEnv::default().marker_covers(&other));
         assert!(base_dir(None, None).is_err());
-        assert_eq!(base_dir(Some(OsStr::new("/x")), Some(OsStr::new("/h"))).unwrap(), PathBuf::from("/x"));
-        assert_eq!(base_dir(None, Some(OsStr::new("/h"))).unwrap(), PathBuf::from("/h/.silvana-agent"));
+        assert_eq!(base_dir(Some(OsStr::new("/x")), Some(Path::new("/a"))).unwrap(), PathBuf::from("/x"));
+        assert_eq!(base_dir(Some(OsStr::new("")), Some(Path::new("/a"))).unwrap(), PathBuf::from("/a"));
+        assert_eq!(base_dir(None, Some(Path::new("/a"))).unwrap(), PathBuf::from("/a"));
+        assert_eq!(legacy_base_dir(Some(OsStr::new("/h"))), Some(PathBuf::from("/h/.silvana-agent")));
+        assert_eq!(legacy_base_dir(None), None);
+    }
+
+    /// Every file under `dir` with its bytes, sorted.
+    fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            for item in fs::read_dir(&next).unwrap() {
+                let path = item.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push((path.strip_prefix(dir).unwrap().to_path_buf(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A store an earlier version kept under `home`, holding `n` entries, with evidence.
+    async fn legacy_store(home: &Path, seed: [u8; 32], n: usize) -> (ControlStore, TestChain) {
+        let party = party_for(seed, "agent-1").unwrap();
+        let legacy = legacy_dir(&home.join(LEGACY_BASE_DIR), Network::Devnet, &party);
+        let store = ControlStore::open(legacy.parent().unwrap(), Network::Devnet, &party);
+        assert_eq!(store.dir(), legacy);
+        let chain = TestChain::build(seed, &party, Network::Devnet, n).unwrap();
+        let lock = store.lock().await.unwrap();
+        store.append(&lock, &chain.entries, &[]).unwrap();
+        drop(lock);
+        let evidence = RegisterEvidence {
+            public_key_hex: "00".into(),
+            invite_code: "AGT-x".into(),
+            canonical_b64: "Y2Fu".into(),
+            signature_b64: "c2ln".into(),
+            recorded_at: 5,
+        };
+        store.write_evidence(&evidence).unwrap();
+        (store, chain)
+    }
+
+    fn agent_env(folder: &Path, home: &Path, party: &PartyId, marker: Option<ControlMarker>) -> ControlEnv {
+        ControlEnv {
+            home: Some(home.as_os_str().to_owned()),
+            chain: Some("devnet".into()),
+            marker: marker.map(|m| m.to_string()),
+            party: Some(party.to_string()),
+            agent_dir: Some(folder.to_path_buf()),
+            ..ControlEnv::default()
+        }
+    }
+
+    fn marker_at(chain: &TestChain, seq: usize) -> ControlMarker {
+        let entry = &chain.entries[seq - 1];
+        ControlMarker { network: Network::Devnet, head: HeadRef { seq: entry.seq(), hash: *entry.hash() } }
+    }
+
+    #[test]
+    fn the_store_lives_in_the_agent_folder_unless_overridden() {
+        let root = temp_dir("agent-folder");
+        let party = party_for(SEED, "agent-1").unwrap();
+        let env = agent_env(&root.join("agent"), &root.join("home"), &party, None);
+        let store = ControlStore::locate(&env, Network::Devnet, &party).unwrap();
+        assert_eq!(store.dir(), root.join("agent").join("control"));
+        assert!(!store.dir().exists(), "nothing is created before a write");
+        let env = ControlEnv { control_dir: Some(root.join("elsewhere").into_os_string()), ..env };
+        let store = ControlStore::locate(&env, Network::Devnet, &party).unwrap();
+        assert_eq!(store.dir(), root.join("elsewhere").join("control"));
+        let none = ControlEnv { agent_dir: None, control_dir: None, ..env };
+        assert!(ControlStore::locate(&none, Network::Devnet, &party).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_store_moves_once_verified_and_the_old_copy_is_left_untouched() {
+        let root = temp_dir("move");
+        let (home, folder) = (root.join("home"), root.join("agent"));
+        let (legacy, chain) = legacy_store(&home, SEED, 2).await;
+        let before = tree(legacy.dir());
+        // A stale copy of an interrupted move is our own temp: it is replaced.
+        fs::create_dir_all(folder.join("control.migrating").join("policies")).unwrap();
+        fs::write(folder.join("control.migrating").join(LOG_FILE), b"junk").unwrap();
+        let env = agent_env(&folder, &home, legacy.party(), Some(marker_at(&chain, 2)));
+        let store = ControlStore::locate(&env, Network::Devnet, legacy.party()).unwrap();
+        assert_eq!(store.dir(), folder.join("control"));
+        assert!(!folder.join("control.migrating").exists());
+        assert_eq!(store.snapshot().unwrap().unwrap().log.head(), marker_at(&chain, 2).head);
+        assert!(store.read_evidence().unwrap().is_some());
+        assert!(folder.join("control").join(crate::agent_dir::MOVED_FROM_FILE).exists());
+        assert_eq!(tree(legacy.dir()), before, "the old store is unchanged");
+        // Later opens use the moved store; the old one beside it is the stale copy.
+        let again = ControlStore::locate(&env, Network::Devnet, legacy.party()).unwrap();
+        assert_eq!(again, store);
+        let key = SigningKey::from_bytes(&SEED).verifying_key().to_bytes();
+        assert_eq!(ControlStore::locate_for_key(&env, Network::Devnet, &key).unwrap(), Some(store));
+        assert_eq!(tree(legacy.dir()), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_move_finds_the_old_store_by_key_and_refuses_two_stores() {
+        let root = temp_dir("both");
+        let (home, folder) = (root.join("home"), root.join("agent"));
+        let (legacy, chain) = legacy_store(&home, SEED, 1).await;
+        // Without PARTY_AGENT the old store is found by the key's namespace.
+        let env = ControlEnv { party: None, ..agent_env(&folder, &home, legacy.party(), None) };
+        let key = SigningKey::from_bytes(&SEED).verifying_key().to_bytes();
+        let moved = ControlStore::locate_for_key(&env, Network::Devnet, &key).unwrap().unwrap();
+        assert_eq!(moved.dir(), folder.join("control"));
+        // A store that was not moved from it, beside the old one: refused, both named.
+        let other = root.join("agent-2");
+        let store = ControlStore::open(&other, Network::Devnet, legacy.party());
+        let lock = store.lock().await.unwrap();
+        store.append(&lock, &chain.entries, &[]).unwrap();
+        drop(lock);
+        let env = agent_env(&other, &home, legacy.party(), Some(marker_at(&chain, 1)));
+        let err = format!("{:#}", ControlStore::locate(&env, Network::Devnet, legacy.party()).unwrap_err());
+        assert!(err.contains(&*store.dir().to_string_lossy()) && err.contains(&*legacy.dir().to_string_lossy()), "{err}");
+        assert!(ControlStore::locate_for_key(&env, Network::Devnet, &key).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_copy_behind_or_ahead_of_the_marker_is_refused_and_removed() {
+        let root = temp_dir("marker");
+        let (home, folder) = (root.join("home"), root.join("agent"));
+        let (legacy, _) = legacy_store(&home, SEED, 2).await;
+        let longer = TestChain::build(SEED, legacy.party(), Network::Devnet, 3).unwrap();
+        let before = tree(legacy.dir());
+        for (seq, reason) in [(1, "ahead of the linked marker"), (3, "behind the linked marker")] {
+            let env = agent_env(&folder, &home, legacy.party(), Some(marker_at(&longer, seq)));
+            let err = format!("{:#}", ControlStore::locate(&env, Network::Devnet, legacy.party()).unwrap_err());
+            assert!(err.contains(reason) && err.contains("refusing to move the control store"), "{err}");
+            assert!(!folder.join("control").exists() && !folder.join("control.migrating").exists());
+        }
+        assert_eq!(tree(legacy.dir()), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_store_of_another_party_or_network_is_refused() {
+        let root = temp_dir("owner");
+        let folder = root.join("agent");
+        let party = party_for(SEED, "agent-1").unwrap();
+        let mainnet = ControlStore::open(&folder, Network::Mainnet, &party);
+        let chain = TestChain::build(SEED, &party, Network::Mainnet, 1).unwrap();
+        let lock = mainnet.lock().await.unwrap();
+        mainnet.append(&lock, &chain.entries, &[]).unwrap();
+        drop(lock);
+        let env = agent_env(&folder, &root.join("home"), &party, None);
+        let err = ControlStore::locate(&env, Network::Devnet, &party).unwrap_err().to_string();
+        assert!(err.contains("is for mainnet, but this agent runs on devnet"), "{err}");
+        let other = party_for([0x44; 32], "agent-2").unwrap();
+        let env = agent_env(&folder, &root.join("home"), &other, None);
+        let err = ControlStore::locate(&env, Network::Mainnet, &other).unwrap_err().to_string();
+        assert!(err.contains("another agent's control files"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_second_agent_in_a_shared_folder_is_told_it_holds_another_agent() {
+        let root = temp_dir("shared");
+        let (home, folder) = (root.join("home"), root.join("agents"));
+        let (first, chain) = legacy_store(&home, SEED, 1).await;
+        let env = agent_env(&folder, &home, first.party(), Some(marker_at(&chain, 1)));
+        ControlStore::locate(&env, Network::Devnet, first.party()).unwrap();
+        let (second, chain) = legacy_store(&home, [0x44; 32], 1).await;
+        let before = tree(second.dir());
+        let env = agent_env(&folder, &home, second.party(), Some(marker_at(&chain, 1)));
+        let err = format!("{:#}", ControlStore::locate(&env, Network::Devnet, second.party()).unwrap_err());
+        assert!(err.contains("another agent's control files") && !err.contains("two copies"), "{err}");
+        assert_eq!(tree(second.dir()), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_control_dir_naming_the_old_store_uses_it_in_place() {
+        let root = temp_dir("in-place");
+        let home = root.join("home");
+        let (legacy, chain) = legacy_store(&home, SEED, 1).await;
+        let before = tree(legacy.dir());
+        let env = ControlEnv {
+            control_dir: legacy.dir().parent().map(|p| p.as_os_str().to_owned()),
+            ..agent_env(&root.join("agent"), &home, legacy.party(), Some(marker_at(&chain, 1)))
+        };
+        let store = ControlStore::locate(&env, Network::Devnet, legacy.party()).unwrap();
+        assert_eq!(store.dir(), legacy.dir());
+        assert_eq!(tree(legacy.dir()), before);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

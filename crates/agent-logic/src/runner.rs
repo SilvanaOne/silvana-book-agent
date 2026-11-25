@@ -2107,6 +2107,9 @@ mod loop_tests {
         entered: u32,
         visited: u32,
         reports: Vec<CycleReport>,
+        /// Each CC/USD rate applied, and the one held as each cycle starts
+        cc_rates: Vec<Option<f64>>,
+        cycle_rates: Vec<Option<f64>>,
     }
 
     type SharedLog = Arc<std::sync::Mutex<GridLog>>;
@@ -2116,12 +2119,13 @@ mod loop_tests {
         markets: u32,
         per_market: Duration,
         log: SharedLog,
+        cc_rate: Option<f64>,
     }
 
     impl FakeGrid {
         fn new(markets: u32, per_market: Duration) -> (Self, SharedLog) {
             let log = SharedLog::default();
-            (Self { markets, per_market, log: Arc::clone(&log) }, log)
+            (Self { markets, per_market, log: Arc::clone(&log), cc_rate: None }, log)
         }
     }
 
@@ -2131,8 +2135,17 @@ mod loop_tests {
             self.log.lock().unwrap().balances += 1;
         }
 
+        fn apply_cc_usd_rate(&mut self, rate: Option<f64>) {
+            self.cc_rate = rate;
+            self.log.lock().unwrap().cc_rates.push(rate);
+        }
+
         async fn run_cycle(&mut self, stop: &Shutdown, deadline: Instant) -> Result<CycleReport> {
-            self.log.lock().unwrap().starts.push(Instant::now());
+            {
+                let mut log = self.log.lock().unwrap();
+                log.starts.push(Instant::now());
+                log.cycle_rates.push(self.cc_rate);
+            }
             let mut report = CycleReport::default();
             for i in 0..self.markets {
                 if stop.is_shutting_down() || past_soft_deadline(i as usize, Instant::now(), deadline) {
@@ -2907,6 +2920,61 @@ mod loop_tests {
         assert!(join_grid(handle, WAIT).await.is_some());
         assert_eq!(log.lock().unwrap().balances, 0);
         assert_eq!(logs.count("Failed to fetch balances: ledger unavailable"), 1);
+    }
+
+    /// Run `grid` with `lm` until two cycles end; returns the grid.
+    async fn two_cycles(grid: FakeGrid, provider: Arc<dyn BalanceProvider>, lm: &Arc<LiquidityManager>) -> FakeGrid {
+        let shutdown = Shutdown::new();
+        let stats = GridStats::new();
+        let handle = spawn_grid_task(
+            grid,
+            BaseConfig::test_minimal().unwrap(),
+            provider,
+            Some(Arc::clone(lm)),
+            shutdown.clone(),
+            Arc::new(Notify::new()),
+            stats.clone(),
+            timing(10, 5, 1_000, 30),
+        )
+        .unwrap();
+        assert!(wait_for(WAIT, || stats.snapshot().cycles >= 2).await);
+        shutdown.signal();
+        join_grid(handle, WAIT).await.expect("grid returned on shutdown")
+    }
+
+    // Each cycle starts with the LM's CC/USD rate, or None while it has none
+    #[tokio::test]
+    async fn grid_task_applies_the_cc_usd_rate_before_each_cycle() {
+        for (rate, expect) in [(Some(rust_decimal::Decimal::new(746, 4)), Some(0.0746)), (None, None)] {
+            let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+            if let Some(rate) = rate {
+                lm.update_cc_usd_rate(rate).await;
+            }
+            let (mut grid, log) = FakeGrid::new(1, Duration::ZERO);
+            grid.cc_rate = Some(0.05);
+            let (provider, _calls) = counting();
+            let grid = two_cycles(grid, provider, &lm).await;
+            let log = log.lock().unwrap();
+            assert!(log.cc_rates.len() >= 2 && log.cc_rates.iter().all(|r| *r == expect), "{:?}", log.cc_rates);
+            assert!(log.cycle_rates.len() >= 2 && log.cycle_rates.iter().all(|r| *r == expect), "{:?}", log.cycle_rates);
+            assert_eq!(grid.cc_rate, expect);
+        }
+    }
+
+    // A read held past the balance timeout applies no rate; the grid keeps its last one
+    #[tokio::test]
+    async fn grid_task_keeps_the_last_cc_usd_rate_when_the_read_times_out() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_usd_rate(rust_decimal::Decimal::new(746, 4)).await;
+        let (mut grid, log) = FakeGrid::new(1, Duration::ZERO);
+        grid.cc_rate = Some(0.05);
+        let held = lm.hold_lock().await;
+        let grid = two_cycles(grid, Arc::new(FailingProvider), &lm).await;
+        drop(held);
+        let log = log.lock().unwrap();
+        assert!(log.cc_rates.is_empty(), "{:?}", log.cc_rates);
+        assert!(log.cycle_rates.len() >= 2 && log.cycle_rates.iter().all(|r| *r == Some(0.05)), "{:?}", log.cycle_rates);
+        assert_eq!(grid.cc_rate, Some(0.05));
     }
 
     // ---- Ctrl-C, shutdown save and startup ----
