@@ -128,7 +128,7 @@ impl OrderbookRpcClient {
         Ok(Self::with_channel(channel, jwt, deadline))
     }
 
-    fn with_channel(channel: Channel, jwt: Option<String>, deadline: Duration) -> Self {
+    pub(crate) fn with_channel(channel: Channel, jwt: Option<String>, deadline: Duration) -> Self {
         let token = Arc::new(RwLock::new(jwt.unwrap_or_default()));
         let auth_interceptor = AuthInterceptor { token: token.clone() };
         let settlement_client = SettlementServiceClient::with_interceptor(channel, auth_interceptor)

@@ -1820,12 +1820,12 @@ impl DAppProviderClient {
     }
 
     /// Convenience wrapper: prepare → verify → authorize → execute.
-    /// `fee_type` is "dvp" or "allocate".
+    /// `fee_type` is "dvp" or "allocate"; returns the debit the server stated, when exact.
     pub async fn pay_processing_fee(
         &mut self,
         proposal_id: &str,
         fee_type: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<rust_decimal::Decimal>> {
         let prep = self.prepare_pay_fee(proposal_id, fee_type).await?;
         let exec = self
             .execute_pay_fee(proposal_id, fee_type, &prep.fees_json, &prep.session_id)
@@ -1837,8 +1837,16 @@ impl DAppProviderClient {
                 exec.error_message.unwrap_or_else(|| "<no error message>".to_string())
             ));
         }
-        Ok(())
+        Ok(debited_cc(&prep))
     }
+}
+
+/// The CC a prepared fee debits; `None` unless an exact, non-negative decimal.
+pub(crate) fn debited_cc(prep: &PreparePayFeeResponse) -> Option<rust_decimal::Decimal> {
+    let amount = prep.fee.as_ref()?.amount_cc.trim();
+    rust_decimal::Decimal::from_str_exact(amount)
+        .ok()
+        .filter(|cc| *cc >= rust_decimal::Decimal::ZERO)
 }
 
 /// Result of scanning ledger updates for one command.
@@ -5346,5 +5354,29 @@ mod bounded_io_tests {
             refused_before_signing(&o, &refusal(unmapped));
             assert_eq!((calls(), logs.count(&line(unmapped, ""))), (3, 1));
         }
+    }
+}
+
+#[cfg(test)]
+mod pay_fee_amount_tests {
+    use super::debited_cc;
+    use orderbook_proto::ledger::{Fee, PreparePayFeeResponse};
+    use rust_decimal::Decimal;
+
+    fn prep(amount: &str) -> PreparePayFeeResponse {
+        PreparePayFeeResponse {
+            fee: Some(Fee { amount_cc: amount.to_string(), ..Default::default() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_debited_amount_is_read_exactly_or_not_at_all() {
+        assert_eq!(debited_cc(&prep("13.4000000000")), Some(Decimal::new(134, 1)));
+        assert_eq!(debited_cc(&prep("0")), Some(Decimal::ZERO));
+        for unusable in ["1e3", "-1", "", "x"] {
+            assert_eq!(debited_cc(&prep(unusable)), None, "{unusable:?}");
+        }
+        assert_eq!(debited_cc(&PreparePayFeeResponse::default()), None);
     }
 }

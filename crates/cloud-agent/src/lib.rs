@@ -46,6 +46,7 @@ mod log_text;
 mod lp_stream;
 pub mod merge_worker;
 pub mod payment_queue;
+pub mod prepaid_poller;
 pub mod rfq_handler;
 pub mod rfq_v2;
 pub mod split_worker;
@@ -643,6 +644,10 @@ pub async fn run_cloud_agent(
         config.depletion_max_hours,
         config.depletion_min_hours,
     );
+    // Prepaid held per settlement for its own transactions
+    liquidity_manager
+        .set_settlement_traffic(agent_logic::liquidity::settlement_traffic_cc(config.settlement_traffic_cc))
+        .await;
     // 0 disables the balance-staleness gate.
     liquidity_manager.set_stale_after(if config.balance_stale_after_secs == 0 {
         std::time::Duration::MAX
@@ -907,6 +912,22 @@ pub async fn run_cloud_agent(
     .await
     .context("Failed to create ledger client")?;
 
+    // Settlement fees are debited from prepaid credit; the fee checks need a fresh figure.
+    let prepaid_client = DAppProviderClient::new(
+        &config.orderbook_grpc_url,
+        &config.party_id,
+        &config.role,
+        &config.private_key,
+        config.token_ttl_secs,
+        Some(config.node_name.as_str()),
+        &config.ledger_service_public_key,
+        Some(config.connection_timeout_secs),
+        Some(config.request_timeout_secs),
+    )
+    .await
+    .context("Failed to create prepaid poller client")?;
+    prepaid_poller::spawn(prepaid_client, Arc::clone(&liquidity_manager), lp_shutdown.clone())?;
+
     // Auto-topup wiring: build a separate DAppProviderClient for the
     // background topup runner (its own JWT, its own connection — so its
     // submit_transaction never recurses through the main client's
@@ -939,13 +960,15 @@ pub async fn run_cloud_agent(
             .ok_or_else(|| {
                 anyhow!("auto-topup: MIN_PREPAID_TRAFFIC_BALANCE_CC / PREPAID_TRAFFIC_TOPUP_CC rejected")
             })?
-            .with_fee_demand(liquidity_manager)
+            .with_fee_demand(Arc::clone(&liquidity_manager))
             .with_pins(prepaid_traffic_pin(&config), named_party(&config.dso_party));
             info!(
                 min_cc = %min_cc,
                 topup_cc = %topup_cc,
                 "Auto-topup enabled"
             );
+            // Wallet CC a top-up can move counts as fee capacity
+            liquidity_manager.set_auto_topup(Some(topup_cc)).await;
             Some(Arc::new(runner).spawn(lp_shutdown.clone())?)
         }
         _ => {
@@ -1497,6 +1520,9 @@ pub async fn run_fill(
         config.depletion_max_hours,
         config.depletion_min_hours,
     );
+    fill_lm
+        .set_settlement_traffic(agent_logic::liquidity::settlement_traffic_cc(config.settlement_traffic_cc))
+        .await;
     // CloudSettlementBackend spawns the ACS / merge / payment-queue workers.
     // Wire Ctrl-C and natural fill-loop completion to its `Shutdown` so those
     // workers exit promptly instead of being cleaned up only when the runtime

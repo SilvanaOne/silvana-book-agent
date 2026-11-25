@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -11,6 +12,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
 use orderbook_proto::ledger::TokenBalance;
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::config::BaseConfig;
 use crate::liquidity::LiquidityManager;
@@ -42,6 +44,10 @@ pub trait GridCycle: Send + 'static {
     /// Take a fresh, registry-filtered balance snapshot.
     fn apply_balances(&mut self, balances: Vec<TokenBalance>);
 
+    /// Take the prepaid fee capacity in CC (`None` while unknown) and what one fill needs,
+    /// by market where a fee was seen there.
+    fn apply_fee_capacity(&mut self, _capacity: Option<f64>, _per_fill: f64, _by_market: HashMap<String, f64>) {}
+
     /// One pass over the markets; stops between markets on shutdown or past `deadline`.
     async fn run_cycle(&mut self, stop: &Shutdown, deadline: Instant) -> Result<CycleReport>;
 }
@@ -50,6 +56,10 @@ pub trait GridCycle: Send + 'static {
 impl GridCycle for OrderManager {
     fn apply_balances(&mut self, balances: Vec<TokenBalance>) {
         self.set_balances(balances);
+    }
+
+    fn apply_fee_capacity(&mut self, capacity: Option<f64>, per_fill: f64, by_market: HashMap<String, f64>) {
+        self.set_fee_capacity(capacity, per_fill, by_market);
     }
 
     async fn run_cycle(&mut self, stop: &Shutdown, deadline: Instant) -> Result<CycleReport> {
@@ -244,6 +254,17 @@ pub fn spawn_grid_task<G: GridCycle>(
                 Ok(Err(e)) => Some(format!("Failed to fetch balances: {e:#}")),
                 Err(_) => Some("Balance fetch timed out".to_string()),
             };
+            if let Some(lm) = lm.as_ref() {
+                let read = async { (lm.fee_capacity().await, lm.fill_needs().await) };
+                let (capacity, (per_fill, by_market)) = tokio::time::timeout(timing.balance_timeout, read)
+                    .await
+                    .unwrap_or((None, (rust_decimal::Decimal::ZERO, Vec::new())));
+                let by_market = by_market
+                    .into_iter()
+                    .map(|(market, need)| (market, need.to_f64().unwrap_or(f64::MAX)))
+                    .collect();
+                grid.apply_fee_capacity(capacity.and_then(|c| c.to_f64()), per_fill.to_f64().unwrap_or(0.0), by_market);
+            }
             if let Some(failure) = failure {
                 if balance_warned_at.is_none_or(|t| t.elapsed() >= BALANCE_WARN_EVERY) {
                     balance_warned_at = Some(Instant::now());

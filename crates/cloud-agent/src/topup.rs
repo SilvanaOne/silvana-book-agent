@@ -11,7 +11,7 @@
 //! 3. After each settlement step the backend runs, paid or refused.
 //!
 //! With a fee source attached it also tops up when the available balance
-//! is below the largest fee reserved for an in-flight settlement.
+//! is below what in-flight settlements still hold in prepaid.
 //!
 //! All three share a re-entrancy guard so the topup itself (which submits a tx)
 //! never recurses or stacks up under load. The runner owns its OWN
@@ -103,7 +103,7 @@ impl TopupRunner {
         }
     }
 
-    /// Also top up when balance plus credit is below the largest fee reserved for an in-flight settlement.
+    /// Also top up when balance plus credit is below what in-flight settlements still hold in prepaid.
     pub fn with_fee_demand(mut self, lm: Arc<LiquidityManager>) -> Self {
         self.fee_demand = Some(lm);
         self
@@ -158,7 +158,7 @@ impl TopupRunner {
         let mut client = self.client.clone();
         let pt = within(deadline, client.get_prepaid_traffic_balance()).await?;
         let demand = match &self.fee_demand {
-            Some(lm) => within(deadline, async { Ok(lm.largest_fee_commitment().await) }).await?,
+            Some(lm) => within(deadline, async { Ok(lm.prepaid_demand().await) }).await?,
             None => Decimal::ZERO,
         };
 
@@ -335,7 +335,7 @@ fn drain(rx: &mut mpsc::Receiver<()>) {
     }
 }
 
-/// Below the floor, or below the largest fee reserved for an in-flight settlement.
+/// Below the floor, or below what in-flight settlements still hold in prepaid.
 fn needs_topup(balance: Decimal, available: Decimal, min: Decimal, demand: Decimal) -> bool {
     balance < min || available < demand
 }
@@ -588,6 +588,7 @@ mod tests {
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_prepaid(Decimal::from(100), std::time::Instant::now()).await;
         lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::from(20)).await.unwrap();
         for (with_demand, topups) in [(true, 1), (false, 0)] {
             let ledger = crate::test_util::FakeLedger::start(balances("10", "10", "100")).await;
@@ -600,6 +601,23 @@ mod tests {
             assert_eq!(ledger.calls("GetBalances"), topups, "with_demand={with_demand}");
             ledger.stop().await;
         }
+    }
+
+    // Ten pending fees of 14.7 CC each need a top-up though each alone fits in 50
+    #[tokio::test]
+    async fn the_demand_is_every_pending_fee_not_the_largest() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(1000)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_prepaid(Decimal::from(50), std::time::Instant::now()).await;
+        lm.set_auto_topup(Some(Decimal::from(125))).await;
+        let fee = Decimal::from_str_exact("14.7").unwrap();
+        for i in 0..10 {
+            lm.try_commit(&format!("p{i}"), "USDCx", Decimal::ONE, fee).await.unwrap();
+        }
+        let demand = lm.prepaid_demand().await;
+        assert_eq!(demand, Decimal::from(147));
+        assert!(needs_topup(Decimal::from(50), Decimal::from(50), Decimal::from(20), demand));
     }
 
     // A wallet short of CC used to be read again, with a WARN, on every settlement step

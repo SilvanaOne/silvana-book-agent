@@ -562,6 +562,59 @@ fn fmt_sig4(d: rust_decimal::Decimal) -> String {
     d.round_dp(dp).to_string()
 }
 
+/// The heartbeat line for the prepaid credit that pays settlement fees.
+fn prepaid_line(p: &crate::liquidity::PrepaidStats) -> String {
+    let shown = |v: Option<rust_decimal::Decimal>| v.map_or_else(|| "unknown".to_string(), fmt_sig4);
+    let refreshed = match p.refreshed_secs_ago {
+        Some(secs) if p.stale => format!("STALE {secs}s"),
+        Some(secs) => format!("refreshed {secs}s ago"),
+        None => "never refreshed".to_string(),
+    };
+    let topup = p
+        .auto_topup_cc
+        .map_or_else(|| "off".to_string(), |cc| format!("{} CC", fmt_sig4(cc)));
+    format!(
+        "LIQUIDITY PREPAID: {} avail / {} fees + {} traffic committed / {} fee capacity, auto top-up {}, {}",
+        shown(p.available),
+        fmt_sig4(p.fee_committed),
+        fmt_sig4(p.traffic_held),
+        shown(p.capacity),
+        topup,
+        refreshed,
+    )
+}
+
+#[cfg(test)]
+mod prepaid_line_tests {
+    use super::prepaid_line;
+    use crate::liquidity::PrepaidStats;
+    use rust_decimal::Decimal;
+
+    fn stats(refreshed_secs_ago: Option<u64>, stale: bool, capacity: Option<Decimal>) -> PrepaidStats {
+        PrepaidStats {
+            available: refreshed_secs_ago.map(|_| Decimal::from(94)),
+            refreshed_secs_ago,
+            stale,
+            fee_committed: Decimal::from(15),
+            traffic_held: Decimal::new(12, 1),
+            capacity,
+            auto_topup_cc: stale.then(|| Decimal::from(125)),
+        }
+    }
+
+    #[test]
+    fn the_prepaid_line_names_unknown_stale_and_never_refreshed_figures() {
+        let never = prepaid_line(&stats(None, false, None));
+        assert!(never.starts_with("LIQUIDITY PREPAID: unknown avail / 15 fees + 1.2 traffic committed / unknown fee capacity"), "{never}");
+        assert!(never.ends_with("auto top-up off, never refreshed"), "{never}");
+        let stale = prepaid_line(&stats(Some(130), true, None));
+        assert!(stale.contains("94 avail") && stale.contains("unknown fee capacity"), "{stale}");
+        assert!(stale.ends_with("auto top-up 125 CC, STALE 130s"), "{stale}");
+        let fresh = prepaid_line(&stats(Some(5), false, Some(Decimal::from(79))));
+        assert!(fresh.contains("79 fee capacity") && fresh.ends_with("refreshed 5s ago"), "{fresh}");
+    }
+}
+
 /// Trade parameters recorded when buyer accepts an RFQ quote
 #[derive(Debug, Clone)]
 pub struct AcceptedRfqTrade {
@@ -1422,15 +1475,10 @@ where
                                 None => ", never refreshed".to_string(),
                             };
                             info!(
-                                "LIQUIDITY {}: {} bal / {} committed{}{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}{}",
+                                "LIQUIDITY {}: {} bal / {} committed{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}{}",
                                 s.token,
                                 fmt_sig4(s.balance),
                                 fmt_sig4(s.committed),
-                                if s.fee_committed > rust_decimal::Decimal::ZERO {
-                                    format!(" + {} fees", fmt_sig4(s.fee_committed))
-                                } else {
-                                    String::new()
-                                },
                                 if s.fee_reserve > rust_decimal::Decimal::ZERO {
                                     format!(" + {} reserve", fmt_sig4(s.fee_reserve))
                                 } else {
@@ -1444,6 +1492,9 @@ where
                                 holdings_str,
                                 refreshed_str,
                             );
+                        }
+                        if let Ok(p) = tokio::time::timeout(HEARTBEAT_STATS_TIMEOUT, lm.prepaid_stats()).await {
+                            info!("{}", prepaid_line(&p));
                         }
                     }
                     // Every 5 minutes, also list individual settlement IDs

@@ -42,6 +42,34 @@ pub(crate) enum Funding {
 pub(crate) enum UnknownWhy {
     Aged,
     FeeReserve,
+    FeeCapacity,
+}
+
+/// What the grid's fee prerequisite reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum FeeHeadroom {
+    /// No prepaid figure is fed: wallet CC must cover the fee reserve.
+    Wallet,
+    /// Prepaid fee capacity in CC (`None` while unknown or stale) and what one fill needs.
+    Capacity { capacity: Option<f64>, per_fill: f64 },
+}
+
+impl FeeHeadroom {
+    /// This headroom for a market whose fill needs `need` (when a fee was seen there).
+    fn for_market(self, need: Option<f64>) -> Self {
+        match (self, need) {
+            (Self::Capacity { capacity, .. }, Some(per_fill)) => Self::Capacity { capacity, per_fill },
+            (headroom, _) => headroom,
+        }
+    }
+
+    /// Whether the fees of one fill can be paid.
+    fn covers_fees(self, balances: &[TokenBalance], fee_reserve_cc: f64) -> bool {
+        match self {
+            Self::Wallet => unlocked_cc(balances) >= fee_reserve_cc,
+            Self::Capacity { capacity, per_fill } => capacity.is_some_and(|c| c > 0.0 && c >= per_fill),
+        }
+    }
 }
 
 /// Per-side funding of a market's grid and the amounts behind it.
@@ -175,6 +203,10 @@ pub struct OrderManager {
     balance_age_warned_at: Option<Instant>,
     /// Rate limit for the CC fee-reserve warning.
     fee_warned_at: Option<Instant>,
+    /// Fee prerequisite: wallet CC until a prepaid capacity is fed.
+    fee_headroom: FeeHeadroom,
+    /// One fill's fee need per market where a fee was seen; others use the headroom's own.
+    fill_needs: HashMap<String, f64>,
     /// Rate limit for the missing-order-id warning.
     order_ref_warned_at: Option<Instant>,
     /// Last valid price per market, so the park check can size bids without an RPC.
@@ -316,6 +348,8 @@ impl OrderManager {
             balances_set_at: None,
             balance_age_warned_at: None,
             fee_warned_at: None,
+            fee_headroom: FeeHeadroom::Wallet,
+            fill_needs: HashMap::new(),
             order_ref_warned_at: None,
             last_seen_price: HashMap::new(),
             last_resting: HashMap::new(),
@@ -433,6 +467,18 @@ impl OrderManager {
             }
         }
         self.tick_sizes.get(market_id).copied().unwrap_or(0.0000000100)
+    }
+
+    /// Fee capacity from prepaid credit and one fill's need (by market where a fee was seen);
+    /// replaces the wallet CC prerequisite.
+    pub fn set_fee_capacity(&mut self, capacity: Option<f64>, per_fill: f64, by_market: HashMap<String, f64>) {
+        self.fee_headroom = FeeHeadroom::Capacity { capacity, per_fill };
+        self.fill_needs = by_market;
+    }
+
+    /// The fee prerequisite for one market.
+    fn headroom_for(&self, market_id: &str) -> FeeHeadroom {
+        self.fee_headroom.for_market(self.fill_needs.get(market_id).copied())
     }
 
     /// Update cached balances. On-chain wire ids are normalized to the internal
@@ -790,6 +836,7 @@ impl OrderManager {
             mid_price,
             offer_levels,
             self.config.fee_reserve_cc,
+            self.headroom_for(&market_config.market_id),
         )
     }
 
@@ -810,6 +857,10 @@ impl OrderManager {
                     );
                 }
             }
+            Some(UnknownWhy::FeeCapacity) if rate_limit(&mut self.fee_warned_at, FUNDING_WARN_EVERY) => {
+                warn!("Grid paused for {}: prepaid fee capacity unknown or short of one fill's fees", market_id);
+            }
+            Some(UnknownWhy::FeeCapacity) => {}
             None => {}
         }
         let (base, quote) = market_id.split_once('-').unwrap_or((market_id, market_id));
@@ -1545,7 +1596,7 @@ impl OrderManager {
         let (activity, inventory) = {
             let mut tracker = self.tracker.lock().await;
             let activity = tracker.market_activity(market_id);
-            let inventory = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, &activity);
+            let inventory = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, self.headroom_for(market_id), &activity);
             if inventory.usable {
                 note_start(tracker.strategy_starts_mut(), market_id, rt, &inventory, price);
             }
@@ -1807,6 +1858,7 @@ impl OrderManager {
             &ladder.bids,
             &ladder.offers,
             self.config.fee_reserve_cc,
+            self.headroom_for(market_id),
         );
         if funding.bid == Funding::Unknown && funding.offer == Funding::Unknown {
             report.held_unknown = report.held_unknown.saturating_add(1);
@@ -1947,7 +1999,7 @@ impl OrderManager {
         rt.prune(now);
         if let Some(price) = self.last_seen_price.get(market_id).copied().filter(|_| rt.start.is_none()) {
             let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
-            let inv = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, &activity);
+            let inv = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, self.headroom_for(market_id), &activity);
             if inv.usable {
                 rt.start = Some(Start { base: inv.base, quote: inv.quote, price });
             }
@@ -1965,7 +2017,7 @@ impl OrderManager {
         let Some(price) = self.last_seen_price.get(market_id).copied() else { return };
         rt.last_report = now;
         let usable = balances_usable(self.balances_set_at, self.config.balance_stale_after_secs, now);
-        let inv = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, activity);
+        let inv = market_inventory(&self.balances, usable, market_id, self.config.fee_reserve_cc, self.headroom_for(market_id), activity);
         info!(
             "{}",
             format_report(&ReportLine {
@@ -2066,6 +2118,7 @@ pub(crate) fn market_inventory(
     usable: bool,
     market_id: &str,
     fee_reserve_cc: f64,
+    headroom: FeeHeadroom,
     activity: &MarketActivity,
 ) -> Inventory {
     let Some((base, quote)) = market_id.split_once('-').filter(|(_, q)| !q.contains('-')) else {
@@ -2078,7 +2131,7 @@ pub(crate) fn market_inventory(
         quote: amount(q, |t| &t.total_amount) - activity.pending_bid_quote + activity.pending_offer_quote,
         base_avail: (amount(b, |t| &t.unlocked_amount) - reserve(base)).max(0.0),
         quote_avail: (amount(q, |t| &t.unlocked_amount) - reserve(quote)).max(0.0),
-        usable: usable && !balances.is_empty() && unlocked_cc(balances) >= fee_reserve_cc,
+        usable: usable && !balances.is_empty() && headroom.covers_fees(balances, fee_reserve_cc),
     }
 }
 
@@ -2170,11 +2223,13 @@ pub(crate) fn grid_funding(
     mid: Option<f64>,
     offer_levels: &[PriceLevel],
     fee_reserve_cc: f64,
+    headroom: FeeHeadroom,
 ) -> GridFunding {
-    ladder_funding(balances, usable, &market.market_id, mid, &market.bid_levels, offer_levels, fee_reserve_cc)
+    ladder_funding(balances, usable, &market.market_id, mid, &market.bid_levels, offer_levels, fee_reserve_cc, headroom)
 }
 
 /// [`grid_funding`] for any ladder.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ladder_funding(
     balances: &[TokenBalance],
     usable: bool,
@@ -2183,6 +2238,7 @@ pub(crate) fn ladder_funding(
     bid_levels: &[PriceLevel],
     offer_levels: &[PriceLevel],
     fee_reserve_cc: f64,
+    headroom: FeeHeadroom,
 ) -> GridFunding {
     let mut out = GridFunding {
         bid: Funding::Unknown,
@@ -2212,9 +2268,12 @@ pub(crate) fn ladder_funding(
     let quote_unlocked = if quote == "CC" { cc_unlocked } else { unlocked_token(balances, quote) };
     out.cc_avail = cc_unlocked;
 
-    // CC fee reserve is a prerequisite for either side
-    if cc_unlocked < fee_reserve_cc {
-        out.why = Some(UnknownWhy::FeeReserve);
+    // Paying fees is a prerequisite for either side
+    if !headroom.covers_fees(balances, fee_reserve_cc) {
+        out.why = Some(match headroom {
+            FeeHeadroom::Wallet => UnknownWhy::FeeReserve,
+            FeeHeadroom::Capacity { .. } => UnknownWhy::FeeCapacity,
+        });
         return out;
     }
 
@@ -2834,9 +2893,9 @@ mod grid_plan_tests {
     fn aged_or_missing_balances_are_unknown() {
         let m = market("SPYe-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "0.05"));
         let offers = m.offer_levels.clone();
-        let f = grid_funding(&[cc("100")], false, &m, Some(700.0), &offers, 5.0);
+        let f = grid_funding(&[cc("100")], false, &m, Some(700.0), &offers, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.bid, f.offer, f.why), (Unknown, Unknown, Some(UnknownWhy::Aged)));
-        let f = grid_funding(&[], true, &m, Some(700.0), &offers, 5.0);
+        let f = grid_funding(&[], true, &m, Some(700.0), &offers, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.bid, f.offer, f.why), (Unknown, Unknown, Some(UnknownWhy::Aged)));
     }
 
@@ -2844,9 +2903,57 @@ mod grid_plan_tests {
     fn cc_below_the_fee_reserve_is_unknown() {
         let m = market("SPYe-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "0.05"));
         let balances = [cc("1"), token("SPYe", "10"), token("USDCx", "10000")];
-        let f = grid_funding(&balances, true, &m, Some(700.0), &m.offer_levels, 5.0);
+        let f = grid_funding(&balances, true, &m, Some(700.0), &m.offer_levels, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.bid, f.offer, f.why), (Unknown, Unknown, Some(UnknownWhy::FeeReserve)));
         assert_eq!(f.cc_avail, 1.0);
+    }
+
+    /// With prepaid fee capacity wallet CC is no prerequisite; unknown or used-up capacity holds both sides.
+    #[test]
+    fn fee_capacity_replaces_the_wallet_cc_prerequisite() {
+        let m = market("SPYe-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "0.05"));
+        let balances = [cc("0"), token("SPYe", "10"), token("USDCx", "10000")];
+        let funded = FeeHeadroom::Capacity { capacity: Some(94.0), per_fill: 14.7 };
+        let f = ladder_funding(&balances, true, &m.market_id, Some(700.0), &m.bid_levels, &m.offer_levels, 5.0, funded);
+        assert_eq!((f.bid, f.offer, f.why), (Funded, Funded, None));
+        // Unknown, used up, or short of one fill's fee
+        for (capacity, per_fill) in [(None, 0.0), (Some(0.0), 0.0), (Some(3.0), 14.7)] {
+            let held = FeeHeadroom::Capacity { capacity, per_fill };
+            let f = ladder_funding(&balances, true, &m.market_id, Some(700.0), &m.bid_levels, &m.offer_levels, 5.0, held);
+            assert_eq!((f.bid, f.offer, f.why), (Unknown, Unknown, Some(UnknownWhy::FeeCapacity)), "{capacity:?}");
+            let activity = MarketActivity::default();
+            assert!(!market_inventory(&balances, true, "SPYe-USDCx", 5.0, held, &activity).usable, "{capacity:?}");
+        }
+        let activity = MarketActivity::default();
+        assert!(market_inventory(&balances, true, "SPYe-USDCx", 5.0, funded, &activity).usable);
+        // Without a rate the per-fill estimate is zero: any capacity counts
+        let no_rate = FeeHeadroom::Capacity { capacity: Some(3.0), per_fill: 0.0 };
+        assert!(market_inventory(&balances, true, "SPYe-USDCx", 5.0, no_rate, &activity).usable);
+        assert!(!market_inventory(&balances, true, "SPYe-USDCx", 5.0, FeeHeadroom::Wallet, &activity).usable);
+        // The reserve still stays out of CC inventory
+        let ccm = market("CC-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "100"));
+        let cc_rich = [cc("50"), token("USDCx", "10000")];
+        let f = ladder_funding(&cc_rich, true, "CC-USDCx", Some(0.1), &ccm.bid_levels, &ccm.offer_levels, 5.0, funded);
+        assert_eq!(f.offer_avail, 45.0);
+        assert_eq!(market_inventory(&cc_rich, true, "CC-USDCx", 5.0, funded, &activity).base_avail, 45.0);
+    }
+
+    /// A market where a fee was seen needs that fee per fill, more or less than the default.
+    #[test]
+    fn a_market_with_a_seen_fee_needs_that_fee_per_fill() {
+        let m = market("SPYe-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "0.05"));
+        let balances = [cc("0"), token("SPYe", "10"), token("USDCx", "10000")];
+        let fund = |headroom| ladder_funding(&balances, true, &m.market_id, Some(700.0), &m.bid_levels, &m.offer_levels, 5.0, headroom);
+        // $2.00 per side seen here: 30.5 CC a fill, above 20 CC of capacity
+        let default = FeeHeadroom::Capacity { capacity: Some(20.0), per_fill: 15.87 };
+        assert_eq!(fund(default).why, None);
+        assert_eq!(fund(default.for_market(Some(30.5))).why, Some(UnknownWhy::FeeCapacity));
+        // A discounted fee: 3 CC of capacity covers a 2.67 CC fill
+        let low = FeeHeadroom::Capacity { capacity: Some(3.0), per_fill: 15.87 };
+        assert_eq!(fund(low).why, Some(UnknownWhy::FeeCapacity));
+        assert_eq!((fund(low.for_market(Some(2.67))).bid, fund(low.for_market(Some(2.67))).why), (Funded, None));
+        assert_eq!(low.for_market(None), low);
+        assert_eq!(FeeHeadroom::Wallet.for_market(Some(1.0)), FeeHeadroom::Wallet);
     }
 
     /// Offers far short of their rungs while bids are funded.
@@ -2854,7 +2961,7 @@ mod grid_plan_tests {
     fn spye_offers_short_while_bids_are_funded() {
         let m = market("SPYe-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "0.05"));
         let balances = [cc("100"), token("SPYe", "0.001"), token("USDCx", "1000")];
-        let f = grid_funding(&balances, true, &m, Some(700.0), &m.offer_levels, 5.0);
+        let f = grid_funding(&balances, true, &m, Some(700.0), &m.offer_levels, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.bid, f.offer, f.why), (Funded, Short, None));
         assert!((f.offer_need - 0.15).abs() < 1e-12, "offer_need {}", f.offer_need);
         assert_eq!(f.offer_avail, 0.001);
@@ -2867,19 +2974,19 @@ mod grid_plan_tests {
         let m = market("EDELx-CC", flat(), Vec::new());
         let balances = [cc("100"), token("EDELx", "0")];
         // 30 base at 3.0 = 90 quote needed, 95 available after the reserve
-        let f = grid_funding(&balances, true, &m, Some(3.0), &[], 5.0);
+        let f = grid_funding(&balances, true, &m, Some(3.0), &[], 5.0, FeeHeadroom::Wallet);
         assert_eq!(f.bid, Funded);
         assert_eq!(f.bid_avail, 95.0);
         // 30 base at 3.2 = 96 > 95
-        let f = grid_funding(&balances, true, &m, Some(3.2), &[], 5.0);
+        let f = grid_funding(&balances, true, &m, Some(3.2), &[], 5.0, FeeHeadroom::Wallet);
         assert_eq!(f.bid, Short);
 
         let m = market("CC-USDCx", Vec::new(), flat());
         let balances = [cc("100"), token("USDCx", "0")];
-        let f = grid_funding(&balances, true, &m, Some(0.15), &m.offer_levels, 5.0);
+        let f = grid_funding(&balances, true, &m, Some(0.15), &m.offer_levels, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.offer, f.offer_avail), (Funded, 95.0));
         let heavy = vec![level(0.0, "32"), level(0.0, "32"), level(0.0, "32")];
-        let f = grid_funding(&balances, true, &m, Some(0.15), &heavy, 5.0);
+        let f = grid_funding(&balances, true, &m, Some(0.15), &heavy, 5.0, FeeHeadroom::Wallet);
         assert_eq!(f.offer, Short);
     }
 
@@ -2888,7 +2995,7 @@ mod grid_plan_tests {
         let balances = [cc("100")];
         for id in ["SPYE", "A-B-C"] {
             let m = market(id, ladder(-1.0, "1"), ladder(1.0, "1"));
-            let f = grid_funding(&balances, true, &m, Some(1.0), &m.offer_levels, 5.0);
+            let f = grid_funding(&balances, true, &m, Some(1.0), &m.offer_levels, 5.0, FeeHeadroom::Wallet);
             assert_eq!((f.bid, f.offer), (Funded, Funded), "market {id}");
         }
     }
@@ -2897,9 +3004,9 @@ mod grid_plan_tests {
     fn no_mid_leaves_bids_unknown() {
         let m = market("SPYe-USDCx", ladder(-1.0, "0.05"), ladder(1.0, "0.05"));
         let balances = [cc("100"), token("SPYe", "1"), token("USDCx", "1000")];
-        let f = grid_funding(&balances, true, &m, None, &m.offer_levels, 5.0);
+        let f = grid_funding(&balances, true, &m, None, &m.offer_levels, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.bid, f.offer), (Unknown, Funded));
-        let f = grid_funding(&balances, true, &m, Some(f64::NAN), &m.offer_levels, 5.0);
+        let f = grid_funding(&balances, true, &m, Some(f64::NAN), &m.offer_levels, 5.0, FeeHeadroom::Wallet);
         assert_eq!(f.bid, Unknown);
     }
 
@@ -2907,7 +3014,7 @@ mod grid_plan_tests {
     fn a_side_needing_nothing_is_funded() {
         let m = market("SPYe-USDCx", Vec::new(), ladder(1.0, "0.05"));
         let balances = [cc("100"), token("SPYe", "0"), token("USDCx", "0")];
-        let f = grid_funding(&balances, true, &m, Some(700.0), &m.offer_levels, 5.0);
+        let f = grid_funding(&balances, true, &m, Some(700.0), &m.offer_levels, 5.0, FeeHeadroom::Wallet);
         assert_eq!((f.bid, f.bid_need), (Funded, 0.0));
         assert_eq!(f.offer, Short);
     }
