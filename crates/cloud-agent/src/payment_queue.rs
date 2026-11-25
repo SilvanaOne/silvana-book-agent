@@ -982,6 +982,7 @@ async fn execute_pay_fee(
             contract_id: String::new(),
             update_id: format!("{}:{}", fee_type, proposal_id),
             traffic_total: 0,
+            fee_cc: None,
         });
     }
 
@@ -990,7 +991,7 @@ async fn execute_pay_fee(
     // Off-chain processing-fee payment via PreparePayFee / ExecutePayFee.
     // The fee is debited from the cloud-agent's prepaid traffic balance.
     match client.pay_processing_fee(proposal_id, fee_type).await {
-        Ok(()) => {
+        Ok(fee_cc) => {
             info!(
                 "{} fee paid off-chain for {} (debited from prepaid traffic balance)",
                 fee_type, proposal_id
@@ -999,6 +1000,7 @@ async fn execute_pay_fee(
                 contract_id: String::new(),
                 update_id: format!("{}:{}", fee_type, proposal_id),
                 traffic_total: 0,
+                fee_cc,
             })
         }
         Err(e) => Err(e),
@@ -1079,6 +1081,7 @@ async fn execute_allocate(
                 contract_id: cid,
                 update_id: resp.update_id.clone(),
                 traffic_total: traffic,
+                fee_cc: None,
             })
         }
         Err(e) => {
@@ -1283,7 +1286,7 @@ mod scheduler_tests {
 
         let (tx, rx) = oneshot::channel();
         drop(rx);
-        let paid = StepResult { contract_id: String::new(), update_id: "dvp:p2".into(), traffic_total: 0 };
+        let paid = StepResult { contract_id: String::new(), update_id: "dvp:p2".into(), traffic_total: 0, fee_cc: None };
         answer(tx, "p2", Ok(paid));
         let (tx, mut rx) = oneshot::channel();
         answer(tx, "p3", Err(anyhow!("rejected")));

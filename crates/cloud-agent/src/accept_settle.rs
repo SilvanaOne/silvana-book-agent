@@ -316,7 +316,8 @@ trait FeeDebitClient: Send {
 
 impl FeeDebitClient for DAppProviderClient {
     fn pay_processing_fee(&mut self, proposal_id: &str, fee_type: &str) -> impl Future<Output = Result<()>> + Send {
-        DAppProviderClient::pay_processing_fee(self, proposal_id, fee_type)
+        let paid = DAppProviderClient::pay_processing_fee(self, proposal_id, fee_type);
+        async move { paid.await.map(|_| ()) }
     }
 }
 
@@ -647,6 +648,7 @@ impl MulticallSettler {
             contract_id: cid,
             update_id: exec_result.update_id,
             traffic_total: traffic,
+            fee_cc: None,
         }
     }
 

@@ -71,6 +71,8 @@ pub struct StepResult {
     pub contract_id: String,
     pub update_id: String,
     pub traffic_total: u64,
+    /// CC an off-chain fee payment debited from prepaid, as the server stated it.
+    pub fee_cc: Option<Decimal>,
 }
 
 /// Maximum number of spawn-loop iterations that may actually spawn a task in a
@@ -269,6 +271,40 @@ fn allocate_wait(
     (!ready).then_some(seen)
 }
 
+/// Which of this side's processing fees the server already shows as paid.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PaidFees {
+    dvp: bool,
+    allocation: bool,
+}
+
+impl PaidFees {
+    /// A fee step at Submitted or later is paid: the debit runs before Submitted is recorded.
+    fn of(status: &GetSettlementStatusResponse, is_buyer: bool) -> Self {
+        let (dvp, allocation) = if is_buyer {
+            (&status.dvp_processing_fee_buyer, &status.allocation_processing_fee_buyer)
+        } else {
+            (&status.dvp_processing_fee_seller, &status.allocation_processing_fee_seller)
+        };
+        Self {
+            dvp: step_at_least_submitted(dvp.as_ref()),
+            allocation: step_at_least_submitted(allocation.as_ref()),
+        }
+    }
+
+    /// This side's fees in USD not yet paid; an overflowing sum reads as unaffordable.
+    fn unpaid_usd(self, proposal: &SettlementProposal, is_buyer: bool) -> Decimal {
+        let (dvp, allocation) = side_fees_usd(proposal, is_buyer);
+        let owed = |paid: bool, fee: Decimal| if paid { Decimal::ZERO } else { fee };
+        owed(self.dvp, dvp)
+            .checked_add(owed(self.allocation, allocation))
+            .unwrap_or(Decimal::MAX)
+    }
+}
+
+/// Bound on a local liquidity update after a fee payment; the next prepaid poll corrects a miss.
+const FEE_NOTE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// This side's processing fee, as the fee arms of `advance_single` see it.
 struct FeeStep<'a> {
     fee_type: &'static str,
@@ -277,12 +313,15 @@ struct FeeStep<'a> {
     own_step: Option<&'a orderbook_proto::DvpStepStatus>,
     submitted_event: SettlementEventType,
     stage: SettlementStage,
+    /// This side's other fee is already paid.
+    last_leg: bool,
 }
 
 /// Debit first, record after: a failed debit leaves no row and backs off, so the
 /// server asks for the fee again. A zero fee is recorded without a debit.
 async fn pay_fee_step<B: SettlementBackend>(
     backend: &B,
+    liquidity_manager: Option<&LiquidityManager>,
     rpc_client: &mut OrderbookRpcClient,
     proposal_id: String,
     party_id: &str,
@@ -291,16 +330,39 @@ async fn pay_fee_step<B: SettlementBackend>(
 ) -> AdvanceResult {
     let already_submitted = step_at_least_submitted(step.own_step);
     let zero_fee = Decimal::from_str(step.amount).is_ok_and(|v| v.is_zero());
+    let mut debited = None;
     if zero_fee {
         if already_submitted {
             // Nothing to debit; a repeated prompt waits instead of re-running.
             return AdvanceResult::Wait { proposal_id };
         }
-    } else if let Err(e) = backend.pay_fee(&proposal_id, step.fee_type).await {
-        return AdvanceResult::Error {
-            proposal_id,
-            error: format!("{} debit failed: {:#}", step.label, e),
+    } else {
+        match backend.pay_fee(&proposal_id, step.fee_type).await {
+            Ok(paid) => debited = Some(paid.fee_cc),
+            Err(e) => {
+                return AdvanceResult::Error {
+                    proposal_id,
+                    error: format!("{} debit failed: {:#}", step.label, e),
+                };
+            }
+        }
+    }
+    if let Some(lm) = liquidity_manager {
+        // The prepaid figure drops now, not at the next poll; after the last fee no margin stays held.
+        let note = async {
+            if let Some(paid_cc) = debited {
+                lm.record_fee_paid(&proposal_id, paid_cc, Decimal::from_str(step.amount).ok()).await;
+            }
+            if step.last_leg {
+                lm.clear_fee_commitment(&proposal_id).await;
+            }
         };
+        if tokio::time::timeout(FEE_NOTE_TIMEOUT, note).await.is_err() {
+            warn!(
+                "[{}] {} recorded without the local prepaid update (timed out); the next poll carries it",
+                proposal_id, step.label
+            );
+        }
     }
     if !already_submitted {
         record_step_submitted(rpc_client, &proposal_id, party_id, is_buyer, step.submitted_event)
@@ -1279,17 +1341,25 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                 self.hold(&proposal_id, prior_hold);
                 return Ok(());
             }
-            let fee_cc = lm.estimate_fee_cc(my_fees_usd).await;
-
-            if let Err(reason) = lm.can_commit(&allocation_token, allocation_amount, fee_cc).await {
-                warn!("[{}] Rejecting proposal: {}", proposal_id, reason);
-                if let Err(e) = self.reject_proposal(&proposal_id).await {
-                    warn!("[{}] Failed to reject: {}", proposal_id, e);
+            // Fees are paid from prepaid credit: an unknown figure or rate defers, a shortfall rejects.
+            lm.note_fill_fee(&proposal.market_id, my_fees_usd).await;
+            match lm.adoption_check(&allocation_token, allocation_amount, my_fees_usd).await {
+                liquidity::Adoption::Accept => {}
+                liquidity::Adoption::Defer(why) => {
+                    info!("[{}] {}, deferring preconfirmation", proposal_id, why);
+                    self.hold(&proposal_id, prior_hold);
+                    return Ok(());
                 }
-                if let Some(ref rejected) = self.rejected_rfq_trades {
-                    rejected.lock().await.insert(proposal_id.clone());
+                liquidity::Adoption::Reject(reason) => {
+                    warn!("[{}] Rejecting proposal: {}", proposal_id, reason);
+                    if let Err(e) = self.reject_proposal(&proposal_id).await {
+                        warn!("[{}] Failed to reject: {}", proposal_id, e);
+                    }
+                    if let Some(ref rejected) = self.rejected_rfq_trades {
+                        rejected.lock().await.insert(proposal_id.clone());
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
         }
 
@@ -1977,6 +2047,7 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
                     || error.contains("PRECONDITION_FAILED");
                 let is_inactive = error.contains("INACTIVE_CONTRACTS");
                 let is_transient = !is_permanent && (is_inactive
+                    || error.contains(liquidity::FEE_CAPACITY_UNKNOWN)
                     || error.contains("No Dvp contract ID found")
                     || error.contains("No DvpProposal CID found"));
                 let expired = self.past_deadline(&proposal_id);
@@ -2653,18 +2724,24 @@ fn reservation_inputs(
         _ => my_instrument.clone(),
     };
 
+    let (dvp_fee, allocation_fee) = side_fees_usd(proposal, is_buyer);
+    // An overflowing sum reads as unaffordable
+    let my_fees_usd = dvp_fee.checked_add(allocation_fee).unwrap_or(Decimal::MAX);
+
+    (allocation_token, allocation_amount, my_fees_usd)
+}
+
+/// This side's (DVP, allocation) processing fees in USD; an unparsable fee reads as zero.
+fn side_fees_usd(proposal: &SettlementProposal, is_buyer: bool) -> (Decimal, Decimal) {
     let (dvp_fee, allocation_fee) = if is_buyer {
         (&proposal.dvp_processing_fee_buyer, &proposal.allocation_processing_fee_buyer)
     } else {
         (&proposal.dvp_processing_fee_seller, &proposal.allocation_processing_fee_seller)
     };
-    // An overflowing sum reads as unaffordable
-    let my_fees_usd = Decimal::from_str(dvp_fee)
-        .unwrap_or_default()
-        .checked_add(Decimal::from_str(allocation_fee).unwrap_or_default())
-        .unwrap_or(Decimal::MAX);
-
-    (allocation_token, allocation_amount, my_fees_usd)
+    (
+        Decimal::from_str(dvp_fee).unwrap_or_default(),
+        Decimal::from_str(allocation_fee).unwrap_or_default(),
+    )
 }
 
 /// Largest amount a proposal may carry in any quantity or fee field.
@@ -2757,12 +2834,16 @@ fn unresolved_leg_event(
 ///
 /// Depletion outflow is recorded only when the tracker reservation is NEW —
 /// never per-step, never again after a restart restore.
+///
+/// Only the fees `paid` leaves unpaid are held: a restored settlement past a
+/// fee step already had that fee debited from prepaid.
 async fn ensure_reserved(
     state: &SettlementState,
     config: &BaseConfig,
     liquidity_manager: &Option<Arc<LiquidityManager>>,
     tracker: &Arc<Mutex<OrderTracker>>,
     proposal_id: &str,
+    paid: PaidFees,
 ) -> Result<(), String> {
     // Precompute reservation inputs once (used for both the LM commit and the
     // depletion outflow) so the two can never diverge.
@@ -2776,12 +2857,13 @@ async fn ensure_reserved(
     // cleanly. Skipped when a commitment already exists (its own commitment
     // counts against availability, so a bare re-commit would spuriously fail;
     // and this is the restart lazy-recommit path). Idempotent.
-    if let (Some(lm), Some((allocation_token, allocation_amount, my_fees_usd))) =
+    if let (Some(lm), Some((allocation_token, allocation_amount, _))) =
         (liquidity_manager, inputs.as_ref())
     {
         if !lm.has_commitment(proposal_id).await {
-            let fee_cc = lm.estimate_fee_cc(*my_fees_usd).await;
-            lm.try_commit(proposal_id, allocation_token, *allocation_amount, fee_cc)
+            let unpaid_usd = paid.unpaid_usd(&state.proposal, state.is_buyer);
+            let fee_cc = lm
+                .try_commit_settlement(proposal_id, allocation_token, *allocation_amount, unpaid_usd)
                 .await?;
             info!(
                 "[{}] Reserved {} {} + {:.4} CC fees (counterparty committed)",
@@ -3055,12 +3137,14 @@ async fn advance_single<B: SettlementBackend>(
     // inventory. Idempotent; a failure (balance dropped since the adoption
     // advisory check) routes through the Error backoff/retry path.
     // A multicall accept is never run here, so it reserves nothing.
+    // Fee legs are read from the server status: the local stage is reset on restore.
+    let paid = PaidFees::of(&status, state.is_buyer);
     if !matches!(
         my_action,
         NextAction::Preconfirm | NextAction::Wait | NextAction::MulticallAccept | NextAction::None
     ) {
         if let Err(e) =
-            ensure_reserved(&state, &config, &liquidity_manager, &tracker, &proposal_id).await
+            ensure_reserved(&state, &config, &liquidity_manager, &tracker, &proposal_id, paid).await
         {
             return AdvanceResult::Error {
                 proposal_id,
@@ -3112,6 +3196,7 @@ async fn advance_single<B: SettlementBackend>(
                     own_step: status.dvp_processing_fee_buyer.as_ref(),
                     submitted_event: SettlementEventType::DvpProcessingFeeBuyerSubmitted,
                     stage: SettlementStage::DvpFeePaid,
+                    last_leg: paid.allocation,
                 }
             } else {
                 FeeStep {
@@ -3121,9 +3206,10 @@ async fn advance_single<B: SettlementBackend>(
                     own_step: status.dvp_processing_fee_seller.as_ref(),
                     submitted_event: SettlementEventType::DvpProcessingFeeSellerSubmitted,
                     stage: SettlementStage::DvpFeePaid,
+                    last_leg: paid.allocation,
                 }
             };
-            pay_fee_step(&*backend, &mut rpc_client, proposal_id, &config.party_id, state.is_buyer, step)
+            pay_fee_step(&*backend, liquidity_manager.as_deref(), &mut rpc_client, proposal_id, &config.party_id, state.is_buyer, step)
                 .await
         }
         NextAction::CreateDvp => {
@@ -3197,6 +3283,7 @@ async fn advance_single<B: SettlementBackend>(
                     own_step: status.allocation_processing_fee_buyer.as_ref(),
                     submitted_event: SettlementEventType::AllocationProcessingFeeBuyerSubmitted,
                     stage: SettlementStage::AllocationFeePaid,
+                    last_leg: paid.dvp,
                 }
             } else {
                 FeeStep {
@@ -3206,9 +3293,10 @@ async fn advance_single<B: SettlementBackend>(
                     own_step: status.allocation_processing_fee_seller.as_ref(),
                     submitted_event: SettlementEventType::AllocationProcessingFeeSellerSubmitted,
                     stage: SettlementStage::AllocationFeePaid,
+                    last_leg: paid.dvp,
                 }
             };
-            pay_fee_step(&*backend, &mut rpc_client, proposal_id, &config.party_id, state.is_buyer, step)
+            pay_fee_step(&*backend, liquidity_manager.as_deref(), &mut rpc_client, proposal_id, &config.party_id, state.is_buyer, step)
                 .await
         }
         NextAction::Allocate => {
@@ -3331,18 +3419,19 @@ mod tests {
     }
 
     /// Executor with one committed proposal "p1": seller (is_buyer=false)
-    /// allocating 1000 USDCx + ~11 CC fees. CC available drops 95 -> 84.
+    /// allocating 1000 USDCx + ~11 CC fees. Fee capacity drops 100 -> 89.
     async fn committed_executor() -> (SettlementExecutor<MockBackend>, Arc<LiquidityManager>) {
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        lm.update_prepaid(Decimal::from(100), std::time::Instant::now()).await;
         let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
         assert!(fee_cc > Decimal::ZERO);
         lm.try_commit("p1", "USDCx", Decimal::from(1000), fee_cc).await.unwrap();
         // Reservation in effect: allocation + fee both held.
         assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
-        assert!(lm.available_cc().await < Decimal::from(95));
+        assert!(lm.fee_capacity().await.unwrap() < Decimal::from(100));
 
         let config = BaseConfig::test_minimal().unwrap();
         let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
@@ -3376,6 +3465,7 @@ mod tests {
 
         assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
         assert_eq!(lm.available_cc().await, Decimal::from(95));
+        assert_eq!(lm.fee_capacity().await, Some(Decimal::from(100)));
         assert!(!exec.active_settlements.contains_key("p1"));
         assert!(exec.completed_proposals.contains("p1"));
     }
@@ -3418,6 +3508,7 @@ mod tests {
 
         assert_eq!(lm.available("USDCx").await, Decimal::from(5000));
         assert_eq!(lm.available_cc().await, Decimal::from(95));
+        assert_eq!(lm.fee_capacity().await, Some(Decimal::from(100)));
         assert!(!exec.active_settlements.contains_key("p1"));
         assert!(exec.rejected_proposals.contains("p1"));
     }
@@ -3629,6 +3720,7 @@ mod tests {
     /// Fresh LM: 100 CC + 5000 USDCx, rate 0.10, ready.
     async fn ready_lm() -> Arc<LiquidityManager> {
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_prepaid(Decimal::from(1000), std::time::Instant::now()).await;
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
@@ -3846,14 +3938,14 @@ mod tests {
         // ensure_reserved commits both halves.
         let state = exec.active_settlements.get("p1").unwrap().clone();
         let lm_opt = Some(lm.clone());
-        ensure_reserved(&state, &exec.config, &lm_opt, &tracker, "p1")
+        ensure_reserved(&state, &exec.config, &lm_opt, &tracker, "p1", PaidFees::default())
             .await
             .unwrap();
         assert!(lm.has_commitment("p1").await);
         assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
 
         // Idempotent re-entry — nothing double-reserved.
-        ensure_reserved(&state, &exec.config, &lm_opt, &tracker, "p1")
+        ensure_reserved(&state, &exec.config, &lm_opt, &tracker, "p1", PaidFees::default())
             .await
             .unwrap();
         assert_eq!(lm.available("USDCx").await, Decimal::from(4000));
@@ -3880,6 +3972,7 @@ mod tests {
         let config = BaseConfig::test_minimal().unwrap();
         let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(10)).await;
+        lm.update_prepaid(Decimal::from(1000), std::time::Instant::now()).await;
         lm.update_token_balance("USDCx", Decimal::from(1000)).await; // exactly the leg
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
         let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
@@ -3890,15 +3983,15 @@ mod tests {
 
         let state = SettlementState::new(test_proposal("p1"), false);
         let lm_opt = Some(lm.clone());
-        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1", PaidFees::default()).await.unwrap();
         assert_eq!(lm.available("USDCx").await, Decimal::ZERO);
 
         // Re-entry with zero remaining availability must still succeed.
-        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1", PaidFees::default()).await.unwrap();
 
         // Unadopted proposal → invariant error, nothing reserved.
         let state2 = SettlementState::new(test_proposal("p2"), false);
-        assert!(ensure_reserved(&state2, &config, &lm_opt, &tracker, "p2").await.is_err());
+        assert!(ensure_reserved(&state2, &config, &lm_opt, &tracker, "p2", PaidFees::default()).await.is_err());
         assert!(!lm.has_commitment("p2").await);
     }
 
@@ -3953,6 +4046,7 @@ mod tests {
         let config = BaseConfig::test_minimal().unwrap();
         let lm = LiquidityManager::new(0.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(50)).await;
+        lm.update_prepaid(Decimal::from(1000), std::time::Instant::now()).await;
         lm.update_token_balance("USDCx", Decimal::from(500)).await; // < the 1000 leg
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
 
@@ -3970,18 +4064,18 @@ mod tests {
 
         // First attempt: LM commit fails (500 < 1000) → Err, NOTHING latched
         // (LM ordered first, so the tracker was never reached).
-        assert!(ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.is_err());
+        assert!(ensure_reserved(&state, &config, &lm_opt, &tracker, "p1", PaidFees::default()).await.is_err());
         assert!(!lm.has_commitment("p1").await);
         assert_eq!(lm.available("USDCx").await, Decimal::from(500));
 
         // Balance recovers; retry succeeds and commits exactly the leg once.
         lm.update_token_balance("USDCx", Decimal::from(2000)).await;
-        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1", PaidFees::default()).await.unwrap();
         assert!(lm.has_commitment("p1").await);
         assert_eq!(lm.available("USDCx").await, Decimal::from(1000)); // 2000 − 1000, once
 
         // Idempotent re-entry: no second commit, availability unchanged.
-        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1").await.unwrap();
+        ensure_reserved(&state, &config, &lm_opt, &tracker, "p1", PaidFees::default()).await.unwrap();
         assert_eq!(lm.available("USDCx").await, Decimal::from(1000));
     }
 
@@ -4457,6 +4551,277 @@ mod tests {
         entry.0 = Instant::now();
     }
 
+    // Fees come from prepaid credit: a 0-CC seller owing $1.00 (~14.67 CC) adopts on 94,
+    // rejects on 10, and holds while the figure is unknown.
+    #[tokio::test]
+    async fn test_fee_gate_counts_prepaid_credit() {
+        let config = BaseConfig::test_minimal().unwrap();
+        for (prepaid, adopted, held) in [(Some(94), true, false), (Some(10), false, false), (None, false, true)] {
+            let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+            lm.update_cc_balance(Decimal::ZERO).await;
+            lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+            lm.update_cc_usd_rate(Decimal::from_str("0.075").unwrap()).await;
+            if let Some(p) = prepaid {
+                lm.update_prepaid(Decimal::from(p), std::time::Instant::now()).await;
+            }
+            let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+            let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
+            exec.set_liquidity_manager(lm.clone());
+            exec.set_quoted_rfq_trades(Arc::new(Mutex::new(vec![QuotedTrade {
+                market_id: String::new(),
+                price: String::new(),
+                base_quantity: "1000".to_string(),
+                quote_quantity: "500".to_string(),
+            }])));
+            let rejected = Arc::new(Mutex::new(HashSet::new()));
+            exec.set_rejected_rfq_trades(rejected.clone());
+            let mut p1 = our_sale("p1");
+            p1.dvp_processing_fee_seller = "0.3".to_string();
+            p1.allocation_processing_fee_seller = "0.7".to_string();
+            exec.handle_settlement_update(created_update(p1)).await.unwrap();
+            assert_eq!(exec.active_settlements.contains_key("p1"), adopted, "prepaid {prepaid:?}");
+            assert_eq!(exec.held_until.contains_key("p1"), held, "prepaid {prepaid:?}");
+            assert_eq!(rejected.lock().await.contains("p1"), !adopted && !held, "prepaid {prepaid:?}");
+        }
+    }
+
+    /// Backend whose fee debit succeeds; nothing else is used.
+    struct PayingBackend(Option<Decimal>);
+
+    #[async_trait]
+    impl SettlementBackend for PayingBackend {
+        async fn pay_fee(&self, _: &str, _: &str) -> Result<StepResult> {
+            Ok(StepResult { contract_id: String::new(), update_id: String::new(), traffic_total: 0, fee_cc: self.0 })
+        }
+        async fn propose_dvp(&self, _: &SettlementProposal) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn accept_dvp(&self, _: &SettlementProposal, _: &str) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn allocate(&self, _: &SettlementProposal, _: &str, _: Option<Decimal>) -> Result<StepResult> {
+            Err(anyhow::anyhow!("unused"))
+        }
+        async fn sync_contracts(&self, _: &[String]) -> Result<Vec<DiscoveredContract>> {
+            Ok(Vec::new())
+        }
+        fn queue_depth(&self) -> (u64, u64) {
+            (0, 0)
+        }
+    }
+
+    // A paid fee lowers the prepaid figure before the next poll
+    #[tokio::test]
+    async fn test_paid_fee_is_debited_from_prepaid_at_once() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.075").unwrap()).await;
+        lm.update_prepaid(Decimal::from(94), std::time::Instant::now()).await;
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut rpc = OrderbookRpcClient::with_channel(channel, Some("t".to_string()), Duration::from_millis(100));
+        let submitted = orderbook_proto::DvpStepStatus {
+            status: DvpStepStatusEnum::DvpStepStatusSubmitted as i32,
+            ..Default::default()
+        };
+        let step = |amount| FeeStep {
+            fee_type: "dvp",
+            label: "DVP processing fee",
+            amount,
+            own_step: Some(&submitted),
+            submitted_event: SettlementEventType::DvpProcessingFeeSellerSubmitted,
+            stage: SettlementStage::DvpFeePaid,
+            last_leg: false,
+        };
+        let paid = pay_fee_step(&PayingBackend(None), Some(&*lm), &mut rpc, "p1".to_string(), "test-party", false, step("0.3")).await;
+        assert!(matches!(paid, AdvanceResult::StepCompleted { .. }));
+        // 0.3 / 0.075 * 1.1 = 4.4 CC
+        let after = lm.fee_capacity().await.unwrap();
+        assert!((after - Decimal::from_str("89.6").unwrap()).abs() < Decimal::from_str("0.0001").unwrap(), "{after}");
+        // A zero fee debits nothing
+        let zero = pay_fee_step(&PayingBackend(None), Some(&*lm), &mut rpc, "p1".to_string(), "test-party", false, step("0")).await;
+        assert!(matches!(zero, AdvanceResult::Wait { .. }));
+        assert_eq!(lm.fee_capacity().await, Some(after));
+        // The amount the server states it debited replaces the estimate (0.7 / 0.075 * 1.1 = 10.27)
+        let stated = PayingBackend(Some(Decimal::from_str("9.3").unwrap()));
+        let mut alloc = step("0.7");
+        alloc.fee_type = "allocate";
+        let paid = pay_fee_step(&stated, Some(&*lm), &mut rpc, "p1".to_string(), "test-party", false, alloc).await;
+        assert!(matches!(paid, AdvanceResult::StepCompleted { .. }));
+        assert_eq!(lm.fee_capacity().await, Some(after - Decimal::from_str("9.3").unwrap()));
+    }
+
+    // A prepaid figure gone stale before the reservation waits; it never uses up the retries
+    #[tokio::test]
+    async fn test_unknown_fee_capacity_at_reservation_is_transient() {
+        let config = BaseConfig::test_minimal().unwrap();
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::ZERO).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.075").unwrap()).await;
+        let polled = Instant::now().checked_sub(Duration::from_secs(121)).unwrap();
+        lm.update_prepaid(Decimal::from(94), polled).await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker.clone(), MockBackend).unwrap();
+        exec.set_liquidity_manager(lm.clone());
+        let mut p1 = our_sale("p1");
+        p1.dvp_processing_fee_seller = "0.3".to_string();
+        p1.allocation_processing_fee_seller = "0.7".to_string();
+        let state = SettlementState::new(p1, false);
+        exec.active_settlements.insert("p1".to_string(), state.clone());
+        let err = ensure_reserved(&state, &config, &Some(lm.clone()), &tracker, "p1", PaidFees::default()).await.unwrap_err();
+        assert!(!lm.has_commitment("p1").await);
+        for _ in 0..3 {
+            let error = format!("reservation failed: {err}");
+            exec.apply_result(AdvanceResult::Error { proposal_id: "p1".to_string(), error }).await;
+        }
+        assert_eq!(exec.failed_settlements.get("p1").map(|f| f.retry_count), Some(0), "{err}");
+        assert!(exec.active_settlements.contains_key("p1"));
+    }
+
+    // A restored settlement past its fee steps holds only what is still unpaid, plus its traffic
+    #[tokio::test]
+    async fn test_a_restored_settlement_holds_only_its_unpaid_fees() {
+        use DvpStepStatusEnum::{DvpStepStatusConfirmed as CONFIRMED, DvpStepStatusFailed as FAILED, DvpStepStatusSubmitted as SUBMITTED};
+        let config = BaseConfig::test_minimal().unwrap();
+        let traffic = liquidity::DEFAULT_SETTLEMENT_TRAFFIC_CC;
+        let both = GetSettlementStatusResponse {
+            dvp_processing_fee_seller: step_status(SUBMITTED),
+            allocation_processing_fee_seller: step_status(CONFIRMED),
+            ..Default::default()
+        };
+        let dvp_only = GetSettlementStatusResponse {
+            dvp_processing_fee_seller: step_status(CONFIRMED),
+            allocation_processing_fee_seller: step_status(FAILED),
+            ..Default::default()
+        };
+        let buyer_paid = GetSettlementStatusResponse {
+            dvp_processing_fee_buyer: step_status(SUBMITTED),
+            allocation_processing_fee_buyer: step_status(SUBMITTED),
+            ..Default::default()
+        };
+        assert_eq!(PaidFees::of(&both, false), PaidFees { dvp: true, allocation: true });
+        assert_eq!(PaidFees::of(&dvp_only, false), PaidFees { dvp: true, allocation: false });
+        assert_eq!(PaidFees::of(&buyer_paid, false), PaidFees::default());
+        assert_eq!(PaidFees::of(&buyer_paid, true), PaidFees { dvp: true, allocation: true });
+        let rate = Decimal::from_str("0.075").unwrap();
+        let reference = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        reference.update_cc_usd_rate(rate).await;
+        let alloc_fee_cc = reference.estimate_fee_cc(Decimal::from_str("0.7").unwrap()).await;
+        let none = GetSettlementStatusResponse::default();
+        // (status, prepaid, demand once reserved; None = refused)
+        for (status, prepaid, demand) in [
+            (&both, traffic, Some(traffic)),
+            (&dvp_only, traffic + alloc_fee_cc, Some(traffic + alloc_fee_cc)),
+            (&none, traffic + alloc_fee_cc, None),
+        ] {
+            let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+            lm.update_cc_balance(Decimal::ZERO).await;
+            lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+            lm.update_cc_usd_rate(rate).await;
+            lm.update_prepaid(prepaid, std::time::Instant::now()).await;
+            let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+            tracker.lock().await.record_settlement_order("p1", 0, Decimal::from(1000));
+            let mut p1 = our_sale("p1");
+            p1.dvp_processing_fee_seller = "0.3".to_string();
+            p1.allocation_processing_fee_seller = "0.7".to_string();
+            let state = SettlementState::new(p1, false);
+            let reserved = ensure_reserved(&state, &config, &Some(lm.clone()), &tracker, "p1", PaidFees::of(status, false)).await;
+            match demand {
+                Some(demand) => {
+                    reserved.unwrap();
+                    assert_eq!(lm.prepaid_demand().await, demand);
+                }
+                None => {
+                    assert!(reserved.unwrap_err().contains("insufficient fee capacity"));
+                    assert!(!lm.has_commitment("p1").await);
+                }
+            }
+        }
+    }
+
+    // The last fee leg leaves only the traffic held, whatever margin the estimate carried
+    #[tokio::test]
+    async fn test_the_last_fee_leg_leaves_only_the_traffic_held() {
+        let traffic = liquidity::DEFAULT_SETTLEMENT_TRAFFIC_CC;
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::from_str("0.075").unwrap()).await;
+        lm.update_prepaid(Decimal::from(94), std::time::Instant::now()).await;
+        lm.try_commit_settlement("p1", "USDCx", Decimal::ONE, Decimal::ONE).await.unwrap();
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut rpc = OrderbookRpcClient::with_channel(channel, Some("t".to_string()), Duration::from_millis(100));
+        let submitted = orderbook_proto::DvpStepStatus {
+            status: DvpStepStatusEnum::DvpStepStatusSubmitted as i32,
+            ..Default::default()
+        };
+        let step = |fee_type, amount, last_leg| FeeStep {
+            fee_type,
+            label: "processing fee",
+            amount,
+            own_step: Some(&submitted),
+            submitted_event: SettlementEventType::DvpProcessingFeeSellerSubmitted,
+            stage: SettlementStage::DvpFeePaid,
+            last_leg,
+        };
+        // The server states debits without the margin: 4 + 9.3333 CC of the 14.67 held
+        let dvp = pay_fee_step(&PayingBackend(Some(Decimal::from(4))), Some(&*lm), &mut rpc, "p1".to_string(), "test-party", false, step("dvp", "0.3", false)).await;
+        assert!(matches!(dvp, AdvanceResult::StepCompleted { .. }));
+        assert!(lm.prepaid_demand().await > traffic + Decimal::from(9));
+        let stated = PayingBackend(Some(Decimal::from_str("9.3333").unwrap()));
+        let alloc = pay_fee_step(&stated, Some(&*lm), &mut rpc, "p1".to_string(), "test-party", false, step("allocate", "0.7", true)).await;
+        assert!(matches!(alloc, AdvanceResult::StepCompleted { .. }));
+        assert_eq!(lm.prepaid_demand().await, traffic);
+        // A zero last fee also leaves no margin held
+        lm.try_commit_settlement("p2", "USDCx", Decimal::ONE, Decimal::ONE).await.unwrap();
+        let none = pay_fee_step(&PayingBackend(None), Some(&*lm), &mut rpc, "p2".to_string(), "test-party", false, FeeStep { own_step: None, ..step("allocate", "0", true) }).await;
+        assert!(matches!(none, AdvanceResult::StepCompleted { .. }));
+        assert_eq!(lm.prepaid_demand().await, traffic + traffic);
+    }
+
+    // A paid fee is reported even while the liquidity state is locked elsewhere
+    #[tokio::test]
+    async fn test_a_paid_fee_never_waits_on_a_held_liquidity_lock() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut rpc = OrderbookRpcClient::with_channel(channel, Some("t".to_string()), Duration::from_millis(100));
+        let submitted = orderbook_proto::DvpStepStatus {
+            status: DvpStepStatusEnum::DvpStepStatusSubmitted as i32,
+            ..Default::default()
+        };
+        let step = FeeStep {
+            fee_type: "dvp",
+            label: "DVP processing fee",
+            amount: "0.3",
+            own_step: Some(&submitted),
+            submitted_event: SettlementEventType::DvpProcessingFeeSellerSubmitted,
+            stage: SettlementStage::DvpFeePaid,
+            last_leg: true,
+        };
+        let held = lm.hold_lock().await;
+        let paid = pay_fee_step(&PayingBackend(None), Some(&*lm), &mut rpc, "p1".to_string(), "test-party", false, step);
+        let paid = tokio::time::timeout(FEE_NOTE_TIMEOUT.saturating_mul(3), paid).await;
+        drop(held);
+        assert!(matches!(paid, Ok(AdvanceResult::StepCompleted { .. })), "the fee step waited on the lock");
+    }
+
+    // The adoption gate keeps each market's per-side fee for the grid's per-fill need
+    #[tokio::test]
+    async fn test_the_adoption_gate_notes_the_market_fee() {
+        let config = BaseConfig::test_minimal().unwrap();
+        let lm = ready_lm().await;
+        let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
+        let mut exec = SettlementExecutor::new(&config, tracker, MockBackend).unwrap();
+        exec.set_liquidity_manager(lm.clone());
+        let mut p1 = our_sale("p1");
+        p1.market_id = "USDCx-CCY".to_string();
+        p1.dvp_processing_fee_seller = "0.6".to_string();
+        p1.allocation_processing_fee_seller = "1.4".to_string();
+        exec.handle_settlement_update(created_update(p1)).await.unwrap();
+        let two = lm.estimate_fee_cc(Decimal::from(2)).await;
+        let (_, by_market) = lm.fill_needs().await;
+        assert_eq!(by_market, vec![("USDCx-CCY".to_string(), two + liquidity::DEFAULT_SETTLEMENT_TRAFFIC_CC)]);
+    }
+
     #[tokio::test]
     async fn test_held_proposal_backs_off_poll_refeeds() {
         let config = BaseConfig::test_minimal().unwrap();
@@ -4522,6 +4887,7 @@ mod tests {
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        lm.update_prepaid(Decimal::from(100), std::time::Instant::now()).await;
         exec.set_quoted_rfq_trades(Arc::new(Mutex::new(vec![QuotedTrade {
             market_id: String::new(),
             price: String::new(),
@@ -4838,6 +5204,7 @@ mod tests {
         lm.update_cc_balance(Decimal::MAX).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.0000000001").unwrap()).await;
+        lm.update_prepaid(Decimal::MAX, std::time::Instant::now()).await;
         let tracker = Arc::new(Mutex::new(OrderTracker::new(0, crate::secret::Secret::seal(&mut [0u8; 32]).unwrap())));
         tracker.lock().await.record_settlement_order("p1", 0, Decimal::from(1000));
         let mut proposal = test_proposal("p1");
@@ -4845,7 +5212,7 @@ mod tests {
         let state = SettlementState::new(proposal, false);
         assert!(lm.estimate_fee_cc(Decimal::from(100_000_000_000_000_000u64)).await >= Decimal::from_scientific("1e27").unwrap());
 
-        ensure_reserved(&state, &config, &Some(lm.clone()), &tracker, "p1").await.unwrap();
+        ensure_reserved(&state, &config, &Some(lm.clone()), &tracker, "p1", PaidFees::default()).await.unwrap();
         assert!(lm.has_commitment("p1").await);
         assert_eq!(logs.count("18446744073709551615.0000 CC fees (counterparty committed)"), 1);
     }
@@ -5178,6 +5545,7 @@ mod tests {
                     contract_id: cid.to_string(),
                     update_id: "u1".to_string(),
                     traffic_total: 0,
+                    fee_cc: None,
                 }),
                 None => Err(anyhow::anyhow!("recording backend: {call} is not answered")),
             }

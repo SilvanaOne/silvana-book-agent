@@ -16,9 +16,9 @@ use agent_logic::clock;
 use agent_logic::config::{
     resolve_rfq_config, BaseConfig, LiquidityProviderConfig, MarketConfig, VenueOverride,
 };
-use agent_logic::liquidity::LiquidityManager;
+use agent_logic::liquidity::{Adoption, LiquidityManager};
 use agent_logic::net_position::NetPositionTracker;
-use agent_logic::num::{Dp, Px};
+use agent_logic::num::Px;
 use agent_logic::pool_impact::{self, ImpactSide, MarketMid};
 use agent_logic::runner::QuotedTrade;
 use rust_decimal::prelude::ToPrimitive;
@@ -38,6 +38,35 @@ fn warn_stale_rate_limited(token: &str, age_secs: u64) {
     if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
         *last = Some(std::time::Instant::now());
         warn!("rejecting RFQs: {} balance stale for {}s", token, age_secs);
+    }
+}
+
+static DEFER_WARN_AT: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// Log a quote held back for an unknown figure at WARN at most once per minute per reason.
+fn warn_deferred_rate_limited(rfq_id: impl std::fmt::Display, why: &str) {
+    let due = {
+        let mut last = agent_logic::sync::lock(&DEFER_WARN_AT);
+        let now = std::time::Instant::now();
+        match last.iter_mut().find(|(reason, _)| reason == why) {
+            Some((_, at)) if at.elapsed() < std::time::Duration::from_secs(60) => false,
+            Some((_, at)) => {
+                *at = now;
+                true
+            }
+            None => {
+                if last.len() >= 16 {
+                    last.clear();
+                }
+                last.push((why.to_string(), now));
+                true
+            }
+        }
+    };
+    if due {
+        warn!("RFQ {}: rejected — {} (repeats logged at debug for a minute)", rfq_id, why);
+    } else {
+        debug!("RFQ {}: rejected — {}", rfq_id, why);
     }
 }
 
@@ -757,7 +786,7 @@ impl RfqHandler {
 
             // Fee headroom the LP itself needs for this settle:
             //  - V1 (enforce_min_notional): the LP pays its own dvp +
-            //    allocation fees in CC. Worst non-dust share-count multiplier
+            //    allocation fees from prepaid credit. Worst non-dust share-count multiplier
             //    (2026-08 rule) is x4 on ($0.3 dvp + max($0.7, 0.1% x
             //    notional) alloc); unknown notional falls back to the $0.7
             //    alloc minimum.
@@ -765,7 +794,7 @@ impl RfqHandler {
             //    leg (see rfq_v2.rs: try_commit passes a zero fee term), so
             //    requiring CC here would spuriously reject V2 quotes on a
             //    CC-poor LP.
-            let fee_cc = if enforce_min_notional {
+            let fee_usd = if enforce_min_notional {
                 let Some(fee_usd) = v1_fee_headroom_usd(notional_usd) else {
                     warn!(
                         "RFQ {}: rejected — fee headroom out of range (notional {:?} USD)",
@@ -776,18 +805,10 @@ impl RfqHandler {
                         "Amount out of range",
                     ));
                 };
-                lm.estimate_fee_cc(fee_usd).await
+                fee_usd
             } else {
                 Decimal::ZERO
             };
-            // Decimal::MAX is the unaffordable sentinel (unusable CC/USD rate)
-            if fee_cc == Decimal::MAX {
-                warn!("RFQ {}: rejected — CC fee estimate out of range", rfq_id);
-                return Err(RejectInfo::new(
-                    RfqRejectionReason::TemporarilyUnavailable,
-                    "Insufficient liquidity",
-                ));
-            }
             let Some(alloc_dec) = Decimal::from_f64_retain(alloc_amount) else {
                 warn!(
                     "RFQ {}: rejected — {} amount {} out of range",
@@ -798,65 +819,29 @@ impl RfqHandler {
                     "Insufficient liquidity",
                 ));
             };
-
-            let available = lm.available(alloc_token).await;
-            let needed = if alloc_token == agent_logic::liquidity::CC_TOKEN {
-                match alloc_dec.checked_add(fee_cc) {
-                    Some(n) => n,
-                    None => {
-                        warn!(
-                            "RFQ {}: rejected — {} needed out of range ({} + {} fees)",
-                            rfq_id, alloc_token, alloc_dec, fee_cc
-                        );
-                        return Err(RejectInfo::new(
-                            RfqRejectionReason::TemporarilyUnavailable,
-                            "Insufficient liquidity",
-                        ));
-                    }
-                }
+            // The allocation from inventory, the fees from prepaid fee capacity: the adoption check
+            // A V2 quote is checked as its confirm commit is: no fee or traffic hold
+            let verdict = if enforce_min_notional {
+                lm.adoption_check(alloc_token, alloc_dec, fee_usd).await
             } else {
-                alloc_dec
+                lm.quote_check(alloc_token, alloc_dec).await
             };
-            // Also check CC for fees when allocating non-CC
-            let cc_ok = if alloc_token != agent_logic::liquidity::CC_TOKEN {
-                lm.available_cc().await >= fee_cc
-            } else {
-                true // already checked above
-            };
-
-            if available < needed || !cc_ok {
-                if available < needed && !cc_ok {
-                    warn!(
-                        "RFQ {}: rejected — insufficient {} ({} available, {} needed) AND insufficient CC for fees ({} available, {} needed)",
-                        rfq_id,
-                        alloc_token,
-                        Dp(available, 4),
-                        Dp(needed, 4),
-                        Dp(lm.available_cc().await, 4),
-                        Dp(fee_cc, 4)
-                    );
-                } else if !cc_ok {
-                    warn!(
-                        "RFQ {}: rejected — insufficient CC for fees ({} available, {} needed), {} OK ({} available)",
-                        rfq_id,
-                        Dp(lm.available_cc().await, 4),
-                        Dp(fee_cc, 4),
-                        alloc_token,
-                        Dp(available, 4)
-                    );
-                } else {
-                    warn!(
-                        "RFQ {}: rejected — insufficient {} ({} available, {} needed)",
-                        rfq_id,
-                        alloc_token,
-                        Dp(available, 4),
-                        Dp(needed, 4)
-                    );
+            match verdict {
+                Adoption::Accept => {}
+                Adoption::Defer(why) => {
+                    warn_deferred_rate_limited(rfq_id, &why);
+                    return Err(RejectInfo::new(
+                        RfqRejectionReason::TemporarilyUnavailable,
+                        "Balances loading",
+                    ));
                 }
-                return Err(RejectInfo::new(
-                    RfqRejectionReason::TemporarilyUnavailable,
-                    "Insufficient liquidity",
-                ));
+                Adoption::Reject(reason) => {
+                    warn!("RFQ {}: rejected — {}", rfq_id, reason);
+                    return Err(RejectInfo::new(
+                        RfqRejectionReason::TemporarilyUnavailable,
+                        "Insufficient liquidity",
+                    ));
+                }
             }
         }
 
@@ -1293,15 +1278,16 @@ mod price_rfq_tests {
         }
     }
 
-    /// The liquidity gate's CC fee headroom is V1-only: the LP pays its own
+    /// The liquidity gate's fee headroom is V1-only: the LP pays its own
     /// dvp+alloc fees on a V1 settle (~$4 worst non-dust ⇒ 44 CC at $0.10 ×
-    /// 1.1 margin), but pays NOTHING on V2 — a CC-poor LP must still quote V2.
+    /// 1.1 margin), but pays NOTHING on V2 — a credit-poor LP must still quote V2.
     #[tokio::test]
     async fn v1_fee_headroom_requires_cc_but_v2_needs_none() {
         let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(6)).await; // 1 CC free above the 5 reserve
         lm.update_token_balance("EDELx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::new(1, 1)).await; // $0.10 per CC
+        lm.update_prepaid(Decimal::ONE, std::time::Instant::now()).await; // 1 CC of fee credit
         let mut h = handler();
         h.liquidity_manager = Some(lm);
 
@@ -1319,6 +1305,49 @@ mod price_rfq_tests {
         if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", false, None, None, None).await {
             panic!("V2 must quote with no CC headroom: {:?}", e.reason_detail);
         }
+    }
+
+    /// V1 fee headroom is prepaid fee capacity, not wallet CC: a 0-CC LP quotes
+    /// on enough credit, rejects on too little, and holds off while it is unknown.
+    #[tokio::test]
+    async fn v1_fee_headroom_uses_prepaid_capacity() {
+        let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::ZERO).await;
+        lm.update_token_balance("EDELx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::new(1, 1)).await; // 44 CC of worst-case V1 fees
+        let mut h = handler();
+        h.liquidity_manager = Some(Arc::clone(&lm));
+        let Err(unknown) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await else { panic!("V1 must wait for the prepaid figure") };
+        assert!(matches!(unknown.reason, RfqRejectionReason::TemporarilyUnavailable));
+        assert_eq!(unknown.reason_detail.as_deref(), Some("Balances loading"));
+
+        lm.update_prepaid(Decimal::from(40), std::time::Instant::now()).await;
+        let Err(short) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await else { panic!("40 CC of credit is short of 44") };
+        assert_eq!(short.reason_detail.as_deref(), Some("Insufficient liquidity"));
+
+        lm.update_prepaid(Decimal::from(50), std::time::Instant::now()).await;
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await {
+            panic!("50 CC of credit covers the V1 fees: {:?}", e.reason_detail);
+        }
+    }
+
+    /// While the prepaid figure is unknown, a WARN at most once a minute per reason, not one per RFQ.
+    #[tokio::test]
+    async fn deferred_v1_quotes_warn_at_most_once_a_minute() {
+        let logs = crate::test_util::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::ZERO).await;
+        lm.update_token_balance("EDELx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::new(1, 1)).await;
+        let mut h = handler();
+        h.liquidity_manager = Some(lm);
+        for _ in 0..3 {
+            let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await else { panic!("V1 must wait for the prepaid figure") };
+            assert_eq!(e.reason_detail.as_deref(), Some("Balances loading"));
+        }
+        let warned = logs.count("rejected — Prepaid balance not loaded yet");
+        assert!(warned <= 1, "{warned} WARN lines for 3 RFQs");
     }
 
     /// The stress coefficient widens a protective (>= 0) spread by the full
@@ -1920,10 +1949,11 @@ mod price_rfq_tests {
             assert_eq!(err.reason_detail.as_deref(), Some("Insufficient liquidity"), "v1={v1}");
         }
 
-        // CC short only, with a fee estimate above 1e27
+        // Fee capacity short only, with a fee estimate above 1e27
         let mut h = handler();
-        h.liquidity_manager =
-            Some(lm_with(1.1, &[("EDELx", Decimal::from(5000))], Decimal::new(1, 28)).await);
+        let lm = lm_with(1.1, &[("EDELx", Decimal::from(5000))], Decimal::new(1, 28)).await;
+        lm.update_prepaid(Decimal::from(100), std::time::Instant::now()).await;
+        h.liquidity_manager = Some(lm);
         let err = h
             .price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None)
             .await

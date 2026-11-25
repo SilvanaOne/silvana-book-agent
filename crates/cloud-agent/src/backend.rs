@@ -245,6 +245,7 @@ impl CloudSettlementBackend {
             contract_id: cid,
             update_id: result.update_id,
             traffic_total: traffic,
+            fee_cc: None,
         })
     }
 
@@ -303,6 +304,7 @@ impl CloudSettlementBackend {
             contract_id: cid,
             update_id: result.update_id,
             traffic_total: traffic,
+            fee_cc: None,
         })
     }
 

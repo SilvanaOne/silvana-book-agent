@@ -505,6 +505,7 @@ cloud-agent --quote-private-key <HEX> agent
 | `PARTY_FEE`                      | Platform fee party: once linked, the agent pays fees, a swap quote's fee included, only to this party, and refuses them while it is unset (see [docs/control.md](docs/control.md#platform-parties)) | once, when unset |
 | `PARTY_PREPAID_TRAFFIC`          | Prepaid traffic party: once linked, the agent tops up prepaid traffic only to this party, and refuses top-ups while it is unset | once, when unset |
 | `AGENT_FEE_RESERVE_CC`           | CC balance held back for fees (default: `5.0`; a finite number)        |          no          |
+| `AGENT_SETTLEMENT_TRAFFIC_CC`    | Prepaid CC held per in-flight settlement for its own transactions, apart from its fees (default: `1.2`; a finite number, at least 0) | no |
 | `MERGE_THRESHOLD`                | Merge worker triggers when selectable amulets exceed this count        |         yes          |
 | `MERGE_MAX_AMULETS`              | Max amulets merged per round (default: `100`)                          |         yes          |
 | `MERGE_POLL_INTERVAL_SEC`        | Merge worker poll interval in seconds (default: `600`; at least 1)     |         yes          |
@@ -514,7 +515,7 @@ cloud-agent --quote-private-key <HEX> agent
 | `MAX_ALLOCATION_WORKERS`         | Concurrent allocation payments, 1–256 (default `20` when unset)        |          no          |
 | `MAX_FEE_WORKERS`                | Concurrent fee payments, 1–256 (default `5` when unset)                |          no          |
 | `MAX_PAYMENT_WORKERS`            | Sets both payment pools at once, 1–256; overrides the two above        |          no          |
-| `MIN_PREPAID_TRAFFIC_BALANCE_CC` | Auto top-up floor for the prepaid-traffic balance that settlement fees are paid from; the agent also tops up when the available prepaid balance (balance plus credit) is below the largest fee reserved for an in-flight settlement. Set together with `PREPAID_TRAFFIC_TOPUP_CC` | yes |
+| `MIN_PREPAID_TRAFFIC_BALANCE_CC` | Auto top-up floor for the prepaid-traffic balance that settlement fees are paid from; the agent also tops up when the available prepaid balance (balance plus credit) is below what in-flight settlements still hold in prepaid (their unpaid fees and traffic holds). Set together with `PREPAID_TRAFFIC_TOPUP_CC` | yes |
 | `PREPAID_TRAFFIC_TOPUP_CC`       | CC moved into the prepaid-traffic balance per top-up                   |         yes          |
 | `MAX_SETTLEMENT_RETRIES`         | Failed attempts of one settlement step before the agent abandons the settlement and, if it has not allocated yet, cancels it; permanent errors abandon at once (default `30`, about 28 min of backoff) | no |
 | `AGENT_MAX_PENDING_PER_COUNTERPARTY` | Open settlements allowed with one counterparty; further proposals are rejected (default `10`) | no |

@@ -143,6 +143,8 @@ pub struct BaseConfig {
     pub public_key_hex: String,
     pub settlement_operator: String,
     pub fee_reserve_cc: f64,
+    /// Prepaid CC held per settlement for its own transactions (`AGENT_SETTLEMENT_TRAFFIC_CC`).
+    pub settlement_traffic_cc: f64,
     // agent_fee_cc / participant_fee_cc / signature_fee_cc moved to
     // ledger-service (`LedgerServiceConfig`). The ledger now issues these
     // fees as a server-signed schedule and debits them off-chain.
@@ -335,6 +337,7 @@ impl BaseConfig {
             public_key_hex: String::new(),
             settlement_operator: String::new(),
             fee_reserve_cc: 5.0,
+            settlement_traffic_cc: 1.2,
             merge_threshold: None,
             merge_max_amulets: 0,
             merge_poll_interval_sec: 600,
@@ -561,6 +564,7 @@ impl BaseConfig {
             public_key_hex,
             settlement_operator: settlement_operator.to_string(),
             fee_reserve_cc: 5.0,
+            settlement_traffic_cc: 1.2,
             merge_threshold: None,
             merge_max_amulets: 100,
             merge_poll_interval_sec: 600,
@@ -835,6 +839,7 @@ impl BaseConfig {
         // handled off-chain by the ledger via the prepaid pool.
 
         let fee_reserve_cc: f64 = env_or("AGENT_FEE_RESERVE_CC", 5.0)?;
+        let settlement_traffic_cc: f64 = env_or("AGENT_SETTLEMENT_TRAFFIC_CC", 1.2)?;
 
         // AGENT_FEE_CC / PARTICIPANT_FEE_CC / SIGNATURE_FEE_CC have moved to
         // the ledger-service config (`LedgerServiceConfig`). The ledger
@@ -1258,6 +1263,7 @@ impl BaseConfig {
             public_key_hex,
             settlement_operator,
             fee_reserve_cc,
+            settlement_traffic_cc,
             merge_threshold,
             merge_max_amulets,
             merge_poll_interval_sec,
@@ -1321,6 +1327,7 @@ impl BaseConfig {
         check_range("canton_op_timeout_secs", self.canton_op_timeout_secs, 1..=86_400)?;
         for (name, value) in [
             ("fee_reserve_cc (AGENT_FEE_RESERVE_CC)", self.fee_reserve_cc),
+            ("settlement_traffic_cc (AGENT_SETTLEMENT_TRAFFIC_CC)", self.settlement_traffic_cc),
             ("liquidity_margin (LIQUIDITY_MARGIN)", self.liquidity_margin),
             ("flow_ema_window_hours (FLOW_EMA_WINDOW_HOURS)", self.flow_ema_window_hours),
             ("depletion_max_hours (DEPLETION_COEFF_MAX_HOURS)", self.depletion_max_hours),
@@ -1329,6 +1336,12 @@ impl BaseConfig {
             if !value.is_finite() {
                 bail!("{name}={value} must be a finite number");
             }
+        }
+        if self.settlement_traffic_cc < 0.0 {
+            bail!(
+                "settlement_traffic_cc (AGENT_SETTLEMENT_TRAFFIC_CC)={} must not be negative",
+                self.settlement_traffic_cc
+            );
         }
         for market in &self.markets {
             if let Some(rfq) = &market.rfq {
@@ -3824,6 +3837,8 @@ max_quantity = "0"
             ("FLOW_EMA_WINDOW_HOURS", |c| c.flow_ema_window_hours = f64::NAN),
             ("DEPLETION_COEFF_MAX_HOURS", |c| c.depletion_max_hours = f64::NEG_INFINITY),
             ("DEPLETION_COEFF_MIN_HOURS", |c| c.depletion_min_hours = f64::NAN),
+            ("AGENT_SETTLEMENT_TRAFFIC_CC", |c| c.settlement_traffic_cc = f64::NAN),
+            ("AGENT_SETTLEMENT_TRAFFIC_CC", |c| c.settlement_traffic_cc = -0.1),
             ("ticket_batch_size", |c| { with_v2(c); v2(c).ticket_batch_size = 0 }),
             ("ticket_batch_size", |c| { with_v2(c); v2(c).ticket_batch_size = 1001 }),
             ("atomic_quote_valid_secs", |c| { with_v2(c); v2(c).atomic_quote_valid_secs = 0 }),

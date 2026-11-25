@@ -10,7 +10,7 @@
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +26,35 @@ pub const CC_TOKEN: &str = "CC";
 
 /// A balance not refreshed within this window is reported as stale.
 pub const DEFAULT_BALANCE_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// A prepaid figure without a successful poll within this window is unknown to the fee checks.
+pub const PREPAID_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// Local fee debits kept between polls; past this the oldest two are merged.
+const MAX_LOCAL_DEBITS: usize = 1024;
+
+/// Prepaid CC held per settlement for its own transactions: traffic and service fees.
+pub const DEFAULT_SETTLEMENT_TRAFFIC_CC: Decimal = Decimal::from_parts(12, 0, 0, false, 1);
+
+/// The per-side processing fee of one fill, in USD, for a market with none seen yet.
+const MIN_FILL_FEES_USD: Decimal = Decimal::ONE;
+
+/// Markets whose last per-side fee is kept.
+const MAX_FILL_FEE_MARKETS: usize = 256;
+
+/// Marks a commit refused only because fee capacity is not known yet; it is retried.
+pub const FEE_CAPACITY_UNKNOWN: &str = "fee capacity unknown";
+
+const BALANCES_NOT_LOADED: &str = "Balances not loaded yet";
+const PREPAID_NOT_LOADED: &str = "Prepaid balance not loaded yet";
+const PREPAID_STALE: &str = "Prepaid balance stale";
+
+/// A configured per-settlement traffic hold in CC; the default when unusable.
+pub fn settlement_traffic_cc(configured: f64) -> Decimal {
+    Decimal::from_f64(configured)
+        .filter(|cc| *cc >= Decimal::ZERO)
+        .unwrap_or(DEFAULT_SETTLEMENT_TRAFFIC_CC)
+}
 
 /// Display bounds: `±u64::MAX`.
 const SHOWN_MAX: Decimal = Decimal::from_parts(u32::MAX, u32::MAX, 0, false, 0);
@@ -159,12 +188,50 @@ struct LiquidityState {
     tokens: HashMap<String, TokenState>,
     /// Per-token flow tracking.
     flows: HashMap<String, TokenFlow>,
-    /// CC committed for fees (separate from CC allocation commitments).
+    /// CC committed for fees, paid from prepaid credit (separate from CC allocations).
     fee_commitments: FeeCommitments,
     /// Cached CC/USD exchange rate (for fee estimation).
     cc_usd_rate: Decimal,
     /// Alias map: short name → canonical key (e.g. "USDCx" → instrument_id).
     aliases: HashMap<String, String>,
+    /// Off-chain prepaid credit that settlement fees are debited from.
+    prepaid: PrepaidState,
+    /// Prepaid held per settlement for its own transactions, apart from its fees.
+    traffic_holds: HashMap<String, Decimal>,
+    /// This side's fees (USD) on the last settlement seen per market.
+    fill_fees_usd: HashMap<String, Decimal>,
+}
+
+/// Prepaid credit as last polled, with the fees paid since.
+#[derive(Default)]
+struct PrepaidState {
+    /// Available credit (balance plus credit limit) and when that poll was sent.
+    polled: Option<(Decimal, Instant)>,
+    /// Fees debited locally, by time; a poll sent after one already reflects it.
+    local_debits: VecDeque<(Instant, Decimal)>,
+    /// Amount of one auto top-up, while auto top-up runs.
+    topup_cc: Option<Decimal>,
+    /// Prepaid held for each settlement's own transactions.
+    traffic_cc: Decimal,
+}
+
+/// Why fee capacity does not cover a fee.
+enum FeeShortfall {
+    /// A figure the check needs is unknown or stale.
+    Unknown(&'static str),
+    /// Capacity is known and too small.
+    Short(String),
+}
+
+/// The adoption gate's verdict on one settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adoption {
+    /// Funds and fee capacity suffice.
+    Accept,
+    /// Not decidable yet (balance, rate or prepaid credit unknown): hold it.
+    Defer(String),
+    /// Short of funds or fee capacity.
+    Reject(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +283,12 @@ impl LiquidityManager {
                 fee_commitments: FeeCommitments::new(),
                 cc_usd_rate: Decimal::ZERO,
                 aliases: HashMap::new(),
+                prepaid: PrepaidState {
+                    traffic_cc: DEFAULT_SETTLEMENT_TRAFFIC_CC,
+                    ..PrepaidState::default()
+                },
+                traffic_holds: HashMap::new(),
+                fill_fees_usd: HashMap::new(),
             }),
             fee_reserve_cc: Decimal::from_f64_retain(fee_reserve_cc).unwrap_or(Decimal::ZERO),
             margin,
@@ -236,14 +309,13 @@ impl LiquidityManager {
         Duration::from_secs(self.stale_after_secs.load(Ordering::Relaxed))
     }
 
-    /// Returns true once both CC and at least one non-CC balance have been loaded.
-    /// Before this, the liquidity gate reports "Balances loading" rather than
-    /// falsely rejecting as "Insufficient liquidity" due to an unknown balance.
+    /// True once a non-CC balance and either the CC balance or the prepaid credit are loaded;
+    /// until then the gates report "Balances loading", not a false "Insufficient liquidity".
     pub async fn is_ready(&self) -> bool {
         let s = self.state.read().await;
         let has_cc = s.tokens.contains_key(CC_TOKEN);
         let has_non_cc = s.tokens.keys().any(|k| k != CC_TOKEN);
-        has_cc && has_non_cc
+        has_non_cc && (has_cc || s.prepaid.polled.is_some())
     }
 
     // -----------------------------------------------------------------------
@@ -350,6 +422,85 @@ impl LiquidityManager {
         s.cc_usd_rate = rate;
     }
 
+    /// Record a polled prepaid figure (balance plus credit limit, in CC) sent at `polled_at`;
+    /// debits after that time are kept, and an older poll is ignored.
+    pub async fn update_prepaid(&self, available_cc: Decimal, polled_at: Instant) {
+        let mut s = self.state.write().await;
+        if s.prepaid.polled.is_some_and(|(_, at)| polled_at < at) {
+            return;
+        }
+        s.prepaid.local_debits.retain(|(at, _)| *at >= polled_at);
+        s.prepaid.polled = Some((available_cc, polled_at));
+    }
+
+    /// Whether auto top-up runs, and the CC it moves per top-up.
+    pub async fn set_auto_topup(&self, topup_cc: Option<Decimal>) {
+        let mut s = self.state.write().await;
+        s.prepaid.topup_cc = topup_cc.filter(|t| *t > Decimal::ZERO);
+    }
+
+    /// Prepaid CC held for each settlement's own transactions (negative reads as zero).
+    pub async fn set_settlement_traffic(&self, traffic_cc: Decimal) {
+        let mut s = self.state.write().await;
+        s.prepaid.traffic_cc = traffic_cc.max(Decimal::ZERO);
+    }
+
+    /// A fee was debited: lowers the prepaid figure and the proposal's fee commitment by
+    /// `paid_cc` as stated, else by the estimate for `fee_usd`, else by the remaining commitment.
+    pub async fn record_fee_paid(&self, proposal_id: &str, paid_cc: Option<Decimal>, fee_usd: Option<Decimal>) {
+        let mut s = self.state.write().await;
+        let committed = s.fee_commitments.entries.get(proposal_id).copied();
+        let debit = match paid_cc.filter(|cc| *cc >= Decimal::ZERO) {
+            Some(stated) => stated,
+            None => fee_usd
+                .and_then(|usd| self.fee_cc_at(s.cc_usd_rate, usd))
+                .filter(|cc| *cc > Decimal::ZERO)
+                .or(committed)
+                .unwrap_or(Decimal::ZERO),
+        };
+        if debit <= Decimal::ZERO {
+            return;
+        }
+        if s.prepaid.local_debits.len() >= MAX_LOCAL_DEBITS {
+            // Merged under the later time, so it is dropped no sooner
+            let oldest = s.prepaid.local_debits.pop_front().map_or(Decimal::ZERO, |(_, d)| d);
+            if let Some(next) = s.prepaid.local_debits.front_mut() {
+                next.1 = next.1.saturating_add(oldest);
+            }
+        }
+        s.prepaid.local_debits.push_back((Instant::now(), debit));
+        if let Some(c) = s.fee_commitments.entries.get_mut(proposal_id) {
+            *c = c.saturating_sub(debit).max(Decimal::ZERO);
+        }
+        debug!("[{}] Prepaid credit debited locally: {:.4} CC", proposal_id, shown(debit));
+    }
+
+    /// This side's last fee is recorded: what its fee commitment still holds is margin,
+    /// not a future debit. The traffic hold stays until release.
+    pub async fn clear_fee_commitment(&self, proposal_id: &str) {
+        let mut s = self.state.write().await;
+        if let Some(c) = s.fee_commitments.entries.get_mut(proposal_id) {
+            *c = Decimal::ZERO;
+        }
+    }
+
+    /// Note this side's fees (USD) on a settlement in `market_id`, for that market's per-fill need.
+    pub async fn note_fill_fee(&self, market_id: &str, fees_usd: Decimal) {
+        if market_id.is_empty() || fees_usd < Decimal::ZERO {
+            return;
+        }
+        let mut s = self.state.write().await;
+        if s.fill_fees_usd.len() < MAX_FILL_FEE_MARKETS || s.fill_fees_usd.contains_key(market_id) {
+            s.fill_fees_usd.insert(market_id.to_string(), fees_usd);
+        }
+    }
+
+    /// Hold the state lock until the guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_lock(&self) -> impl Drop + '_ {
+        self.state.write().await
+    }
+
     // -----------------------------------------------------------------------
     // Commitment management
     // -----------------------------------------------------------------------
@@ -360,33 +511,139 @@ impl LiquidityManager {
     /// Returns `my_fees_usd / cc_usd_rate * margin`, or `Decimal::ZERO` if rate unknown.
     pub async fn estimate_fee_cc(&self, my_fees_usd: Decimal) -> Decimal {
         let s = self.state.read().await;
-        if s.cc_usd_rate <= Decimal::ZERO || my_fees_usd <= Decimal::ZERO {
-            return Decimal::ZERO;
+        self.fee_cc_at(s.cc_usd_rate, my_fees_usd).unwrap_or(Decimal::ZERO)
+    }
+
+    /// `fees_usd / rate * margin`; `None` without a usable rate.
+    fn fee_cc_at(&self, rate: Decimal, fees_usd: Decimal) -> Option<Decimal> {
+        if rate <= Decimal::ZERO {
+            return None;
+        }
+        if fees_usd <= Decimal::ZERO {
+            return Some(Decimal::ZERO);
         }
         let margin = Decimal::from_f64_retain(self.margin).unwrap_or(Decimal::ONE);
         // Out of Decimal range reads as unaffordable
-        my_fees_usd
-            .checked_div(s.cc_usd_rate)
-            .and_then(|raw| raw.checked_mul(margin))
+        Some(
+            fees_usd
+                .checked_div(rate)
+                .and_then(|raw| raw.checked_mul(margin))
+                .unwrap_or(Decimal::MAX),
+        )
+    }
+
+    /// Polled prepaid credit less local debits, while the poll is fresh.
+    fn prepaid_now(s: &LiquidityState, now: Instant) -> Option<Decimal> {
+        let (polled, at) = s.prepaid.polled?;
+        if now.saturating_duration_since(at) >= PREPAID_STALE_AFTER {
+            return None;
+        }
+        Some(polled.saturating_sub(Self::local_debit_total(s)))
+    }
+
+    fn local_debit_total(s: &LiquidityState) -> Decimal {
+        s.prepaid
+            .local_debits
+            .iter()
+            .fold(Decimal::ZERO, |acc, (_, d)| acc.saturating_add(*d))
+    }
+
+    /// Prepaid held for in-flight settlements: unpaid fees and traffic holds.
+    fn held_total(s: &LiquidityState) -> Decimal {
+        s.traffic_holds
+            .values()
+            .fold(s.fee_commitments.total(), |acc, v| acc.saturating_add(*v))
+            .max(Decimal::ZERO)
+    }
+
+    /// Wallet CC that held fees need moved into prepaid, in whole top-ups (unknown
+    /// prepaid reads as zero); zero without auto top-up.
+    fn wallet_hold(s: &LiquidityState, now: Instant) -> Decimal {
+        let Some(topup) = s.prepaid.topup_cc.filter(|t| *t > Decimal::ZERO) else {
+            return Decimal::ZERO;
+        };
+        let short = Self::held_total(s).saturating_sub(Self::prepaid_now(s, now).unwrap_or(Decimal::ZERO));
+        if short <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        short
+            .checked_div(topup)
+            .map(|n| n.ceil())
+            .and_then(|n| n.checked_mul(topup))
             .unwrap_or(Decimal::MAX)
     }
 
-    /// Shared availability check for `try_commit` / `can_commit`.
-    ///
-    /// Read-only: absent token entries count as zero balance (identical to the
-    /// `TokenState::new()` a commit would insert) so both callers see the same
-    /// verdict without mutating state.
-    fn check_commit(
+    /// CC free to trade: after commitments, the fee reserve and the wallet hold.
+    fn cc_free(&self, s: &LiquidityState, cc_available: Decimal, now: Instant) -> Decimal {
+        cc_available
+            .saturating_sub(self.fee_reserve_cc)
+            .saturating_sub(Self::wallet_hold(s, now))
+            .max(Decimal::ZERO)
+    }
+
+    /// The CC part of an allocation (zero for any other token).
+    fn cc_allocation(s: &LiquidityState, allocation_token: &str, allocation_amount: Decimal) -> Decimal {
+        if Self::resolve_alias(&s.aliases, allocation_token) == CC_TOKEN {
+            allocation_amount
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    /// Wallet CC that auto top-up can move into prepaid credit: whole top-ups of
+    /// the CC above the reserve and `cc_allocation`; zero without auto top-up.
+    fn wallet_term(&self, s: &LiquidityState, cc_allocation: Decimal) -> Decimal {
+        let Some(topup) = s.prepaid.topup_cc.filter(|t| *t > Decimal::ZERO) else {
+            return Decimal::ZERO;
+        };
+        let spare = s
+            .tokens
+            .get(CC_TOKEN)
+            .map_or(Decimal::ZERO, |t| t.available())
+            .saturating_sub(self.fee_reserve_cc)
+            .saturating_sub(cc_allocation);
+        if spare <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        spare
+            .checked_div(topup)
+            .map(|n| n.floor())
+            .and_then(|n| n.checked_mul(topup))
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO)
+    }
+
+    /// Fee capacity in CC: prepaid credit plus the wallet term, less what in-flight settlements
+    /// hold, never below zero; `None` while the prepaid figure is unknown or stale.
+    fn capacity(&self, s: &LiquidityState, now: Instant, cc_allocation: Decimal) -> Option<Decimal> {
+        let prepaid = Self::prepaid_now(s, now)?;
+        Some(
+            prepaid
+                .saturating_add(self.wallet_term(s, cc_allocation))
+                .saturating_sub(Self::held_total(s))
+                .max(Decimal::ZERO),
+        )
+    }
+
+    /// Why the prepaid figure is unusable.
+    fn prepaid_unknown(s: &LiquidityState) -> &'static str {
+        if s.prepaid.polled.is_none() {
+            PREPAID_NOT_LOADED
+        } else {
+            PREPAID_STALE
+        }
+    }
+
+    /// Whether the allocation token covers the allocation (absent entries count as zero);
+    /// a CC allocation also leaves the fee reserve in place.
+    fn check_allocation(
         &self,
         s: &LiquidityState,
         allocation_token: &str,
         allocation_amount: Decimal,
-        fee_cc: Decimal,
     ) -> Result<(), String> {
         // Resolve aliases so commitment checks agree with `available()`.
         let allocation_token = Self::resolve_alias(&s.aliases, allocation_token);
-
-        // --- Check allocation token availability ---
         let token_available = s
             .tokens
             .get(allocation_token)
@@ -398,31 +655,174 @@ impl LiquidityManager {
                 allocation_token, shown(token_available), shown(allocation_amount)
             ));
         }
-
-        // --- Check CC for fees (may overlap if allocation_token == CC) ---
-        let cc_available = s
-            .tokens
-            .get(CC_TOKEN)
-            .map_or(Decimal::ZERO, |t| t.available());
-        let cc_available_for_fees = cc_available
-            .saturating_sub(self.fee_reserve_cc)
-            .saturating_sub(s.fee_commitments.total());
-        // If allocation_token is CC, the allocation also consumes CC
-        let cc_after_alloc = if allocation_token == CC_TOKEN {
-            cc_available_for_fees.saturating_sub(allocation_amount)
-        } else {
-            cc_available_for_fees
-        };
-
-        if cc_after_alloc < fee_cc {
-            return Err(format!(
-                "insufficient CC for fees ({:.4} available after allocation + reserve, {:.4} needed)",
-                shown(cc_after_alloc.max(Decimal::ZERO)),
-                shown(fee_cc)
-            ));
+        if allocation_token == CC_TOKEN {
+            let free = token_available.saturating_sub(self.fee_reserve_cc);
+            if free < allocation_amount {
+                return Err(format!(
+                    "insufficient CC ({:.4} available after reserve, {:.4} needed for allocation)",
+                    shown(free.max(Decimal::ZERO)),
+                    shown(allocation_amount)
+                ));
+            }
         }
-
         Ok(())
+    }
+
+    /// Whether fee capacity covers this settlement's `fee_cc` and `traffic_cc` for this allocation.
+    fn check_fee(
+        &self,
+        s: &LiquidityState,
+        now: Instant,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fee_cc: Decimal,
+        traffic_cc: Decimal,
+    ) -> Result<(), FeeShortfall> {
+        let cc_allocation = Self::cc_allocation(s, allocation_token, allocation_amount);
+        let need = fee_cc.max(Decimal::ZERO).saturating_add(traffic_cc.max(Decimal::ZERO));
+        if need <= Decimal::ZERO {
+            return self.check_wallet_cover(s, now, cc_allocation);
+        }
+        match self.capacity(s, now, cc_allocation) {
+            Some(capacity) if capacity >= need => Ok(()),
+            // The wallet term read an unloaded CC balance as zero
+            Some(_) if s.prepaid.topup_cc.is_some() && !s.tokens.contains_key(CC_TOKEN) => {
+                Err(FeeShortfall::Unknown(BALANCES_NOT_LOADED))
+            }
+            Some(capacity) => Err(FeeShortfall::Short(format!(
+                "insufficient fee capacity ({:.4} CC available, {:.4} needed)",
+                shown(capacity),
+                shown(need)
+            ))),
+            // Out of Decimal range: unaffordable whatever the credit
+            None if need == Decimal::MAX => Err(FeeShortfall::Short(format!(
+                "fee estimate out of range ({:.4} needed)",
+                shown(need)
+            ))),
+            None => Err(FeeShortfall::Unknown(Self::prepaid_unknown(s))),
+        }
+    }
+
+    /// With nothing of its own to fund, a CC allocation must still leave the wallet CC
+    /// that held fees count on for their top-up (unknown prepaid reads as zero).
+    fn check_wallet_cover(
+        &self,
+        s: &LiquidityState,
+        now: Instant,
+        cc_allocation: Decimal,
+    ) -> Result<(), FeeShortfall> {
+        let held = Self::held_total(s);
+        if cc_allocation <= Decimal::ZERO || s.prepaid.topup_cc.is_none() || held <= Decimal::ZERO {
+            return Ok(());
+        }
+        let prepaid = Self::prepaid_now(s, now);
+        let cover = prepaid
+            .unwrap_or(Decimal::ZERO)
+            .saturating_add(self.wallet_term(s, cc_allocation));
+        if cover >= held {
+            return Ok(());
+        }
+        match prepaid {
+            Some(_) => Err(FeeShortfall::Short(format!(
+                "insufficient CC ({:.4} CC of held fees need wallet CC for top-up, {:.4} covered)",
+                shown(held),
+                shown(cover.max(Decimal::ZERO))
+            ))),
+            None => Err(FeeShortfall::Unknown(Self::prepaid_unknown(s))),
+        }
+    }
+
+    /// Shared availability check for the commits and `can_commit`; read-only, so all see
+    /// the same verdict. Unknown fee capacity fails with [`FEE_CAPACITY_UNKNOWN`].
+    fn check_commit(
+        &self,
+        s: &LiquidityState,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fee_cc: Decimal,
+        traffic_cc: Decimal,
+    ) -> Result<(), String> {
+        self.check_allocation(s, allocation_token, allocation_amount)?;
+        self.check_fee(s, Instant::now(), allocation_token, allocation_amount, fee_cc, traffic_cc)
+            .map_err(|shortfall| match shortfall {
+                FeeShortfall::Unknown(why) => format!("{FEE_CAPACITY_UNKNOWN} ({why})"),
+                FeeShortfall::Short(reason) => reason,
+            })
+    }
+
+    /// The adoption gate's check for a settlement this agent runs, under one lock: a
+    /// shortfall rejects, while an unknown CC balance, rate or prepaid figure defers.
+    pub async fn adoption_check(
+        &self,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        my_fees_usd: Decimal,
+    ) -> Adoption {
+        self.gate(allocation_token, allocation_amount, my_fees_usd, true).await
+    }
+
+    /// [`Self::adoption_check`] for a quote whose settlement runs none of this agent's
+    /// transactions or fees: the allocation, and the CC that held fees count on.
+    pub async fn quote_check(&self, allocation_token: &str, allocation_amount: Decimal) -> Adoption {
+        self.gate(allocation_token, allocation_amount, Decimal::ZERO, false).await
+    }
+
+    async fn gate(
+        &self,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        my_fees_usd: Decimal,
+        own_traffic: bool,
+    ) -> Adoption {
+        let s = self.state.read().await;
+        if Self::resolve_alias(&s.aliases, allocation_token) == CC_TOKEN
+            && !s.tokens.contains_key(CC_TOKEN)
+        {
+            return Adoption::Defer(BALANCES_NOT_LOADED.to_string());
+        }
+        if let Err(reason) = self.check_allocation(&s, allocation_token, allocation_amount) {
+            return Adoption::Reject(reason);
+        }
+        let fee_cc = match self.fee_cc_at(s.cc_usd_rate, my_fees_usd) {
+            Some(fee_cc) => fee_cc,
+            None if my_fees_usd > Decimal::ZERO => {
+                return Adoption::Defer("CC rate not known yet".to_string())
+            }
+            None => Decimal::ZERO,
+        };
+        let traffic_cc = if own_traffic { s.prepaid.traffic_cc } else { Decimal::ZERO };
+        match self.check_fee(&s, Instant::now(), allocation_token, allocation_amount, fee_cc, traffic_cc) {
+            Ok(()) => Adoption::Accept,
+            Err(FeeShortfall::Short(reason)) => Adoption::Reject(reason),
+            Err(FeeShortfall::Unknown(why)) => Adoption::Defer(why.to_string()),
+        }
+    }
+
+    /// Fee capacity in CC with no allocation; `None` while prepaid credit is unknown or stale.
+    pub async fn fee_capacity(&self) -> Option<Decimal> {
+        let s = self.state.read().await;
+        self.capacity(&s, Instant::now(), Decimal::ZERO)
+    }
+
+    /// Fee capacity in CC for a settlement allocating `allocation_amount` of `allocation_token`.
+    #[cfg(test)]
+    pub async fn fee_capacity_for(&self, allocation_token: &str, allocation_amount: Decimal) -> Option<Decimal> {
+        let s = self.state.read().await;
+        let cc_allocation = Self::cc_allocation(&s, allocation_token, allocation_amount);
+        self.capacity(&s, Instant::now(), cc_allocation)
+    }
+
+    /// Fee capacity one fill needs, plus its own traffic: per market from the last fee seen
+    /// there, and the default for a market with none (zero fee without a rate).
+    pub async fn fill_needs(&self) -> (Decimal, Vec<(String, Decimal)>) {
+        let s = self.state.read().await;
+        let need = |fees_usd: Decimal| {
+            self.fee_cc_at(s.cc_usd_rate, fees_usd)
+                .unwrap_or(Decimal::ZERO)
+                .saturating_add(s.prepaid.traffic_cc)
+        };
+        let by_market = s.fill_fees_usd.iter().map(|(m, usd)| (m.clone(), need(*usd))).collect();
+        (need(MIN_FILL_FEES_USD), by_market)
     }
 
     /// Advisory availability check — same rules as `try_commit`, no mutation.
@@ -438,27 +838,28 @@ impl LiquidityManager {
         fee_cc: Decimal,
     ) -> Result<(), String> {
         let s = self.state.read().await;
-        self.check_commit(&s, allocation_token, allocation_amount, fee_cc)
+        self.check_commit(&s, allocation_token, allocation_amount, fee_cc, Decimal::ZERO)
     }
 
-    /// True if a commitment (allocation or fee) exists for this proposal.
+    /// True if a commitment (allocation, fee or traffic) exists for this proposal.
     pub async fn has_commitment(&self, proposal_id: &str) -> bool {
         let s = self.state.read().await;
         s.fee_commitments.entries.contains_key(proposal_id)
+            || s.traffic_holds.contains_key(proposal_id)
             || s.tokens
                 .values()
                 .any(|t| t.allocation_commitments.contains_key(proposal_id))
     }
 
-    /// Largest CC fee reserved for one settlement; zero when none.
-    pub async fn largest_fee_commitment(&self) -> Decimal {
+    /// Prepaid that in-flight settlements still hold: unpaid fees and traffic; never below zero.
+    pub async fn prepaid_demand(&self) -> Decimal {
         let s = self.state.read().await;
-        s.fee_commitments.entries.values().copied().max().unwrap_or(Decimal::ZERO).max(Decimal::ZERO)
+        Self::held_total(&s)
     }
 
     /// Try to commit resources for a settlement.
     ///
-    /// Checks **both** the allocation token balance **and** CC for fees.
+    /// Checks **both** the allocation token balance **and** fee capacity.
     /// On success, records the commitment.  On failure, returns an error
     /// description suitable for logging.
     ///
@@ -472,17 +873,60 @@ impl LiquidityManager {
         allocation_amount: Decimal,
         fee_cc: Decimal,
     ) -> Result<(), String> {
+        self.commit(proposal_id, allocation_token, allocation_amount, fee_cc, false).await
+    }
+
+    /// [`Self::try_commit`] for a settlement this agent runs: prices `fees_usd` under the lock and
+    /// holds its traffic too; returns the fee held, or [`FEE_CAPACITY_UNKNOWN`] without a rate.
+    pub async fn try_commit_settlement(
+        &self,
+        proposal_id: &str,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fees_usd: Decimal,
+    ) -> Result<Decimal, String> {
         let mut s = self.state.write().await;
+        let fee_cc = match self.fee_cc_at(s.cc_usd_rate, fees_usd) {
+            Some(fee_cc) => fee_cc,
+            None if fees_usd > Decimal::ZERO => {
+                return Err(format!("{FEE_CAPACITY_UNKNOWN} (CC rate not known yet)"));
+            }
+            None => Decimal::ZERO,
+        };
+        self.commit_in(&mut s, proposal_id, allocation_token, allocation_amount, fee_cc, true)?;
+        Ok(fee_cc)
+    }
+
+    async fn commit(
+        &self,
+        proposal_id: &str,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fee_cc: Decimal,
+        own_traffic: bool,
+    ) -> Result<(), String> {
+        let mut s = self.state.write().await;
+        self.commit_in(&mut s, proposal_id, allocation_token, allocation_amount, fee_cc, own_traffic)
+    }
+
+    fn commit_in(
+        &self,
+        s: &mut LiquidityState,
+        proposal_id: &str,
+        allocation_token: &str,
+        allocation_amount: Decimal,
+        fee_cc: Decimal,
+        own_traffic: bool,
+    ) -> Result<(), String> {
+        let traffic_cc = if own_traffic { s.prepaid.traffic_cc } else { Decimal::ZERO };
 
         // Atomic check-and-reserve: same check as `can_commit`, but under the
         // write lock so no other committer can slip in between check and insert.
-        self.check_commit(&s, allocation_token, allocation_amount, fee_cc)?;
+        self.check_commit(s, allocation_token, allocation_amount, fee_cc, traffic_cc)?;
 
         // Commit under the same resolved key the checks read.
         let allocation_token = Self::resolve_alias(&s.aliases, allocation_token).to_string();
 
-        // --- Commit ---
-        // Re-borrow token_state (may be same as cc_state if CC)
         s.tokens
             .entry(allocation_token.clone())
             .or_insert_with(TokenState::new)
@@ -492,10 +936,13 @@ impl LiquidityManager {
         s.fee_commitments
             .entries
             .insert(proposal_id.to_string(), fee_cc);
+        if traffic_cc > Decimal::ZERO {
+            s.traffic_holds.insert(proposal_id.to_string(), traffic_cc);
+        }
 
         debug!(
-            "[{}] Committed: {} {} + {:.4} CC fees",
-            proposal_id, allocation_amount, allocation_token, shown(fee_cc)
+            "[{}] Committed: {} {} + {:.4} CC fees + {:.4} CC traffic",
+            proposal_id, allocation_amount, allocation_token, shown(fee_cc), shown(traffic_cc)
         );
         Ok(())
     }
@@ -509,8 +956,9 @@ impl LiquidityManager {
             token_state.allocation_commitments.remove(proposal_id);
         }
 
-        // Remove fee commitment
+        // Remove fee commitment and traffic hold
         s.fee_commitments.entries.remove(proposal_id);
+        s.traffic_holds.remove(proposal_id);
 
         debug!("[{}] Released liquidity commitments", proposal_id);
     }
@@ -553,6 +1001,7 @@ impl LiquidityManager {
                 .keys()
                 .filter(|pid| !keep(*pid)),
         );
+        orphaned.extend(s.traffic_holds.keys().filter(|pid| !keep(*pid)));
         let dropped = orphaned.len();
         for token_state in s.tokens.values_mut() {
             token_state
@@ -562,6 +1011,7 @@ impl LiquidityManager {
         s.fee_commitments
             .entries
             .retain(|pid, _| keep(pid));
+        s.traffic_holds.retain(|pid, _| keep(pid));
         if dropped > 0 {
             debug!("Reconciled liquidity commitments: dropped {} orphaned reservation(s)", dropped);
         }
@@ -589,20 +1039,20 @@ impl LiquidityManager {
     // -----------------------------------------------------------------------
 
     /// Available balance for a token after commitments.
-    /// For CC, also subtracts fee_reserve and fee commitments.
+    /// For CC, also subtracts the fee reserve and the wallet CC held fees need for top-up.
     /// Resolves aliases (e.g. "USDCx" → instrument_id).
     pub async fn available(&self, token: &str) -> Decimal {
         let s = self.state.read().await;
         let resolved = Self::resolve_alias(&s.aliases, token);
         let base = s.tokens.get(resolved).map_or(Decimal::ZERO, |t| t.available());
         if resolved == CC_TOKEN {
-            base.saturating_sub(self.fee_reserve_cc).saturating_sub(s.fee_commitments.total()).max(Decimal::ZERO)
+            self.cc_free(&s, base, Instant::now())
         } else {
             base
         }
     }
 
-    /// Available CC after all commitments and fee reserve.
+    /// Available CC after allocation commitments and the fee reserve.
     pub async fn available_cc(&self) -> Decimal {
         self.available(CC_TOKEN).await
     }
@@ -628,9 +1078,9 @@ impl LiquidityManager {
         }
 
         let available = s.tokens.get(resolved.as_str()).map_or(Decimal::ZERO, |t| t.available());
-        // For CC, subtract fee reserve and fee commitments
+        // For CC, subtract the fee reserve
         let effective_available = if resolved == CC_TOKEN {
-            available.saturating_sub(self.fee_reserve_cc).saturating_sub(s.fee_commitments.total()).max(Decimal::ZERO)
+            self.cc_free(&s, available, Instant::now())
         } else {
             available
         };
@@ -670,15 +1120,13 @@ impl LiquidityManager {
         }
 
         // Now collect stats (immutable borrows only)
-        let fee_total = s.fee_commitments.total();
         let now = Instant::now();
         let mut result = Vec::new();
 
         for (token, state) in &s.tokens {
             let committed = state.committed();
-            let fee_committed = if token == CC_TOKEN { fee_total } else { Decimal::ZERO };
             let available = if token == CC_TOKEN {
-                state.available().saturating_sub(self.fee_reserve_cc).saturating_sub(fee_total).max(Decimal::ZERO)
+                self.cc_free(&s, state.available(), now)
             } else {
                 state.available()
             };
@@ -700,7 +1148,6 @@ impl LiquidityManager {
                 token: token.clone(),
                 balance: state.balance,
                 committed,
-                fee_committed,
                 fee_reserve: if token == CC_TOKEN { self.fee_reserve_cc } else { Decimal::ZERO },
                 available,
                 num_commitments: state.allocation_commitments.len(),
@@ -716,6 +1163,28 @@ impl LiquidityManager {
         result.sort_by(|a, b| stats_order(&a.token, &b.token));
 
         result
+    }
+
+    /// Prepaid credit and fee capacity for heartbeat logging.
+    pub async fn prepaid_stats(&self) -> PrepaidStats {
+        let s = self.state.read().await;
+        let now = Instant::now();
+        let capacity = self.capacity(&s, now, Decimal::ZERO);
+        PrepaidStats {
+            available: s
+                .prepaid
+                .polled
+                .map(|(polled, _)| polled.saturating_sub(Self::local_debit_total(&s))),
+            refreshed_secs_ago: s
+                .prepaid
+                .polled
+                .map(|(_, at)| now.saturating_duration_since(at).as_secs()),
+            stale: s.prepaid.polled.is_some() && capacity.is_none(),
+            fee_committed: s.fee_commitments.total(),
+            traffic_held: s.traffic_holds.values().fold(Decimal::ZERO, |acc, v| acc.saturating_add(*v)),
+            capacity,
+            auto_topup_cc: s.prepaid.topup_cc,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -754,7 +1223,6 @@ pub struct TokenStats {
     pub token: String,
     pub balance: Decimal,
     pub committed: Decimal,
-    pub fee_committed: Decimal,
     pub fee_reserve: Decimal,
     pub available: Decimal,
     pub num_commitments: usize,
@@ -777,7 +1245,7 @@ impl std::fmt::Display for TokenStats {
             "{} {:.2} bal / {:.2} committed / {:.2} avail ({} stlmts), flow {:.1}/hr, depl={:.1} ({})",
             self.token,
             self.balance,
-            self.committed.saturating_add(self.fee_committed),
+            self.committed,
             self.available,
             self.num_commitments,
             self.net_outflow_per_hour,
@@ -785,6 +1253,24 @@ impl std::fmt::Display for TokenStats {
             depl_str,
         )
     }
+}
+
+/// Prepaid fee credit (returned by `LiquidityManager::prepaid_stats()`).
+pub struct PrepaidStats {
+    /// Polled credit less local debits; `None` until the first poll.
+    pub available: Option<Decimal>,
+    /// Seconds since the last successful poll was sent; `None` if never.
+    pub refreshed_secs_ago: Option<u64>,
+    /// The figure is too old for the fee checks.
+    pub stale: bool,
+    /// Fees committed to in-flight settlements.
+    pub fee_committed: Decimal,
+    /// Prepaid held for in-flight settlements' own transactions.
+    pub traffic_held: Decimal,
+    /// Fee capacity; `None` while the figure is unknown or stale.
+    pub capacity: Option<Decimal>,
+    /// CC moved per auto top-up, when enabled.
+    pub auto_topup_cc: Option<Decimal>,
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +1306,6 @@ mod tests {
             token: CC_TOKEN.to_string(),
             balance: Decimal::MAX,
             committed: Decimal::MAX,
-            fee_committed: Decimal::MAX,
             fee_reserve: Decimal::ZERO,
             available: Decimal::MIN,
             num_commitments: 1,
@@ -934,6 +1419,8 @@ mod tests {
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
 
+        lm.update_prepaid(Decimal::from(100), Instant::now()).await;
+
         // Check initial availability
         // CC: 100 - 5 (reserve) = 95
         assert_eq!(lm.available_cc().await, Decimal::from(95));
@@ -974,6 +1461,7 @@ mod tests {
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
+        lm.update_prepaid(Decimal::from(100), Instant::now()).await;
         let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
 
         // Pass case: advisory says yes, commit then succeeds
@@ -986,9 +1474,13 @@ mod tests {
         // Fail cases mirror try_commit: token shortfall...
         assert!(lm.can_commit("USDCx", Decimal::from(3001), fee_cc).await.is_err());
         assert!(lm.try_commit("px", "USDCx", Decimal::from(3001), fee_cc).await.is_err());
-        // ...and CC-for-fees shortfall (incl. CC allocation overlap)
-        assert!(lm.can_commit(CC_TOKEN, Decimal::from(95), Decimal::ONE).await.is_err());
-        assert!(lm.try_commit("py", CC_TOKEN, Decimal::from(95), Decimal::ONE).await.is_err());
+        // ...a CC allocation into the reserve...
+        assert!(lm.can_commit(CC_TOKEN, Decimal::from(96), Decimal::ONE).await.is_err());
+        assert!(lm.try_commit("py", CC_TOKEN, Decimal::from(96), Decimal::ONE).await.is_err());
+        // ...and a fee beyond the remaining capacity
+        assert!(lm.can_commit("USDCx", Decimal::ONE, Decimal::from(90)).await.is_err());
+        assert!(lm.try_commit("pf", "USDCx", Decimal::ONE, Decimal::from(90)).await.is_err());
+        assert!(!lm.has_commitment("pf").await);
         // Unknown token = zero balance on both paths
         assert!(lm.can_commit("NOPE", Decimal::ONE, Decimal::ZERO).await.is_err());
         assert!(lm.try_commit("pz", "NOPE", Decimal::ONE, Decimal::ZERO).await.is_err());
@@ -1019,10 +1511,11 @@ mod tests {
         lm.update_token_balance("USDCx", Decimal::from(10000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
 
-        // Allocate USDCx (plenty available), but need 20 CC for fees (only 15 available after reserve)
+        // Allocate USDCx (plenty available), but need 20 CC for fees (15 of prepaid credit)
+        lm.update_prepaid(Decimal::from(15), Instant::now()).await;
         let result = lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::from(20)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("insufficient CC for fees"));
+        assert!(result.unwrap_err().contains("insufficient fee capacity"));
     }
 
     #[tokio::test]
@@ -1090,6 +1583,7 @@ mod tests {
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.10").unwrap()).await;
 
+        lm.update_prepaid(Decimal::from(100), Instant::now()).await;
         let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
         lm.try_commit("p1", CC_TOKEN, Decimal::from(30), fee_cc).await.unwrap();
 
@@ -1138,12 +1632,13 @@ mod tests {
         let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
         assert!(fee_cc > Decimal::ZERO);
 
+        lm.update_prepaid(Decimal::from(100), Instant::now()).await;
         // Commit two proposals: p_live (still in flight) and p_orphan (its
         // terminal event will be "missed").
         lm.try_commit("p_live", "USDCx", Decimal::from(1000), fee_cc).await.unwrap();
         lm.try_commit("p_orphan", "USDCx", Decimal::from(2000), fee_cc).await.unwrap();
         assert_eq!(lm.available("USDCx").await, Decimal::from(2000)); // 5000 - 1000 - 2000
-        let cc_both = lm.available_cc().await;
+        let cc_both = lm.fee_capacity().await.unwrap();
 
         // Reconcile against the live set (only p_live remains active).
         let mut live = HashSet::new();
@@ -1152,7 +1647,7 @@ mod tests {
 
         // p_orphan's allocation + fee reservation freed; p_live's retained.
         assert_eq!(lm.available("USDCx").await, Decimal::from(4000)); // 5000 - 1000
-        assert!(lm.available_cc().await > cc_both);
+        assert!(lm.fee_capacity().await.unwrap() > cc_both);
 
         // Idempotent: re-running with the same live set drops nothing.
         assert_eq!(lm.retain_commitments(&live).await, 0);
@@ -1193,6 +1688,7 @@ mod tests {
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_prepaid(Decimal::from(10), Instant::now()).await;
         lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::ZERO).await.unwrap();
         lm.try_commit("p2", CC_TOKEN, Decimal::from(10), Decimal::ONE).await.unwrap();
         lm.update_token_balance("USDCx", Decimal::MIN).await;
@@ -1221,31 +1717,41 @@ mod tests {
         fees.entries.insert("b".into(), Decimal::MIN);
         assert_eq!(fees.total(), Decimal::MIN);
 
-        // A negative fee total takes each CC site past the maximum
+        // A negative fee total leaves CC inventory alone and adds no capacity
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         lm.update_cc_balance(Decimal::from(100)).await;
         lm.restore_flows(vec![SavedTokenFlow { token: CC_TOKEN.to_string(), net_outflow_per_hour: 1.0 }])
             .await;
         lm.state.write().await.fee_commitments.entries.insert("f".into(), Decimal::MIN);
-        assert_eq!(lm.available_cc().await, Decimal::MAX);
+        assert_eq!(lm.available_cc().await, Decimal::from(95));
         assert_eq!(lm.depletion_coefficient(CC_TOKEN).await, 0.0);
         let stats = lm.stats().await;
         assert_eq!(stats.len(), 1);
-        assert!(stats.iter().all(|s| s.available == Decimal::MAX));
+        assert!(stats.iter().all(|s| s.available == Decimal::from(95)));
+        lm.update_prepaid(Decimal::from(10), Instant::now()).await;
+        lm.set_auto_topup(Some(Decimal::from(25))).await;
+        assert_eq!(lm.fee_capacity().await, Some(Decimal::from(85)));
+        assert_eq!(lm.fee_capacity_for(CC_TOKEN, Decimal::MIN).await, Some(Decimal::MAX));
+        lm.state.write().await.prepaid.polled = Some((Decimal::MIN, Instant::now()));
+        lm.state.write().await.fee_commitments.entries.insert("f".into(), Decimal::MAX);
+        assert_eq!(lm.fee_capacity().await, Some(Decimal::ZERO));
+        lm.record_fee_paid("f", None, Some(Decimal::MAX)).await;
+        assert_eq!(lm.prepaid_stats().await.capacity, Some(Decimal::ZERO));
     }
 
-    // The top-up's fee demand: the largest single reservation, never below zero
+    // The top-up's demand: every pending fee and traffic hold together, never below zero
     #[tokio::test]
-    async fn the_largest_fee_commitment_is_the_biggest_entry_or_zero() {
+    async fn the_prepaid_demand_is_the_sum_of_every_hold() {
         let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
-        assert_eq!(lm.largest_fee_commitment().await, Decimal::ZERO);
+        assert_eq!(lm.prepaid_demand().await, Decimal::ZERO);
         for (pid, fee) in [("a", 2), ("b", 7), ("c", 3)] {
             lm.state.write().await.fee_commitments.entries.insert(pid.into(), Decimal::from(fee));
         }
-        assert_eq!(lm.largest_fee_commitment().await, Decimal::from(7));
+        lm.state.write().await.traffic_holds.insert("a".into(), Decimal::ONE);
+        assert_eq!(lm.prepaid_demand().await, Decimal::from(13));
         let negative = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
         negative.state.write().await.fee_commitments.entries.insert("a".into(), Decimal::from(-5));
-        assert_eq!(negative.largest_fee_commitment().await, Decimal::ZERO);
+        assert_eq!(negative.prepaid_demand().await, Decimal::ZERO);
     }
 
     // A fee too large for fixed-precision formatting is logged capped
@@ -1257,8 +1763,361 @@ mod tests {
         lm.update_cc_balance(Decimal::MAX).await;
         lm.update_cc_usd_rate(Decimal::from_str("0.0000000001").unwrap()).await;
         lm.update_token_balance("USDCx", Decimal::from(10)).await;
+        lm.update_prepaid(Decimal::MAX, Instant::now()).await;
         let fee_cc = Decimal::from_scientific("1e27").unwrap();
         assert!(lm.try_commit("p", "USDCx", Decimal::ONE, fee_cc).await.is_ok());
         assert_eq!(logs.count("18446744073709551615.0000 CC fees"), 1);
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    fn ago(secs: u64) -> Instant {
+        Instant::now().checked_sub(Duration::from_secs(secs)).unwrap()
+    }
+
+    /// An agent holding no CC: 174 TUSDT, rate 0.075 (so $1.00 of fees is ~14.67 CC).
+    async fn zero_cc_agent(prepaid: Option<Decimal>) -> Arc<LiquidityManager> {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::ZERO).await;
+        lm.update_token_balance("TUSDT", Decimal::from(174)).await;
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        if let Some(p) = prepaid {
+            lm.update_prepaid(p, Instant::now()).await;
+        }
+        lm
+    }
+
+    #[tokio::test]
+    async fn a_zero_cc_agent_adopts_on_prepaid_credit() {
+        let lm = zero_cc_agent(Some(dec("94"))).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        assert!(fee_cc > dec("14.6") && fee_cc < dec("14.7"), "{fee_cc}");
+        assert_eq!(lm.adoption_check("TUSDT", dec("25.38"), Decimal::ONE).await, Adoption::Accept);
+        assert!(lm.can_commit("TUSDT", dec("25.38"), fee_cc).await.is_ok());
+        lm.try_commit("p1", "TUSDT", dec("25.38"), fee_cc).await.unwrap();
+        assert_eq!(lm.fee_capacity().await, Some(dec("94").saturating_sub(fee_cc)));
+    }
+
+    #[tokio::test]
+    async fn too_little_prepaid_credit_rejects_for_fee_capacity() {
+        let lm = zero_cc_agent(Some(dec("10"))).await;
+        match lm.adoption_check("TUSDT", dec("25.38"), Decimal::ONE).await {
+            Adoption::Reject(reason) => assert!(reason.contains("insufficient fee capacity"), "{reason}"),
+            other => panic!("expected a reject, got {other:?}"),
+        }
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        assert!(lm.try_commit("p1", "TUSDT", dec("25.38"), fee_cc).await.is_err());
+        assert!(!lm.has_commitment("p1").await);
+    }
+
+    #[tokio::test]
+    async fn unknown_or_stale_prepaid_or_rate_defers() {
+        let lm = zero_cc_agent(None).await;
+        assert!(matches!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Defer(_)));
+        assert_eq!(lm.fee_capacity().await, None);
+        // The reservation path refuses too, and records nothing.
+        assert!(lm.try_commit("p1", "TUSDT", Decimal::ONE, Decimal::ONE).await.is_err());
+        assert!(!lm.has_commitment("p1").await);
+
+        lm.update_prepaid(dec("94"), ago(PREPAID_STALE_AFTER.as_secs() + 1)).await;
+        assert!(matches!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Defer(_)));
+        lm.update_prepaid(dec("94"), Instant::now()).await;
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Accept);
+
+        let no_rate = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        no_rate.update_token_balance("TUSDT", Decimal::from(174)).await;
+        no_rate.update_prepaid(dec("94"), Instant::now()).await;
+        assert!(matches!(no_rate.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Defer(_)));
+        // No fee: nothing to fund, so nothing to wait for.
+        assert_eq!(no_rate.adoption_check("TUSDT", Decimal::ONE, Decimal::ZERO).await, Adoption::Accept);
+        // A known shortfall of the allocated token still rejects.
+        let short = zero_cc_agent(None).await;
+        assert!(matches!(short.adoption_check("TUSDT", Decimal::from(175), Decimal::ONE).await, Adoption::Reject(_)));
+    }
+
+    #[tokio::test]
+    async fn a_cc_seller_never_counts_its_allocated_cc_as_fee_credit() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(300)).await;
+        lm.update_token_balance("TUSDT", Decimal::from(10)).await;
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        lm.update_prepaid(dec("2"), Instant::now()).await;
+        lm.set_auto_topup(Some(Decimal::from(125))).await;
+        // Selling 200 of 300 CC: 95 left above the reserve, less than one top-up.
+        match lm.adoption_check(CC_TOKEN, Decimal::from(200), Decimal::ONE).await {
+            Adoption::Reject(reason) => assert!(reason.contains("insufficient fee capacity"), "{reason}"),
+            other => panic!("expected a reject, got {other:?}"),
+        }
+        assert_eq!(lm.fee_capacity_for(CC_TOKEN, Decimal::from(200)).await, Some(dec("2")));
+        // Allocating another token, two top-ups of the wallet CC count.
+        assert_eq!(lm.fee_capacity_for("TUSDT", Decimal::ONE).await, Some(dec("252")));
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Accept);
+        // CC already allocated to another settlement is not fee credit either.
+        lm.try_commit("p0", CC_TOKEN, Decimal::from(100), Decimal::ZERO).await.unwrap();
+        assert_eq!(lm.fee_capacity().await, Some(dec("127")));
+    }
+
+    #[tokio::test]
+    async fn wallet_cc_counts_only_with_auto_topup() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(1000)).await;
+        lm.update_token_balance("TUSDT", Decimal::from(100)).await;
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        lm.update_prepaid(dec("2"), Instant::now()).await;
+        assert_eq!(lm.fee_capacity().await, Some(dec("2")));
+        assert!(matches!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Reject(_)));
+        lm.set_auto_topup(Some(Decimal::from(125))).await;
+        assert_eq!(lm.fee_capacity().await, Some(dec("877")));
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Accept);
+        lm.set_auto_topup(None).await;
+        assert_eq!(lm.fee_capacity().await, Some(dec("2")));
+    }
+
+    #[tokio::test]
+    async fn a_paid_fee_is_debited_locally_until_the_next_poll() {
+        let lm = zero_cc_agent(Some(dec("94"))).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        lm.try_commit("p1", "TUSDT", Decimal::ONE, fee_cc).await.unwrap();
+        let held = lm.fee_capacity().await.unwrap();
+        // A poll sent before the debit does not undo it.
+        let before = Instant::now();
+        lm.record_fee_paid("p1", None, Some(dec("0.3"))).await;
+        lm.record_fee_paid("p1", None, Some(dec("0.7"))).await;
+        // Paying moves the fee from the commitment to the prepaid figure: no double count.
+        assert!(held.saturating_sub(lm.fee_capacity().await.unwrap()).abs() < dec("0.0001"));
+        lm.release("p1").await;
+        let after_release = lm.fee_capacity().await.unwrap();
+        assert!(after_release < dec("94"), "{after_release}");
+        assert!(dec("94").saturating_sub(fee_cc).saturating_sub(after_release).abs() < dec("0.0001"));
+        lm.update_prepaid(dec("94"), before).await;
+        assert_eq!(lm.fee_capacity().await, Some(after_release));
+        // A poll sent after the debit carries it.
+        lm.update_prepaid(dec("79.33"), Instant::now()).await;
+        assert_eq!(lm.fee_capacity().await, Some(dec("79.33")));
+        // Without a rate, the proposal's own commitment is the debit.
+        lm.try_commit("p2", "TUSDT", Decimal::ONE, Decimal::from(10)).await.unwrap();
+        lm.update_cc_usd_rate(Decimal::ZERO).await;
+        lm.record_fee_paid("p2", None, Some(dec("0.3"))).await;
+        lm.release("p2").await;
+        assert_eq!(lm.fee_capacity().await, Some(dec("69.33")));
+    }
+
+    #[tokio::test]
+    async fn fee_commitments_no_longer_reduce_cc_inventory() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(100)).await;
+        lm.update_token_balance("USDCx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(dec("0.10")).await;
+        lm.update_prepaid(Decimal::from(100), Instant::now()).await;
+        lm.try_commit("p1", "USDCx", Decimal::from(1000), Decimal::from(11)).await.unwrap();
+        assert_eq!(lm.available_cc().await, Decimal::from(95));
+        assert_eq!(lm.available(CC_TOKEN).await, Decimal::from(95));
+        let stats = lm.stats().await;
+        let cc = stats.iter().find(|s| s.token == CC_TOKEN).unwrap();
+        assert_eq!(cc.available, Decimal::from(95));
+        assert_eq!(lm.prepaid_stats().await.fee_committed, Decimal::from(11));
+        assert_eq!(lm.fee_capacity().await, Some(Decimal::from(89)));
+        lm.state.write().await.flows.entry(CC_TOKEN.to_string()).or_insert_with(TokenFlow::new).net_outflow_per_hour = 19.0;
+        // 95 CC at 19 CC/h is 5 h: 10 * (12 - 5) / 11
+        assert!((lm.depletion_coefficient(CC_TOKEN).await - 6.36).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn readiness_needs_no_cc_entry_once_prepaid_is_known() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_token_balance("TUSDT", Decimal::from(174)).await;
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        assert!(!lm.is_ready().await);
+        lm.update_prepaid(dec("94"), Instant::now()).await;
+        assert!(lm.is_ready().await);
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Accept);
+        // A CC allocation still waits for the CC balance.
+        assert!(matches!(lm.adoption_check(CC_TOKEN, Decimal::ONE, Decimal::ONE).await, Adoption::Defer(_)));
+    }
+
+    /// 300 CC, 100 TUSDT, prepaid 10, auto top-up 125: a $1.00 fee (~14.67 CC) fits only with the wallet term.
+    async fn fee_on_wallet_term() -> Arc<LiquidityManager> {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::from(300)).await;
+        lm.update_token_balance("TUSDT", Decimal::from(100)).await;
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        lm.update_prepaid(dec("10"), Instant::now()).await;
+        lm.set_auto_topup(Some(Decimal::from(125))).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        lm.try_commit("p1", "TUSDT", Decimal::ONE, fee_cc).await.unwrap();
+        lm
+    }
+
+    #[tokio::test]
+    async fn a_zero_fee_cc_payout_cannot_take_the_cc_a_pending_fee_needs() {
+        let lm = fee_on_wallet_term().await;
+        // 200 CC out leaves 95 above the reserve: no whole top-up, so p1's fee is unfunded
+        assert!(lm.can_commit(CC_TOKEN, Decimal::from(200), Decimal::ZERO).await.is_err());
+        assert!(lm.try_commit("rfqv2:q1", CC_TOKEN, Decimal::from(200), Decimal::ZERO).await.is_err());
+        assert!(!lm.has_commitment("rfqv2:q1").await);
+        // Advisory sizing keeps one top-up back: 300 - 5 - 125
+        assert_eq!(lm.available(CC_TOKEN).await, Decimal::from(170));
+        // 160 CC out leaves 135, one top-up: 10 + 125 still covers the fee
+        lm.try_commit("rfqv2:q2", CC_TOKEN, Decimal::from(160), Decimal::ZERO).await.unwrap();
+        // Prepaid alone covering the fee needs no wallet CC
+        lm.update_prepaid(dec("50"), Instant::now()).await;
+        assert_eq!(lm.available(CC_TOKEN).await, Decimal::from(135));
+        // Without fee commitments a zero-fee CC commit is bounded by the reserve only
+        let free = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        free.update_cc_balance(Decimal::from(300)).await;
+        free.set_auto_topup(Some(Decimal::from(125))).await;
+        free.try_commit("rfqv2:q3", CC_TOKEN, Decimal::from(295), Decimal::ZERO).await.unwrap();
+        assert!(free.try_commit("rfqv2:q4", CC_TOKEN, Decimal::ONE, Decimal::ZERO).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_topup_with_the_cc_balance_not_loaded_defers() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_token_balance("TUSDT", Decimal::from(174)).await;
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        lm.update_prepaid(dec("40"), Instant::now()).await;
+        lm.set_auto_topup(Some(Decimal::from(125))).await;
+        // $3.00 is 44 CC: prepaid alone is short and the wallet CC is not known yet
+        let held = Adoption::Defer("Balances not loaded yet".to_string());
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::from(3)).await, held);
+        let fee_cc = lm.estimate_fee_cc(Decimal::from(3)).await;
+        let err = lm.try_commit("p1", "TUSDT", Decimal::ONE, fee_cc).await.unwrap_err();
+        assert!(err.contains("fee capacity unknown"), "{err}");
+        // Prepaid alone covering the fee needs no wallet figure
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, dec("0.5")).await, Adoption::Accept);
+        lm.update_cc_balance(Decimal::from(2000)).await;
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::from(3)).await, Adoption::Accept);
+    }
+
+    #[tokio::test]
+    async fn each_settlement_holds_prepaid_for_its_own_transactions() {
+        let traffic = DEFAULT_SETTLEMENT_TRAFFIC_CC;
+        let lm = zero_cc_agent(Some(dec("16"))).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        // 14.67 CC of fees and 1.2 CC of traffic fit in 16
+        assert_eq!(lm.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Accept);
+        assert_eq!(lm.try_commit_settlement("p1", "TUSDT", Decimal::ONE, Decimal::ONE).await, Ok(fee_cc));
+        assert_eq!(lm.prepaid_demand().await, fee_cc + traffic);
+        assert_eq!(lm.fee_capacity().await, Some(dec("16") - fee_cc - traffic));
+        // A debit without a rate takes the fee commitment, never the traffic hold
+        lm.update_cc_usd_rate(Decimal::ZERO).await;
+        lm.record_fee_paid("p1", None, None).await;
+        assert_eq!(lm.prepaid_demand().await, traffic);
+        lm.release("p1").await;
+        assert_eq!(lm.prepaid_demand().await, Decimal::ZERO);
+        assert_eq!(lm.fee_capacity().await, Some(dec("16") - fee_cc));
+
+        // 15.5 covers the fee but not its traffic
+        let short = zero_cc_agent(Some(dec("15.5"))).await;
+        assert!(matches!(short.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Reject(_)));
+        assert!(short.try_commit_settlement("p1", "TUSDT", Decimal::ONE, Decimal::ONE).await.is_err());
+        // A quote this agent runs no transactions for, and a plain commit, hold no traffic
+        assert_eq!(short.quote_check("TUSDT", Decimal::ONE).await, Adoption::Accept);
+        short.try_commit("rfqv2:q", "TUSDT", Decimal::ONE, fee_cc).await.unwrap();
+        assert_eq!(short.prepaid_demand().await, fee_cc);
+
+        // The hold is configurable, and a zero-fee settlement still holds it
+        let tuned = zero_cc_agent(Some(dec("15.5"))).await;
+        tuned.set_settlement_traffic(dec("0.5")).await;
+        assert_eq!(tuned.adoption_check("TUSDT", Decimal::ONE, Decimal::ONE).await, Adoption::Accept);
+        tuned.try_commit_settlement("p2", "TUSDT", Decimal::ONE, Decimal::ZERO).await.unwrap();
+        assert_eq!(tuned.prepaid_demand().await, dec("0.5"));
+        assert_eq!(tuned.retain_commitments(&HashSet::new()).await, 1);
+        assert_eq!(tuned.prepaid_demand().await, Decimal::ZERO);
+        let unknown = zero_cc_agent(None).await;
+        assert!(matches!(unknown.adoption_check("TUSDT", Decimal::ONE, Decimal::ZERO).await, Adoption::Defer(_)));
+    }
+
+    #[tokio::test]
+    async fn the_stated_debit_replaces_the_estimate() {
+        let lm = zero_cc_agent(Some(dec("94"))).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        lm.try_commit("p1", "TUSDT", Decimal::ONE, fee_cc).await.unwrap();
+        // $0.30 at 0.075 was debited as 4 CC; the estimate with its margin is 4.4
+        lm.record_fee_paid("p1", Some(dec("4")), Some(dec("0.3"))).await;
+        assert_eq!(lm.prepaid_stats().await.available, Some(dec("90")));
+        assert_eq!(lm.prepaid_demand().await, fee_cc - dec("4"));
+        // Without a stated amount the estimate stands in; a stated zero debits nothing
+        lm.record_fee_paid("p1", None, Some(dec("0.3"))).await;
+        let avail = lm.prepaid_stats().await.available.unwrap();
+        assert!((avail - dec("85.6")).abs() < dec("0.0001"), "{avail}");
+        lm.record_fee_paid("p1", Some(Decimal::ZERO), Some(dec("0.3"))).await;
+        assert_eq!(lm.prepaid_stats().await.available, Some(avail));
+    }
+
+    #[tokio::test]
+    async fn one_fill_needs_the_last_fee_seen_in_its_market_and_its_traffic() {
+        let traffic = DEFAULT_SETTLEMENT_TRAFFIC_CC;
+        let lm = zero_cc_agent(Some(dec("94"))).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        assert_eq!(lm.fill_needs().await, (fee_cc + traffic, Vec::new()));
+        // $2.00 per side seen on CC-USDCx, $0.10 on a discounted market
+        lm.note_fill_fee("CC-USDCx", Decimal::from(2)).await;
+        lm.note_fill_fee("CC-USDCx", Decimal::from(2)).await;
+        lm.note_fill_fee("cETH-TUSDT", dec("0.1")).await;
+        lm.note_fill_fee("", Decimal::from(5)).await;
+        lm.note_fill_fee("X-Y", Decimal::from(-1)).await;
+        let (default, mut by_market) = lm.fill_needs().await;
+        by_market.sort();
+        let two = lm.estimate_fee_cc(Decimal::from(2)).await;
+        let tenth = lm.estimate_fee_cc(dec("0.1")).await;
+        assert_eq!(default, fee_cc + traffic);
+        assert_eq!(by_market, vec![("CC-USDCx".to_string(), two + traffic), ("cETH-TUSDT".to_string(), tenth + traffic)]);
+        lm.update_cc_usd_rate(Decimal::ZERO).await;
+        let (default, by_market) = lm.fill_needs().await;
+        assert_eq!(default, traffic);
+        assert!(by_market.iter().all(|(_, need)| *need == traffic));
+        // Bounded: a new market past the cap is not kept, a known one still updates
+        for i in 0..MAX_FILL_FEE_MARKETS {
+            lm.note_fill_fee(&format!("M{i}-USDCx"), Decimal::ONE).await;
+        }
+        lm.note_fill_fee("CC-USDCx", Decimal::from(3)).await;
+        lm.note_fill_fee("NEW-USDCx", Decimal::ONE).await;
+        let s = lm.state.read().await;
+        assert_eq!(s.fill_fees_usd.len(), MAX_FILL_FEE_MARKETS);
+        assert_eq!(s.fill_fees_usd.get("CC-USDCx"), Some(&Decimal::from(3)));
+        assert!(!s.fill_fees_usd.contains_key("NEW-USDCx"));
+    }
+
+    // The rate is read under the commit's lock: unknown with fees owed, nothing is held
+    #[tokio::test]
+    async fn a_settlement_commit_without_a_rate_waits_instead_of_holding_no_fee() {
+        let traffic = DEFAULT_SETTLEMENT_TRAFFIC_CC;
+        let lm = zero_cc_agent(Some(dec("94"))).await;
+        lm.update_cc_usd_rate(Decimal::ZERO).await;
+        let err = lm.try_commit_settlement("p1", "TUSDT", Decimal::ONE, Decimal::ONE).await.unwrap_err();
+        assert!(err.contains(FEE_CAPACITY_UNKNOWN), "{err}");
+        assert!(!lm.has_commitment("p1").await);
+        assert_eq!(lm.prepaid_demand().await, Decimal::ZERO);
+        // Nothing owed: only the traffic is held
+        assert_eq!(lm.try_commit_settlement("p2", "TUSDT", Decimal::ONE, Decimal::ZERO).await, Ok(Decimal::ZERO));
+        assert_eq!(lm.prepaid_demand().await, traffic);
+        lm.update_cc_usd_rate(dec("0.075")).await;
+        let fee_cc = lm.estimate_fee_cc(Decimal::ONE).await;
+        assert_eq!(lm.try_commit_settlement("p1", "TUSDT", Decimal::ONE, Decimal::ONE).await, Ok(fee_cc));
+        assert_eq!(lm.prepaid_demand().await, fee_cc + traffic + traffic);
+    }
+
+    // Stated debits carry no margin: after the last fee leg the rest is not demand; the traffic hold stays
+    #[tokio::test]
+    async fn clearing_the_fee_commitment_keeps_the_traffic_hold() {
+        let traffic = DEFAULT_SETTLEMENT_TRAFFIC_CC;
+        let lm = zero_cc_agent(Some(dec("94"))).await;
+        lm.try_commit_settlement("p1", "TUSDT", Decimal::ONE, Decimal::ONE).await.unwrap();
+        // $1.00 at 0.075 is 13.33 CC debited; the commitment held it with the 1.1 margin
+        lm.record_fee_paid("p1", Some(dec("4")), None).await;
+        lm.record_fee_paid("p1", Some(dec("9.3333")), None).await;
+        assert!(lm.prepaid_demand().await > traffic + Decimal::ONE);
+        lm.clear_fee_commitment("p1").await;
+        assert_eq!(lm.prepaid_demand().await, traffic);
+        assert!(lm.has_commitment("p1").await);
+        assert_eq!(lm.fee_capacity().await, Some(dec("94") - dec("13.3333") - traffic));
+        // Unknown proposals are left alone
+        lm.clear_fee_commitment("nope").await;
+        assert!(!lm.has_commitment("nope").await);
+        lm.release("p1").await;
+        assert_eq!(lm.prepaid_demand().await, Decimal::ZERO);
     }
 }
