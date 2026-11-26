@@ -16,7 +16,7 @@ use orderbook_proto::ledger::multi_call_op::Op as McOp;
 use orderbook_proto::ledger::prepare_transaction_request::Params;
 use orderbook_proto::rfqv2::prepare_atomic_transaction_request::Params as AtomicParams;
 use rust_decimal::Decimal;
-use tx_verifier::facts::{DvpTerms, FlowKind, QuoteSide, TxFacts, ValueFlow};
+use tx_verifier::facts::{DvpTerms, ExerciseFact, FlowKind, QuoteSide, SERVICE_TEMPLATE, TxFacts, ValueFlow};
 use tx_verifier::{ExpectedDvpTerms, HashCheck, OperationExpectation, VerificationResult};
 
 /// Platform parties pinned in the agent's own env, never taken from server data.
@@ -24,6 +24,8 @@ use tx_verifier::{ExpectedDvpTerms, HashCheck, OperationExpectation, Verificatio
 pub struct PlatformParties {
     pub fee: Option<String>,
     pub prepaid_traffic: Option<String>,
+    /// Receives top-ups paid in a token other than CC.
+    pub traffic_fee: Option<String>,
 }
 
 impl PlatformParties {
@@ -31,6 +33,7 @@ impl PlatformParties {
         Self {
             fee: config.party_fee.clone(),
             prepaid_traffic: config.party_prepaid_traffic.clone(),
+            traffic_fee: config.party_traffic_fee.clone(),
         }
     }
 
@@ -44,8 +47,49 @@ impl PlatformParties {
         Ok(agent_control::PlatformParties {
             fee: parse(&self.fee, "PARTY_FEE")?,
             prepaid_traffic: parse(&self.prepaid_traffic, "PARTY_PREPAID_TRAFFIC")?,
+            traffic_fee: parse(&self.traffic_fee, TRAFFIC_FEE_PIN)?,
         })
     }
+}
+
+/// References of the traffic purchases this process is paying: only these may be paid to
+/// the traffic-fee party.
+static OPEN_TRAFFIC_PURCHASES: std::sync::RwLock<BTreeSet<String>> = std::sync::RwLock::new(BTreeSet::new());
+/// Bound on the open purchases one process tracks.
+const MAX_OPEN_TRAFFIC_PURCHASES: usize = 32;
+/// Bound on the length of a purchase reference.
+const MAX_PURCHASE_REFERENCE_CHARS: usize = 256;
+
+/// Adds `reference` to `open`; false when it is blank, padded, too long, carries an unsafe
+/// character, or `open` is full. A reference already open stays open.
+fn open_purchase_in(open: &mut BTreeSet<String>, reference: &str) -> bool {
+    let admissible = !reference.trim().is_empty()
+        && reference.trim() == reference
+        && reference.chars().count() <= MAX_PURCHASE_REFERENCE_CHARS
+        && !reference.chars().any(crate::log_text::is_log_unsafe);
+    if !admissible {
+        return false;
+    }
+    if open.contains(reference) {
+        return true;
+    }
+    open.len() < MAX_OPEN_TRAFFIC_PURCHASES && open.insert(reference.to_string())
+}
+
+/// Records `reference` as an open traffic purchase of this process, before its payment is
+/// signed; false when it is refused (see [`open_purchase_in`]).
+pub fn insert_open_traffic_purchase(reference: &str) -> bool {
+    open_purchase_in(&mut agent_logic::sync::write(&OPEN_TRAFFIC_PURCHASES), reference)
+}
+
+/// Forgets `reference` once its purchase is credited, rejected or given up; true when it was open.
+pub fn remove_open_traffic_purchase(reference: &str) -> bool {
+    agent_logic::sync::write(&OPEN_TRAFFIC_PURCHASES).remove(reference)
+}
+
+/// Whether `reference` is an open traffic purchase of this process.
+pub fn is_open_traffic_purchase(reference: &str) -> bool {
+    agent_logic::sync::read(&OPEN_TRAFFIC_PURCHASES).contains(reference)
 }
 
 /// The typed request the agent itself built.
@@ -66,14 +110,20 @@ pub enum ContentRefusal {
     UnexpectedOutflow { operation: &'static str, flow: ValueFlow },
     /// Nothing else is wrong, but a leg goes to a platform party whose pin is not set.
     PinMissing { operation: &'static str, pin: &'static str },
+    /// The transaction is not the one root exercise the operation runs; names its first roots.
+    RootMismatch { operation: &'static str, root_nodes: usize, roots: Vec<ExerciseFact> },
+    /// The venues the transaction creates are not the one venue the request asks for, or
+    /// the request asks for none; names the first term that differs.
+    VenueMismatch { operation: &'static str, venues: usize, term: &'static str },
 }
 
 /// The pins a request may need, by their env names.
 const FEE_PIN: &str = "PARTY_FEE";
 const PREPAID_TRAFFIC_PIN: &str = "PARTY_PREPAID_TRAFFIC";
+const TRAFFIC_FEE_PIN: &str = "PARTY_TRAFFIC_FEE";
 
 /// `text` with control, line separator and bidi characters replaced by spaces.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     text.chars().map(|c| if crate::log_text::is_log_unsafe(c) { ' ' } else { c }).collect()
 }
 
@@ -96,6 +146,19 @@ impl fmt::Display for ContentRefusal {
             Self::PinMissing { operation, pin } => {
                 write!(f, "{pin} is not set, so the platform leg of this {operation} request is unchecked")
             }
+            Self::RootMismatch { operation, root_nodes, roots } => {
+                let named: Vec<String> =
+                    roots.iter().map(|r| clean(&format!("{} {} on {}", r.template, r.choice, r.contract_id))).collect();
+                write!(
+                    f,
+                    "the transaction's roots ({root_nodes} nodes: {}) are not the one exercise of this {operation} request",
+                    named.join(", ")
+                )
+            }
+            Self::VenueMismatch { operation, venues, term } => write!(
+                f,
+                "the transaction creates {venues} venue(s) and the {term} does not fit this {operation} request"
+            ),
         }
     }
 }
@@ -510,6 +573,48 @@ fn multicall_legs(
     Ok(legs)
 }
 
+/// How a CIP-56 transfer to another party stands toward the traffic-fee pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrafficFeeLeg {
+    /// Not a traffic purchase: an ordinary transfer.
+    Ordinary,
+    /// Pays an open purchase of this process to the pinned party: a Holding only.
+    Purchase,
+    /// Pays an open purchase while the pin is unset: a Holding only, then refused for the pin.
+    Unpinned,
+}
+
+/// A leg to the traffic-fee pin pays one of this process's open purchases, whose reference
+/// the transaction carries as a memo; an open purchase is paid to the pin alone.
+fn traffic_fee_leg(
+    platform: &PlatformParties,
+    receiver: &str,
+    reference: Option<&str>,
+    facts: &TxFacts,
+) -> Result<TrafficFeeLeg, ContentRefusal> {
+    let open = reference.filter(|r| is_open_traffic_purchase(r));
+    let named = |reference: &str| {
+        if facts.memos.iter().any(|memo| memo == reference) {
+            Ok(())
+        } else {
+            Err(ContentRefusal::BadRequest(
+                "the transfer to the traffic-fee party does not carry its purchase reference as its memo".to_string(),
+            ))
+        }
+    };
+    match (platform.traffic_fee.as_deref(), open) {
+        (Some(pin), Some(reference)) if pin == receiver => named(reference).map(|()| TrafficFeeLeg::Purchase),
+        (Some(pin), None) if pin == receiver => Err(ContentRefusal::BadRequest(format!(
+            "a transfer to the traffic-fee party ({TRAFFIC_FEE_PIN}) must pay an open traffic purchase of this agent"
+        ))),
+        (Some(_), Some(_)) => Err(ContentRefusal::BadRequest(format!(
+            "an open traffic purchase is paid only to the traffic-fee party ({TRAFFIC_FEE_PIN})"
+        ))),
+        (None, Some(reference)) => named(reference).map(|()| TrafficFeeLeg::Unpinned),
+        (Some(_), None) | (None, None) => Ok(TrafficFeeLeg::Ordinary),
+    }
+}
+
 /// Everything the request explains, by operation; anything else is refused.
 fn expected_legs(
     agent: &str,
@@ -532,13 +637,25 @@ fn expected_legs(
             if receiver_party == sender_party {
                 Vec::new()
             } else {
-                vec![Leg::exact(
+                let leg = Leg::exact(
                     receiver_party,
                     Some(instrument_admin),
                     Some(instrument_id),
                     amount(a, "the transfer amount")?,
                     TRANSFER_KINDS,
-                )]
+                );
+                let reference = match ledger_params {
+                    Some(Params::TransferCip56(p)) => p.reference.as_deref(),
+                    _ => None,
+                };
+                match traffic_fee_leg(platform, receiver_party, reference, facts)? {
+                    TrafficFeeLeg::Ordinary => vec![leg],
+                    TrafficFeeLeg::Purchase => vec![Leg { kinds: HOLDING_KINDS, ..leg }],
+                    TrafficFeeLeg::Unpinned => {
+                        missing = Some(TRAFFIC_FEE_PIN);
+                        vec![Leg { to: Recipient::Unpinned, kinds: HOLDING_KINDS, ..leg }]
+                    }
+                }
             }
         }
         E::PrepayTraffic { amount: a, .. } => {
@@ -625,6 +742,119 @@ fn expected_legs(
     Ok((legs, missing))
 }
 
+/// The multicall and lock templates, as `module:entity`.
+const MULTICALL_TEMPLATE: &str = "MultiCall:MultiCall";
+const LOCK_SERVICE_TEMPLATE: &str = "Lock:LockService";
+const LOCK_CONTROLLER_TEMPLATE: &str = "Lock:LockController";
+/// The most roots a root refusal names.
+const MAX_NAMED_ROOTS: usize = 3;
+
+/// The one root exercise the SDK command builder submits for the operation: its template,
+/// choice, and contract when the expectation names it; `None` for the other operations.
+fn expected_root(expectation: &OperationExpectation) -> Option<(&'static str, &'static str, Option<&str>)> {
+    use OperationExpectation as E;
+    let root = match expectation {
+        E::SplitHoldings { .. } => (SERVICE_TEMPLATE, "AtomicDVPService_SplitHoldings", None),
+        E::IssueTickets { .. } => (SERVICE_TEMPLATE, "AtomicDVPService_IssueTickets", None),
+        E::CancelTickets { .. } => (SERVICE_TEMPLATE, "AtomicDVPService_CancelTickets", None),
+        E::CreateAtomicDvpVenue { .. } => (SERVICE_TEMPLATE, "AtomicDVPService_CreateVenue", None),
+        E::UpdateVenueKey { venue_cid, .. } => (VENUE_TEMPLATE, "AtomicDVP_UpdateKey", Some(venue_cid.as_str())),
+        E::RetireVenue { venue_cid, .. } => (VENUE_TEMPLATE, "AtomicDVP_Retire", Some(venue_cid.as_str())),
+        E::ExecuteMulticall { .. } => (MULTICALL_TEMPLATE, "Execute_MultiCall", None),
+        E::LockHoldings { .. } => (LOCK_SERVICE_TEMPLATE, "LockHoldings", None),
+        E::ProcessLockUnlockRequests { .. } => (LOCK_CONTROLLER_TEMPLATE, "ProcessLockUnlockRequests", None),
+        E::ResizeLock { .. } => (LOCK_CONTROLLER_TEMPLATE, "ResizeLock", None),
+        E::TerminateLock { .. } => (LOCK_CONTROLLER_TEMPLATE, "Terminate", None),
+        E::PayFee { .. }
+        | E::ProposeDvp { .. }
+        | E::AcceptDvp { .. }
+        | E::Allocate { .. }
+        | E::CancelDvpProposal { .. }
+        | E::RejectDvpProposal { .. }
+        | E::TransferCc { .. }
+        | E::PrepayTraffic { .. }
+        | E::RequestPreapproval { .. }
+        | E::RequestRecurringPrepaid { .. }
+        | E::RequestRecurringPayasyougo { .. }
+        | E::RequestUserService { .. }
+        | E::TransferCip56 { .. }
+        | E::AcceptCip56 { .. }
+        | E::SplitCc { .. }
+        | E::BatchPayCc { .. }
+        | E::AtomicDvpSettle { .. }
+        | E::UsdcxRequestAgreement { .. }
+        | E::UsdcxMint { .. }
+        | E::UsdcxBurn { .. }
+        | E::UsdcxReclaimHolding { .. }
+        | E::UsdcxUpdatePreApproval { .. }
+        | E::UsdcxTerminateAgreement { .. } => return None,
+    };
+    Some(root)
+}
+
+/// Refuses a transaction that is not exactly one root node, an exercise that fits `expected`.
+fn check_root(
+    operation: &'static str,
+    (template, choice, contract): (&str, &str, Option<&str>),
+    facts: &TxFacts,
+) -> Result<(), ContentRefusal> {
+    let fits = |r: &ExerciseFact| {
+        r.template == template && r.choice == choice && contract.is_none_or(|c| r.contract_id == c)
+    };
+    if facts.root_nodes == 1 && facts.roots.len() == 1 && facts.roots.iter().all(fits) {
+        return Ok(());
+    }
+    Err(ContentRefusal::RootMismatch {
+        operation,
+        root_nodes: facts.root_nodes,
+        roots: facts.roots.iter().take(MAX_NAMED_ROOTS).cloned().collect(),
+    })
+}
+
+/// Refuses any venue the request does not ask for: only a venue creation or key update
+/// creates one, for this agent, under the requested key and terms.
+fn check_venues(
+    agent: &str,
+    operation: &'static str,
+    expectation: &OperationExpectation,
+    request: OwnRequest<'_>,
+    facts: &TxFacts,
+) -> Result<(), ContentRefusal> {
+    use OperationExpectation as E;
+    let refuse = |term| Err(ContentRefusal::VenueMismatch { operation, venues: facts.venues.len(), term });
+    let (key, pair_name) = match expectation {
+        E::CreateAtomicDvpVenue { quote_public_key_spki_hex, pair_name, .. } => {
+            (quote_public_key_spki_hex, Some(pair_name))
+        }
+        E::UpdateVenueKey { new_key_spki_hex, .. } => (new_key_spki_hex, None),
+        _ if facts.venues.is_empty() => return Ok(()),
+        _ => return refuse("count"),
+    };
+    let [venue] = facts.venues.as_slice() else {
+        return refuse("count");
+    };
+    let terms = &venue.terms;
+    if terms.lp != agent {
+        return refuse("lp");
+    }
+    // The venue compares quote keys lowercased.
+    if !venue.quote_public_key.eq_ignore_ascii_case(key) {
+        return refuse("quote key");
+    }
+    if pair_name.is_some_and(|p| *p != terms.pair_name) {
+        return refuse("pair name");
+    }
+    if let OwnRequest::Atomic(Some(AtomicParams::CreateAtomicDvpVenue(p))) = request {
+        if terms.base.admin != p.base_instrument_admin || terms.base.id != p.base_instrument_id {
+            return refuse("base instrument");
+        }
+        if terms.quote.admin != p.quote_instrument_admin || terms.quote.id != p.quote_instrument_id {
+            return refuse("quote instrument");
+        }
+    }
+    Ok(())
+}
+
 /// The whole-transaction check of a linked agent, before any signature that no command
 /// directs: such a transaction never carries a directed (`ctl-`) command id.
 pub fn check_before_signing(
@@ -671,11 +901,15 @@ fn check_content(
     if !facts.unmodelled.is_empty() {
         return Err(ContentRefusal::Unmodelled(facts.unmodelled.clone()));
     }
+    let operation = crate::control_survey::operation_kind(expectation);
+    if let Some(root) = expected_root(expectation) {
+        check_root(operation, root, facts)?;
+    }
+    check_venues(agent, operation, expectation, request, facts)?;
     check_command_id(directed, &facts.command_id).map_err(|e| {
         ContentRefusal::BadRequest(format!("the transaction's command id {:?} is refused: {}", facts.command_id, e.code_name()))
     })?;
     let (legs, missing_pin) = expected_legs(agent, platform, expectation, request, facts)?;
-    let operation = crate::control_survey::operation_kind(expectation);
     let mut used = vec![false; legs.len()];
     for flow in facts.outflows.iter().filter(|f| f.to != agent) {
         let slot = legs
@@ -960,7 +1194,7 @@ mod tests {
     use tx_verifier::{BatchPayTarget, ExpectedQuantity};
     use orderbook_proto::rfqv2::{AtomicDvpSettleParams, AtomicFeeSpec};
     use tx_verifier::Coverage;
-    use tx_verifier::facts::{ExerciseFact, Quantity, SettleFacts};
+    use tx_verifier::facts::{CreatedVenue, ExerciseFact, Instrument, Quantity, SettleFacts, VenueTerms};
 
     const ME: &str = "agent::1220aa";
     const BOB: &str = "bob::1220bb";
@@ -985,6 +1219,154 @@ mod tests {
         TxFacts { act_as: vec![ME.into()], outflows, ..TxFacts::default() }
     }
 
+    /// `f` run as the one root exercise `choice` of `template` on `cid`.
+    fn rooted(f: TxFacts, template: &str, choice: &str, cid: &str) -> TxFacts {
+        let root = ExerciseFact { template: template.into(), choice: choice.into(), contract_id: cid.into() };
+        TxFacts { roots: vec![root], root_nodes: 1, ..f }
+    }
+
+    /// `f` run as one multicall, the root every ledger-service multicall has.
+    fn in_multicall(f: TxFacts) -> TxFacts {
+        rooted(f, "MultiCall:MultiCall", "Execute_MultiCall", "mc1")
+    }
+
+    /// Each operation that runs one root exercise, with the template, choice and contract of
+    /// the root its SDK command builder submits.
+    fn one_root_operations() -> Vec<(OperationExpectation, &'static str, &'static str, &'static str)> {
+        const SERVICE: &str = "AtomicDVP:AtomicDVPService";
+        const CONTROLLER: &str = "Lock:LockController";
+        let me = || ME.to_string();
+        vec![
+            (
+                OperationExpectation::SplitHoldings { lp_party: me(), instrument_id: "TOK".into(), split_count: 2, input_cids: vec!["h1".into()] },
+                SERVICE,
+                "AtomicDVPService_SplitHoldings",
+                "svc",
+            ),
+            (OperationExpectation::IssueTickets { lp_party: me(), ticket_count: 2 }, SERVICE, "AtomicDVPService_IssueTickets", "svc"),
+            (OperationExpectation::CancelTickets { lp_party: me(), ticket_count: 2 }, SERVICE, "AtomicDVPService_CancelTickets", "svc"),
+            (
+                OperationExpectation::CreateAtomicDvpVenue { lp_party: me(), pair_name: "TOK-USD".into(), quote_public_key_spki_hex: "00".into() },
+                SERVICE,
+                "AtomicDVPService_CreateVenue",
+                "svc",
+            ),
+            (
+                OperationExpectation::UpdateVenueKey { lp_party: me(), venue_cid: "v1".into(), new_key_spki_hex: "00".into() },
+                VENUE_TEMPLATE,
+                "AtomicDVP_UpdateKey",
+                "v1",
+            ),
+            (OperationExpectation::RetireVenue { lp_party: me(), venue_cid: "v1".into() }, VENUE_TEMPLATE, "AtomicDVP_Retire", "v1"),
+            (OperationExpectation::ExecuteMulticall { party: me(), op_count: 1, terms: None }, "MultiCall:MultiCall", "Execute_MultiCall", "mc1"),
+            (
+                OperationExpectation::LockHoldings { party: me(), amount: "5".into(), instrument_id: "TOK".into(), context: "c".into() },
+                "Lock:LockService",
+                "LockHoldings",
+                "ls1",
+            ),
+            (OperationExpectation::ProcessLockUnlockRequests { party: me(), request_count: 1 }, CONTROLLER, "ProcessLockUnlockRequests", "lc1"),
+            (OperationExpectation::ResizeLock { party: me(), new_amount: "5".into() }, CONTROLLER, "ResizeLock", "lc1"),
+            (OperationExpectation::TerminateLock { party: me() }, CONTROLLER, "Terminate", "lc1"),
+        ]
+    }
+
+    fn is_root_mismatch(result: &Result<(), ContentRefusal>) -> bool {
+        matches!(result, Err(ContentRefusal::RootMismatch { .. }))
+    }
+
+    fn is_venue_mismatch(result: &Result<(), ContentRefusal>, expected: &str) -> bool {
+        matches!(result, Err(ContentRefusal::VenueMismatch { term, .. }) if *term == expected)
+    }
+
+    /// A venue of `lp` for TOK-USD under the quote key `key`.
+    fn venue(lp: &str, key: &str) -> CreatedVenue {
+        CreatedVenue {
+            contract_id: "v2".into(),
+            terms: VenueTerms {
+                lp: lp.into(),
+                provider: DSO.into(),
+                pair_name: "TOK-USD".into(),
+                base: Instrument { admin: DSO.into(), id: "TOK".into() },
+                quote: Instrument { admin: DSO.into(), id: "USD".into() },
+            },
+            quote_public_key: key.into(),
+        }
+    }
+
+    /// `f` with the venue `e` asks for, when it asks for one.
+    fn with_requested_venue(e: &OperationExpectation, f: TxFacts) -> TxFacts {
+        let venues = match e {
+            OperationExpectation::CreateAtomicDvpVenue { quote_public_key_spki_hex: key, .. }
+            | OperationExpectation::UpdateVenueKey { new_key_spki_hex: key, .. } => vec![venue(ME, key)],
+            _ => Vec::new(),
+        };
+        TxFacts { venues, ..f }
+    }
+
+    /// `venues` created under the root the builder of `e`, a venue creation or key update, submits.
+    fn venue_tx(e: &OperationExpectation, venues: Vec<CreatedVenue>) -> TxFacts {
+        let (template, choice, cid) = match e {
+            OperationExpectation::UpdateVenueKey { .. } => (VENUE_TEMPLATE, "AtomicDVP_UpdateKey", "v1"),
+            _ => (SERVICE_TEMPLATE, "AtomicDVPService_CreateVenue", "svc"),
+        };
+        TxFacts { venues, ..rooted(facts(vec![]), template, choice, cid) }
+    }
+
+    #[test]
+    fn a_venue_is_created_only_as_its_request_asks() {
+        let create = OperationExpectation::CreateAtomicDvpVenue {
+            lp_party: ME.into(),
+            pair_name: "TOK-USD".into(),
+            quote_public_key_spki_hex: "30AA".into(),
+        };
+        let update = OperationExpectation::UpdateVenueKey { lp_party: ME.into(), venue_cid: "v1".into(), new_key_spki_hex: "30bb".into() };
+        // The key is compared without regard to case, as the venue compares it.
+        for (e, key, other_key) in [(&create, "30aa", "30bb"), (&update, "30BB", "30aa")] {
+            assert_eq!(check(e, venue_tx(e, vec![venue(ME, key)])), Ok(()), "{e:?}");
+            let refused = |venues: Vec<CreatedVenue>, term: &str| {
+                let result = check(e, venue_tx(e, venues));
+                assert!(is_venue_mismatch(&result, term), "{e:?}, {term}: {result:?}");
+            };
+            refused(vec![venue(ME, other_key)], "quote key");
+            refused(vec![venue(BOB, key)], "lp");
+            refused(vec![], "count");
+            refused(vec![venue(ME, key), venue(ME, key)], "count");
+        }
+        // The requested pair name, and the requested instruments when the request is at hand.
+        let mut other_pair = venue(ME, "30aa");
+        other_pair.terms.pair_name = "TOK-CC".into();
+        assert!(is_venue_mismatch(&check(&create, venue_tx(&create, vec![other_pair])), "pair name"));
+        let params = AtomicParams::CreateAtomicDvpVenue(orderbook_proto::rfqv2::CreateAtomicDvpVenueParams {
+            pair_name: "TOK-USD".into(),
+            base_instrument_id: "TOK".into(),
+            base_instrument_admin: DSO.into(),
+            quote_instrument_id: "USD".into(),
+            quote_instrument_admin: DSO.into(),
+            quote_public_key_spki_hex: "30AA".into(),
+        });
+        let requested = |f: TxFacts| check_with(&create, OwnRequest::Atomic(Some(&params)), f, &pins());
+        assert_eq!(requested(venue_tx(&create, vec![venue(ME, "30aa")])), Ok(()));
+        let mut other_base = venue(ME, "30aa");
+        other_base.terms.base.admin = BOB.into();
+        assert!(is_venue_mismatch(&requested(venue_tx(&create, vec![other_base])), "base instrument"));
+        let mut other_quote = venue(ME, "30aa");
+        other_quote.terms.quote.id = "CC".into();
+        assert!(is_venue_mismatch(&requested(venue_tx(&create, vec![other_quote])), "quote instrument"));
+        // No other operation creates a venue.
+        let tickets = OperationExpectation::IssueTickets { lp_party: ME.into(), ticket_count: 1 };
+        let issue = rooted(facts(vec![]), SERVICE_TEMPLATE, "AtomicDVPService_IssueTickets", "svc");
+        assert!(is_venue_mismatch(&check(&tickets, TxFacts { venues: vec![venue(ME, "30aa")], ..issue }), "count"));
+        let retire = OperationExpectation::RetireVenue { lp_party: ME.into(), venue_cid: "v1".into() };
+        let retired = rooted(facts(vec![]), VENUE_TEMPLATE, "AtomicDVP_Retire", "v1");
+        assert!(is_venue_mismatch(&check(&retire, TxFacts { venues: vec![venue(ME, "30aa")], ..retired }), "count"));
+        let transfer = TxFacts { venues: vec![venue(ME, "30aa")], ..facts(vec![cc(BOB, "1")]) };
+        assert!(is_venue_mismatch(&check(&transfer_cc("1"), transfer), "count"));
+        // The refusal names the operation, the count and the term.
+        let text = check(&create, venue_tx(&create, vec![venue(ME, "30bb")])).unwrap_err().to_string();
+        assert!(text.contains("create_atomic_dvp_venue") && text.contains("1 venue(s)") && text.contains("quote key"), "{text}");
+    }
+
     fn matched() -> VerificationResult {
         VerificationResult {
             accepted: true,
@@ -1000,7 +1382,7 @@ mod tests {
     }
 
     fn pins() -> PlatformParties {
-        PlatformParties { fee: Some(FEE.into()), prepaid_traffic: Some(TRAFFIC.into()) }
+        PlatformParties { fee: Some(FEE.into()), prepaid_traffic: Some(TRAFFIC.into()), traffic_fee: None }
     }
 
     fn check_with(
@@ -1067,6 +1449,66 @@ mod tests {
     }
 
     #[test]
+    fn each_one_root_operation_passes_only_with_its_own_root() {
+        let all = one_root_operations();
+        for (e, template, choice, cid) in &all {
+            assert_eq!(check(e, with_requested_venue(e, rooted(facts(vec![]), template, choice, cid))), Ok(()), "{e:?}");
+            // No root, a second root, or a root node that is not an exercise.
+            assert!(is_root_mismatch(&check(e, facts(vec![]))), "{e:?}");
+            let mut two = rooted(facts(vec![]), template, choice, cid);
+            two.roots.extend(two.roots.clone());
+            two.root_nodes = 2;
+            assert!(is_root_mismatch(&check(e, two)), "{e:?}");
+            let with_create = TxFacts { root_nodes: 2, ..rooted(facts(vec![]), template, choice, cid) };
+            assert!(is_root_mismatch(&check(e, with_create)), "{e:?}");
+            // The root of every other operation, of a settle, or of another template or choice.
+            for (_, other_template, other_choice, other_cid) in all.iter().filter(|o| (o.1, o.2) != (*template, *choice)) {
+                let result = check(e, rooted(facts(vec![]), other_template, other_choice, other_cid));
+                assert!(is_root_mismatch(&result), "{e:?} with {other_choice}: {result:?}");
+            }
+            for (t, c) in [(VENUE_TEMPLATE, SETTLE_CHOICE), ("AtomicDVPx:AtomicDVPService", *choice), (*template, "Archive")] {
+                let result = check(e, rooted(facts(vec![]), t, c, cid));
+                assert!(is_root_mismatch(&result), "{e:?} with {t} {c}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_venue_key_update_and_retirement_run_on_the_requested_venue() {
+        for (e, template, choice, _) in one_root_operations().into_iter().filter(|o| o.1 == VENUE_TEMPLATE) {
+            assert_eq!(check(&e, with_requested_venue(&e, rooted(facts(vec![]), template, choice, "v1"))), Ok(()), "{e:?}");
+            assert!(is_root_mismatch(&check(&e, rooted(facts(vec![]), template, choice, "v2"))), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_root_mismatch_names_the_operation_and_the_roots() {
+        let retire = OperationExpectation::RetireVenue { lp_party: ME.into(), venue_cid: "v1".into() };
+        let update_key = rooted(facts(vec![]), VENUE_TEMPLATE, "AtomicDVP_UpdateKey", "v1");
+        let refusal = check(&retire, update_key.clone()).unwrap_err();
+        let ContentRefusal::RootMismatch { operation, root_nodes, roots } = &refusal else {
+            panic!("expected a root mismatch, got {refusal:?}");
+        };
+        assert_eq!((*operation, *root_nodes), ("retire_venue", 1));
+        assert_eq!(roots, &update_key.roots);
+        let text = refusal.to_string();
+        assert!(text.contains("AtomicDVP:AtomicDVP AtomicDVP_UpdateKey on v1") && text.contains("retire_venue"), "{text}");
+        // A key update and a venue creation are not ticket issuance either.
+        let tickets = OperationExpectation::IssueTickets { lp_party: ME.into(), ticket_count: 1 };
+        assert!(is_root_mismatch(&check(&tickets, update_key)));
+        let create_venue = rooted(facts(vec![]), SERVICE_TEMPLATE, "AtomicDVPService_CreateVenue", "svc");
+        assert!(is_root_mismatch(&check(&tickets, create_venue)));
+        // At most three roots are named.
+        let mut many = rooted(facts(vec![]), VENUE_TEMPLATE, "AtomicDVP_Retire", "v1");
+        many.roots = vec![many.roots[0].clone(); 5];
+        many.root_nodes = 5;
+        match check(&retire, many) {
+            Err(ContentRefusal::RootMismatch { root_nodes: 5, roots, .. }) => assert_eq!(roots.len(), 3),
+            other => panic!("expected a root mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn merges_and_splits_move_nothing_to_others() {
         let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec!["1".into()], amulet_cids: vec![], dso_party: None };
         assert_eq!(check(&split, facts(vec![cc(ME, "1")])), Ok(()));
@@ -1110,6 +1552,165 @@ mod tests {
         refused_outflow(check(&transfer_cc("1"), facts(vec![cc(BOB, "1"), cc(FEE, "0.3")])));
         let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec![], amulet_cids: vec![], dso_party: None };
         refused_outflow(check(&split, facts(vec![cc(TRAFFIC, "1")])));
+    }
+
+    const TRAFFIC_FEE: &str = "traffic-fee::1220ef";
+    const REG: &str = "reg::1220ab";
+
+    fn token_transfer(to: &str, amount: &str) -> OperationExpectation {
+        OperationExpectation::TransferCip56 {
+            sender_party: ME.into(),
+            receiver_party: to.into(),
+            instrument_id: "TUSDT".into(),
+            instrument_admin: REG.into(),
+            amount: amount.into(),
+            command_id: None,
+            input_holding_cids: vec![],
+        }
+    }
+
+    fn token_request(to: &str, amount: &str, reference: Option<&str>) -> Params {
+        Params::TransferCip56(orderbook_proto::ledger::TransferCip56Params {
+            instrument_id: "TUSDT".into(),
+            instrument_admin: REG.into(),
+            receiver_party: to.into(),
+            amount: amount.into(),
+            reference: reference.map(str::to_string),
+            input_holding_cids: Vec::new(),
+            max_input_holdings: None,
+            direct_only: true,
+        })
+    }
+
+    fn with_traffic_fee() -> PlatformParties {
+        PlatformParties { traffic_fee: Some(TRAFFIC_FEE.into()), ..pins() }
+    }
+
+    fn token(to: &str, amount: &str, kind: FlowKind) -> ValueFlow {
+        flow(to, REG, "TUSDT", amount, kind)
+    }
+
+    fn with_memos(outflows: Vec<ValueFlow>, memos: &[&str]) -> TxFacts {
+        TxFacts { memos: memos.iter().map(|m| m.to_string()).collect(), ..facts(outflows) }
+    }
+
+    fn bad_request(result: Result<(), ContentRefusal>) -> String {
+        match result {
+            Err(ContentRefusal::BadRequest(reason)) => reason,
+            other => panic!("expected a bad request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_traffic_fee_leg_is_a_holding_paying_an_open_purchase_named_in_its_memo() {
+        let reference = "traffic-purchase-c17-holding";
+        assert!(insert_open_traffic_purchase(reference));
+        let e = token_transfer(TRAFFIC_FEE, "13.25");
+        let req = token_request(TRAFFIC_FEE, "13.25", Some(reference));
+        let run = |facts: TxFacts, req: &Params, platform: &PlatformParties| {
+            check_with(&e, OwnRequest::Ledger(Some(req)), facts, platform)
+        };
+        let paid = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding), token(ME, "1", FlowKind::Holding)], &[reference]);
+        assert_eq!(run(paid.clone(), &req, &with_traffic_fee()), Ok(()));
+        // A pending transfer to the traffic-fee party is never a top-up.
+        let pending = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::PendingTransfer)], &[reference]);
+        assert_eq!(refused_outflow(run(pending, &req, &with_traffic_fee())).kind, FlowKind::PendingTransfer);
+        // A second payment or another amount is not the leg.
+        let twice = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding), token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], &[reference]);
+        refused_outflow(run(twice, &req, &with_traffic_fee()));
+        refused_outflow(run(with_memos(vec![token(TRAFFIC_FEE, "13.26", FlowKind::Holding)], &[reference]), &req, &with_traffic_fee()));
+        // The memo must carry the purchase reference.
+        for memos in [&[][..], &["traffic-purchase-other"][..], &["traffic-purchase-c17-holding "][..]] {
+            let reason = bad_request(run(with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], memos), &req, &with_traffic_fee()));
+            assert!(reason.contains("memo"), "{reason}");
+        }
+        // A reference that is not an open purchase of this process, or none, is refused.
+        for foreign in [Some("traffic-purchase-c17-foreign"), None] {
+            let req = token_request(TRAFFIC_FEE, "13.25", foreign);
+            let memos: Vec<&str> = foreign.into_iter().collect();
+            let reason = bad_request(run(with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], &memos), &req, &with_traffic_fee()));
+            assert!(reason.contains("open traffic purchase"), "{reason}");
+        }
+        // An open purchase pays only the pinned party.
+        let elsewhere = token_request(BOB, "13.25", Some(reference));
+        let reason = bad_request(check_with(
+            &token_transfer(BOB, "13.25"),
+            OwnRequest::Ledger(Some(&elsewhere)),
+            with_memos(vec![token(BOB, "13.25", FlowKind::Holding)], &[reference]),
+            &with_traffic_fee(),
+        ));
+        assert!(reason.contains("PARTY_TRAFFIC_FEE"), "{reason}");
+        // Once closed, the same payment is refused.
+        assert!(remove_open_traffic_purchase(reference));
+        bad_request(run(paid, &req, &with_traffic_fee()));
+        // An ordinary transfer to another party keeps both transfer shapes.
+        let ordinary = token_request(BOB, "2", Some("invoice-7"));
+        for kind in [FlowKind::Holding, FlowKind::PendingTransfer] {
+            let r = check_with(&token_transfer(BOB, "2"), OwnRequest::Ledger(Some(&ordinary)), facts(vec![token(BOB, "2", kind)]), &with_traffic_fee());
+            assert_eq!(r, Ok(()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_traffic_purchase_without_the_pin_is_refused_for_that_alone() {
+        let reference = "traffic-purchase-c17-unpinned";
+        assert!(insert_open_traffic_purchase(reference));
+        let e = token_transfer(TRAFFIC_FEE, "13.25");
+        let req = token_request(TRAFFIC_FEE, "13.25", Some(reference));
+        let paid = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], &[reference]);
+        let unpinned = check_with(&e, OwnRequest::Ledger(Some(&req)), paid, &pins());
+        assert_eq!(unpinned, Err(ContentRefusal::PinMissing { operation: "transfer_cip56", pin: TRAFFIC_FEE_PIN }));
+        assert!(unpinned.unwrap_err().to_string().contains("PARTY_TRAFFIC_FEE is not set"));
+        // Anything else wrong still refuses as such.
+        let pending = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::PendingTransfer)], &[reference]);
+        refused_outflow(check_with(&e, OwnRequest::Ledger(Some(&req)), pending, &pins()));
+        let unnamed = facts(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)]);
+        bad_request(check_with(&e, OwnRequest::Ledger(Some(&req)), unnamed, &pins()));
+        assert!(remove_open_traffic_purchase(reference));
+        // Without an open purchase it is an ordinary transfer, judged as before.
+        let paid = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::PendingTransfer)], &[reference]);
+        assert_eq!(check_with(&e, OwnRequest::Ledger(Some(&req)), paid, &pins()), Ok(()));
+    }
+
+    #[test]
+    fn open_traffic_purchases_are_bounded_and_forgotten() {
+        let mut open = BTreeSet::new();
+        for bad in ["", "  ", " padded", "line\nbreak", "bidi\u{202e}"] {
+            assert!(!open_purchase_in(&mut open, bad), "{bad:?}");
+        }
+        assert!(!open_purchase_in(&mut open, &"r".repeat(257)));
+        for n in 0..MAX_OPEN_TRAFFIC_PURCHASES {
+            assert!(open_purchase_in(&mut open, &format!("purchase-{n}")));
+        }
+        assert!(open_purchase_in(&mut open, "purchase-0"), "an open one stays open");
+        assert!(!open_purchase_in(&mut open, "purchase-new"), "the set is full");
+        let reference = "traffic-purchase-c17-lifecycle";
+        assert!(!is_open_traffic_purchase(reference));
+        assert!(insert_open_traffic_purchase(reference));
+        assert!(is_open_traffic_purchase(reference));
+        assert!(remove_open_traffic_purchase(reference));
+        assert!(!is_open_traffic_purchase(reference));
+        assert!(!remove_open_traffic_purchase(reference));
+    }
+
+    #[test]
+    fn the_traffic_fee_pin_reaches_the_evaluator() {
+        let full = |hint: &str, digit: &str| format!("{hint}::1220{}", digit.repeat(64));
+        let traffic_fee = full("traffic-fee", "d");
+        let parties = PlatformParties {
+            fee: Some(full("fee", "a")),
+            prepaid_traffic: Some(full("traffic", "b")),
+            traffic_fee: Some(traffic_fee.clone()),
+        };
+        let pinned = parties.pinned().unwrap();
+        assert_eq!(pinned.traffic_fee.as_ref().map(|p| p.as_str()), Some(traffic_fee.as_str()));
+        let unpinned = PlatformParties { traffic_fee: None, ..parties.clone() };
+        assert_eq!(unpinned.pinned().unwrap().traffic_fee, None);
+        let bad = PlatformParties { traffic_fee: Some("traffic fee".into()), ..parties };
+        assert!(bad.pinned().unwrap_err().contains("PARTY_TRAFFIC_FEE"));
+        let mut config = agent_logic::config::BaseConfig::test_minimal().unwrap();
+        config.party_traffic_fee = Some(TRAFFIC_FEE.into());
+        assert_eq!(PlatformParties::from_config(&config).traffic_fee.as_deref(), Some(TRAFFIC_FEE));
     }
 
     fn terms(proposal: &str, buyer: &str, seller: &str) -> DvpTerms {
@@ -1256,8 +1857,8 @@ mod tests {
         });
         let multicall = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1, terms: None };
         let request = OwnRequest::Ledger(Some(&params));
-        assert_eq!(check_with(&multicall, request, facts(vec![cc(BOB, "2")]), &pins()), Ok(()));
-        refused_outflow(check_with(&multicall, request, facts(vec![pending]), &pins()));
+        assert_eq!(check_with(&multicall, request, in_multicall(facts(vec![cc(BOB, "2")])), &pins()), Ok(()));
+        refused_outflow(check_with(&multicall, request, in_multicall(facts(vec![pending])), &pins()));
     }
 
     #[test]
@@ -1289,8 +1890,9 @@ mod tests {
         });
         let multicall = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 1, terms: None };
         let request = OwnRequest::Ledger(Some(&params));
-        assert_eq!(check_with(&multicall, request, facts(vec![cc(BOB, "4"), cc(EVE, "2")]), &pins()), Ok(()));
-        refused_outflow(check_with(&multicall, request, facts(vec![cc(BOB, "1.5"), cc(BOB, "2.5"), cc(EVE, "2")]), &pins()));
+        assert_eq!(check_with(&multicall, request, in_multicall(facts(vec![cc(BOB, "4"), cc(EVE, "2")])), &pins()), Ok(()));
+        let split_up = in_multicall(facts(vec![cc(BOB, "1.5"), cc(BOB, "2.5"), cc(EVE, "2")]));
+        refused_outflow(check_with(&multicall, request, split_up, &pins()));
     }
 
     #[test]
@@ -1320,7 +1922,7 @@ mod tests {
                 payment: quantity("usd::1220ab", "USD", amount),
                 ..terms("p1", ME, BOB)
             };
-            TxFacts { dvp: vec![dvp], allocations: vec![allocated(reference, &leg)], ..facts(vec![leg]) }
+            in_multicall(TxFacts { dvp: vec![dvp], allocations: vec![allocated(reference, &leg)], ..facts(vec![leg]) })
         };
         let params = Params::ExecuteMulticall(ExecuteMultiCallParams {
             operations: vec![MultiCallOp {
@@ -1399,7 +2001,7 @@ mod tests {
         });
         let e = OperationExpectation::ExecuteMulticall { party: ME.into(), op_count: 2, terms: Some(recorded(BOB, ME)) };
         let leg = flow(BOB, "reg::1220ab", "TOK", "4", FlowKind::Allocation);
-        let mut f = facts(vec![cc(BOB, "2"), leg.clone()]);
+        let mut f = in_multicall(facts(vec![cc(BOB, "2"), leg.clone()]));
         f.dvp = vec![terms("p1", BOB, ME)];
         f.allocations = vec![allocated("p1", &leg)];
         assert_eq!(check_with(&e, OwnRequest::Ledger(Some(&params)), f.clone(), &pins()), Ok(()));
@@ -2053,7 +2655,7 @@ mod tests {
         fn a_multicall_of_cc_transfers_passes_with_the_config_state() {
             let mut nodes = vec![node(
                 "mc",
-                NodeType::Exercise(exercise("mc1", ("MultiCall", "MultiCall"), "MultiCall_Execute", &[ME], false, &["a", "b"])),
+                NodeType::Exercise(exercise("mc1", ("MultiCall", "MultiCall"), "Execute_MultiCall", &[ME], false, &["a", "b"])),
             )];
             nodes.extend(transfer_nodes("a", BOB, "10.0000000000", "in1", "90.0000000000"));
             nodes.extend(transfer_nodes("b", EVE, "0.5000000000", "in2", "4.5000000000"));
@@ -2104,6 +2706,178 @@ mod tests {
                     assert_eq!(templates, ["Utility.Collateral.App.Service.User:UserServiceRequest"])
                 }
                 other => panic!("expected the lookalike to refuse, got {other:?}"),
+            }
+        }
+
+        const SERVICE_T: (&str, &str) = ("AtomicDVP", "AtomicDVPService");
+        const TICKET_T: (&str, &str) = ("AtomicDVP", "SettlementTicket");
+        const HOLDING_T: (&str, &str) = ("Utility.Registry.Holding.V0.Holding", "Holding");
+        const FACTORY_T: (&str, &str) = ("Utility.Registry.App.V0.Service.AllocationFactory", "AllocationFactory");
+        const REG: &str = "reg::1220ab";
+
+        fn reg_holding(cid: &str, owner: &str, amount: &str) -> Create {
+            let text = |t: &str| val(Sum::Text(t.into()));
+            let instrument = record(vec![("source", party(REG)), ("id", text("TOK")), ("scheme", text("s"))]);
+            let arg = record(vec![("registrar", party(REG)), ("owner", party(owner)), ("instrument", instrument), ("amount", numeric(amount))]);
+            create(cid, HOLDING_T, arg, &[REG, owner])
+        }
+
+        /// The service root `choice` with `children`, as the SDK's AtomicDVPService builders submit it.
+        fn service_root(choice: &str, children: &[&str]) -> daml_transaction::Node {
+            node("r", NodeType::Exercise(exercise("svc", SERVICE_T, choice, &[ME], false, children)))
+        }
+
+        /// A split of the agent's 100 TOK into two outputs of 10 and the change, one
+        /// self-transfer per output; the second output is owned by `second`.
+        fn split(second: &str) -> Vec<u8> {
+            let transfer = |id: &str, children: &[&str]| {
+                node(id, NodeType::Exercise(exercise("fac", FACTORY_T, "TransferFactory_Transfer", &[ME], false, children)))
+            };
+            let archive = |id: &str, cid: &str| node(id, NodeType::Exercise(exercise(cid, HOLDING_T, "Archive", &[REG, ME], true, &[])));
+            let nodes = vec![
+                service_root("AtomicDVPService_SplitHoldings", &["t1", "t2"]),
+                transfer("t1", &["a1", "o1", "c1"]),
+                archive("a1", "in1"),
+                node("o1", NodeType::Create(reg_holding("out1", ME, "10.0000000000"))),
+                node("c1", NodeType::Create(reg_holding("ch1", ME, "90.0000000000"))),
+                transfer("t2", &["a2", "o2", "c2"]),
+                archive("a2", "ch1"),
+                node("o2", NodeType::Create(reg_holding("out2", second, "10.0000000000"))),
+                node("c2", NodeType::Create(reg_holding("ch2", ME, "80.0000000000"))),
+            ];
+            encode(&["r"], nodes, vec![reg_holding("in1", ME, "100.0000000000")])
+        }
+
+        fn split_holdings() -> OperationExpectation {
+            OperationExpectation::SplitHoldings { lp_party: ME.into(), instrument_id: "TOK".into(), split_count: 1, input_cids: vec!["in1".into()] }
+        }
+
+        #[test]
+        fn a_split_of_the_agents_own_holdings_passes() {
+            let bytes = split(ME);
+            let facts = facts_of(&bytes).unwrap();
+            assert!(facts.unmodelled.is_empty() && facts.outflows.is_empty(), "{facts:?}");
+            assert_eq!(checked(&split_holdings(), OwnRequest::Atomic(None), &bytes), Ok(()));
+        }
+
+        #[test]
+        fn a_split_output_for_another_party_is_an_unexpected_outflow() {
+            let result = checked(&split_holdings(), OwnRequest::Atomic(None), &split(BOB));
+            assert!(matches!(&result, Err(ContentRefusal::UnexpectedOutflow { flow, .. }) if flow.to == BOB), "{result:?}");
+        }
+
+        #[test]
+        fn a_create_of_the_service_stays_outside_the_model() {
+            let bytes = request_tx("s1", SERVICE_T, record(vec![("provider", party(ME))]));
+            let result = checked(&split_holdings(), OwnRequest::Atomic(None), &bytes);
+            assert_eq!(result, Err(ContentRefusal::Unmodelled(vec![SERVICE_TEMPLATE.into()])));
+        }
+
+        /// The venue `cid` of the agent with provider BOB for TOK-CC, under the quote key `key`.
+        fn venue_contract(cid: &str, key: &str) -> Create {
+            let text = |t: &str| val(Sum::Text(t.into()));
+            let instrument = |admin: &str, id: &str| record(vec![("admin", party(admin)), ("id", text(id))]);
+            let arg = record(vec![
+                ("provider", party(BOB)),
+                ("lp", party(ME)),
+                ("pairName", text("TOK-CC")),
+                ("baseInstrumentId", instrument(REG, "TOK")),
+                ("quoteInstrumentId", instrument(DSO, "Amulet")),
+                ("quotePublicKey", text(key)),
+            ]);
+            create(cid, ("AtomicDVP", "AtomicDVP"), arg, &[ME, BOB])
+        }
+
+        /// The service's venue creation, as its builder submits it, of a venue under `key`.
+        fn create_venue(key: &str) -> Vec<u8> {
+            let venue = node("1", NodeType::Create(venue_contract("v1", key)));
+            encode(&["r"], vec![service_root("AtomicDVPService_CreateVenue", &["1"]), venue], Vec::new())
+        }
+
+        #[test]
+        fn a_venue_is_signed_only_under_the_requested_key() {
+            let create = OperationExpectation::CreateAtomicDvpVenue {
+                lp_party: ME.into(),
+                pair_name: "TOK-CC".into(),
+                quote_public_key_spki_hex: "30aa".into(),
+            };
+            let params = AtomicParams::CreateAtomicDvpVenue(orderbook_proto::rfqv2::CreateAtomicDvpVenueParams {
+                pair_name: "TOK-CC".into(),
+                base_instrument_id: "TOK".into(),
+                base_instrument_admin: REG.into(),
+                quote_instrument_id: "Amulet".into(),
+                quote_instrument_admin: DSO.into(),
+                quote_public_key_spki_hex: "30aa".into(),
+            });
+            assert_eq!(checked(&create, OwnRequest::Atomic(Some(&params)), &create_venue("30aa")), Ok(()));
+            let result = checked(&create, OwnRequest::Atomic(Some(&params)), &create_venue("30bb"));
+            assert!(is_venue_mismatch(&result, "quote key"), "{result:?}");
+            // A key update creates the venue again under the new key.
+            let update_root = exercise("v1", ("AtomicDVP", "AtomicDVP"), "AtomicDVP_UpdateKey", &[ME], true, &["1"]);
+            let update_key = encode(
+                &["r"],
+                vec![node("r", NodeType::Exercise(update_root)), node("1", NodeType::Create(venue_contract("v2", "30bb")))],
+                vec![venue_contract("v1", "30aa")],
+            );
+            let update = |key: &str| OperationExpectation::UpdateVenueKey {
+                lp_party: ME.into(),
+                venue_cid: "v1".into(),
+                new_key_spki_hex: key.into(),
+            };
+            assert_eq!(checked(&update("30BB"), OwnRequest::Atomic(None), &update_key), Ok(()));
+            let result = checked(&update("30cc"), OwnRequest::Atomic(None), &update_key);
+            assert!(is_venue_mismatch(&result, "quote key"), "{result:?}");
+            let retire = OperationExpectation::RetireVenue { lp_party: ME.into(), venue_cid: "v1".into() };
+            assert!(is_root_mismatch(&checked(&retire, OwnRequest::Atomic(None), &update_key)));
+        }
+
+        #[test]
+        fn ticket_and_venue_upkeep_on_the_service_passes() {
+            let ticket = |cid: &str| create(cid, TICKET_T, record(vec![("lp", party(ME)), ("ticketId", val(Sum::Text(cid.into())))]), &[ME]);
+            let issue = encode(
+                &["r"],
+                vec![
+                    service_root("AtomicDVPService_IssueTickets", &["1", "2"]),
+                    node("1", NodeType::Create(ticket("tk1"))),
+                    node("2", NodeType::Create(ticket("tk2"))),
+                ],
+                Vec::new(),
+            );
+            let fetch = Fetch {
+                lf_version: "2.1".into(),
+                contract_id: "tk1".into(),
+                package_name: "pkg".into(),
+                template_id: Some(ident(TICKET_T)),
+                acting_parties: vec![ME.into()],
+                ..Default::default()
+            };
+            let cancel = encode(
+                &["r"],
+                vec![
+                    service_root("AtomicDVPService_CancelTickets", &["1", "2"]),
+                    node("1", NodeType::Fetch(fetch)),
+                    node("2", NodeType::Exercise(exercise("tk1", TICKET_T, "Archive", &[ME], true, &[]))),
+                ],
+                vec![ticket("tk1")],
+            );
+            let me = || ME.to_string();
+            let cases = [
+                (OperationExpectation::IssueTickets { lp_party: me(), ticket_count: 2 }, issue),
+                (OperationExpectation::CancelTickets { lp_party: me(), ticket_count: 1 }, cancel),
+                (
+                    OperationExpectation::CreateAtomicDvpVenue { lp_party: me(), pair_name: "TOK-CC".into(), quote_public_key_spki_hex: "30aa".into() },
+                    create_venue("30AA"),
+                ),
+            ];
+            for (e, bytes) in &cases {
+                let facts = facts_of(bytes).unwrap();
+                assert!(facts.unmodelled.is_empty() && facts.outflows.is_empty(), "{e:?}: {facts:?}");
+                assert_eq!(checked(e, OwnRequest::Atomic(None), bytes), Ok(()), "{e:?}");
+            }
+            // Each tree is refused under another of the three operations.
+            for (i, (e, _)) in cases.iter().enumerate() {
+                let (_, other) = &cases[(i + 1) % cases.len()];
+                assert!(is_root_mismatch(&checked(e, OwnRequest::Atomic(None), other)), "{e:?}");
             }
         }
 

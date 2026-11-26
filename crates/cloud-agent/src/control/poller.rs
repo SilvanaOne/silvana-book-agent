@@ -763,6 +763,7 @@ mod tests {
         let pins = |traffic: Option<&String>| crate::control::PlatformParties {
             fee: Some(kept.clone()),
             prepaid_traffic: traffic.cloned(),
+            traffic_fee: None,
         };
         assert_eq!(ctx.platform(), pins(None), "kept, and not a party id");
         // A pin written later is taken on the next round, without a restart.

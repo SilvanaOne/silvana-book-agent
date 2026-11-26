@@ -22,6 +22,8 @@ message TransferCip56Params {
   // Cap on auto-selected inputs, biggest first. Unset ⇒ the amulet protocol
   // limit for CC and no cap for registry instruments.
   optional uint32 max_input_holdings = 7;
+  // True ⇒ refuse instead of creating a two-step offer when no direct transfer is possible.
+  bool direct_only = 8;
 }
 
 // Accept incoming CIP-56 TransferOffer — registrar extracted from contract payload

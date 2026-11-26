@@ -1,6 +1,6 @@
 //! The per-market report line.
 
-use super::{Start, Stats};
+use super::{clampf, Start, Stats};
 use crate::num::Px;
 
 pub(crate) struct ReportLine<'a> {
@@ -9,6 +9,8 @@ pub(crate) struct ReportLine<'a> {
     pub base: f64,
     pub quote: f64,
     pub price: f64,
+    /// USD value of one quote unit, when known
+    pub quote_usd: Option<f64>,
     pub start: Option<Start>,
     pub stats: Stats,
     /// Whether the market takes; the grid only rests
@@ -16,25 +18,38 @@ pub(crate) struct ReportLine<'a> {
     pub status: &'a str,
 }
 
+/// Places for quote amounts: a cent's worth for a quote unit over $1, else 2.
+fn quote_places(quote_usd: Option<f64>) -> usize {
+    match quote_usd.filter(|r| r.is_finite() && *r > 1.0) {
+        Some(r) => clampf(2.0 + r.log10().ceil(), 2.0, 10.0) as usize,
+        None => 2,
+    }
+}
+
 /// One line: inventory, value at the reference, change since the start and against holding.
 pub(crate) fn format_report(r: &ReportLine<'_>) -> String {
     let value = r.base * r.price + r.quote;
+    let dp = quote_places(r.quote_usd);
     let mut out = format!("Strategy {} [{}]: base {:.2}", r.market_id, r.kind, r.base);
     if let Some(s) = r.start {
         out.push_str(&format!(" ({:+.2})", r.base - s.base));
     }
-    out.push_str(&format!(" quote {:.2}", r.quote));
+    out.push_str(&format!(" quote {:.dp$}", r.quote));
     if let Some(s) = r.start {
-        out.push_str(&format!(" ({:+.2})", r.quote - s.quote));
+        out.push_str(&format!(" ({:+.dp$})", r.quote - s.quote));
     }
-    out.push_str(&format!(" value {:.2} @ {}", value, Px(r.price, 6)));
+    out.push_str(&format!(" value {value:.dp$}"));
+    if let Some(rate) = r.quote_usd.filter(|r| r.is_finite() && *r > 0.0 && *r != 1.0) {
+        out.push_str(&format!(" (${:.2})", value * rate));
+    }
+    out.push_str(&format!(" @ {}", Px(r.price, 6)));
     if let Some(s) = r.start {
         let start_value = s.base * s.price + s.quote;
         let hold_value = s.base * r.price + s.quote;
         let change = value - start_value;
         let pct = if start_value > 0.0 { change / start_value * 100.0 } else { 0.0 };
         out.push_str(&format!(
-            " (start {:.2}, {:+.2} {:+.2}%, vs hold {:+.2})",
+            " (start {:.dp$}, {:+.dp$} {:+.2}%, vs hold {:+.dp$})",
             start_value,
             change,
             pct,
@@ -67,6 +82,7 @@ mod tests {
             base: 1520.0,
             quote: 1480.2,
             price: 0.99,
+            quote_usd: Some(1.0),
             start: Some(Start { base: 1500.0, quote: 1500.0, price: 1.0 }),
             stats: Stats { takes: 3, takes_filled: 2, takes_empty: 1, fills: 5, bought: 30.0, sold: 10.0 },
             takes: true,
@@ -83,6 +99,7 @@ mod tests {
             base: 1.0,
             quote: 2.0,
             price: 3.0,
+            quote_usd: None,
             start: None,
             stats: Stats::default(),
             takes: true,
@@ -104,11 +121,44 @@ mod tests {
             base: 0.0,
             quote: 2.0,
             price: 1.0,
+            quote_usd: None,
             start: None,
             stats: Stats::default(),
             takes: true,
             status: "",
         }
+    }
+
+    #[test]
+    fn a_quote_worth_more_than_a_dollar_keeps_cent_precision_and_shows_usd() {
+        let line = format_report(&ReportLine {
+            market_id: "EDELx-cETH",
+            kind: "noise_taker",
+            base: 4_000_000.0,
+            quote: 22.0123456,
+            price: 0.0000055,
+            quote_usd: Some(1700.0),
+            start: Some(Start { base: 4_001_300.0, quote: 22.0052, price: 0.0000055 }),
+            stats: Stats::default(),
+            takes: false,
+            status: "",
+        });
+        // Six places of cETH resolve under a cent at $1700
+        assert_eq!(
+            line,
+            "Strategy EDELx-cETH [noise_taker]: base 4000000.00 (-1300.00) quote 22.012346 (+0.007146) \
+             value 44.012346 ($74820.99) @ 0.00000550000 (start 44.012350, -0.000004 -0.00%, vs hold -0.000004) \
+             fills 0 (buy 0.00 / sell 0.00)"
+        );
+        // A USD quote, or one whose rate is not known, reads as before
+        for quote_usd in [Some(1.0), None] {
+            let usd = format_report(&ReportLine { quote_usd, ..line_args("HTEST-USDC") });
+            assert_eq!(usd, format_report(&line_args("HTEST-USDC")));
+            assert_eq!(usd, "Strategy HTEST-USDC [arbitrage]: base 0.00 quote 2.00 value 2.00 @ 1.000000 takes 0 (0 filled, 0 empty) fills 0 (buy 0.00 / sell 0.00)");
+        }
+        // CC is worth under a dollar: two places, and its USD value
+        let cc = format_report(&ReportLine { quote: 1000.0, quote_usd: Some(0.0746), ..line_args("TUSDT-CC") });
+        assert!(cc.contains(" quote 1000.00 value 1000.00 ($74.60) @ 1.000000 "), "{cc}");
     }
 
     #[test]
@@ -119,6 +169,7 @@ mod tests {
             base: 100.0,
             quote: 51.0,
             price: 0.15,
+            quote_usd: Some(1.0),
             start: Some(Start { base: 110.0, quote: 48.5, price: 0.16 }),
             stats: Stats { fills: 2, bought: 0.0, sold: 10.0, ..Stats::default() },
             takes: false,

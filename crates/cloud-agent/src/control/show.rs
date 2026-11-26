@@ -130,6 +130,8 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
     let marker = ctx.marker.map(|m| m.to_string());
     let fee = ctx.config.party_fee.clone();
     let traffic = ctx.config.party_prepaid_traffic.clone();
+    let traffic_fee = ctx.config.party_traffic_fee.clone();
+    let topup_tokens = &ctx.config.prepaid_traffic_topup_tokens;
     let in_force = state.in_force_policy(now);
     let scheduled = state.scheduled_policy(now);
 
@@ -168,8 +170,9 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
             "controllers": controllers,
             "policyInForce": state.is_linked().then(|| policy_json(in_force, now)),
             "policyScheduled": scheduled.map(|p| policy_json(Some(p), now)),
-            "platformParties": {"PARTY_FEE": fee, "PARTY_PREPAID_TRAFFIC": traffic},
+            "platformParties": {"PARTY_FEE": fee, "PARTY_PREPAID_TRAFFIC": traffic, "PARTY_TRAFFIC_FEE": traffic_fee},
             "settings": {
+                "prepaidTrafficTopupTokens": topup_tokens,
                 "autoExecuteCommands": ctx.config.control.auto_execute_commands,
                 "autoAcceptPolicies": ctx.config.control.auto_accept_policies,
                 "swapMaxDeviationBps": ctx.config.control.swap_max_deviation_bps,
@@ -200,6 +203,7 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
         let _ = writeln!(out, "Owner:        account {owner}");
     }
     let _ = writeln!(out, "Marker:       {}", marker.as_deref().unwrap_or("unset"));
+    let _ = writeln!(out, "Store:        {}", ctx.store.dir().display());
     if let Some(p) = pending {
         let status = match p.status {
             PendingStatus::Uploading => "signed, awaiting the rpc (run `cloud-agent control sync`)".to_string(),
@@ -241,12 +245,20 @@ pub async fn run_show(ctx: &ControlContext, rpc: Option<&ControlRpc>, out: &mut 
     }
     let _ = writeln!(
         out,
-        "Pinned parties: PARTY_FEE={} PARTY_PREPAID_TRAFFIC={}",
+        "Pinned parties: PARTY_FEE={} PARTY_PREPAID_TRAFFIC={} PARTY_TRAFFIC_FEE={}",
         fee.as_deref().unwrap_or("unset"),
-        traffic.as_deref().unwrap_or("unset")
+        traffic.as_deref().unwrap_or("unset"),
+        traffic_fee.as_deref().unwrap_or("unset")
     );
     if fee.is_none() || traffic.is_none() {
         let _ = writeln!(out, "  (an unset party means no payment is treated as a fee or traffic purchase)");
+    }
+    if traffic_fee.is_none() && super::pins::traffic_fee_needed(topup_tokens) {
+        let _ = writeln!(
+            out,
+            "  (PARTY_TRAFFIC_FEE is unset: top-ups paid in a token other than CC are refused; top-up tokens {})",
+            topup_tokens.join(",")
+        );
     }
     let _ = writeln!(
         out,

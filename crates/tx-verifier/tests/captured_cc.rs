@@ -713,3 +713,12 @@ fn batch_pay_mutations_refuse() {
         assert!(refusal(&common::encode(&q), &exp).is_some(), "{name} is accepted");
     }
 }
+
+#[test]
+fn cc_transfers_and_top_ups_name_their_memo_once() {
+    let memos = |kind: &str| -> Vec<Vec<String>> {
+        common::load(kind).iter().map(|c| common::facts(c).memos).collect()
+    };
+    assert_eq!(memos("transfer_cc"), [vec!["test3"], vec!["cc-transfer"]]);
+    assert_eq!(memos("prepay_traffic"), [vec!["cc-transfer"], vec!["auto-topup"]]);
+}

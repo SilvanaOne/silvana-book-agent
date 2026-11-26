@@ -18,7 +18,7 @@ use agent_logic::config::BaseConfig;
 use agent_logic::liquidity::LiquidityManager;
 use agent_logic::shutdown::Shutdown;
 use agent_logic::supervise::{self, Bounded, Policy};
-use orderbook_proto::ledger::ActiveContractInfo;
+use orderbook_proto::ledger::{ActiveContractInfo, GetDsoRatesResponse};
 
 use crate::holdings_cache::{
     instrument_key, CachedAmulet, CachedHolding, HoldingsCache, CC_INSTRUMENT, TEMPLATE_AMULET,
@@ -28,6 +28,9 @@ use crate::ledger_client::{self, DAppProviderClient};
 
 /// ACS refresh interval
 const REFRESH_INTERVAL_SECS: u64 = 30;
+
+/// While the CC/USD rate cannot be refreshed, a warning at most this often.
+const RATE_WARN_EVERY: Duration = Duration::from_secs(600);
 
 /// Minimum request timeout for the streaming ACS snapshot fetch. The
 /// channel-wide request timeout (default 120s) bounds the WHOLE streamed
@@ -72,6 +75,7 @@ async fn run(
     info!("ACS worker started (refresh every {}s)", REFRESH_INTERVAL_SECS);
     let budget = fetch_budget(&config);
     let rate_wait = ledger_client::call_wait(acs_request_timeout_secs(&config));
+    let mut rate_warned_at: Option<Instant> = None;
 
     loop {
         if shutdown.is_shutting_down() {
@@ -79,12 +83,12 @@ async fn run(
             return;
         }
 
-        let apply = |(mut client, fetched): (DAppProviderClient, Fetched)| {
-            let (config, cache, lm, shutdown) = (&config, &cache, &liquidity_manager, &shutdown);
-            async move {
-                apply_holdings(config, cache, lm, fetched).await;
-                refresh_cc_usd_rate(&mut client, lm, shutdown, rate_wait).await;
-            }
+        let (config_ref, cache_ref, lm, stop) = (&config, &cache, &liquidity_manager, &shutdown);
+        let warned_at = &mut rate_warned_at;
+        let apply = move |(mut client, fetched): (DAppProviderClient, Fetched)| async move {
+            apply_holdings(config_ref, cache_ref, lm, fetched).await;
+            let refreshed = refresh_cc_usd_rate(client.get_dso_rates(), lm, stop, rate_wait).await;
+            note_rate_refresh(refreshed, warned_at);
         };
         if !cycle(&shutdown, budget, fetch_holdings(&config), apply, &cache).await {
             info!("ACS worker shutting down");
@@ -233,27 +237,40 @@ async fn apply_holdings(
     }
 }
 
-/// Update the CC/USD rate for fee estimation, waiting at most `wait`.
-async fn refresh_cc_usd_rate(
-    client: &mut DAppProviderClient,
+/// Update the CC/USD rate for fee estimates and strategy amounts, waiting at most
+/// `wait`; the error says why no rate was taken.
+async fn refresh_cc_usd_rate<F>(
+    fetch: F,
     lm: &LiquidityManager,
     shutdown: &Shutdown,
     wait: Duration,
-) {
-    match supervise::bounded(shutdown, wait, client.get_dso_rates()).await {
-        Bounded::Done(Ok(rates)) => {
-            if let Ok(rate) = rates.cc_usd_rate.parse::<Decimal>() {
-                if rate > Decimal::ZERO {
-                    lm.update_cc_usd_rate(rate).await;
-                }
+) -> Result<(), String>
+where
+    F: Future<Output = anyhow::Result<GetDsoRatesResponse>>,
+{
+    match supervise::bounded(shutdown, wait, fetch).await {
+        Bounded::Done(Ok(rates)) => match rates.cc_usd_rate.parse::<Decimal>() {
+            Ok(rate) if rate > Decimal::ZERO => {
+                lm.update_cc_usd_rate(rate).await;
+                Ok(())
             }
+            _ => Err(format!("unusable rate {:?}", rates.cc_usd_rate)),
+        },
+        Bounded::Done(Err(e)) => Err(format!("{e:#}")),
+        Bounded::Elapsed => Err(format!("no answer within {}s", wait.as_secs())),
+        Bounded::Shutdown => Ok(()),
+    }
+}
+
+/// A failed rate refresh warns at most every [`RATE_WARN_EVERY`]; a success re-arms it.
+fn note_rate_refresh(outcome: Result<(), String>, warned_at: &mut Option<Instant>) {
+    match outcome {
+        Ok(()) => *warned_at = None,
+        Err(e) if warned_at.is_none_or(|at| at.elapsed() >= RATE_WARN_EVERY) => {
+            *warned_at = Some(Instant::now());
+            warn!("ACS worker: CC/USD rate not refreshed ({}); CC-quoted strategies hold once the last rate is too old", e);
         }
-        Bounded::Done(Err(e)) => debug!("ACS worker: failed to fetch CC/USD rate: {:#}", e),
-        Bounded::Elapsed => debug!(
-            "ACS worker: failed to fetch CC/USD rate: no answer within {}s",
-            wait.as_secs()
-        ),
-        Bounded::Shutdown => {}
+        Err(e) => debug!("ACS worker: CC/USD rate not refreshed: {}", e),
     }
 }
 
@@ -482,6 +499,47 @@ mod tests {
                 assert!(budget > connect + open + open, "the amulet fallback fits too");
             }
         }
+    }
+
+    fn rates(rate: &str) -> GetDsoRatesResponse {
+        GetDsoRatesResponse { cc_usd_rate: rate.to_string(), ..Default::default() }
+    }
+
+    // A refresh takes only a positive rate, and says why it took none
+    #[tokio::test]
+    async fn a_rate_refresh_takes_only_a_usable_rate() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        let shutdown = Shutdown::new();
+        let refresh = |reply: anyhow::Result<GetDsoRatesResponse>| {
+            refresh_cc_usd_rate(std::future::ready(reply), &lm, &shutdown, Duration::from_secs(1))
+        };
+        for bad in ["", "abc", "0", "-0.07"] {
+            assert!(refresh(Ok(rates(bad))).await.is_err(), "{bad}");
+        }
+        assert!(refresh(Err(anyhow::anyhow!("unavailable"))).await.is_err());
+        assert_eq!(lm.cc_usd_rate().await, None);
+        assert_eq!(refresh(Ok(rates("0.0746"))).await, Ok(()));
+        assert_eq!(lm.cc_usd_rate().await, Some(Decimal::new(746, 4)));
+        // A slow answer is dropped at the bound, and the last rate stays
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(rates("0.08"))
+        };
+        let e = refresh_cc_usd_rate(slow, &lm, &shutdown, Duration::from_millis(20)).await.unwrap_err();
+        assert!(e.contains("no answer"), "{e}");
+        assert_eq!(lm.cc_usd_rate().await, Some(Decimal::new(746, 4)));
+    }
+
+    // Failures warn once per window; a success re-arms the warning
+    #[test]
+    fn rate_refresh_failures_warn_at_most_once_per_window() {
+        let logs = crate::test_util::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::WARN);
+        let mut warned_at = None;
+        for outcome in [Err("x".to_string()), Err("y".to_string()), Ok(()), Err("z".to_string())] {
+            note_rate_refresh(outcome, &mut warned_at);
+        }
+        assert_eq!(logs.count("CC/USD rate not refreshed"), 2);
     }
 
     #[test]

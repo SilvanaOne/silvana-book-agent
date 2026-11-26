@@ -48,6 +48,9 @@ pub trait GridCycle: Send + 'static {
     /// by market where a fee was seen there.
     fn apply_fee_capacity(&mut self, _capacity: Option<f64>, _per_fill: f64, _by_market: HashMap<String, f64>) {}
 
+    /// Take the CC/USD rate (`None` while unknown) that strategy amounts in USD use.
+    fn apply_cc_usd_rate(&mut self, _rate: Option<f64>) {}
+
     /// One pass over the markets; stops between markets on shutdown or past `deadline`.
     async fn run_cycle(&mut self, stop: &Shutdown, deadline: Instant) -> Result<CycleReport>;
 }
@@ -60,6 +63,10 @@ impl GridCycle for OrderManager {
 
     fn apply_fee_capacity(&mut self, capacity: Option<f64>, per_fill: f64, by_market: HashMap<String, f64>) {
         self.set_fee_capacity(capacity, per_fill, by_market);
+    }
+
+    fn apply_cc_usd_rate(&mut self, rate: Option<f64>) {
+        self.set_cc_usd_rate(rate);
     }
 
     async fn run_cycle(&mut self, stop: &Shutdown, deadline: Instant) -> Result<CycleReport> {
@@ -255,10 +262,15 @@ pub fn spawn_grid_task<G: GridCycle>(
                 Err(_) => Some("Balance fetch timed out".to_string()),
             };
             if let Some(lm) = lm.as_ref() {
-                let read = async { (lm.fee_capacity().await, lm.fill_needs().await) };
-                let (capacity, (per_fill, by_market)) = tokio::time::timeout(timing.balance_timeout, read)
-                    .await
-                    .unwrap_or((None, (rust_decimal::Decimal::ZERO, Vec::new())));
+                let read = async { (lm.fee_capacity().await, lm.fill_needs().await, lm.cc_usd_rate().await) };
+                // A timed-out read keeps the last CC/USD rate
+                let (capacity, (per_fill, by_market)) = match tokio::time::timeout(timing.balance_timeout, read).await {
+                    Ok((capacity, needs, cc_usd)) => {
+                        grid.apply_cc_usd_rate(cc_usd.and_then(|r| r.to_f64()));
+                        (capacity, needs)
+                    }
+                    Err(_) => (None, (rust_decimal::Decimal::ZERO, Vec::new())),
+                };
                 let by_market = by_market
                     .into_iter()
                     .map(|(market, need)| (market, need.to_f64().unwrap_or(f64::MAX)))

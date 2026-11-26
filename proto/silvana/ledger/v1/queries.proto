@@ -136,6 +136,7 @@ message GetPrepaidTrafficBalanceResponse {
   string available_cc = 3;      // balance_cc + credit_limit_cc (convenience)
   string total_credited_cc = 4; // lifetime credits
   string total_debited_cc = 5;  // lifetime debits
+  string orderbook_fee_discount_pct = 6; // order-book fee discount percent; "" or "0" = full price
 }
 
 // --- GetDsoRates ---

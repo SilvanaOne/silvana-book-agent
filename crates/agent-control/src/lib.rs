@@ -68,7 +68,7 @@ pub use command::{
 #[cfg(feature = "facts")]
 pub use facts_map::{
     BindingRefusal, DirectedTx, authorize_directed_swap, authorize_directed_transfer,
-    settle_terms, swap_intent, transfer_intent,
+    delivery_of, settle_terms, swap_intent, transfer_intent,
 };
 /// The facts reader the binding takes; name its types through here to get the same crate.
 #[cfg(feature = "facts")]
@@ -103,7 +103,8 @@ pub use log::{
 };
 pub use party::{PartyId, namespace_for_key, verify_party_key};
 pub use policy::eval::{
-    DirectedAuthorization, DirectedRefusal, Leg, SettleFee, SettleTerms, authorize_directed,
+    Delivery, DirectedAuthorization, DirectedRefusal, Leg, SettleFee, SettleTerms,
+    TRAFFIC_PURCHASE_MEMO_PREFIX, authorize_directed, is_traffic_purchase_memo,
 };
 pub use policy::widening::required_delay_secs;
 pub use policy::{

@@ -6,8 +6,8 @@ use orderbook_proto::orderbook::OrderType;
 use rust_decimal::prelude::ToPrimitive;
 
 use super::maker::{make_price, rung_delta};
-use super::sizing::{order_qty, MIN_ORDER_USD};
-use super::{BookNeed, Decide, Decision, Ladder, MarketView, TakeTif, Want};
+use super::sizing::{order_qty, ticks_price, MIN_ORDER_USD};
+use super::{BookNeed, Decide, Decision, Ladder, MarketView, Rung, TakeTif, Want};
 use crate::config::{PriceLevel, RebalancerConfig, StrategyMode};
 use crate::order_tracker::Fill;
 
@@ -75,11 +75,12 @@ impl Decide for Rebalancer {
         if self.last_fill.is_some_and(|(s, at)| s != side && v.now.saturating_duration_since(at) < flip_wait) {
             return self.idle();
         }
-        let budget = c.max_usd_per_hour - v.usd_last_hour;
-        if budget < MIN_ORDER_USD {
+        let budget = v.in_quote(c.max_usd_per_hour) - v.usd_last_hour;
+        let min_order = v.in_quote(MIN_ORDER_USD);
+        if budget < min_order {
             return self.idle();
         }
-        let usd = (gap.abs() * value).min(c.clip_usd).min(budget).max(MIN_ORDER_USD);
+        let clip = (gap.abs() * value).min(v.in_quote(c.clip_usd)).min(budget).max(min_order);
         match c.mode {
             StrategyMode::Taker => {
                 if !v.can_take {
@@ -87,7 +88,7 @@ impl Decide for Rebalancer {
                 }
                 Decision::Take(Some(Want {
                     side,
-                    max_quantity: usd / r,
+                    max_quantity: clip / r,
                     max_deviation_percent: c.max_slip_bps / 100.0,
                     tif: TakeTif::Ioc,
                 }))
@@ -105,11 +106,14 @@ impl Decide for Rebalancer {
                 }
                 let offset = c.maker_offset_bps / 10_000.0;
                 let target_price = if side == OrderType::Bid { r * (1.0 - offset) } else { r * (1.0 + offset) };
-                let price = make_price(side, target_price, book, v.tick, true);
-                let Some(qty) = order_qty(usd, price, v.floor_value, v.lot_exp) else { return self.idle() };
+                let Some(n) = make_price(side, target_price, book, v.tick, true) else { return self.idle() };
+                let Some(exact) = ticks_price(n, v.tick) else { return self.idle() };
+                let price = n as f64 * v.tick;
+                let Some(qty) = order_qty(clip, min_order, price, v.floor_value, v.lot_exp) else { return self.idle() };
                 let qf = qty.to_f64().unwrap_or(f64::INFINITY);
                 let delta = rung_delta(side, price, v.tick, r);
-                let rung = vec![PriceLevel { delta_percent: delta, quantity: qty.to_string() }];
+                let level = PriceLevel { delta_percent: delta, quantity: qty.to_string() };
+                let rung = vec![Rung { level, price: exact }];
                 if side == OrderType::Bid {
                     if qf * r * (1.0 + delta / 100.0) > v.inventory.quote_avail {
                         return self.idle();
@@ -141,7 +145,7 @@ impl Decide for Rebalancer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::maker::tests::{lp_book, view};
+    use super::super::maker::tests::{cc_flat_base, cc_view, ceth_flat_base, ceth_view, lp_book, view, CC_USD, CETH_REF, CETH_USD};
     use super::*;
 
     fn cfg(target: f64, mode: StrategyMode) -> RebalancerConfig {
@@ -183,6 +187,42 @@ mod tests {
     }
 
     #[test]
+    fn a_cc_quoted_clip_and_budget_are_usd() {
+        // clip_usd 13 at $0.0746 a CC is about 174 CC, near 13 TUSDT at 13.4
+        let mut rb = Rebalancer::new(RebalancerConfig { clip_usd: 13.0, ..cfg(0.25, StrategyMode::Taker) });
+        let base = cc_flat_base();
+        let w = want(rb.decide(&cc_view(None, base, base)));
+        assert_eq!(w.side, OrderType::Offer);
+        assert!((w.max_quantity * 13.4 - 13.0 / CC_USD).abs() < 1e-6, "{}", w.max_quantity);
+        // $590 of $600 spent this hour leaves under $12
+        let mut v = cc_view(None, base, base);
+        v.usd_last_hour = 590.0 / CC_USD;
+        assert_eq!(rb.decide(&v), Decision::Take(None));
+        v.usd_last_hour = 580.0 / CC_USD;
+        assert!((want(rb.decide(&v)).max_quantity * 13.4 - 13.0 / CC_USD).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_ceth_quoted_clip_budget_and_resting_clip_are_usd() {
+        let clip = |mode| RebalancerConfig { clip_usd: 13.0, ..cfg(0.25, mode) };
+        let mut rb = Rebalancer::new(clip(StrategyMode::Taker));
+        let base = ceth_flat_base();
+        let w = want(rb.decide(&ceth_view(None, base, base)));
+        assert_eq!(w.side, OrderType::Offer);
+        assert!((w.max_quantity * CETH_REF * CETH_USD - 13.0).abs() < 1e-9, "{}", w.max_quantity);
+        let mut v = ceth_view(None, base, base);
+        v.usd_last_hour = 590.0 / CETH_USD;
+        assert_eq!(rb.decide(&v), Decision::Take(None));
+        // A resting clip is whole 100 EDELx lots, so within $1 of the clip
+        let book = lp_book(CETH_REF);
+        let mut maker = Rebalancer::new(clip(StrategyMode::Maker));
+        let Decision::Rest(ladder) = maker.decide(&ceth_view(Some(&book), base, base)) else { panic!("a clip") };
+        assert!(ladder.bids.is_empty() && ladder.offers.len() == 1, "{ladder:?}");
+        let usd = ladder.offers[0].level.quantity.parse::<f64>().unwrap() * CETH_REF * CETH_USD;
+        assert!((13.0..14.0).contains(&usd), "{ladder:?}");
+    }
+
+    #[test]
     fn no_flip_within_the_flip_cooldown() {
         let mut rb = Rebalancer::new(cfg(0.65, StrategyMode::Taker));
         rb.on_fill(&Fill {
@@ -206,8 +246,9 @@ mod tests {
         let Decision::Rest(ladder) = rb.decide(&view(Some(&book), 1_250_000.0, 0.0)) else { panic!() };
         assert!(ladder.offers.is_empty() && ladder.bids.len() == 1);
         // 3 bps under the reference rounds down to 0.0015995, well inside the LP's 15 bps
-        assert!((ladder.bids[0].delta_percent + 0.028125).abs() < 1e-9, "{:?}", ladder.bids);
-        assert_eq!(ladder.bids[0].quantity, "12600");
+        assert!((ladder.bids[0].level.delta_percent + 0.028125).abs() < 1e-9, "{:?}", ladder.bids);
+        assert_eq!(ladder.bids[0].price.normalize().to_string(), "0.0015995");
+        assert_eq!(ladder.bids[0].level.quantity, "12600");
         // Waiting for a settlement: hold what rests
         let mut v = view(Some(&book), 1_250_000.0, 0.0);
         v.can_take = false;

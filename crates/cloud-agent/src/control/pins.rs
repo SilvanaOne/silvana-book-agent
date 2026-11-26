@@ -1,5 +1,5 @@
-//! The platform parties an agent pins on first use, the fee party and the prepaid traffic
-//! party: written only where the agent's env sets none, never replaced or removed.
+//! The platform parties an agent pins on first use (fee, prepaid traffic, traffic fee):
+//! written only where the agent's env sets none, never replaced or removed.
 
 #![cfg_attr(
     not(test),
@@ -36,8 +36,11 @@ use tracing::{info, warn};
 
 use super::PlatformParties;
 
-/// The env keys of the two platform parties.
-pub const PIN_KEYS: [&str; 2] = ["PARTY_FEE", "PARTY_PREPAID_TRAFFIC"];
+/// The env keys of the platform parties.
+pub const PIN_KEYS: [&str; 3] = ["PARTY_FEE", "PARTY_PREPAID_TRAFFIC", TRAFFIC_FEE_KEY];
+/// The pin only top-ups paid in a token other than CC need; unset, it is reported only
+/// where such a token is listed or the agent config names it.
+pub const TRAFFIC_FEE_KEY: &str = "PARTY_TRAFFIC_FEE";
 /// Bound on reading the agent config for the pins.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -113,6 +116,7 @@ pub fn pin_missing(
                 crate::upsert_env_value(env_file, key, &party)?;
                 PinState::Pinned(party)
             }
+            (None, None) if key == TRAFFIC_FEE_KEY => continue,
             (None, None) => PinState::Unset,
         };
         states.push((key, state));
@@ -122,11 +126,18 @@ pub fn pin_missing(
 
 /// What a linked agent refuses while `key` is unset.
 fn refused_payments(key: &str) -> &'static str {
-    if key == "PARTY_FEE" {
-        "to sign its fee payments and to take a swap quote with a fee"
-    } else {
-        "to sign its prepaid traffic top-ups"
+    match key {
+        "PARTY_FEE" => "to sign its fee payments and to take a swap quote with a fee",
+        TRAFFIC_FEE_KEY => "to sign its prepaid traffic top-ups paid in a token other than CC",
+        _ => "to sign its prepaid traffic top-ups",
     }
+}
+
+/// Whether a top-up token list needs the traffic-fee pin: it lists a token other than CC.
+pub fn traffic_fee_needed(topup_tokens: &[String]) -> bool {
+    topup_tokens
+        .iter()
+        .any(|token| !token.eq_ignore_ascii_case(agent_logic::config::CC_FEE_TOKEN))
 }
 
 /// How the pins stand, one line each.
@@ -177,8 +188,8 @@ pub async fn fetch(rpc_url: &str) -> Result<Vec<(&'static str, String)>> {
         .map_err(|_| anyhow!("the agent config was not read within {FETCH_TIMEOUT:?}"))?
 }
 
-/// The keys a link would pin, each with the value the agent config names; empty when the
-/// env sets both. A failed read only leaves the values unknown.
+/// The keys a link would pin, with the values the agent config names (the traffic-fee pin
+/// only when named); empty when the env sets them all. A failed read leaves values unknown.
 pub async fn for_link(env_file: &Path, rpc_url: &str) -> Vec<(&'static str, Option<String>)> {
     let missing = missing(env_file, &|name| std::env::var_os(name));
     if missing.is_empty() {
@@ -199,6 +210,7 @@ pub async fn for_link(env_file: &Path, rpc_url: &str) -> Vec<(&'static str, Opti
                     .map(|(_, v)| v.clone()),
             )
         })
+        .filter(|(key, value)| *key != TRAFFIC_FEE_KEY || value.is_some())
         .collect()
 }
 
@@ -253,7 +265,7 @@ pub fn write_after_link(
         Err(e) => {
             let _ = writeln!(
                 out,
-                "The platform parties were not written to {} ({e:#}); set PARTY_FEE and PARTY_PREPAID_TRAFFIC there by hand.",
+                "The platform parties were not written to {} ({e:#}); set PARTY_FEE, PARTY_PREPAID_TRAFFIC and PARTY_TRAFFIC_FEE there by hand.",
                 env_file.display()
             );
         }
@@ -267,6 +279,7 @@ pub fn fill_unset(env_file: &Path, current: &PlatformParties, announce: bool) ->
     for (key, slot) in [
         ("PARTY_FEE", &mut next.fee),
         ("PARTY_PREPAID_TRAFFIC", &mut next.prepaid_traffic),
+        (TRAFFIC_FEE_KEY, &mut next.traffic_fee),
     ] {
         if slot.is_some() {
             continue;
@@ -289,20 +302,23 @@ pub fn fill_unset(env_file: &Path, current: &PlatformParties, announce: bool) ->
     next
 }
 
-/// The startup warning of a linked agent whose env lacks a pin; None with both set.
+/// The startup warning of a linked agent whose env lacks a pin it needs; None with them set.
 pub fn unset_warning(config: &BaseConfig) -> Option<String> {
-    unset_warning_of(&PlatformParties::from_config(config))
+    unset_warning_of(&PlatformParties::from_config(config), &config.prepaid_traffic_topup_tokens)
 }
 
-/// [`unset_warning`] for the pins in force.
-pub fn unset_warning_of(parties: &PlatformParties) -> Option<String> {
+/// [`unset_warning`] for the pins in force; the traffic-fee pin counts only when
+/// `topup_tokens` lists a token other than CC.
+pub fn unset_warning_of(parties: &PlatformParties, topup_tokens: &[String]) -> Option<String> {
+    let needs_traffic_fee = traffic_fee_needed(topup_tokens);
     let unset: Vec<&str> = [
-        ("PARTY_FEE", &parties.fee),
-        ("PARTY_PREPAID_TRAFFIC", &parties.prepaid_traffic),
+        ("PARTY_FEE", &parties.fee, true),
+        ("PARTY_PREPAID_TRAFFIC", &parties.prepaid_traffic, true),
+        (TRAFFIC_FEE_KEY, &parties.traffic_fee, needs_traffic_fee),
     ]
     .into_iter()
-    .filter(|(_, value)| value.is_none())
-    .map(|(key, _)| key)
+    .filter(|(_, value, needed)| *needed && value.is_none())
+    .map(|(key, _, _)| key)
     .collect();
     if unset.is_empty() {
         return None;
@@ -312,7 +328,9 @@ pub fn unset_warning_of(parties: &PlatformParties) -> Option<String> {
         "{} not pinned: this linked agent refuses {}. Set {} in the agent's env from a trusted source.",
         match unset.as_slice() {
             [one] => format!("{one} is"),
-            _ => format!("{} are", unset.join(" and ")),
+            [first, second] => format!("{first} and {second} are"),
+            [rest @ .., last] => format!("{} and {last} are", rest.join(", ")),
+            [] => String::new(),
         },
         refused.join(", and "),
         if unset.len() == 1 { "it" } else { "them" }
@@ -422,7 +440,7 @@ mod tests {
             ))
         );
         assert_eq!(crate::read_env_value(&fresh, "PARTY_FEE"), None);
-        assert_eq!(missing(&fresh, &|_| None), vec!["PARTY_FEE"]);
+        assert_eq!(missing(&fresh, &|_| None), vec!["PARTY_FEE", "PARTY_TRAFFIC_FEE"]);
         let mut out = Vec::new();
         write_states(&mut out, &[("PARTY_FEE", PinState::Unset)]);
         assert!(
@@ -455,5 +473,87 @@ mod tests {
         );
         config.party_prepaid_traffic = Some(traffic.clone());
         assert_eq!(unset_warning(&config), None);
+    }
+
+    #[test]
+    fn the_traffic_fee_pin_is_taken_once_and_reported_only_where_it_is_named() {
+        let (fee, traffic, traffic_fee, mine) =
+            (party("fee", 'a'), party("traffic", 'b'), party("traffic-fee", 'd'), party("mine", 'c'));
+        let env = format!("PARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\nPARTY_TRAFFIC_FEE={traffic_fee}\n");
+        let named = template_pins(&env).unwrap();
+        assert_eq!(named.last(), Some(&("PARTY_TRAFFIC_FEE", traffic_fee.clone())));
+        let err = template_pins("PARTY_TRAFFIC_FEE=traffic-fee\n").unwrap_err().to_string();
+        assert!(err.contains("refusing to pin PARTY_TRAFFIC_FEE"), "{err}");
+        // Written where unset, never replaced.
+        let file = env_file("traffic-fee", "PARTY_AGENT=a::1220\n");
+        let states = pin_missing(&file, &named, &|_| None).unwrap();
+        assert_eq!(states.last(), Some(&("PARTY_TRAFFIC_FEE", PinState::Pinned(traffic_fee.clone()))));
+        let other = vec![("PARTY_TRAFFIC_FEE", mine.clone())];
+        let states = pin_missing(&file, &other, &|_| None).unwrap();
+        assert_eq!(
+            states.last(),
+            Some(&("PARTY_TRAFFIC_FEE", PinState::Kept { local: traffic_fee.clone(), offered: Some(mine.clone()) }))
+        );
+        assert_eq!(crate::read_env_value(&file, "PARTY_TRAFFIC_FEE").as_deref(), Some(traffic_fee.as_str()));
+        // Named nowhere and set nowhere, it is not reported: only token top-ups need it.
+        let bare = env_file("traffic-fee-bare", "PARTY_AGENT=a::1220\n");
+        let states = pin_missing(&bare, &named[..2], &|_| None).unwrap();
+        assert_eq!(states.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec!["PARTY_FEE", "PARTY_PREPAID_TRAFFIC"]);
+        let mut out = Vec::new();
+        write_states(&mut out, &[("PARTY_TRAFFIC_FEE", PinState::Unset)]);
+        assert!(
+            String::from_utf8_lossy(&out).contains("PARTY_TRAFFIC_FEE is not set: a linked agent refuses to sign its prepaid traffic top-ups paid in a token other than CC"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        // The content check takes it from the env file, once.
+        let filled = fill_unset(&file, &PlatformParties::default(), false);
+        assert_eq!(filled.traffic_fee.as_deref(), Some(traffic_fee.as_str()));
+        let kept = PlatformParties { traffic_fee: Some(mine.clone()), ..PlatformParties::default() };
+        assert_eq!(fill_unset(&file, &kept, false).traffic_fee.as_deref(), Some(mine.as_str()));
+        let malformed = env_file("traffic-fee-bad", "PARTY_TRAFFIC_FEE=traffic-fee\n");
+        assert_eq!(fill_unset(&malformed, &PlatformParties::default(), true).traffic_fee, None);
+    }
+
+    #[test]
+    fn the_traffic_fee_pin_is_warned_about_only_when_a_token_top_up_is_listed() {
+        let (fee, traffic, traffic_fee) = (party("fee", 'a'), party("traffic", 'b'), party("traffic-fee", 'd'));
+        let tokens = |list: &[&str]| list.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let two = PlatformParties { fee: Some(fee.clone()), prepaid_traffic: Some(traffic.clone()), traffic_fee: None };
+        assert_eq!(unset_warning_of(&two, &tokens(&["CC"])), None);
+        assert_eq!(unset_warning_of(&two, &tokens(&[])), None);
+        let warned = unset_warning_of(&two, &tokens(&["TUSDT", "CC"])).unwrap();
+        assert!(warned.starts_with("PARTY_TRAFFIC_FEE is not pinned"), "{warned}");
+        assert!(warned.contains("paid in a token other than CC"), "{warned}");
+        assert!(!traffic_fee_needed(&tokens(&["CC", "cc"])));
+        assert!(traffic_fee_needed(&tokens(&["USDCx"])));
+        let none = PlatformParties::default();
+        let all = unset_warning_of(&none, &tokens(&["USDCx"])).unwrap();
+        assert!(all.starts_with("PARTY_FEE, PARTY_PREPAID_TRAFFIC and PARTY_TRAFFIC_FEE are not pinned"), "{all}");
+        let three = PlatformParties { traffic_fee: Some(traffic_fee), ..two };
+        assert_eq!(unset_warning_of(&three, &tokens(&["USDCx"])), None);
+        let mut config = BaseConfig::test_minimal().unwrap();
+        config.party_fee = Some(fee);
+        config.party_prepaid_traffic = Some(traffic);
+        assert_eq!(unset_warning(&config), None);
+        config.prepaid_traffic_topup_tokens = tokens(&["TUSDT"]);
+        assert!(unset_warning(&config).is_some_and(|w| w.starts_with("PARTY_TRAFFIC_FEE is not pinned")));
+    }
+
+    #[test]
+    fn the_server_config_never_writes_the_traffic_fee_pin_over_a_local_one() {
+        let (served_party, mine) = (party("served", 'e'), party("mine", 'f'));
+        let file = env_file("server-config", &format!("PARTY_AGENT=a::1220\nPARTY_TRAFFIC_FEE={mine}\n"));
+        let served = orderbook_proto::ledger::GetAgentConfigResponse {
+            env: format!("SYNCHRONIZER_ID=s\nPARTY_TRAFFIC_FEE={served_party}\n"),
+            ..Default::default()
+        };
+        let states = crate::write_server_config_with(&file, "http://rpc", &served, &|_| None).unwrap();
+        assert_eq!(
+            states.last(),
+            Some(&("PARTY_TRAFFIC_FEE", PinState::Kept { local: mine.clone(), offered: Some(served_party) }))
+        );
+        assert_eq!(crate::read_env_value(&file, "PARTY_TRAFFIC_FEE").as_deref(), Some(mine.as_str()));
+        assert_eq!(crate::read_env_value(&file, "SYNCHRONIZER_ID").as_deref(), Some("s"));
     }
 }

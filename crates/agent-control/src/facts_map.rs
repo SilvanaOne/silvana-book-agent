@@ -12,8 +12,8 @@ use crate::command::{Command, CommandOp, command_matches};
 use crate::error::CommandError;
 use crate::party::PartyId;
 use crate::policy::eval::{
-    Coverage, DirectedAuthorization, DirectedRefusal, EvalContext, Flow, Intent, Leg, Recipient,
-    SettleFee, SettleTerms, authorize_directed,
+    Coverage, Delivery, DirectedAuthorization, DirectedRefusal, EvalContext, Flow, Intent, Leg,
+    Recipient, SettleFee, SettleTerms, authorize_directed,
 };
 use crate::policy::kinds::OperationKind;
 use crate::proof::ProofEnvelope;
@@ -220,8 +220,27 @@ pub fn transfer_intent(
         outgoing,
         instruments,
         coverage,
+        memos: facts.memos.clone(),
+        delivery: delivery_of(facts),
         ..Intent::new(kind)
     })
+}
+
+/// Direct when every outflow is a holding of its recipient, pending when one is an offer.
+pub fn delivery_of(facts: &TxFacts) -> Option<Delivery> {
+    if facts
+        .outflows
+        .iter()
+        .any(|flow| flow.kind == FlowKind::PendingTransfer)
+    {
+        return Some(Delivery::Pending);
+    }
+    let direct = !facts.outflows.is_empty()
+        && facts
+            .outflows
+            .iter()
+            .all(|flow| flow.kind == FlowKind::Holding);
+    direct.then_some(Delivery::Direct)
 }
 
 /// The root exercises of `facts`, for `check_directed_roots`.
@@ -623,6 +642,7 @@ mod tests {
                 platform: PlatformParties {
                     fee: Some(p(&fee())),
                     prepaid_traffic: None,
+                    traffic_fee: None,
                 },
                 usage: UsageTotals::new(),
             }
@@ -1111,6 +1131,27 @@ mod tests {
                 transfer_intent(&facts, OperationKind::TransferCc, Coverage::Fields).unwrap();
             assert_eq!(command_matches(&pay, &intent, &env.ctx()), paid, "{kind:?}");
         }
+    }
+
+    // The traffic top-up rule reads the memos and how the outflows are delivered
+    #[test]
+    fn a_transfer_intent_carries_the_memos_and_the_delivery() {
+        let with = |kinds: &[FlowKind], memos: &[&str]| TxFacts {
+            outflows: kinds.iter().map(|k| out(&alice(), &reg(), "USDCx", "1", *k)).collect(),
+            memos: memos.iter().map(|m| m.to_string()).collect(),
+            ..TxFacts::default()
+        };
+        let intent = |facts: &TxFacts| {
+            transfer_intent(facts, OperationKind::TransferCip56, Coverage::Fields).unwrap()
+        };
+        let direct = intent(&with(&[FlowKind::Holding], &["agent-traffic:p-1"]));
+        assert_eq!(direct.memos, vec!["agent-traffic:p-1".to_string()]);
+        assert_eq!(direct.delivery, Some(Delivery::Direct));
+        let mixed = with(&[FlowKind::Holding, FlowKind::PendingTransfer], &[]);
+        assert_eq!(intent(&mixed).delivery, Some(Delivery::Pending));
+        assert!(intent(&mixed).memos.is_empty());
+        assert_eq!(intent(&with(&[FlowKind::Lock], &[])).delivery, None);
+        assert_eq!(delivery_of(&TxFacts::default()), None);
     }
 
     #[test]

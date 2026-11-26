@@ -757,3 +757,24 @@ fn request_preapproval_mutations_refuse() {
         }
     }
 }
+
+#[test]
+fn a_cip56_transfer_names_its_reason_as_its_memo() {
+    for c in common::load("transfer_cip56") {
+        assert!(common::facts(&c).memos.is_empty(), "{}: an empty reason is no memo", c.fixture_id);
+        let mut p = common::prepared_transaction(&c);
+        let values = path_mut(chosen_mut(root_mut(&mut p)), &["transfer", "meta", "values"]);
+        let Some(Sum::TextMap(map)) = values.sum.as_mut() else {
+            panic!("{}: meta values are not a text map", c.fixture_id);
+        };
+        let entry = map
+            .entries
+            .iter_mut()
+            .find(|e| e.key == tx_verifier::facts::REASON_META_KEY)
+            .unwrap_or_else(|| panic!("{}: no reason", c.fixture_id));
+        entry.value = Some(text("buy-01"));
+        let facts = tx_verifier::facts::extract_facts(&common::encode(&p), &c.party)
+            .unwrap_or_else(|e| panic!("{}: facts: {e}", c.fixture_id));
+        assert_eq!(facts.memos, ["buy-01"], "{}", c.fixture_id);
+    }
+}

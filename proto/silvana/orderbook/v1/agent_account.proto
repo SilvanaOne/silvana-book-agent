@@ -17,6 +17,14 @@ service AgentAccountService {
   rpc CreateTrafficPurchase(CreateTrafficPurchaseRequest) returns (CreateTrafficPurchaseResponse);
   rpc GetTrafficPurchase(GetTrafficPurchaseRequest) returns (GetTrafficPurchaseResponse);
   rpc CancelTrafficPurchase(CancelTrafficPurchaseRequest) returns (CancelTrafficPurchaseResponse);
+  rpc GetAgentTrafficLedger(GetAgentTrafficLedgerRequest) returns (GetAgentTrafficLedgerResponse);
+}
+
+// The agent's own traffic purchases; the caller is the agent party of the token.
+service AgentTrafficService {
+  rpc CreateAgentTrafficPurchase(CreateAgentTrafficPurchaseRequest) returns (CreateTrafficPurchaseResponse);
+  rpc GetAgentTrafficPurchase(GetAgentTrafficPurchaseRequest) returns (GetTrafficPurchaseResponse);
+  rpc CancelAgentTrafficPurchase(CancelAgentTrafficPurchaseRequest) returns (CancelTrafficPurchaseResponse);
 }
 
 enum AgentOnboardingStatus {
@@ -210,6 +218,7 @@ message GetAgentTrafficResponse {
   repeated TrafficPurchaseToken tokens = 10;
   string recipient_party = 11;
   google.protobuf.Timestamp as_of = 12;
+  string orderbook_fee_discount_pct = 13; // order-book fee discount percent; empty means full price
 }
 
 message CreateTrafficPurchaseRequest {
@@ -242,4 +251,124 @@ message CancelTrafficPurchaseRequest {
 
 message CancelTrafficPurchaseResponse {
   AgentTrafficPurchase purchase = 1;
+}
+
+message CreateAgentTrafficPurchaseRequest {
+  string token = 1;
+  string token_amount = 2;
+}
+
+message GetAgentTrafficPurchaseRequest {
+  string purchase_id = 1;
+}
+
+message CancelAgentTrafficPurchaseRequest {
+  string purchase_id = 1;
+}
+
+enum TrafficLedgerDirection {
+  TRAFFIC_LEDGER_DIRECTION_ALL = 0;
+  TRAFFIC_LEDGER_DIRECTION_CREDITS = 1;
+  TRAFFIC_LEDGER_DIRECTION_DEBITS = 2;
+}
+
+message TrafficLedgerQuery {
+  uint32 limit = 1;
+  uint64 before_id = 2; // 0 = newest
+  optional google.protobuf.Timestamp from = 3;
+  optional google.protobuf.Timestamp to = 4;
+  TrafficLedgerDirection direction = 5;
+  repeated string categories = 6;
+  string update_id = 7;
+  string proposal_id = 8;
+  bool include_totals = 9;
+  bool export = 10;
+}
+
+message GetAgentTrafficLedgerRequest {
+  string party_id = 1;
+  TrafficLedgerQuery query = 2;
+  optional ReadSessionAuth read_session = 3;
+}
+
+message TrafficLedgerCreditUse {
+  uint64 credit_id = 1;
+  string amount_cc = 2;
+}
+
+// Shown only to the account that owns the purchase.
+message TrafficLedgerPurchase {
+  string purchase_id = 1;
+  string credit_key = 2;
+  string token = 3;
+  string paid_amount = 4;
+  string update_id = 5;
+  string rate = 6;
+  string usd_value = 7;
+}
+
+message TrafficLedgerEntry {
+  uint64 id = 1;
+  google.protobuf.Timestamp created_at = 2;
+  string entry_type = 3;
+  string category = 4;
+  string funding = 5;
+  string amount_cc = 6; // signed
+  optional string running_balance_cc = 7;
+  string recorded_pool_after_cc = 8;
+  optional string list_amount_cc = 9;
+  optional string discount_pct = 10;
+  optional string fee_usd = 11;
+  optional uint64 bytes = 12;
+  optional string rate = 13;
+  optional string usd_per_mb = 14;
+  string update_id = 15;
+  string proposal_id = 16;
+  string command_id = 17;
+  string tx_type = 18;
+  repeated TrafficLedgerCreditUse credits_used = 19;
+  string authorization_id = 20;
+  string description = 21;
+  bool derived = 22; // computed by the server, not a stored row
+  optional string quote_id = 23;
+  optional string rfq_id = 24;
+  optional string ticket_id = 25;
+  optional TrafficLedgerPurchase purchase = 26;
+}
+
+message TrafficLedgerCategoryTotal {
+  string category = 1;
+  string credits_cc = 2;
+  string debits_cc = 3;
+}
+
+// One bucket's window statement: pool, grants or purchases.
+message TrafficLedgerBucket {
+  string bucket = 1;
+  string opening_cc = 2;
+  string credits_cc = 3;
+  string debits_cc = 4;
+  string closing_cc = 5;
+}
+
+message TrafficLedgerTotals {
+  string credits_cc = 1;
+  string debits_cc = 2;
+  repeated TrafficLedgerCategoryTotal categories = 3;
+  repeated TrafficLedgerBucket buckets = 4;
+  string history_net_cc = 5;
+  string pool_cc = 6;
+  string live_credits_cc = 7;
+  string in_grace_cc = 8;
+  string forfeited_cc = 9;
+  string unreconciled_cc = 10;
+  optional google.protobuf.Timestamp first_entry_at = 11;
+  google.protobuf.Timestamp as_of = 12;
+}
+
+message GetAgentTrafficLedgerResponse {
+  repeated TrafficLedgerEntry entries = 1;
+  uint64 next_before_id = 2; // 0 = no older page
+  optional TrafficLedgerTotals totals = 3;
+  google.protobuf.Timestamp upper_bound = 4;
 }

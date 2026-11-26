@@ -263,6 +263,31 @@ pub fn canonical_params_transfer_cip56(
     input_holding_cids: &[String],
     max_input_holdings: Option<u32>,
 ) -> String {
+    canonical_params_transfer_cip56_with_direct_only(
+        instrument_id,
+        instrument_admin,
+        receiver_party,
+        amount,
+        reference,
+        input_holding_cids,
+        max_input_holdings,
+        false,
+    )
+}
+
+/// As `canonical_params_transfer_cip56`, plus a `direct_only=true` line only when set,
+/// so requests without the flag keep a byte-identical canonical.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_params_transfer_cip56_with_direct_only(
+    instrument_id: &str,
+    instrument_admin: &str,
+    receiver_party: &str,
+    amount: &str,
+    reference: Option<&str>,
+    input_holding_cids: &[String],
+    max_input_holdings: Option<u32>,
+    direct_only: bool,
+) -> String {
     let mut s = format!(
         "param_type=TransferCip56\ninstrument_id={}\ninstrument_admin={}\nreceiver_party={}\namount={}\n",
         instrument_id, instrument_admin, receiver_party, amount
@@ -280,6 +305,9 @@ pub fn canonical_params_transfer_cip56(
     // Same append-only rule: absent unless the caller set a cap.
     if let Some(n) = max_input_holdings {
         s.push_str(&format!("max_input_holdings={}\n", n));
+    }
+    if direct_only {
+        s.push_str("direct_only=true\n");
     }
     s
 }
@@ -1393,6 +1421,56 @@ mod tests {
         assert!(!canonical_params_usdcx_reclaim_holding("cid").unwrap().is_empty());
         assert!(!canonical_params_usdcx_update_pre_approval(false).unwrap().is_empty());
         assert!(!canonical_params_usdcx_terminate_agreement("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cip56_direct_only_line_is_appended_only_when_set() {
+        let cids = vec!["c1".to_string(), "c2".to_string()];
+        let today = "param_type=TransferCip56\ninstrument_id=USDC\ninstrument_admin=a\n\
+                     receiver_party=r\namount=100\nreference=ref-1\n\
+                     input_holding_cids=c1,c2\nmax_input_holdings=3\n";
+        let legacy =
+            canonical_params_transfer_cip56("USDC", "a", "r", "100", Some("ref-1"), &cids, Some(3));
+        assert_eq!(legacy, today);
+        let off = canonical_params_transfer_cip56_with_direct_only(
+            "USDC", "a", "r", "100", Some("ref-1"), &cids, Some(3), false,
+        );
+        assert_eq!(off, today);
+        let on = canonical_params_transfer_cip56_with_direct_only(
+            "USDC", "a", "r", "100", Some("ref-1"), &cids, Some(3), true,
+        );
+        assert_eq!(on, format!("{today}direct_only=true\n"));
+        let bare_off =
+            canonical_params_transfer_cip56_with_direct_only("CC", "a", "r", "1", None, &[], None, false);
+        assert_eq!(bare_off, canonical_params_transfer_cip56("CC", "a", "r", "1", None, &[], None));
+        assert!(!bare_off.contains("direct_only"));
+        let bare_on =
+            canonical_params_transfer_cip56_with_direct_only("CC", "a", "r", "1", None, &[], None, true);
+        assert_eq!(bare_on, format!("{bare_off}direct_only=true\n"));
+    }
+
+    #[test]
+    fn a_flipped_direct_only_flag_fails_verification() {
+        let private_key = [0x5au8; 32];
+        let public_key = SigningKey::from_bytes(&private_key).verifying_key().to_bytes();
+        let canonical_for = |direct_only: bool| {
+            canonical_prepare_request(
+                13,
+                &canonical_params_transfer_cip56_with_direct_only(
+                    "TUSDT", "admin", "fee", "13.25", Some("ref-1"), &[], None, direct_only,
+                ),
+            )
+        };
+        for signed_flag in [true, false] {
+            let sig = sign_canonical(&private_key, &canonical_for(signed_flag));
+            verify_canonical(&public_key, &canonical_for(signed_flag), &sig.signature_b64, &sig.signing_scheme)
+                .expect("the signed flag verifies");
+            assert!(
+                verify_canonical(&public_key, &canonical_for(!signed_flag), &sig.signature_b64, &sig.signing_scheme)
+                    .is_err(),
+                "a flipped direct_only must fail verification"
+            );
+        }
     }
 
     #[test]

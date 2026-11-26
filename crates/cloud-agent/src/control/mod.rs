@@ -119,7 +119,8 @@ pub fn signing_settings() -> Arc<SigningSettings> {
     agent_logic::sync::read(&SIGNING).clone().unwrap_or_default()
 }
 
-/// The installed platform parties, else `PARTY_FEE` and `PARTY_PREPAID_TRAFFIC` from the env.
+/// The installed platform parties, else `PARTY_FEE`, `PARTY_PREPAID_TRAFFIC` and
+/// `PARTY_TRAFFIC_FEE` from the env.
 pub fn platform_parties() -> Result<PlatformParties> {
     if let Some(parties) = agent_logic::sync::read(&PLATFORM).clone() {
         return Ok(parties);
@@ -127,6 +128,7 @@ pub fn platform_parties() -> Result<PlatformParties> {
     Ok(PlatformParties {
         fee: agent_logic::config::pinned_party_env("PARTY_FEE")?,
         prepaid_traffic: agent_logic::config::pinned_party_env("PARTY_PREPAID_TRAFFIC")?,
+        traffic_fee: agent_logic::config::pinned_party_env("PARTY_TRAFFIC_FEE")?,
     })
 }
 
@@ -590,7 +592,9 @@ impl ControlContext {
             *agent_logic::sync::write(&self.platform) = next.clone();
             install_platform_parties(next.clone());
         }
-        if let Some(text) = pins::unset_warning_of(&next).filter(|_| linked_now) {
+        if let Some(text) =
+            pins::unset_warning_of(&next, &self.config.prepaid_traffic_topup_tokens).filter(|_| linked_now)
+        {
             warn!("agent control: {text}");
         }
     }
@@ -603,7 +607,7 @@ impl ControlContext {
         };
         let party = PartyId::parse(&config.party_id)
             .map_err(|_| anyhow!("PARTY_AGENT={} is not a party id control accepts", config.party_id))?;
-        let store = ControlStore::open(&env.base()?, network, &party);
+        let store = ControlStore::locate(env, network, &party)?;
         Ok((network, party, store))
     }
 
@@ -645,10 +649,11 @@ impl ControlContext {
     }
 
     /// The context of `restore`: the marker is checked against the rpc's log, not the local store.
+    /// A store an earlier version kept is moved without the marker rule: restore checks it.
     pub fn open_for_restore(config: BaseConfig, env: &ControlEnv, env_file: Option<PathBuf>) -> Result<Self> {
         let env = control_env(&config, env.clone());
-        Self::parts(&config, &env)?;
         let unmarked = ControlEnv { marker: None, ..env.clone() };
+        Self::parts(&config, &unmarked)?;
         let signer = agent_logic::signer::resolve_with(&config.private_key, &unmarked)
             .context("the local control store cannot be loaded; move it aside, then restore")?;
         let guard = Arc::clone(signer.guard());
@@ -788,7 +793,7 @@ pub enum PolicyCommands {
 /// Where a control command runs.
 #[derive(Clone, Debug, Default)]
 pub struct ControlOptions {
-    /// Overrides SILVANA_CONTROL_DIR.
+    /// Overrides SILVANA_CONTROL_DIR: the folder that holds `control/` instead of the agent folder.
     pub control_dir: Option<PathBuf>,
     /// The agent's env file, for the marker.
     pub env_file: Option<PathBuf>,

@@ -180,7 +180,7 @@ use message_signing::{
     canonical_params_reject_dvp_proposal,
     canonical_params_transfer_cc, canonical_params_request_preapproval,
     canonical_params_request_recurring_prepaid, canonical_params_request_recurring_payasyougo,
-    canonical_params_request_user_service, canonical_params_transfer_cip56,
+    canonical_params_request_user_service, canonical_params_transfer_cip56_with_direct_only,
     canonical_params_accept_cip56, canonical_params_split_cc,
     canonical_params_execute_multicall,
     canonical_params_lock_holdings, canonical_params_process_lock_unlock_requests,
@@ -251,10 +251,10 @@ fn build_canonical_from_prepare_request(req: &PrepareTransactionRequest) -> Resu
         Params::RequestUserService(p) => canonical_params_request_user_service(
             p.reference_id.as_deref(), p.party_name.as_deref(),
         ),
-        Params::TransferCip56(p) => canonical_params_transfer_cip56(
+        Params::TransferCip56(p) => canonical_params_transfer_cip56_with_direct_only(
             &p.instrument_id, &p.instrument_admin, &p.receiver_party,
             &p.amount, p.reference.as_deref(), &p.input_holding_cids,
-            p.max_input_holdings,
+            p.max_input_holdings, p.direct_only,
         ),
         Params::AcceptCip56(p) => canonical_params_accept_cip56(&p.contract_id),
         Params::SplitCc(p) => canonical_params_split_cc(&p.output_amounts),
@@ -759,6 +759,7 @@ impl DAppProviderClient {
                 .map_err(|e| anyhow!("invalid total_credited_cc '{}': {}", r.total_credited_cc, e))?,
             total_debited_cc: r.total_debited_cc.parse()
                 .map_err(|e| anyhow!("invalid total_debited_cc '{}': {}", r.total_debited_cc, e))?,
+            orderbook_fee_discount_pct: crate::parse_fee_discount_pct(&r.orderbook_fee_discount_pct),
         })
     }
 
@@ -3104,6 +3105,39 @@ impl AtomicProviderClient {
 }
 
 #[cfg(test)]
+mod direct_only_canonical_tests {
+    use super::*;
+    use orderbook_proto::ledger::TransferCip56Params;
+
+    fn transfer(direct_only: bool) -> PrepareTransactionRequest {
+        PrepareTransactionRequest {
+            operation: TransactionOperation::TransferCip56 as i32,
+            params: Some(Params::TransferCip56(TransferCip56Params {
+                instrument_id: "tusdt-wire".into(),
+                instrument_admin: "registry::1220aa".into(),
+                receiver_party: "traffic-fee::1220bb".into(),
+                amount: "13.125".into(),
+                reference: Some("agent-traffic:p1".into()),
+                input_holding_cids: Vec::new(),
+                max_input_holdings: None,
+                direct_only,
+            })),
+            request_signature: None,
+            controller_command: None,
+        }
+    }
+
+    // The ledger service verifies the flag inside the signed request
+    #[test]
+    fn a_direct_only_transfer_signs_the_flag() {
+        let direct = String::from_utf8(build_canonical_from_prepare_request(&transfer(true)).unwrap()).unwrap();
+        let plain = String::from_utf8(build_canonical_from_prepare_request(&transfer(false)).unwrap()).unwrap();
+        assert!(direct.contains("direct_only=true\n"), "{direct}");
+        assert!(!plain.contains("direct_only"), "an ordinary transfer keeps today's bytes: {plain}");
+    }
+}
+
+#[cfg(test)]
 mod quote_window_tests {
     use super::*;
     use crate::atomic_swap::PRECHECK_VALIDITY_MARGIN_MICROS as MARGIN;
@@ -4770,7 +4804,7 @@ mod bounded_io_tests {
                 let submit = c.submit_atomic_with_retries(req.clone(), &tickets, false, false, force, 1);
                 let err = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded").unwrap_err();
                 let text = format!("{err:#}");
-                let expected = if force { FORCE_REFUSED_WHEN_LINKED } else { "is not a leg of this issue_tickets request" };
+                let expected = if force { FORCE_REFUSED_WHEN_LINKED } else { "are not the one exercise of this issue_tickets request" };
                 assert!(text.contains(expected), "{text}");
             }
             server.abort();

@@ -51,15 +51,15 @@ use crate::log::{
     compare_logs, decode_entries, verify_extension, verify_log,
 };
 use crate::party::{PartyId, namespace_for_key};
-use crate::policy::eval::{Leg, SettleFee, SettleTerms};
+use crate::policy::eval::{Delivery, Leg, SettleFee, SettleTerms, TRAFFIC_PURCHASE_MEMO_PREFIX};
 use crate::policy::{
     Allowlist, CommandScope, Coverage, DEFAULT_LINKED_RULES, EvalContext, Flow, Intent, LimitItem,
     Limits, MAX_DELAY_SECS, MAX_NOT_BEFORE_SECS, MAX_PACKAGES, MAX_POLICY_BYTES,
     MAX_POLICY_VALIDITY_SECS, MAX_SCOPE_COMMANDS, MAX_SCOPE_LPS, MAX_SCOPE_PAIRS, MAX_SCOPES,
     OperationKind, POLICY_CLOCK_SKEW_SECS, PlatformParties, PolicyDocument, PolicyInstrument,
     ReasonCode, Recipient, Rules, ScopePair, Unlisted, UsageBucket, UsageTotals, Widening,
-    check_packages, evaluate, expected_effective_at, required_delay_secs, verify_policy_submission,
-    widening,
+    check_packages, evaluate, expected_effective_at, precheck_intent, required_delay_secs,
+    verify_policy_submission, widening,
 };
 use crate::proof::{
     ControllerProof, ProofEnvelope, ProofOutcome, ProofType, verify_controller_proof,
@@ -100,7 +100,7 @@ const DEVICE: u8 = FLAG_UP | FLAG_UV;
 const DEVNET_RPC: &str = "orderbook-devnet.silvana.dev";
 const MAINNET_RPC: &str = "orderbook-mainnet.silvana.dev";
 
-const NOTES: [&str; 15] = [
+const NOTES: [&str; 17] = [
     "Every key here is a deterministic test key; never use one for anything else.",
     "Bytes are UTF-8 text in a field such as `canonical`, or hex in `canonicalHex` when they are not UTF-8.",
     "u64 values and times are strings; `code` is the number of `codeName`; a decoding line is not part of conformance.",
@@ -114,6 +114,8 @@ const NOTES: [&str; 15] = [
     "A command case's `cc` is Canton Coin as the verifier's own config names it; a case without one verifies with Canton Coin unknown.",
     "Each `expect` holds `ok`; a refusal adds `codeName` and `code`, and log refusals add `stage` and `seq`.",
     "A decision's command counts as verified by `decisionContext.commandSigner` at the case's `verifiedAt`, or at its `now` when absent.",
+    "A decision with `precheck` true runs the precheck of the flows a request names, which sums no caps.",
+    "An intent's `memos` are the memos its transaction carries; `delivery` is direct or pending, absent when not read.",
     "`decisions`, `packageChecks` and `controllerChallenges` exercise checks that only the agent, the ledger-service and the rpc run.",
     "order-book vendors a verbatim copy at test-vectors/agent-control-vectors.json.",
 ];
@@ -475,6 +477,14 @@ fn intent_from(v: &Value) -> Intent {
             Coverage::Fields
         },
         settle: v.get("settle").map(settle_from),
+        memos: items(v, "memos")
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect(),
+        delivery: v
+            .get("delivery")
+            .and_then(Value::as_str)
+            .map(|d| Delivery::parse(d).unwrap()),
     }
 }
 
@@ -1239,6 +1249,7 @@ fn run_decision(c: &Value, ctx: &Ctx) -> Obj {
         "pinned" => PlatformParties {
             fee: Some(party_at(h, "feeParty")),
             prepaid_traffic: Some(party_at(h, "prepaidTrafficParty")),
+            traffic_fee: Some(party_at(h, "trafficFeeParty")),
         },
         _ => PlatformParties::NONE,
     };
@@ -1264,7 +1275,12 @@ fn run_decision(c: &Value, ctx: &Ctx) -> Obj {
         .get("command")
         .and_then(Value::as_str)
         .map(|text| verified_stub(text.as_bytes(), signer, verified_at));
-    let decision = evaluate(&rules, &eval, &intent_from(&c["intent"]), command.as_ref());
+    let intent = intent_from(&c["intent"]);
+    let decision = if c.get("precheck").and_then(Value::as_bool) == Some(true) {
+        precheck_intent(&rules, &eval, &intent, command.as_ref())
+    } else {
+        evaluate(&rules, &eval, &intent, command.as_ref())
+    };
     let deltas: Vec<Value> = decision
         .usage
         .iter()
@@ -1524,6 +1540,10 @@ fn lp_b() -> PartyId {
 
 fn fee_party() -> PartyId {
     named_party("fee", 7)
+}
+
+fn traffic_fee_party() -> PartyId {
+    named_party("traffic-fee", 9)
 }
 
 fn cc_ref() -> InstrumentRef {
@@ -8691,6 +8711,7 @@ fn decision_context() -> Value {
         "cc": instrument_json(&cc_ref()),
         "feeParty": fee_party().to_string(),
         "prepaidTrafficParty": named_party("prepaid", 8).to_string(),
+        "trafficFeeParty": traffic_fee_party().to_string(),
         "commandSigner": command_signer().to_string(),
     })
 }
@@ -8709,6 +8730,7 @@ fn decision_cases(pool: &mut Pool) -> Vec<Value> {
     let agent1 = testkit::agent_party();
     let fee = named_party("fee", 7);
     let prepaid = named_party("prepaid", 8);
+    let traffic_fee = traffic_fee_party();
     let (alice, bob) = (alice(), bob());
     let edit = |f: &dyn Fn(&mut Rules)| {
         let mut rules = DEFAULT_LINKED_RULES;
@@ -8882,6 +8904,15 @@ fn decision_cases(pool: &mut Pool) -> Vec<Value> {
         i
     };
     let multicall = |sub: Vec<Value>| json!({"kind": "execute_multicall", "sub": sub});
+    let purchase_memo = format!("{TRAFFIC_PURCHASE_MEMO_PREFIX}019a8f3e-1c2d-7abc-8def-0123456789ab");
+    let delivered = |mut i: Value, memos: &[&str], delivery: Option<&str>| {
+        put(&mut i, "memos", json!(memos));
+        if let Some(d) = delivery {
+            put(&mut i, "delivery", d);
+        }
+        i
+    };
+    let paid = |i: Value| delivered(i, &[purchase_memo.as_str()], Some("direct"));
     let trade = |value: &str| intent("allocate", vec![flow(&cc, value, &bob)]);
     let usage = |bucket: &str, value: &str| json!([{"bucket": bucket, "admin": cc.admin.to_string(), "id": cc.id.as_str(), "amount": value}]);
     let max = "99999999999999999.9999999999";
@@ -9185,6 +9216,122 @@ fn decision_cases(pool: &mut Pool) -> Vec<Value> {
             "rules.traffic_10",
             "pinned",
             intent("prepay_traffic", vec![flow(&cc, "10.5", &prepaid)]),
+        ),
+        case(
+            "top-up: a direct token transfer with the purchase memo to the pinned traffic-fee party is maintenance",
+            "default",
+            "pinned",
+            paid(intent(
+                "transfer_cip56",
+                vec![flow(&usdc, "13", &traffic_fee), flow(&usdc, "2", &agent1)],
+            )),
+        ),
+        case(
+            "top-up: paused, a purchase payment passes",
+            "rules.paused",
+            "pinned",
+            paid(intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)])),
+        ),
+        case(
+            "top-up: without the purchase memo it is a transfer",
+            "default",
+            "pinned",
+            delivered(
+                intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)]),
+                &[],
+                Some("direct"),
+            ),
+        ),
+        case(
+            "top-up: paused, without the purchase memo it is refused",
+            "rules.paused",
+            "pinned",
+            delivered(
+                intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)]),
+                &["refund"],
+                Some("direct"),
+            ),
+        ),
+        case(
+            "top-up: a two-step offer is a transfer",
+            "default",
+            "pinned",
+            delivered(
+                intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)]),
+                &[purchase_memo.as_str()],
+                Some("pending"),
+            ),
+        ),
+        case(
+            "top-up: an unread delivery is a transfer",
+            "default",
+            "pinned",
+            delivered(
+                intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)]),
+                &[purchase_memo.as_str()],
+                None,
+            ),
+        ),
+        case(
+            "top-up: unpinned, it is a directed-only transfer",
+            "default",
+            "none",
+            paid(intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)])),
+        ),
+        case(
+            "top-up: a CC traffic cap refuses a token top-up",
+            "rules.traffic_10",
+            "pinned",
+            paid(intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)])),
+        ),
+        with(
+            case(
+                "top-up: a CC top-up counts as traffic",
+                "rules.traffic_10",
+                "pinned",
+                paid(intent("transfer_cip56", vec![flow(&cc, "4", &traffic_fee)])),
+            ),
+            "usage",
+            usage("traffic", "6"),
+        ),
+        case(
+            "top-up: a second outflow makes it a transfer",
+            "default",
+            "pinned",
+            paid(intent(
+                "transfer_cip56",
+                vec![flow(&usdc, "13", &traffic_fee), flow(&usdc, "1", &alice)],
+            )),
+        ),
+        with(
+            case(
+                "top-up: the precheck classifies the named flow",
+                "default",
+                "pinned",
+                paid(intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)])),
+            ),
+            "precheck",
+            true.into(),
+        ),
+        with(
+            case(
+                "top-up: the precheck of a request without the memo is a transfer",
+                "default",
+                "pinned",
+                intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)]),
+            ),
+            "precheck",
+            true.into(),
+        ),
+        with(
+            case(
+                "top-up: the precheck refuses a token top-up under a CC traffic cap",
+                "rules.traffic_10",
+                "pinned",
+                paid(intent("transfer_cip56", vec![flow(&usdc, "13", &traffic_fee)])),
+            ),
+            "precheck",
+            true.into(),
         ),
         with(
             case(

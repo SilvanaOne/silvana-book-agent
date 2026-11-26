@@ -660,6 +660,15 @@ fn refusal_text(refusal: &ContentRefusal) -> String {
         ContentRefusal::Unmodelled(templates) => format!("unmodelled {}", templates.join(", ")),
         ContentRefusal::BadRequest(_) => "bad_request".to_string(),
         ContentRefusal::PinMissing { pin, .. } => format!("pins_missing {pin}"),
+        ContentRefusal::RootMismatch { root_nodes, roots, .. } => format!(
+            "root_mismatch {root_nodes} [{}]",
+            roots
+                .iter()
+                .map(|r| crate::control::intent::clean(&format!("{} {}", r.template, r.choice)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ContentRefusal::VenueMismatch { venues, term, .. } => format!("venue_mismatch {venues} {term}"),
         ContentRefusal::UnexpectedOutflow { flow, .. } => format!(
             "unexpected_outflow {} {} ({:?}) to {}",
             flow.amount,
@@ -928,6 +937,16 @@ mod tests {
         assert_eq!(refusal_text(&ContentRefusal::BadRequest("to bob::1220bb".into())), "bad_request");
         assert_eq!(refusal_text(&ContentRefusal::HashNotMatched), "hash_not_matched");
         assert_eq!(refusal_text(&ContentRefusal::Unmodelled(vec!["A.B:C".into()])), "unmodelled A.B:C");
+        let root = |template: &str, choice: &str| tx_verifier::facts::ExerciseFact {
+            template: template.into(),
+            choice: choice.into(),
+            contract_id: "v1".into(),
+        };
+        let roots = vec![root("AtomicDVP:AtomicDVP", "AtomicDVP_UpdateKey"), root("A.B:C\n", "Ch\u{202e}oice")];
+        let text = refusal_text(&ContentRefusal::RootMismatch { operation: "retire_venue", root_nodes: 2, roots });
+        assert_eq!(text, "root_mismatch 2 [AtomicDVP:AtomicDVP AtomicDVP_UpdateKey, A.B:C  Ch oice]");
+        let venue = ContentRefusal::VenueMismatch { operation: "create_atomic_dvp_venue", venues: 1, term: "quote key" };
+        assert_eq!(refusal_text(&venue), "venue_mismatch 1 quote key");
     }
 
     #[test]

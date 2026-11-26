@@ -30,6 +30,9 @@ pub const DEFAULT_BALANCE_STALE_AFTER: Duration = Duration::from_secs(120);
 /// A prepaid figure without a successful poll within this window is unknown to the fee checks.
 pub const PREPAID_STALE_AFTER: Duration = Duration::from_secs(120);
 
+/// A CC/USD rate older than this is not used to convert strategy amounts in USD.
+pub const CC_USD_RATE_MAX_AGE: Duration = Duration::from_secs(1800);
+
 /// Local fee debits kept between polls; past this the oldest two are merged.
 const MAX_LOCAL_DEBITS: usize = 1024;
 
@@ -192,6 +195,8 @@ struct LiquidityState {
     fee_commitments: FeeCommitments,
     /// Cached CC/USD exchange rate (for fee estimation).
     cc_usd_rate: Decimal,
+    /// When `cc_usd_rate` was last set.
+    cc_usd_rate_at: Option<Instant>,
     /// Alias map: short name → canonical key (e.g. "USDCx" → instrument_id).
     aliases: HashMap<String, String>,
     /// Off-chain prepaid credit that settlement fees are debited from.
@@ -213,6 +218,8 @@ struct PrepaidState {
     topup_cc: Option<Decimal>,
     /// Prepaid held for each settlement's own transactions.
     traffic_cc: Decimal,
+    /// The order-book fee discount (percent) the last prepaid poll reported.
+    orderbook_fee_discount_pct: Option<Decimal>,
 }
 
 /// Why fee capacity does not cover a fee.
@@ -282,6 +289,7 @@ impl LiquidityManager {
                 flows: HashMap::new(),
                 fee_commitments: FeeCommitments::new(),
                 cc_usd_rate: Decimal::ZERO,
+                cc_usd_rate_at: None,
                 aliases: HashMap::new(),
                 prepaid: PrepaidState {
                     traffic_cc: DEFAULT_SETTLEMENT_TRAFFIC_CC,
@@ -416,10 +424,24 @@ impl LiquidityManager {
         aliases.get(token).map(|s| s.as_str()).unwrap_or(token)
     }
 
+    /// The CC/USD rate for amounts in USD: None until one is known, and once it is older
+    /// than [`CC_USD_RATE_MAX_AGE`]. Fee estimates keep using the last rate.
+    pub async fn cc_usd_rate(&self) -> Option<Decimal> {
+        self.cc_usd_rate_at(Instant::now()).await
+    }
+
+    /// [`Self::cc_usd_rate`] as of `now`.
+    pub(crate) async fn cc_usd_rate_at(&self, now: Instant) -> Option<Decimal> {
+        let s = self.state.read().await;
+        let fresh = s.cc_usd_rate_at.is_some_and(|at| now.saturating_duration_since(at) < CC_USD_RATE_MAX_AGE);
+        Some(s.cc_usd_rate).filter(|r| fresh && *r > Decimal::ZERO)
+    }
+
     /// Update the cached CC/USD exchange rate.
     pub async fn update_cc_usd_rate(&self, rate: Decimal) {
         let mut s = self.state.write().await;
         s.cc_usd_rate = rate;
+        s.cc_usd_rate_at = Some(Instant::now());
     }
 
     /// Record a polled prepaid figure (balance plus credit limit, in CC) sent at `polled_at`;
@@ -443,6 +465,17 @@ impl LiquidityManager {
     pub async fn set_settlement_traffic(&self, traffic_cc: Decimal) {
         let mut s = self.state.write().await;
         s.prepaid.traffic_cc = traffic_cc.max(Decimal::ZERO);
+    }
+
+    /// Record the order-book fee discount from a prepaid poll; outside 0..100 reads as none.
+    pub async fn set_orderbook_fee_discount_pct(&self, pct: Option<Decimal>) {
+        let mut s = self.state.write().await;
+        s.prepaid.orderbook_fee_discount_pct = pct.filter(|p| *p >= Decimal::ZERO && *p < Decimal::ONE_HUNDRED);
+    }
+
+    /// The last order-book fee discount in percent; `None` means full price.
+    pub async fn orderbook_fee_discount_pct(&self) -> Option<Decimal> {
+        self.state.read().await.prepaid.orderbook_fee_discount_pct
     }
 
     /// A fee was debited: lowers the prepaid figure and the proposal's fee commitment by
@@ -2119,5 +2152,41 @@ mod tests {
         assert!(!lm.has_commitment("nope").await);
         lm.release("p1").await;
         assert_eq!(lm.prepaid_demand().await, Decimal::ZERO);
+    }
+
+    // Strategy amounts in USD use only a recent rate
+    #[tokio::test]
+    async fn a_cc_usd_rate_past_its_age_bound_reads_as_unknown() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        let now = Instant::now();
+        assert_eq!(lm.cc_usd_rate_at(now).await, None);
+        lm.update_cc_usd_rate(dec("0.0746")).await;
+        let later = |d: Duration| now.checked_add(d).unwrap();
+        let just_inside = CC_USD_RATE_MAX_AGE.saturating_sub(Duration::from_secs(1));
+        assert_eq!(lm.cc_usd_rate_at(later(just_inside)).await, Some(dec("0.0746")));
+        let past = CC_USD_RATE_MAX_AGE.saturating_add(Duration::from_secs(1));
+        assert_eq!(lm.cc_usd_rate_at(later(past)).await, None);
+        assert_eq!(lm.cc_usd_rate().await, Some(dec("0.0746")));
+        // A zero rate is no rate
+        lm.update_cc_usd_rate(Decimal::ZERO).await;
+        assert_eq!(lm.cc_usd_rate().await, None);
+    }
+
+    // The prepaid poll's discount is kept until the next poll; out of range is full price
+    #[tokio::test]
+    async fn the_order_book_fee_discount_is_cached_from_the_poll() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        assert_eq!(lm.orderbook_fee_discount_pct().await, None);
+        lm.set_orderbook_fee_discount_pct(Some(dec("90"))).await;
+        assert_eq!(lm.orderbook_fee_discount_pct().await, Some(dec("90")));
+        lm.set_orderbook_fee_discount_pct(Some(Decimal::ZERO)).await;
+        assert_eq!(lm.orderbook_fee_discount_pct().await, Some(Decimal::ZERO));
+        for out_of_range in [dec("100"), dec("-1"), dec("250")] {
+            lm.set_orderbook_fee_discount_pct(Some(out_of_range)).await;
+            assert_eq!(lm.orderbook_fee_discount_pct().await, None, "{out_of_range}");
+        }
+        lm.set_orderbook_fee_discount_pct(Some(dec("12.5"))).await;
+        lm.set_orderbook_fee_discount_pct(None).await;
+        assert_eq!(lm.orderbook_fee_discount_pct().await, None);
     }
 }

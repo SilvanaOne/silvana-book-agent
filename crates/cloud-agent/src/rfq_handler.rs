@@ -181,17 +181,23 @@ fn stress_coefficient(spread_percent: f64, multiplier: f64) -> f64 {
     }
 }
 
-/// V1 worst-case fee in USD: x4 on ($0.3 dvp + max($0.7, 0.1% of notional)).
-/// `None` when the notional is out of `Decimal` range.
-fn v1_fee_headroom_usd(notional_usd: Option<f64>) -> Option<Decimal> {
+/// V1 worst-case fee in USD: x4 on ($0.3 dvp + max($0.7, 0.1% of notional)), less the
+/// order-book discount in percent (none: full price). `None` when out of `Decimal` range.
+fn v1_fee_headroom_usd(notional_usd: Option<f64>, discount_pct: Option<Decimal>) -> Option<Decimal> {
     let alloc = match notional_usd {
         Some(n) => Decimal::from_f64_retain(n * 0.001)?,
         None => Decimal::ZERO,
     }
     .max(Decimal::new(7, 1));
-    Decimal::new(3, 1)
+    let worst = Decimal::new(3, 1)
         .checked_add(alloc)?
-        .checked_mul(Decimal::from(4))
+        .checked_mul(Decimal::from(4))?;
+    match discount_pct.filter(|p| *p >= Decimal::ZERO && *p < Decimal::ONE_HUNDRED) {
+        Some(pct) => worst
+            .checked_mul(Decimal::ONE_HUNDRED.checked_sub(pct)?)?
+            .checked_div(Decimal::ONE_HUNDRED),
+        None => Some(worst),
+    }
 }
 
 /// The requested size (base or quote) as an exact Decimal cut to 10 decimals toward
@@ -795,7 +801,8 @@ impl RfqHandler {
             //    requiring CC here would spuriously reject V2 quotes on a
             //    CC-poor LP.
             let fee_usd = if enforce_min_notional {
-                let Some(fee_usd) = v1_fee_headroom_usd(notional_usd) else {
+                let discount = lm.orderbook_fee_discount_pct().await;
+                let Some(fee_usd) = v1_fee_headroom_usd(notional_usd, discount) else {
                     warn!(
                         "RFQ {}: rejected — fee headroom out of range (notional {:?} USD)",
                         rfq_id, notional_usd
@@ -1328,6 +1335,40 @@ mod price_rfq_tests {
         lm.update_prepaid(Decimal::from(50), std::time::Instant::now()).await;
         if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await {
             panic!("50 CC of credit covers the V1 fees: {:?}", e.reason_detail);
+        }
+    }
+
+    #[test]
+    fn v1_fee_headroom_scales_with_the_order_book_discount() {
+        assert_eq!(v1_fee_headroom_usd(None, Some(dec("90"))), Some(dec("0.4")));
+        assert_eq!(v1_fee_headroom_usd(Some(1_000_000.0), Some(dec("90"))), Some(dec("400.12")));
+        assert_eq!(v1_fee_headroom_usd(None, Some(dec("12.5"))), Some(dec("3.5")));
+        assert_eq!(v1_fee_headroom_usd(None, Some(Decimal::ZERO)), Some(Decimal::from(4)));
+        // Out of range reads as full price, never as a free settle
+        for bad in [dec("100"), dec("-5"), dec("150")] {
+            assert_eq!(v1_fee_headroom_usd(None, Some(bad)), Some(Decimal::from(4)), "{bad}");
+        }
+        assert_eq!(v1_fee_headroom_usd(Some(1e33), Some(dec("90"))), None);
+    }
+
+    /// The discount from the prepaid poll lowers the V1 fee headroom: 10% of 44 CC, with the
+    /// settlement's own traffic hold, fits in 10 CC of credit; the full 44 does not.
+    #[tokio::test]
+    async fn v1_fee_headroom_uses_the_cached_discount() {
+        let lm = agent_logic::liquidity::LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        lm.update_cc_balance(Decimal::ZERO).await;
+        lm.update_token_balance("EDELx", Decimal::from(5000)).await;
+        lm.update_cc_usd_rate(Decimal::new(1, 1)).await;
+        lm.update_prepaid(Decimal::from(10), std::time::Instant::now()).await;
+        let mut h = handler();
+        h.liquidity_manager = Some(Arc::clone(&lm));
+        let Err(full) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await else {
+            panic!("10 CC of credit is short of the full 44")
+        };
+        assert_eq!(full.reason_detail.as_deref(), Some("Insufficient liquidity"));
+        lm.set_orderbook_fee_discount_pct(Some(Decimal::from(90))).await;
+        if let Err(e) = h.price_rfq("t", "EDELx-USDC", 1, "1000", "", true, None, None, None).await {
+            panic!("4.4 CC of discounted fees fit in 10: {:?}", e.reason_detail);
         }
     }
 
@@ -1865,12 +1906,12 @@ mod price_rfq_tests {
 
     #[test]
     fn v1_fee_headroom_follows_the_fee_rule() {
-        assert_eq!(v1_fee_headroom_usd(None), Some(Decimal::from(4)));
-        assert_eq!(v1_fee_headroom_usd(Some(13.6)), Some(Decimal::from(4)));
-        assert_eq!(v1_fee_headroom_usd(Some(1_000_000.0)), Some(dec("4001.2")));
-        assert_eq!(v1_fee_headroom_usd(Some(1e33)), None);
-        assert_eq!(v1_fee_headroom_usd(Some(3e31)), None);
-        assert_eq!(v1_fee_headroom_usd(Some(f64::NAN)), None);
+        assert_eq!(v1_fee_headroom_usd(None, None), Some(Decimal::from(4)));
+        assert_eq!(v1_fee_headroom_usd(Some(13.6), None), Some(Decimal::from(4)));
+        assert_eq!(v1_fee_headroom_usd(Some(1_000_000.0), None), Some(dec("4001.2")));
+        assert_eq!(v1_fee_headroom_usd(Some(1e33), None), None);
+        assert_eq!(v1_fee_headroom_usd(Some(3e31), None), None);
+        assert_eq!(v1_fee_headroom_usd(Some(f64::NAN), None), None);
     }
 
     // An unusable CC/USD rate gives the Decimal::MAX fee sentinel; V1 rejects

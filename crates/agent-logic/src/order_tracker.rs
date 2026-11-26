@@ -886,6 +886,10 @@ mod tests {
             }),
             dvp_proposer_party: None,
             origin: String::new(),
+            fee_token_buyer: String::new(),
+            fee_token_seller: String::new(),
+            fee_discount_pct_buyer: None,
+            fee_discount_pct_seller: None,
         }
     }
 

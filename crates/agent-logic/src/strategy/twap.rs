@@ -104,10 +104,10 @@ impl Twap {
         let behind = self.total * clampf((elapsed + gap) / duration, 0.0, 1.0) - done;
         let nominal = self.total * slice_secs / duration;
         let mut qty = (behind.min(c.max_catchup * nominal) * (1.0 + c.size_jitter * (2.0 * u_size - 1.0)))
-            .max(MIN_ORDER_USD / r)
+            .max(v.in_quote(MIN_ORDER_USD) / r)
             .min(remaining);
         // Never leave less than one order's worth behind
-        if (remaining - qty) * r < MIN_ORDER_USD {
+        if (remaining - qty) * r < v.in_quote(MIN_ORDER_USD) {
             qty = remaining;
         }
         self.slice = (behind > 0.0 && qty * r >= v.floor_value).then_some(Slice {

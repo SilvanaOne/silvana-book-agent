@@ -16,13 +16,70 @@ Linking is optional: an agent that was never linked behaves as before.
 ## Before you start
 
 - `CANTON_CHAIN` must be `devnet` or `mainnet`. Control commands refuse any other value.
-- The agent's `.env` must be known (the one in the working directory, or `--env-file`). The agent
-  records the head of its control log there as `AGENT_CONTROL_HEAD=<network>:<seq>:<hash>`.
-- The control directory is `$SILVANA_CONTROL_DIR`, or `~/.silvana-agent` when it is unset
-  (`--control-dir` overrides both). It holds one folder per network and party. Back it up with
-  the `.env`, and keep it on persistent storage.
+- The agent's `.env` must be known (the one in the working directory, `--config-dir <DIR>`, or
+  `--env-file`). The agent records the head of its control log there as
+  `AGENT_CONTROL_HEAD=<network>:<seq>:<hash>`.
+- The agent keeps its control store in `control/` in its agent folder, the directory of its `.env`
+  (see [Where the state lives](#where-the-state-lives)). Keep that folder on persistent storage.
 - The machine's clock must be within 60 seconds of the rpc's. The agent refuses to sign a control
   entry otherwise.
+
+## Where the state lives
+
+The **agent folder** is the directory of the env file the agent loads: `--env-file`, else
+`DIR/.env` under `--config-dir DIR`, else the `.env` found in the working directory or its nearest
+parent; with no env file it is the working directory. Onboarding writes `./.env`, or the `--env-file` it is given, so the folder is set from
+the start. An env file that is a symlink belongs to the folder of its target, where the marker is
+written.
+
+| Path | What it holds |
+| --- | --- |
+| `.env` | the key, the settings and the marker `AGENT_CONTROL_HEAD` |
+| `control/` | `log.json`, `head.json`, `pending.json`, `policies/`, `evidence/`, `commands.json`, `counters.json`, their locks, and `moved_from.json` after a move |
+| `usdcx/<network>/<party>/` | the `usdcx` burns and deposits |
+
+- One folder holds one agent. A control store whose files name another party or network than the
+  agent's is refused, and so is registration evidence of another key.
+- `control show` prints the store's path (`storeDir` with `--json`).
+- A backup, a copy or a move to another machine must take the **whole agent folder**: the marker
+  in `.env` and the store in `control/` belong together. An agent whose marker is ahead of its
+  store refuses to start; `control restore` rebuilds the store from the rpc.
+- `SILVANA_CONTROL_DIR`, or `control --control-dir`, names another folder to hold `control/`.
+  It no longer holds one folder per network and party: if you set it before, move
+  `<dir>/<network>/<party>/control` to `<dir>/control` yourself.
+
+### Moving from `~/.silvana-agent`
+
+Earlier versions kept every store in `~/.silvana-agent/<network>/<party>/control/`. When the agent
+or a `control` command opens the store, `control/` does not exist yet and the old store does, it
+moves the old store once, holding a lock on the agent folder and the old store's lock files:
+
+1. It copies the old store to `control.migrating/` in the agent folder, replacing an unfinished
+   copy of an earlier attempt.
+2. It checks the copy as at startup: the chain, the head, the pending entry, the policies and,
+   when `AGENT_CONTROL_HEAD` is set, the marker. The copy's head must be the marker's, neither
+   behind nor ahead of it.
+3. It records the old path in `moved_from.json`, renames the copy to `control/` and logs one line
+   naming both paths.
+
+A copy that fails a check is removed and nothing starts; the message gives the reason. The old
+store is never changed, renamed or deleted. It stays behind as a stale copy, which an older build
+refuses once the marker moves past it. Delete `~/.silvana-agent` yourself once every agent has
+started from its own folder.
+
+If `control/` exists but was not moved from the old store, and the old store exists too, the agent
+refuses and names both paths; it never picks one. Keep the right one and move the other out of both
+places. `control restore` moves an old store without the marker check, then rebuilds it from the
+rpc.
+
+Agents that shared one folder with one env file each (`--env-file agent1.env`, `--env-file
+agent2.env`) need a folder each: move each env file into its own folder before the first start. In
+a shared folder the first agent to start moves its store in, and the next one is refused because
+`control/` holds another agent's files.
+
+`usdcx` commands move this party's state from `~/.silvana-agent/usdcx/<network>/<party>/` to
+`usdcx/<network>/<party>/` in the agent folder in the same way, unless `--state-dir` is given. The
+state of other parties there is left alone.
 
 ## Timing rules
 
@@ -335,7 +392,7 @@ signatures at one position, which reads as a fork. Discard only an entry the rpc
 
 ## Recovery
 
-The agent refuses to start when `AGENT_CONTROL_HEAD` is set and the control directory is missing,
+The agent refuses to start when `AGENT_CONTROL_HEAD` is set and the control store is missing,
 does not verify, or is behind the marker. Without the marker, the agent starts as before when the
 rpc cannot be read; it refuses only when the rpc holds a log signed by this agent's key that the
 local copy lacks.

@@ -121,6 +121,7 @@ async fn run(args: Args) -> Result<()> {
         interval_secs: args.poll_period,
         atomic: false,
         fee_tokens: vec![],
+        prune_fee_tokens: false,
     };
 
     // Keep backend alive so its ACS worker keeps refreshing amulets

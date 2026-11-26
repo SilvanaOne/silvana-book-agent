@@ -135,6 +135,7 @@ message Order {
   // Liquidity-provider matching constraints (RFQ-like behavior for terminal orders)
   bool only_liquidity_providers = 26;           // If true, only match counterparties that are currently-connected LPs (server default: true)
   optional string liquidity_provider_name = 27; // If set (with only_liquidity_providers), restrict to parties of this LP name (null = any connected LP)
+  string fee_token = 28; // Settlement fee token; empty means CC
 }
 
 // Orderbook depth level (aggregated view without user details)
@@ -188,6 +189,12 @@ message SettlementProposal {
 
   // Where the proposal originated: 'orderbook' (matching engine) or 'rfq'.
   string origin = 22;
+
+  // Fee token per side (empty means CC) and the fee discount percent applied (unset means none).
+  string fee_token_buyer = 23;
+  string fee_token_seller = 24;
+  optional string fee_discount_pct_buyer = 25;
+  optional string fee_discount_pct_seller = 26;
 }
 
 // Order match message
@@ -509,6 +516,7 @@ message SubmitOrderRequest {
   // Liquidity-provider matching constraints. Unset only_liquidity_providers ⇒ server defaults to true.
   optional bool only_liquidity_providers = 15;
   optional string liquidity_provider_name = 16;
+  repeated string fee_tokens = 17; // Settlement fee tokens in priority order; empty means CC
 }
 
 message SubmitOrderResponse {
@@ -973,6 +981,7 @@ message AcceptQuoteRequest {
   // Auth via gRPC metadata: authorization: Bearer <token>
   string rfq_id = 2;              // Original RFQ session ID
   string quote_id = 3;            // Specific quote to accept
+  repeated string fee_tokens = 4; // Settlement fee tokens in priority order; empty means CC
 }
 
 message AcceptQuoteResponse {
@@ -1077,6 +1086,7 @@ message EstimateSettlementFeesRequest {
   string market_id = 1;
   string base_quantity = 2;               // DECIMAL as string
   string price = 3;                       // DECIMAL as string
+  bool order_book = 4;                    // true = fees for an order-book order (not an RFQ)
 }
 
 message EstimateSettlementFeesResponse {
@@ -1085,6 +1095,7 @@ message EstimateSettlementFeesResponse {
   string estimated_dvp_fee = 3;           // DECIMAL as string
   string estimated_allocation_fee = 4;    // DECIMAL as string
   string estimated_total_fee = 5;         // DECIMAL as string — dvp + allocation (per party)
+  repeated string v1_fee_tokens = 6;      // Fee tokens accepted for V1 settlement fees, CC last
 }
 
 // ============================================================================

@@ -4444,7 +4444,8 @@
     },
     "commandSigner": "0202020202020202020202020202020202020202020202020202020202020202",
     "feeParty": "fee::1220fe79a2f13493de49cb3ddc5305622888e64ad656a20dd304dd325cb70dfe8722",
-    "prepaidTrafficParty": "prepaid::12207563c3b699e8fbe3178540f6934c151fce31aca5d3212cfa9b5ec792b034d189"
+    "prepaidTrafficParty": "prepaid::12207563c3b699e8fbe3178540f6934c151fce31aca5d3212cfa9b5ec792b034d189",
+    "trafficFeeParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
   },
   "decisions": [
     {
@@ -5623,6 +5624,393 @@
       "name": "traffic_daily_cap",
       "now": "2026-11-22T12:00:00Z",
       "platform": "pinned",
+      "rules": "rules.traffic_10"
+    },
+    {
+      "expect": {
+        "allowed": true,
+        "class": "maintenance",
+        "reason": "allowed",
+        "reasonCode": 0,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          },
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "2",
+            "id": "USDCx",
+            "toParty": "agent-1::1220133628fcf469de1c1726313351f2729e6dd6f47b6c1989b76099d363754a39b6"
+          }
+        ]
+      },
+      "name": "top-up: a direct token transfer with the purchase memo to the pinned traffic-fee party is maintenance",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": true,
+        "class": "maintenance",
+        "reason": "allowed",
+        "reasonCode": 0,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: paused, a purchase payment passes",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "rules.paused"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "directed_only",
+        "reasonCode": 4,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: without the purchase memo it is a transfer",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "paused",
+        "reasonCode": 1,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "refund"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: paused, without the purchase memo it is refused",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "rules.paused"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "directed_only",
+        "reasonCode": 4,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "pending",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: a two-step offer is a transfer",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "directed_only",
+        "reasonCode": 4,
+        "usage": []
+      },
+      "intent": {
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: an unread delivery is a transfer",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "directed_only",
+        "reasonCode": 4,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: unpinned, it is a directed-only transfer",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "none",
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "maintenance",
+        "reason": "traffic_daily_cap",
+        "reasonCode": 15,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: a CC traffic cap refuses a token top-up",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "rules.traffic_10"
+    },
+    {
+      "expect": {
+        "allowed": true,
+        "class": "maintenance",
+        "reason": "allowed",
+        "reasonCode": 0,
+        "usage": [
+          {
+            "admin": "DSO::1220974cb80e78f2fea077628a02faa4c57d68a65036eea27fb3463088a1c8527a99",
+            "amount": "4",
+            "bucket": "traffic",
+            "id": "Amulet"
+          }
+        ]
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "DSO::1220974cb80e78f2fea077628a02faa4c57d68a65036eea27fb3463088a1c8527a99",
+            "amount": "4",
+            "id": "Amulet",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: a CC top-up counts as traffic",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "rules.traffic_10",
+      "usage": [
+        {
+          "admin": "DSO::1220974cb80e78f2fea077628a02faa4c57d68a65036eea27fb3463088a1c8527a99",
+          "amount": "6",
+          "bucket": "traffic",
+          "id": "Amulet"
+        }
+      ]
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "directed_only",
+        "reasonCode": 4,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          },
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "1",
+            "id": "USDCx",
+            "toParty": "alice::1220e948f288b45571fd032575920f2ca91fe215d7d244d1bc4070b4b0524c2ce10a"
+          }
+        ]
+      },
+      "name": "top-up: a second outflow makes it a transfer",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": true,
+        "class": "maintenance",
+        "reason": "allowed",
+        "reasonCode": 0,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: the precheck classifies the named flow",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "precheck": true,
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "transfers",
+        "reason": "directed_only",
+        "reasonCode": 4,
+        "usage": []
+      },
+      "intent": {
+        "kind": "transfer_cip56",
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: the precheck of a request without the memo is a transfer",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "precheck": true,
+      "rules": "default"
+    },
+    {
+      "expect": {
+        "allowed": false,
+        "class": "maintenance",
+        "reason": "traffic_daily_cap",
+        "reasonCode": 15,
+        "usage": []
+      },
+      "intent": {
+        "delivery": "direct",
+        "kind": "transfer_cip56",
+        "memos": [
+          "agent-traffic:019a8f3e-1c2d-7abc-8def-0123456789ab"
+        ],
+        "outgoing": [
+          {
+            "admin": "Bank::1220d990467358d96ed953299fd37578db770bd3c3d593e4d32f79c192b7461ecc08",
+            "amount": "13",
+            "id": "USDCx",
+            "toParty": "traffic-fee::12202aa8360fe30319d94eb0a7e305734a540009dfe93d3e6c3f93c84a278d8a402c"
+          }
+        ]
+      },
+      "name": "top-up: the precheck refuses a token top-up under a CC traffic cap",
+      "now": "2026-11-22T12:00:00Z",
+      "platform": "pinned",
+      "precheck": true,
       "rules": "rules.traffic_10"
     },
     {
@@ -16221,6 +16609,8 @@
     "A command case's `cc` is Canton Coin as the verifier's own config names it; a case without one verifies with Canton Coin unknown.",
     "Each `expect` holds `ok`; a refusal adds `codeName` and `code`, and log refusals add `stage` and `seq`.",
     "A decision's command counts as verified by `decisionContext.commandSigner` at the case's `verifiedAt`, or at its `now` when absent.",
+    "A decision with `precheck` true runs the precheck of the flows a request names, which sums no caps.",
+    "An intent's `memos` are the memos its transaction carries; `delivery` is direct or pending, absent when not read.",
     "`decisions`, `packageChecks` and `controllerChallenges` exercise checks that only the agent, the ledger-service and the rpc run.",
     "order-book vendors a verbatim copy at test-vectors/agent-control-vectors.json."
   ],

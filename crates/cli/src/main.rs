@@ -50,10 +50,15 @@ struct Cli {
     #[arg(long, global = true, value_name = "HEX")]
     quote_private_key: Option<String>,
 
-    /// Path to env file to load (default: search for `.env` in CWD and parents).
-    /// An explicit --env-file overrides variables already set in the environment.
+    /// Path to env file to load (default: search for `.env` in CWD and parents); its directory is the
+    /// agent folder, which holds the agent's state. An explicit --env-file overrides set variables.
     #[arg(long, global = true, value_name = "PATH")]
     env_file: Option<PathBuf>,
+
+    /// Working directory: agent.toml, agent-state.json, logs and relative paths (-c, --env-file) resolve
+    /// in it; its .env is the env file, and it the agent folder, unless --env-file names a file elsewhere
+    #[arg(long, global = true, value_name = "DIR")]
+    config_dir: Option<PathBuf>,
 
     /// Enable verbose logging
     #[arg(short, long, global = true)]
@@ -91,6 +96,10 @@ enum Commands {
         /// Accept all proposals without verification (for migration from old worker without saved state)
         #[arg(long)]
         no_reject: bool,
+        /// Longest stop after Ctrl-C, 1-3600 seconds: steps still running then are dropped and resume
+        /// at the next start; cancelling grid orders gets 30s more (default: no overall limit)
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        shutdown_timeout_secs: Option<u64>,
     },
     /// Query information
     Info {
@@ -142,7 +151,7 @@ enum Commands {
         /// mainnet or testnet (default: the network of SYNCHRONIZER_ID)
         #[arg(long)]
         network: Option<String>,
-        /// Directory of the local USDCx state (default: ~/.silvana-agent/usdcx)
+        /// Directory of the local USDCx state (default: <agent folder>/usdcx)
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Do not ask for confirmations
@@ -174,8 +183,8 @@ enum Commands {
         /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
         #[arg(long)]
         atomic: bool,
-        /// Settlement-fee token preference for --atomic, priority order
-        /// (repeatable, e.g. --fee-token USDC --fee-token CC). Default: CC.
+        /// Settlement-fee token preference for --atomic, priority order (repeatable). Default:
+        /// RFQ_V2_FEE_TOKENS less tokens worth under $2 after the pay leg; CC when unset.
         #[arg(long = "fee-token")]
         fee_token: Vec<String>,
     },
@@ -202,14 +211,14 @@ enum Commands {
         /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
         #[arg(long)]
         atomic: bool,
-        /// Settlement-fee token preference for --atomic, priority order
-        /// (repeatable, e.g. --fee-token USDC --fee-token CC). Default: CC.
+        /// Settlement-fee token preference for --atomic, priority order (repeatable). Default:
+        /// RFQ_V2_FEE_TOKENS less tokens worth under $2 after the pay leg; CC when unset.
         #[arg(long = "fee-token")]
         fee_token: Vec<String>,
     },
     /// Agent control: link controllers, change them, show the control log
     Control {
-        /// Base directory of the control stores (default: ~/.silvana-agent)
+        /// Folder that holds the control store, control/ (default: the agent folder, where the env file is)
         #[arg(long, env = "SILVANA_CONTROL_DIR")]
         control_dir: Option<PathBuf>,
         #[command(subcommand)]
@@ -290,9 +299,21 @@ const KEY_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 const STTY_WAIT: Duration = Duration::from_secs(2);
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    // Env changes happen here, while the process is still single-threaded.
-    load_env_file(cli.env_file.as_deref(), matches!(cli.command, Commands::Onboard { .. }))?;
+    let mut cli = Cli::parse();
+    // Env and directory changes happen here, while the process is still single-threaded.
+    let config_dir = match cli.config_dir.take() {
+        Some(raw) => {
+            let dir = config_folder(&raw)?;
+            std::env::set_current_dir(&dir).map_err(|e| anyhow!("--config-dir {}: {e}", raw.display()))?;
+            cli.env_file = Some(config_env_file(cli.env_file.as_deref(), &dir));
+            Some(dir)
+        }
+        None => None,
+    };
+    cli.config_dir.clone_from(&config_dir);
+    let onboarding = matches!(cli.command, Commands::Onboard { .. });
+    load_env_file(cli.env_file.as_deref(), onboarding)?;
+    agent_logic::agent_dir::set(agent_folder(cli.env_file.as_deref(), onboarding)?)?;
 
     // Initialize logging (LOG_DESTINATION=console|file)
     agent_logic::logging::init_logging(
@@ -301,6 +322,14 @@ fn main() -> Result<()> {
         "cloud-agent",
     )?;
     agent_logic::panic_hook::install();
+    if let Some(dir) = &config_dir {
+        // Console logs share stdout with the output of the one-shot commands
+        if matches!(cli.command, Commands::Agent { .. }) || agent_logic::logging::logs_to_file() {
+            tracing::info!("Config folder: {}", dir.display());
+        } else {
+            agent_logic::errln!("Config folder: {}", dir.display());
+        }
+    }
 
     match prepare(cli)? {
         Some(job) => match run_on_runtime(job.run(), SHUTDOWN_GRACE) {
@@ -359,6 +388,30 @@ fn worker_threads(raw: Option<std::ffi::OsString>) -> Result<Option<usize>> {
     }
 }
 
+/// `--config-dir` as an absolute path; it must name an existing folder.
+fn config_folder(raw: &Path) -> Result<PathBuf> {
+    let dir = std::fs::canonicalize(raw).map_err(|e| anyhow!("--config-dir {}: {e}", raw.display()))?;
+    if !dir.is_dir() {
+        bail!("--config-dir {}: not a folder", raw.display());
+    }
+    Ok(dir)
+}
+
+/// The env file of a config folder: `--env-file` resolved inside it, else its `.env`.
+/// It is then loaded as an explicit `--env-file`.
+fn config_env_file(env_file: Option<&Path>, dir: &Path) -> PathBuf {
+    dir.join(env_file.unwrap_or(Path::new(".env")))
+}
+
+/// Where onboard writes agent.toml: the -c path under --config-dir, where `agent` reads it,
+/// else beside the env file.
+fn onboard_agent_toml(config: &Path, env_file: &Path, in_config_dir: bool) -> PathBuf {
+    if in_config_dir {
+        return config.to_path_buf();
+    }
+    env_file.parent().unwrap_or(Path::new(".")).join("agent.toml")
+}
+
 /// An explicit `--env-file` overrides variables already set in the environment;
 /// the default `.env` search only fills in unset ones.
 fn load_env_file(path: Option<&Path>, onboarding: bool) -> Result<()> {
@@ -376,6 +429,17 @@ fn load_env_file(path: Option<&Path>, onboarding: bool) -> Result<()> {
     // SAFETY: first thing in main; no runtime or other thread has started yet
     let applied = unsafe { cloud_agent::env::apply_env_file(&body, overwrite) };
     applied.with_context(|| format!("Failed to load env file {}", file.display()))
+}
+
+/// The agent folder: the directory of the env file in use (`--env-file`, onboard's `.env`,
+/// else the one the search finds), else the current directory.
+fn agent_folder(env_file: Option<&Path>, onboarding: bool) -> Result<PathBuf> {
+    let file = match env_file {
+        Some(path) => Some(path.to_path_buf()),
+        None if onboarding => Some(PathBuf::from(".env")),
+        None => cloud_agent::env::find_dotenv()?,
+    };
+    agent_logic::agent_dir::of_env_file(file.as_deref())
 }
 
 /// Global flags passed through to the command.
@@ -403,6 +467,7 @@ struct OnboardArgs {
     agent_name: String,
     email: Option<String>,
     env_file: PathBuf,
+    agent_toml: PathBuf,
     poll_interval: u64,
 }
 
@@ -422,8 +487,8 @@ impl Job {
     async fn run(self) -> Result<()> {
         match self {
             Job::Onboard(args) => {
-                let OnboardArgs { target, party, key, invite_code, agent_name, email, env_file, poll_interval } = *args;
-                run_onboard(target, party, key, invite_code, agent_name, email, env_file, poll_interval).await
+                let OnboardArgs { target, party, key, invite_code, agent_name, email, env_file, agent_toml, poll_interval } = *args;
+                run_onboard(target, party, key, invite_code, agent_name, email, env_file, agent_toml, poll_interval).await
             }
             Job::NetworkInfo { grpc_url } => network_info_within(&grpc_url, NETWORK_INFO_BUDGET).await,
             Job::Controller(command, options) => cloud_agent::control::run_controller(*command, options).await,
@@ -488,6 +553,7 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
             agent_logic::errln!("{EMAIL_IGNORED}");
         }
         let env_file = cli.env_file.unwrap_or_else(|| PathBuf::from(".env"));
+        let agent_toml = onboard_agent_toml(&cli.config, &env_file, cli.config_dir.is_some());
         let party = party.or(top_party);
         let mut key = private_key.and_then(nonblank).map(Zeroizing::new).or(top_key);
         let env_set = |name: &str| read_env_value(&env_file, name).is_some_and(|v| !v.is_empty());
@@ -509,6 +575,7 @@ fn prepare(mut cli: Cli) -> Result<Option<Job>> {
             agent_name,
             email: email.and_then(nonblank),
             env_file,
+            agent_toml,
             poll_interval,
         }))));
     }
@@ -848,9 +915,11 @@ async fn dispatch(
             orders_only,
             no_restore,
             no_reject,
+            shutdown_timeout_secs,
         } => {
             let version_info = version_info();
-            run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm, Some(&version_info), env_file).await
+            let stop_timeout = shutdown_timeout_secs.map(Duration::from_secs);
+            run_cloud_agent(base_config, settlement_only, orders_only, no_restore, no_reject, verbose, dry_run, force, confirm, Some(&version_info), env_file, stop_timeout).await
         }
         Commands::Info { command } => run_info(base_config, command).await,
         Commands::Preapproval { command } => run_preapproval(base_config, command, verbose, dry_run, force, confirm).await,
@@ -1690,6 +1759,19 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_folder_is_the_env_files_directory_else_the_current_one() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join("agent-folder-probe");
+        assert_eq!(agent_folder(Some(&dir.join(".env")), false).unwrap(), dir);
+        assert_eq!(agent_folder(Some(Path::new("sub/agent.env")), true).unwrap(), cwd.join("sub"));
+        // onboard writes ./.env when no --env-file is given
+        assert_eq!(agent_folder(None, true).unwrap(), cwd);
+        let found = cloud_agent::env::find_dotenv().unwrap();
+        let expected = found.as_deref().and_then(Path::parent).map_or(cwd, Path::to_path_buf);
+        assert_eq!(agent_folder(None, false).unwrap(), expected);
+    }
+
+    #[test]
     fn onboard_picks_the_rpc_of_its_network_and_mainnet_by_default() {
         let mainnet = onboard_target(&[]).unwrap();
         assert_eq!((mainnet.rpc.as_str(), mainnet.network.as_deref()), (cloud_agent::MAINNET_RPC_URL, Some("mainnet")));
@@ -1716,6 +1798,70 @@ mod tests {
         let err = prepare(cli).err().unwrap();
         assert_eq!(err.to_string(), "testnet has no rpc yet");
         assert!(!dir.exists() && !env_file.exists(), "nothing is written");
+    }
+
+    #[test]
+    fn the_config_folder_flag_is_global() {
+        for args in [
+            vec!["--config-dir", "a", "agent"],
+            vec!["agent", "--config-dir", "a"],
+            vec!["info", "network", "--config-dir", "a"],
+            vec!["--config-dir=a", "onboard", "--agent-name", "x", "--invite-code", "i"],
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(cli.config_dir.as_deref(), Some(Path::new("a")), "{args:?}");
+        }
+        assert!(parse(&["agent"]).unwrap().config_dir.is_none());
+    }
+
+    #[test]
+    fn the_config_folder_must_be_an_existing_folder() {
+        let dir = std::env::temp_dir().join(format!("config-folder-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let found = config_folder(&dir).unwrap();
+        assert_eq!(found, std::fs::canonicalize(&dir).unwrap());
+        assert!(found.is_absolute());
+        let missing = dir.join("missing");
+        let err = config_folder(&missing).unwrap_err().to_string();
+        assert!(err.starts_with(&format!("--config-dir {}: ", missing.display())), "{err}");
+        assert!(err.len() > format!("--config-dir {}: ", missing.display()).len(), "the OS error is kept: {err}");
+        let err = config_folder(&file).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err, format!("--config-dir {}: not a folder", file.display()));
+    }
+
+    #[test]
+    fn the_env_file_of_a_config_folder_is_inside_it() {
+        let dir = Path::new("/agents/a");
+        assert_eq!(config_env_file(None, dir), Path::new("/agents/a/.env"));
+        assert_eq!(config_env_file(Some(Path::new("sub/x.env")), dir), Path::new("/agents/a/sub/x.env"));
+        assert_eq!(config_env_file(Some(Path::new("/other/x.env")), dir), Path::new("/other/x.env"));
+    }
+
+    // `agent` reads the -c path inside the folder, so onboard writes agent.toml there too
+    #[test]
+    fn onboarding_in_a_config_folder_writes_agent_toml_at_the_config_path() {
+        let env_file = Path::new("/agents/a/sub/agent.env");
+        assert_eq!(onboard_agent_toml(Path::new("agent.toml"), env_file, true), Path::new("agent.toml"));
+        assert_eq!(onboard_agent_toml(Path::new("custom.toml"), env_file, true), Path::new("custom.toml"));
+        // Without --config-dir it stays beside the env file
+        assert_eq!(onboard_agent_toml(Path::new("custom.toml"), env_file, false), Path::new("/agents/a/sub/agent.toml"));
+        assert_eq!(onboard_agent_toml(Path::new("agent.toml"), Path::new(".env"), false), Path::new("agent.toml"));
+    }
+
+    #[test]
+    fn the_agent_shutdown_timeout_is_bounded() {
+        assert!(refused(&["agent", "--shutdown-timeout-secs", "0"]));
+        assert!(refused(&["agent", "--shutdown-timeout-secs", "3601"]));
+        for (n, secs) in [("1", 1), ("120", 120), ("3600", 3600)] {
+            let cli = parse(&["agent", "--shutdown-timeout-secs", n]).unwrap();
+            assert!(matches!(cli.command, Commands::Agent { shutdown_timeout_secs: Some(s), .. } if s == secs), "{n}");
+        }
+        let default = parse(&["agent"]).unwrap();
+        assert!(matches!(default.command, Commands::Agent { shutdown_timeout_secs: None, .. }));
+        assert!(parse(&["buy", "--market", "M", "--amount", "1", "--shutdown-timeout-secs", "5"]).is_err(), "agent only");
     }
 
     #[test]

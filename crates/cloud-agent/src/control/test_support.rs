@@ -856,6 +856,7 @@ impl TestAgent {
             chain: Some("devnet".into()),
             marker: self.marker(),
             party: Some(self.config.party_id.clone()),
+            agent_dir: Some(self.base.clone()),
         }
     }
 
@@ -1175,9 +1176,12 @@ mod tests {
             assert!(out.contains(needle), "{needle}: {out}");
         }
         assert!(out.contains("swap_max_deviation_bps=100 swap_reference_max_age_secs=300;"), "{out}");
+        let store_line = format!("Store:        {}", agent.base.join("control").display());
+        assert!(out.contains(&store_line), "the store path is shown: {out}");
         let (result, out) = agent.run(ControlCommands::Show { json: true, offline: true }, &[]).await;
         result.unwrap();
         let view: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(view["storeDir"], agent.base.join("control").display().to_string());
         assert_eq!(view["settings"]["swapReferenceMaxAgeSecs"], 300);
         assert_eq!(view["partyFingerprint"], fingerprint.as_str());
         assert_eq!(view["head"]["seq"], 2);
@@ -1187,6 +1191,30 @@ mod tests {
         let (result, out) = agent.run(ControlCommands::Show { json: false, offline: false }, &[]).await;
         result.unwrap();
         assert!(out.contains("equal (seq 2)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn show_names_the_traffic_fee_pin_in_text_and_json() {
+        let rpc = FakeRpc::start().await;
+        let mut agent = TestAgent::new([0xa9; 32], &rpc, "show-traffic-fee");
+        let traffic_fee = format!("traffic-fee::1220{}", "d".repeat(64));
+        agent.config.party_traffic_fee = Some(traffic_fee.clone());
+        let (result, out) = agent.run(ControlCommands::Show { json: false, offline: true }, &[]).await;
+        result.unwrap();
+        assert!(out.contains(&format!("PARTY_PREPAID_TRAFFIC=unset PARTY_TRAFFIC_FEE={traffic_fee}")), "{out}");
+        let (result, out) = agent.run(ControlCommands::Show { json: true, offline: true }, &[]).await;
+        result.unwrap();
+        let view: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(view["platformParties"]["PARTY_TRAFFIC_FEE"], traffic_fee.as_str());
+        assert_eq!(view["platformParties"]["PARTY_FEE"], serde_json::Value::Null);
+        assert_eq!(view["settings"]["prepaidTrafficTopupTokens"], serde_json::json!(["CC"]));
+        // Unset while a token top-up is listed, the text says what is refused.
+        agent.config.party_traffic_fee = None;
+        agent.config.prepaid_traffic_topup_tokens = vec!["TUSDT".into(), "CC".into()];
+        let (result, out) = agent.run(ControlCommands::Show { json: false, offline: true }, &[]).await;
+        result.unwrap();
+        assert!(out.contains("PARTY_TRAFFIC_FEE=unset"), "{out}");
+        assert!(out.contains("top-ups paid in a token other than CC are refused"), "{out}");
     }
 
     #[tokio::test]

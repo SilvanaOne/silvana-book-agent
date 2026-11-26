@@ -1,5 +1,5 @@
-//! arbitrage: takes one agent level priced through the reference while the
-//! reference is fresh and stable.
+//! arbitrage: takes one agent level (or, with `take_lp`, the LP's) priced through
+//! the reference while the reference is fresh and stable.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -87,18 +87,24 @@ impl Decide for Arbitrage {
         if !v.inventory.usable || r.is_nan() || r <= 0.0 {
             return Decision::Take(None);
         }
-        let buy_edge = book.agent_ask.as_ref().map(|l| -bps(l.price, r));
-        let sell_edge = book.agent_bid.as_ref().map(|l| bps(l.price, r));
+        let (ask, bid) = if c.take_lp {
+            (book.best_ask(), book.best_bid())
+        } else {
+            (book.agent_ask.as_ref().map(|l| l.price), book.agent_bid.as_ref().map(|l| l.price))
+        };
+        let buy_edge = ask.map(|p| -bps(p, r));
+        let sell_edge = bid.map(|p| bps(p, r));
         self.edges = (buy_edge, sell_edge);
         if !self.stable || !v.can_take || v.activity.open_settlements >= self.max_inflight() {
             return Decision::Take(None);
         }
         // Past half the position limit only the reducing side trades
         let position = (v.inventory.base - v.start_base) * r;
-        let limit = c.max_position_usd;
+        let limit = v.in_quote(c.max_position_usd);
         let buy_room = if position > 0.5 * limit { 0.0 } else { limit - position };
         let sell_room = if position < -0.5 * limit { 0.0 } else { limit + position };
-        let worth = |edge: Option<f64>, room: f64| edge.filter(|e| *e >= c.min_edge_bps && room >= MIN_ORDER_USD);
+        let min_order = v.in_quote(MIN_ORDER_USD);
+        let worth = |edge: Option<f64>, room: f64| edge.filter(|e| *e >= c.min_edge_bps && room >= min_order);
         let (side, room) = match (worth(buy_edge, buy_room), worth(sell_edge, sell_room)) {
             (Some(b), Some(s)) if s > b => (OrderType::Offer, sell_room),
             (Some(_), _) => (OrderType::Bid, buy_room),
@@ -107,7 +113,7 @@ impl Decide for Arbitrage {
         };
         Decision::Take(Some(Want {
             side,
-            max_quantity: room.min(c.clip_usd_max) / r,
+            max_quantity: room.min(v.in_quote(c.clip_usd_max)) / r,
             // The edge doubles as the price bound: a buy must sit that far under the reference
             max_deviation_percent: -c.min_edge_bps / 100.0,
             tif: TakeTif::Ioc,
@@ -193,6 +199,18 @@ mod tests {
         moving.age(STABLE_AFTER);
         moving.observe(0.0016, Instant::now());
         assert_eq!(want(moving.decide(&view(Some(&book), 1e6, 1e6))).side, OrderType::Bid);
+    }
+
+    #[test]
+    fn with_take_lp_an_lp_level_past_the_edge_counts() {
+        // The LP offers 10 bps under the reference, and no agent quotes at all
+        let book = BookTop { lp_ask: Some(level(0.0016 * (1.0 - 0.001))), ..lp_book(0.0016) };
+        let mut a = watched(&[0.0016]);
+        assert_eq!(a.decide(&view(Some(&book), 1e6, 1e6)), Decision::Take(None));
+        let mut a = Arbitrage { cfg: ArbitrageConfig { take_lp: true, ..Default::default() }, ..watched(&[0.0016]) };
+        let w = want(a.decide(&view(Some(&book), 1e6, 1e6)));
+        assert_eq!((w.side, w.tif), (OrderType::Bid, TakeTif::Ioc));
+        assert!(a.status().contains("buy +10.0 bps"), "{}", a.status());
     }
 
     #[test]

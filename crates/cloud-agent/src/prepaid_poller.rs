@@ -39,6 +39,7 @@ where
     let work = async {
         let balance = fetch().await.map_err(|e| format!("{e:#}"))?;
         lm.update_prepaid(balance.available_cc, sent_at).await;
+        lm.set_orderbook_fee_discount_pct(balance.orderbook_fee_discount_pct).await;
         Ok(())
     };
     match supervise::bounded(shutdown, budget, work).await {
@@ -114,7 +115,20 @@ mod tests {
             available_cc: d,
             total_credited_cc: d,
             total_debited_cc: Decimal::ZERO,
+            orderbook_fee_discount_pct: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_poll_caches_the_order_book_fee_discount() {
+        let lm = lm();
+        let shutdown = Shutdown::new();
+        let discounted = PrepaidTrafficBalance { orderbook_fee_discount_pct: Some(Decimal::from(90)), ..balance("10") };
+        poll_once(|| async { Ok(discounted) }, &lm, &shutdown, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(lm.orderbook_fee_discount_pct().await, Some(Decimal::from(90)));
+        // A later poll without one is full price again
+        poll_once(|| async { Ok(balance("10")) }, &lm, &shutdown, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(lm.orderbook_fee_discount_pct().await, None);
     }
 
     fn lm() -> Arc<LiquidityManager> {

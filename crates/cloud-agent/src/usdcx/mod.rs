@@ -156,7 +156,7 @@ impl UsdcxCommands {
 pub struct UsdcxOptions {
     /// `mainnet` or `testnet`; defaults to the network of the configured synchronizer.
     pub network: Option<String>,
-    /// Base of the local state; defaults to `~/.silvana-agent/usdcx`.
+    /// Base of the local state; defaults to `<agent folder>/usdcx`.
     pub state_dir: Option<PathBuf>,
     /// Do not ask for confirmations.
     pub yes: bool,
@@ -281,11 +281,20 @@ pub async fn run_usdcx(
     }
     let net = network(&options, &config)?;
     let eth = EthNetwork::by_name(net.name)?;
-    let base = match options.state_dir.clone() {
-        Some(dir) => dir,
-        None => state::default_base()?,
+    let dir = match options.state_dir.clone() {
+        Some(base) => state::party_dir(&base, net.name, &config.party_id),
+        None => {
+            let folder = agent_logic::agent_dir::current()
+                .ok_or_else(|| anyhow!("the agent folder is unknown: pass --state-dir"))?;
+            let home = std::env::var_os("HOME");
+            state::settle_party_dir(
+                &state::default_base(&folder),
+                state::legacy_base(home.as_deref()).as_deref(),
+                net.name,
+                &config.party_id,
+            )?
+        }
     };
-    let dir = state::party_dir(&base, net.name, &config.party_id);
     let client = DAppProviderClient::new(
         &config.orderbook_grpc_url,
         &config.party_id,

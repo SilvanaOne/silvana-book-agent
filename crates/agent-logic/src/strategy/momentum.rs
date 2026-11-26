@@ -122,14 +122,14 @@ impl Decide for Momentum {
         if !v.inventory.usable || r.is_nan() || r <= 0.0 {
             return Decision::Take(None);
         }
-        let target = v.start_base + self.trend.sign() * c.max_position_usd / r;
+        let target = v.start_base + self.trend.sign() * v.in_quote(c.max_position_usd) / r;
         let gap = target - v.inventory.base;
-        if gap.abs() * r < MIN_ORDER_USD || !v.can_take || v.activity.open_settlements >= self.max_inflight() {
+        if gap.abs() * r < v.in_quote(MIN_ORDER_USD) || !v.can_take || v.activity.open_settlements >= self.max_inflight() {
             return Decision::Take(None);
         }
         Decision::Take(Some(Want {
             side: if gap > 0.0 { OrderType::Bid } else { OrderType::Offer },
-            max_quantity: gap.abs().min(c.clip_usd / r),
+            max_quantity: gap.abs().min(v.in_quote(c.clip_usd) / r),
             max_deviation_percent: c.max_slip_bps / 100.0,
             tif: TakeTif::Ioc,
         }))

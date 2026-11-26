@@ -819,9 +819,9 @@ fn install_or_existing(guard: Arc<ControlGuard>) -> Result<Arc<ControlGuard>> {
     Ok(guard)
 }
 
-/// The store of `public_key` on `network`: the `PARTY_AGENT` one when it is this key's.
+/// The store of `public_key` on `network` in the agent folder, moved there from an earlier
+/// version's location first: the `PARTY_AGENT` one when it is this key's.
 fn find_store(
-    base: &std::path::Path,
     network: agent_control::Network,
     public_key: &[u8; 32],
     env: &ControlEnv,
@@ -833,28 +833,37 @@ fn find_store(
         .filter(|p| verify_party_key(p, public_key));
     match party {
         Some(party) => {
-            let store = ControlStore::open(base, network, &party);
+            let store = ControlStore::locate(env, network, &party)?;
             Ok(store.exists().then_some(store))
         }
-        None => ControlStore::find(base, network, public_key),
+        None => Ok(ControlStore::locate_for_key(env, network, public_key)?.filter(ControlStore::exists)),
     }
 }
 
-/// Refuses when the control directory of `env` holds a store of `public_key` on any
-/// network: that agent is linked or linking, whatever this process's env says.
+/// Refuses when the agent folder of `env`, or an earlier version's location, holds a
+/// store of `public_key` on any network: that agent is linked or linking.
 fn refuse_with_control_store(public_key: &[u8; 32], env: &ControlEnv) -> Result<()> {
-    let Ok(base) = env.base() else {
-        return Ok(());
+    let refuse = |dir: &std::path::Path| {
+        anyhow!(
+            "signing refused: this key has a control store in {}; the sign command is \
+             refused for a linked agent",
+            dir.display()
+        )
     };
-    for network in [agent_control::Network::Devnet, agent_control::Network::Mainnet] {
-        let found = ControlStore::find(&base, network, public_key)
+    if let Ok(base) = env.base() {
+        let party = ControlStore::stored_party_in(&base)
             .context("signing refused: the control directory cannot be checked")?;
-        if let Some(store) = found.filter(ControlStore::exists) {
-            bail!(
-                "signing refused: this key has a control store in {}; the sign command is \
-                 refused for a linked agent",
-                store.dir().display()
-            );
+        if party.is_some_and(|party| verify_party_key(&party, public_key)) {
+            return Err(refuse(&base.join(crate::control_store::CONTROL_DIR)));
+        }
+    }
+    for network in [agent_control::Network::Devnet, agent_control::Network::Mainnet] {
+        if let Some(legacy) = env.legacy_base() {
+            let found = ControlStore::find_legacy(&legacy, network, public_key)
+                .context("signing refused: the control directory cannot be checked")?;
+            if let Some(store) = found.filter(ControlStore::exists) {
+                return Err(refuse(store.dir()));
+            }
         }
     }
     Ok(())
@@ -872,10 +881,10 @@ pub fn discover(public_key: [u8; 32], env: &ControlEnv) -> Result<ControlGuard> 
         let ChainNetwork::Mapped(network) = env.network() else {
             return Ok(ControlGuard::unlinked(public_key));
         };
-        let Ok(base) = env.base() else {
+        if env.base().is_err() {
             return Ok(ControlGuard::unlinked(public_key));
-        };
-        return match find_store(&base, network, &public_key, env)? {
+        }
+        return match find_store(network, &public_key, env)? {
             Some(store) if store.snapshot()?.is_some() => ControlGuard::load(store, public_key, None),
             _ => Ok(ControlGuard::unlinked(public_key)),
         };
@@ -895,7 +904,7 @@ pub fn discover(public_key: [u8; 32], env: &ControlEnv) -> Result<ControlGuard> 
         marker.network
     );
     let base = env.base().context("refusing to sign: no control directory")?;
-    let store = find_store(&base, network, &public_key, env)?.ok_or_else(|| {
+    let store = find_store(network, &public_key, env)?.ok_or_else(|| {
         anyhow!(
             "refusing to sign: this agent is linked ({MARKER_ENV}={marker}) but its control \
              store under {} is missing: run `cloud-agent control restore`",
@@ -1762,7 +1771,7 @@ mod tests {
         let other = JwtRequest { sub: "someone::1220ab", ..req };
         let err = unlinked.sign_control_jwt_for_head(&other, &store, &lock, &head).unwrap_err();
         assert!(err.to_string().contains("own party"), "{err}");
-        let foreign = ControlStore::open(&base, Network::Devnet, &party_for([0x64; 32], "agent-1").unwrap());
+        let foreign = ControlStore::open(&temp_base("foreign"), Network::Devnet, &party_for([0x64; 32], "agent-1").unwrap());
         let foreign_lock = foreign.lock().await.unwrap();
         let err = unlinked.sign_control_jwt_for_head(&req, &foreign, &foreign_lock, &head).unwrap_err();
         assert!(err.to_string().contains("another key"), "{err}");
@@ -1844,6 +1853,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_moves_an_earlier_versions_store_into_the_agent_folder() {
+        let seed = [0xe7; 32];
+        let party = party_for(seed, "agent-1").unwrap();
+        let root = temp_base("legacy");
+        let legacy = root.join("home/.silvana-agent/devnet").join(party.as_str().replace("::", "__"));
+        let old = ControlStore::open(&legacy, Network::Devnet, &party);
+        let chain = TestChain::build(seed, &party, Network::Devnet, 1).unwrap();
+        let lock = old.lock().await.unwrap();
+        old.append(&lock, &chain.entries, &[]).unwrap();
+        drop(lock);
+        let marker = crate::control_store::ControlMarker {
+            network: Network::Devnet,
+            head: HeadRef { seq: 1, hash: *chain.entries[0].hash() },
+        };
+        let env = ControlEnv {
+            home: Some(root.join("home").into_os_string()),
+            chain: Some("devnet".into()),
+            marker: Some(marker.to_string()),
+            party: Some(party.to_string()),
+            agent_dir: Some(root.join("agent")),
+            ..ControlEnv::default()
+        };
+        // The sign command checks the old location too, before anything moved.
+        let unlinked = signer_with(seed, ControlGuard::unlinked(public(seed)));
+        let err = unlinked.sign_raw_cli_with(b"hello", &env).unwrap_err().to_string();
+        assert!(err.contains(&*old.dir().to_string_lossy()), "{err}");
+        assert!(!root.join("agent/control").exists());
+        assert!(resolve_with(&Secret::seal(&mut { seed }).unwrap(), &env).unwrap().guard().is_linked());
+        assert!(root.join("agent/control").join(crate::control_store::LOG_FILE).exists());
+        assert!(old.dir().join(crate::control_store::LOG_FILE).exists(), "the old store stays");
+        let err = unlinked.sign_raw_cli_with(b"hello", &env).unwrap_err().to_string();
+        assert!(err.contains("refused for a linked agent"), "{err}");
+    }
+
+    #[tokio::test]
     async fn discovery_follows_the_linked_marker() {
         let env_for = |base: &std::path::Path, store: &ControlStore, marker: Option<String>| ControlEnv {
             control_dir: Some(base.as_os_str().to_owned()),
@@ -1851,6 +1895,7 @@ mod tests {
             chain: Some("devnet".into()),
             marker,
             party: Some(store.party().to_string()),
+            agent_dir: None,
         };
         let marker_of = |chain: &TestChain| ControlMarker { network: Network::Devnet, head: chain.state.head().unwrap() }.to_string();
         let key_of = |seed: [u8; 32]| Secret::seal(&mut { seed }).unwrap();
