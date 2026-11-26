@@ -33,8 +33,7 @@ pub fn init_logging(verbose: bool, crate_names: &[&str], default_log_prefix: &st
         })
     };
 
-    let log_dest = std::env::var("LOG_DESTINATION").unwrap_or_else(|_| "console".to_string());
-    let installed = if log_dest.eq_ignore_ascii_case("file") {
+    let installed = if logs_to_file() {
         let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
         let log_prefix = std::env::var("LOG_FILE_PREFIX")
             .unwrap_or_else(|_| default_log_prefix.to_string());
@@ -55,6 +54,11 @@ pub fn init_logging(verbose: bool, crate_names: &[&str], default_log_prefix: &st
         tracing::warn!("logging was already initialised; keeping the existing subscriber: {e}");
     }
     Ok(())
+}
+
+/// Whether LOG_DESTINATION=file sends the logs to a file; otherwise they go to stdout.
+pub fn logs_to_file() -> bool {
+    std::env::var("LOG_DESTINATION").is_ok_and(|d| d.eq_ignore_ascii_case("file"))
 }
 
 /// Daily-rotated appender for `<dir>/<prefix>.<date>`, creating `dir` if needed.

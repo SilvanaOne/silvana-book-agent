@@ -16,8 +16,9 @@ Linking is optional: an agent that was never linked behaves as before.
 ## Before you start
 
 - `CANTON_CHAIN` must be `devnet` or `mainnet`. Control commands refuse any other value.
-- The agent's `.env` must be known (the one in the working directory, or `--env-file`). The agent
-  records the head of its control log there as `AGENT_CONTROL_HEAD=<network>:<seq>:<hash>`.
+- The agent's `.env` must be known (the one in the working directory, `--config-dir <DIR>`, or
+  `--env-file`). The agent records the head of its control log there as
+  `AGENT_CONTROL_HEAD=<network>:<seq>:<hash>`.
 - The agent keeps its control store in `control/` in its agent folder, the directory of its `.env`
   (see [Where the state lives](#where-the-state-lives)). Keep that folder on persistent storage.
 - The machine's clock must be within 60 seconds of the rpc's. The agent refuses to sign a control
@@ -25,9 +26,9 @@ Linking is optional: an agent that was never linked behaves as before.
 
 ## Where the state lives
 
-The **agent folder** is the directory of the env file the agent loads: `--env-file`, else the
-`.env` found in the working directory or its nearest parent; with no env file it is the working
-directory. Onboarding writes `./.env`, or the `--env-file` it is given, so the folder is set from
+The **agent folder** is the directory of the env file the agent loads: `--env-file`, else
+`DIR/.env` under `--config-dir DIR`, else the `.env` found in the working directory or its nearest
+parent; with no env file it is the working directory. Onboarding writes `./.env`, or the `--env-file` it is given, so the folder is set from
 the start. An env file that is a symlink belongs to the folder of its target, where the marker is
 written.
 

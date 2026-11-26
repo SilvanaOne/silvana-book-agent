@@ -1086,6 +1086,7 @@ message EstimateSettlementFeesRequest {
   string market_id = 1;
   string base_quantity = 2;               // DECIMAL as string
   string price = 3;                       // DECIMAL as string
+  bool order_book = 4;                    // true = fees for an order-book order (not an RFQ)
 }
 
 message EstimateSettlementFeesResponse {

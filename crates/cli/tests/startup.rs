@@ -170,6 +170,98 @@ fn the_default_env_file_expands_the_value_it_kept() {
     assert!(err.contains("127.0.0.1:1") && !err.contains("127.0.0.1:2"), "{err}");
 }
 
+/// A new empty folder under the temp dir.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cli-startup-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn the_config_folder_env_file_overrides_set_variables() {
+    let dir = scratch_dir("config-dir-env");
+    std::fs::write(dir.join(".env"), "ORDERBOOK_GRPC_URL=http://127.0.0.1:1\n").unwrap();
+    let shell = [("ORDERBOOK_GRPC_URL", "http://127.0.0.1:2")];
+    let (out, _) = run_in(&std::env::temp_dir(), &shell, &["--config-dir", dir.to_str().unwrap(), "info", "network"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = stderr(&out);
+    assert!(err.contains("127.0.0.1:1") && !err.contains("127.0.0.1:2"), "the folder's .env wins: {err}");
+}
+
+#[test]
+fn a_config_folder_without_an_env_file_does_not_search_its_parents() {
+    let parent = scratch_dir("config-dir-parent");
+    std::fs::write(parent.join(".env"), "ORDERBOOK_GRPC_URL=http://127.0.0.1:1\n").unwrap();
+    std::fs::create_dir_all(parent.join("agent")).unwrap();
+    let (out, _) = run_in(&parent, &[], &["--config-dir", "agent", "info", "network"]);
+    let _ = std::fs::remove_dir_all(&parent);
+    assert_clean_failure(&out, "env file not found");
+    assert!(stderr(&out).contains(".env") && !stderr(&out).contains("127.0.0.1:1"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_missing_config_folder_stops_startup() {
+    let (out, _) = cloud_agent(&["--config-dir", "/nonexistent/cli-startup-agent", "generate-private-key"]);
+    assert_clean_failure(&out, "--config-dir /nonexistent/cli-startup-agent: ");
+    assert!(out.stdout.is_empty(), "no key is printed");
+    let file = env_file("config-dir-file", "");
+    let (out, _) = cloud_agent(&["--config-dir", file.to_str().unwrap(), "generate-private-key"]);
+    let _ = std::fs::remove_file(&file);
+    assert_clean_failure(&out, "not a folder");
+}
+
+#[test]
+fn relative_paths_resolve_in_the_config_folder() {
+    let dir = scratch_dir("config-dir-paths");
+    let folder = dir.to_str().unwrap();
+    std::fs::write(dir.join(".env"), "LOG_DESTINATION=file\n").unwrap();
+    let (out, _) = run_in(&std::env::temp_dir(), &[], &["--config-dir", folder, "generate-private-key"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let logs: Vec<String> = std::fs::read_dir(dir.join("logs"))
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(logs.iter().any(|n| n.starts_with("cloud-agent.")), "logs go to the folder: {logs:?}");
+
+    // -c is read inside the folder: a malformed file there fails to parse
+    std::fs::write(dir.join("custom.toml"), "not toml [\n").unwrap();
+    let (out, _) = run_in(&std::env::temp_dir(), &[], &["--config-dir", folder, "-c", "custom.toml", "agent"]);
+    assert_clean_failure(&out, "Failed to parse custom.toml");
+
+    // --env-file is read inside the folder and replaces its .env
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("agent.env"), "ORDERBOOK_GRPC_URL=http://127.0.0.1:1\n").unwrap();
+    let (out, _) = run_in(&std::env::temp_dir(), &[], &["--config-dir", folder, "--env-file", "sub/agent.env", "info", "network"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(stderr(&out).contains("127.0.0.1:1"), "{}", stderr(&out));
+}
+
+// Console logs share stdout, so the folder notice goes to stderr and the keys can go to a file
+#[test]
+fn the_config_folder_notice_stays_off_stdout() {
+    let dir = scratch_dir("config-dir-stdout");
+    std::fs::write(dir.join(".env"), "FOO=bar\n").unwrap();
+    let (out, _) = run_in(&std::env::temp_dir(), &[], &["--config-dir", dir.to_str().unwrap(), "generate-private-key"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let names: Vec<&str> = stdout.lines().map(|l| l.split_once('=').map_or(l, |(name, _)| name)).collect();
+    assert_eq!(names, ["PARTY_AGENT_PRIVATE_KEY", "PARTY_AGENT_PUBLIC_KEY"]);
+    assert!(err.contains("Config folder: "), "{err}");
+}
+
+#[test]
+fn onboarding_into_a_config_folder_refuses_testnet_before_writing() {
+    let dir = scratch_dir("config-dir-onboard");
+    let args = ["--config-dir", dir.to_str().unwrap(), "onboard", "--network", "testnet", "--agent-name", "a", "--invite-code", "i"];
+    let (out, _) = run_in(&std::env::temp_dir(), &[], &args);
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_clean_failure(&out, "testnet has no rpc yet");
+    assert!(left.is_empty(), "nothing is written: {left:?}");
+}
+
 /// An env file with a full agent identity, plus `extra`.
 fn agent_env(name: &str, extra: &str) -> PathBuf {
     let (keys, _) = cloud_agent(&["generate-private-key"]);

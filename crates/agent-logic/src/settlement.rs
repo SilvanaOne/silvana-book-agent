@@ -109,6 +109,9 @@ const HOLD_MAX: Duration = Duration::from_secs(300);
 /// Bound on waiting for in-flight settlement tasks at shutdown; the rest are aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Bound on collecting the drained tasks' results at shutdown.
+const COLLECT_AT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A settlement step still running after this long is logged; it is never cut short.
 #[cfg(not(test))]
 const STEP_SLOW_AFTER: Duration = Duration::from_secs(300);
@@ -2245,24 +2248,44 @@ impl<B: SettlementBackend + 'static> SettlementExecutor<B> {
 
     /// Drain all in-progress tasks (for graceful shutdown)
     pub async fn drain_tasks(&mut self) -> usize {
-        self.drain_tasks_within(DRAIN_TIMEOUT).await
+        self.drain_tasks_until(std::future::pending()).await
     }
 
-    /// Wait up to `limit` for in-progress tasks, then abort the ones still running.
-    async fn drain_tasks_within(&mut self, limit: Duration) -> usize {
+    /// [`Self::drain_tasks`] that also ends when `stop` resolves.
+    pub async fn drain_tasks_until(&mut self, stop: impl std::future::Future<Output = ()>) -> usize {
+        self.drain_tasks_within(DRAIN_TIMEOUT, stop).await
+    }
+
+    /// Wait up to `limit`, or until `stop`, for in-progress tasks, then abort the ones still running.
+    async fn drain_tasks_within(&mut self, limit: Duration, stop: impl std::future::Future<Output = ()>) -> usize {
         let handles: Vec<_> = self.task_handles.drain(..).collect();
         let count = handles.len();
         if count > 0 {
             info!("Waiting for {} in-progress settlement task(s)...", count);
+            let started = Instant::now();
             let aborts: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
-            if tokio::time::timeout(limit, join_all(handles)).await.is_err() {
+            let ended = tokio::select! {
+                biased;
+                joined = tokio::time::timeout(limit, join_all(handles)) => joined.is_err().then_some("drain bound reached"),
+                () = stop => Some("stop window ended"),
+            };
+            if let Some(why) = ended {
                 let left = aborts.iter().filter(|a| !a.is_finished()).count();
-                warn!("{} settlement task(s) still running after {}s; aborting them", left, limit.as_secs());
+                warn!(
+                    "{} settlement task(s) still running after {}s ({}); aborting them",
+                    left, started.elapsed().as_secs(), why,
+                );
                 for a in &aborts {
                     a.abort();
                 }
             }
-            self.collect_results().await;
+            info!("Settlement task drain ended after {}ms", started.elapsed().as_millis());
+            if tokio::time::timeout(COLLECT_AT_DRAIN_TIMEOUT, self.collect_results()).await.is_err() {
+                warn!(
+                    "Collecting settlement results still running after {}s; not waiting for the rest",
+                    COLLECT_AT_DRAIN_TIMEOUT.as_secs()
+                );
+            }
         }
         count
     }
@@ -5375,7 +5398,7 @@ mod tests {
         }));
         exec.task_handles.push(tokio::spawn(async {}));
         let started = Instant::now();
-        assert_eq!(exec.drain_tasks_within(Duration::from_millis(100)).await, 2);
+        assert_eq!(exec.drain_tasks_within(Duration::from_millis(100), std::future::pending()).await, 2);
         assert!(started.elapsed() < Duration::from_secs(5));
         for _ in 0..100 {
             if dropped.load(Ordering::SeqCst) {
@@ -5385,6 +5408,37 @@ mod tests {
         }
         assert!(dropped.load(Ordering::SeqCst), "the stuck task must be aborted");
         assert!(exec.task_handles.is_empty());
+    }
+
+    // A drain ends when its stop future resolves, well before the drain bound
+    #[tokio::test]
+    async fn a_drain_ends_when_its_stop_resolves() {
+        let mut exec = plain_executor(&BaseConfig::test_minimal().unwrap()).unwrap();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        exec.task_handles.extend(try_spawn("stuck", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        }));
+        let started = Instant::now();
+        let drained = exec.drain_tasks_until(tokio::time::sleep(Duration::from_millis(100))).await;
+        assert_eq!(drained, 1);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(95) && took < Duration::from_secs(5), "{took:?}");
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(dropped.load(Ordering::SeqCst), "the task still running must be aborted");
+        assert!(exec.task_handles.is_empty());
+
+        // Tasks that finish first end the drain; the stop is not waited for
+        exec.task_handles.extend(try_spawn("done", async {}));
+        let started = Instant::now();
+        assert_eq!(exec.drain_tasks_until(std::future::pending()).await, 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // Outside a runtime these spawns are skipped instead of panicking

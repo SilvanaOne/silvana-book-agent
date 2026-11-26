@@ -45,6 +45,8 @@ const MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Most pages one `get_instruments` listing fetches.
 const MAX_INSTRUMENT_PAGES: usize = 100;
+/// Most pages one `get_markets` listing fetches.
+const MAX_MARKET_PAGES: usize = 10;
 /// Most pages one `get_pending_proposals` listing fetches.
 const MAX_PROPOSAL_PAGES: usize = 200;
 /// Most pages one `get_settlements` listing fetches.
@@ -179,20 +181,28 @@ impl OrderbookClient {
 
     /// Get all active markets (includes tick_size)
     pub async fn get_markets(&mut self) -> Result<Vec<Market>> {
-        let request = Request::new(GetMarketsRequest {
-            market_type: None,
-            base_instrument: None,
-            quote_instrument: None,
-            active_only: Some(true),
-            limit: None,
-            offset: None,
-        });
-
-        let response = within(self.deadline, self.orderbook_client.get_markets(request))
-            .await
-            .map_err(|e| anyhow::anyhow!("get_markets failed: {}", e.message()))?;
-
-        Ok(response.into_inner().markets)
+        // The server defaults to 50 per page and caps a request at 1000
+        let client = self.orderbook_client.clone();
+        let deadline = self.deadline;
+        collect_pages("get_markets", MAX_MARKET_PAGES, move |offset| {
+            let mut client = client.clone();
+            async move {
+                let request = Request::new(GetMarketsRequest {
+                    market_type: None,
+                    base_instrument: None,
+                    quote_instrument: None,
+                    active_only: Some(true),
+                    limit: Some(1000),
+                    offset: Some(offset),
+                });
+                let response = within(deadline, client.get_markets(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_markets failed: {}", e.message()))?
+                    .into_inner();
+                Ok(Page { total: response.total, ends: false, items: response.markets })
+            }
+        })
+        .await
     }
 
     /// Get all instruments (includes registry for DVP term verification).
@@ -811,6 +821,8 @@ mod tests {
         assert!(err.to_string().contains("client deadline"), "{err}");
         let err = tokio::time::timeout(bound, client.get_instruments()).await.unwrap().unwrap_err();
         assert!(err.to_string().contains("client deadline"), "{err}");
+        let err = tokio::time::timeout(bound, client.get_markets()).await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("get_markets failed: client deadline"), "{err}");
         let submit = client.submit_order("CC-USDCx", OrderType::Bid, "1".into(), "1".into(), None, None, Vec::new(), 1);
         let err = tokio::time::timeout(bound, submit).await.unwrap().unwrap_err();
         assert!(crate::order_manager::submit_outcome_unknown(&err), "a timed-out submit may have been booked");

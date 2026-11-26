@@ -264,6 +264,40 @@ pub(crate) mod tests {
         2000.0 / CC_USD / 13.4
     }
 
+    /// cETH at $1700 a unit.
+    pub(crate) const CETH_USD: f64 = 1700.0;
+    pub(crate) const CETH_REF: f64 = 0.0000055;
+
+    /// EDELx-cETH at 0.0000055 cETH an EDELx, $2000 on each side unless set otherwise.
+    pub(crate) fn ceth_view<'a>(book: Option<&'a BookTop>, base: f64, start_base: f64) -> MarketView<'a> {
+        let mut v = view(book, base, start_base);
+        (v.reference, v.tick, v.lot_exp) = (CETH_REF, 1e-10, super::super::sizing::lot_exp_usd(CETH_REF, CETH_USD));
+        (v.floor_value, v.quote_usd) = (10.0 / CETH_USD, CETH_USD);
+        (v.inventory.quote, v.inventory.quote_avail) = (2000.0 / CETH_USD, 2000.0 / CETH_USD);
+        v
+    }
+
+    pub(crate) fn ceth_flat_base() -> f64 {
+        2000.0 / CETH_USD / CETH_REF
+    }
+
+    #[test]
+    fn a_ceth_quoted_maker_sizes_its_rungs_and_limits_in_usd() {
+        let book = lp_book(CETH_REF);
+        let base = ceth_flat_base();
+        let ladder = rest(MarketMaker::new(MarketMakerConfig::default()).decide(&ceth_view(Some(&book), base, base)));
+        assert_eq!((ladder.bids.len(), ladder.offers.len()), (2, 2), "{ladder:?}");
+        let usd = |r: &Rung| r.level.quantity.parse::<f64>().unwrap() * CETH_REF * CETH_USD;
+        // $40 then $60 a rung, within one 100 EDELx lot
+        for side in [&ladder.bids, &ladder.offers] {
+            assert!((usd(&side[0]) - 40.0).abs() < 1.0 && (usd(&side[1]) - 60.0).abs() < 1.0, "{side:?}");
+        }
+        let long = ceth_view(Some(&book), base + 225.0 / CETH_USD / CETH_REF, base);
+        let long = rest(MarketMaker::new(MarketMakerConfig::default()).decide(&long));
+        assert_eq!(long.bids.len(), 1, "{long:?}");
+        assert!((usd(&long.bids[0]) - 15.0).abs() < 1.0, "{long:?}");
+    }
+
     #[test]
     fn a_cc_quoted_maker_sizes_its_rungs_and_limits_in_usd() {
         let book = lp_book(13.4);

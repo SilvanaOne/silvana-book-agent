@@ -145,7 +145,7 @@ impl Decide for Rebalancer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::maker::tests::{cc_flat_base, cc_view, lp_book, view, CC_USD};
+    use super::super::maker::tests::{cc_flat_base, cc_view, ceth_flat_base, ceth_view, lp_book, view, CC_USD, CETH_REF, CETH_USD};
     use super::*;
 
     fn cfg(target: f64, mode: StrategyMode) -> RebalancerConfig {
@@ -200,6 +200,26 @@ mod tests {
         assert_eq!(rb.decide(&v), Decision::Take(None));
         v.usd_last_hour = 580.0 / CC_USD;
         assert!((want(rb.decide(&v)).max_quantity * 13.4 - 13.0 / CC_USD).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_ceth_quoted_clip_budget_and_resting_clip_are_usd() {
+        let clip = |mode| RebalancerConfig { clip_usd: 13.0, ..cfg(0.25, mode) };
+        let mut rb = Rebalancer::new(clip(StrategyMode::Taker));
+        let base = ceth_flat_base();
+        let w = want(rb.decide(&ceth_view(None, base, base)));
+        assert_eq!(w.side, OrderType::Offer);
+        assert!((w.max_quantity * CETH_REF * CETH_USD - 13.0).abs() < 1e-9, "{}", w.max_quantity);
+        let mut v = ceth_view(None, base, base);
+        v.usd_last_hour = 590.0 / CETH_USD;
+        assert_eq!(rb.decide(&v), Decision::Take(None));
+        // A resting clip is whole 100 EDELx lots, so within $1 of the clip
+        let book = lp_book(CETH_REF);
+        let mut maker = Rebalancer::new(clip(StrategyMode::Maker));
+        let Decision::Rest(ladder) = maker.decide(&ceth_view(Some(&book), base, base)) else { panic!("a clip") };
+        assert!(ladder.bids.is_empty() && ladder.offers.len() == 1, "{ladder:?}");
+        let usd = ladder.offers[0].level.quantity.parse::<f64>().unwrap() * CETH_REF * CETH_USD;
+        assert!((13.0..14.0).contains(&usd), "{ladder:?}");
     }
 
     #[test]

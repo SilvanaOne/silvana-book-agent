@@ -557,12 +557,6 @@ fn validate_one(check: &Check<'_>, market: &MarketConfig, strategy: &StrategyCon
             config.liquidity_provider.is_none(),
             "cannot run on an agent with [liquidity_provider]",
         )?;
-        // Amounts named `_usd` are converted to the quote at its USD rate
-        let quote = market.market_id.split_once('-').map_or("", |(_, q)| q);
-        check.rule(
-            super::quote_usd(&market.market_id, config.cc_token_id.as_deref(), None) != super::QuoteUsd::Unpriced,
-            format_args!("needs a quote with a USD rate (a USD stable or CC); '{quote}' has no USD rate"),
-        )?;
     }
     if let Some(common) = strategy.common() {
         check.common(common)?;
@@ -1003,17 +997,24 @@ mod tests {
     }
 
     #[test]
-    fn a_strategy_needs_a_quote_with_a_usd_rate() {
+    fn a_strategy_runs_on_any_quote_with_the_other_rules_kept() {
         let noise = || StrategyConfig::NoiseTaker(NoiseTakerConfig::default());
-        for id in ["HECTO-cETH", "TUSDT-HECTO"] {
-            let e = err(validate_with(market(id), noise()));
-            assert!(e.contains("no USD rate"), "{e}");
-        }
-        for id in ["TUSDT-CC", "cETH-TUSDT", "CC-USDCx", "X-usd8", "HTEST-USDC", "A-tf-usdt"] {
+        let quotes = ["HECTO-cETH", "TUSDT-HECTO", "EDELx-cETH", "CC-CBTC", "TUSDT-CC", "cETH-TUSDT", "X-usd8", "A-tf-usdt"];
+        for id in quotes {
             validate_with(market(id), noise()).unwrap();
+            validate_with(market(id), StrategyConfig::MarketMaker(MarketMakerConfig::default())).unwrap();
         }
-        // The grid has no USD amounts
-        validate_with(market("HECTO-cETH"), StrategyConfig::Grid(GridParams {})).unwrap();
+        for id in ["HECTO-cETH", "TUSDT-HECTO", "EDELx-cETH", "CC-CBTC"] {
+            let mut m = market(id);
+            m.offer_levels = vec![PriceLevel { delta_percent: 0.5, quantity: "10".into() }];
+            assert!(err(validate_with(m.clone(), noise())).contains("bid_levels/offer_levels"), "{id}");
+            validate_with(m, StrategyConfig::Grid(GridParams {})).unwrap();
+            let mut config = BaseConfig::test_minimal().unwrap();
+            config.markets = vec![market(id)];
+            config.strategies.insert(id.into(), noise());
+            config.liquidity_provider = Some(toml::from_str("name = \"lp\"").unwrap());
+            assert!(err(config.validate_ranges()).contains("[liquidity_provider]"), "{id}");
+        }
     }
 
     #[test]

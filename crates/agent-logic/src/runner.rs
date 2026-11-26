@@ -30,7 +30,7 @@ use crate::order_tracker::OrderTracker;
 use crate::settlement::{
     SettlementBackend, SettlementExecutor, STREAM_BATCH_BUDGET, STREAM_BATCH_MAX,
 };
-use crate::shutdown::Shutdown;
+use crate::shutdown::{Shutdown, StopWindow};
 use crate::state::{
     SavedAcceptedRfqTrade, SavedFillState, SavedQuotedTrade, SavedState, delete_state, load_state,
     prune_state, save_backup, save_state,
@@ -39,6 +39,15 @@ use crate::state::{
 /// Bound on joining the grid task, or the order sweep after it exits, at
 /// shutdown; covers an in-flight cancel and submit chain.
 const GRID_STOP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Least time the order sweep after the grid stop gets, even once the stop window has ended.
+const GRID_STOP_FLOOR: Duration = Duration::from_secs(30);
+
+/// Delay of the forced exit a second Ctrl-C arms.
+const FORCED_EXIT_DELAY: Duration = Duration::from_secs(45);
+
+/// Bound on taking one shared lock while saving state once the stop window has ended.
+const SHUTDOWN_LOCK_LIMIT_AFTER_WINDOW: Duration = Duration::from_secs(2);
 
 /// Party-wide order fetches per sweep, confirming fetches included.
 const PARTY_CANCEL_ROUNDS: usize = 5;
@@ -391,32 +400,61 @@ async fn clear_party_orders<C: PartyOrders + ?Sized>(client: &mut C, limit: Dura
     }
 }
 
-/// Stop the grid task, then withdraw the whole party's book in one bounded
-/// sweep. A task that does not return in time is aborted first.
-async fn stop_grid<G, C: PartyOrders + ?Sized>(
-    handle: Option<JoinHandle<G>>,
-    client: &mut C,
-    tracker: &Arc<Mutex<OrderTracker>>,
-    limit: Duration,
-) {
-    let Some(handle) = handle else { return };
-    let _ = join_grid(handle, limit).await;
-    withdraw_all(client, tracker, limit).await;
+/// Join a running grid task (aborted past `limit`), or the sweep its exit started; true while
+/// the party's book is still to be withdrawn. At most one handle is set.
+async fn join_grid_stop<G>(grid: Option<JoinHandle<G>>, sweep: Option<GridSweep>, limit: Duration) -> bool {
+    let mut withdraw = false;
+    if let Some(handle) = grid {
+        let _ = join_grid(handle, limit).await;
+        withdraw = true;
+    }
+    if let Some(sweep) = sweep {
+        withdraw |= !join_sweep(sweep, limit).await;
+    }
+    withdraw
 }
 
-/// Shutdown: stop a running grid task, or wait for the sweep its exit started
-/// and redo that sweep here if it did not finish. At most one handle is set.
-async fn finish_grid<G, C: PartyOrders + ?Sized>(
+/// Shutdown: join the grid task or the sweep its exit started, then withdraw the party's book unless
+/// that sweep did. A join is aborted once `ended()` resolves; the withdrawal runs until then, at least `floor`.
+async fn finish_grid_until<G, C, E>(
     grid: Option<JoinHandle<G>>,
     sweep: Option<GridSweep>,
     client: &mut C,
     tracker: &Arc<Mutex<OrderTracker>>,
     limit: Duration,
-) {
-    stop_grid(grid, client, tracker, limit).await;
-    let Some(sweep) = sweep else { return };
-    if !join_sweep(sweep, limit).await {
-        withdraw_all(client, tracker, limit).await;
+    ended: impl Fn() -> E,
+    floor: Duration,
+) where
+    C: PartyOrders + ?Sized,
+    E: Future<Output = ()>,
+{
+    let mut aborts: Vec<tokio::task::AbortHandle> = grid.iter().map(JoinHandle::abort_handle).collect();
+    if let Some(GridSweep::Running(handle)) = &sweep {
+        aborts.push(handle.abort_handle());
+    }
+    let withdraw = tokio::select! {
+        biased;
+        withdraw = join_grid_stop(grid, sweep, limit) => withdraw,
+        () = ended() => {
+            for a in &aborts {
+                a.abort();
+            }
+            warn!("Grid stop cut off by the stop window; cancelling orders");
+            true
+        }
+    };
+    if !withdraw {
+        return;
+    }
+    let sweep_bound = async {
+        tokio::join!(ended(), tokio::time::sleep(floor));
+    };
+    tokio::select! {
+        biased;
+        () = withdraw_all(client, tracker, limit) => {}
+        () = sweep_bound => {
+            warn!("Order cancellation cut off by the stop window; orders may stay live until the next start, which cancels them");
+        }
     }
 }
 
@@ -687,6 +725,8 @@ pub struct AgentOptions {
     /// LP: trailing net tracker, wired into the OrderManager for grid shaping
     /// and checkpointed from the heartbeat. Load/save is the caller's job.
     pub net_positions: Option<Arc<crate::net_position::NetPositionTracker>>,
+    /// Longest stop from its first signal; steps still running then are dropped. `None`: no limit.
+    pub stop_timeout: Option<Duration>,
 }
 
 /// Run the agent event loop
@@ -797,32 +837,91 @@ pub(crate) fn spawn_balance_poller(
     }))
 }
 
-/// First Ctrl-C signals shutdown, a second calls `force_exit`. A signal
-/// listener that fails is logged and treated as no signal.
-async fn watch_ctrl_c<S, Fut>(
-    mut next_signal: S,
+/// First Ctrl-C signals shutdown and begins the stop window, a second cuts it short and calls
+/// `arm_exit`, a third calls `exit_now`; a listener that fails is logged and is no signal.
+async fn watch_ctrl_c<S>(
+    signals: S,
     shutdown: Shutdown,
     lp_shutdown: Option<Shutdown>,
-    force_exit: impl FnOnce(),
+    window: StopWindow,
+    arm_exit: impl FnOnce(),
+    exit_now: impl FnOnce(),
 ) where
-    S: FnMut() -> Fut,
-    Fut: Future<Output = std::io::Result<()>>,
+    S: tokio_stream::Stream<Item = std::io::Result<()>>,
 {
-    if let Err(e) = next_signal().await {
-        warn!("Ctrl-C handler unavailable: {}", e);
+    let mut signals = std::pin::pin!(signals);
+    if !next_ctrl_c(&mut signals).await {
         return;
     }
     warn!("Ctrl-C received, shutting down gracefully...");
+    window.begin();
     shutdown.signal();
     if let Some(ref lp) = lp_shutdown {
         lp.signal();
     }
-    match next_signal().await {
-        Ok(()) => {
-            warn!("Second Ctrl-C received, forcing immediate shutdown");
-            force_exit();
+    if !next_ctrl_c(&mut signals).await {
+        return;
+    }
+    warn!("Second Ctrl-C received: cutting the stop short and saving state; a third exits at once");
+    window.cut_short();
+    arm_exit();
+    if next_ctrl_c(&mut signals).await {
+        warn!("Third Ctrl-C received, forcing immediate shutdown");
+        exit_now();
+    }
+}
+
+/// True on the next Ctrl-C; a listener that fails or ends gives false.
+async fn next_ctrl_c<S>(signals: &mut std::pin::Pin<&mut S>) -> bool
+where
+    S: tokio_stream::Stream<Item = std::io::Result<()>>,
+{
+    match signals.next().await {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            warn!("Ctrl-C handler unavailable: {}", e);
+            false
         }
-        Err(e) => warn!("Ctrl-C handler unavailable: {}", e),
+        None => false,
+    }
+}
+
+/// Every Ctrl-C the process receives.
+fn ctrl_c_signals() -> impl tokio_stream::Stream<Item = std::io::Result<()>> {
+    futures::stream::unfold((), |()| async { Some((signal::ctrl_c().await, ())) })
+}
+
+/// Run `exit` after `delay` on a plain thread, which a stuck runtime cannot hold up;
+/// at once when that thread cannot start.
+fn arm_forced_exit(delay: Duration, exit: impl Fn() + Clone + Send + 'static) {
+    let fallback = exit.clone();
+    let armed = std::thread::Builder::new()
+        .name("forced-exit".to_string())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            warn!("Stop still running {}s after the second Ctrl-C; exiting", delay.as_secs());
+            exit();
+        });
+    if let Err(e) = armed {
+        warn!("Cannot arm the forced exit ({}); exiting now", e);
+        fallback();
+    }
+}
+
+/// Run `work` until the stop window ends; `None` when the window cut it off.
+async fn until_window_ends<F: Future>(work: F, window: &StopWindow, stop: &Shutdown) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        out = work => Some(out),
+        () = window.ended(stop) => None,
+    }
+}
+
+/// Per-lock bound of the state snapshot: shorter once the stop window has ended.
+fn snapshot_lock_limit(window: &StopWindow) -> Duration {
+    match window.remaining() {
+        Some(left) if left.is_zero() => SHUTDOWN_LOCK_LIMIT_AFTER_WINDOW,
+        _ => SHUTDOWN_LOCK_TIMEOUT,
     }
 }
 
@@ -1221,8 +1320,16 @@ where
     // recvs unblock the moment Ctrl-C fires.
     let shutdown = Shutdown::new();
     let lp_shutdown = options.lp_shutdown.clone();
+    let window = StopWindow::new(options.stop_timeout);
     let mut helper_tasks = AbortOnReturn(Vec::new());
-    let ctrl_c = watch_ctrl_c(signal::ctrl_c, shutdown.clone(), lp_shutdown.clone(), || std::process::exit(1));
+    let ctrl_c = watch_ctrl_c(
+        ctrl_c_signals(),
+        shutdown.clone(),
+        lp_shutdown.clone(),
+        window.clone(),
+        || arm_forced_exit(FORCED_EXIT_DELAY, || std::process::exit(1)),
+        || std::process::exit(1),
+    );
     if let Some(task) = crate::supervise::try_spawn("Ctrl-C handler", ctrl_c) {
         helper_tasks.0.push(task);
     }
@@ -1339,328 +1446,338 @@ where
     // Set when the grid ends while running in orders-only mode; the agent then exits with an error
     let mut grid_failed = false;
 
-    // Main event loop
-    if !options.orders_only {
-        let mut stream_backlog: VecDeque<SettlementUpdate> = VecDeque::new();
-        let mut loop_stats = LoopStats::new(Instant::now());
-        loop {
-            if shutdown.is_shutting_down() {
-                break;
-            }
-            let has_backlog = !stream_backlog.is_empty();
-            tokio::select! {
-                // Arms are polled in order. Timer arms reset after their body, so none
-                // can make itself ready again at once and starve the arms below it.
-                biased;
-                _ = shutdown.wait() => {
+    // Main event loop; once the stop window ends, the step in progress is dropped
+    let main_loop = async {
+        if !options.orders_only {
+            let mut stream_backlog: VecDeque<SettlementUpdate> = VecDeque::new();
+            let mut loop_stats = LoopStats::new(Instant::now());
+            loop {
+                if shutdown.is_shutting_down() {
                     break;
                 }
-
-                _ = heartbeat_timer.tick() => {
-                    let arm_started = Instant::now();
-                    heartbeat_count = heartbeat_count.wrapping_add(1);
-
-                    // Net-position checkpoint (dirty-gated, ≤1 write/min) —
-                    // covers grid-only agents where the V2 sweep never runs.
-                    if let Some(ref np) = options.net_positions {
-                        np.checkpoint_if_dirty();
+                let has_backlog = !stream_backlog.is_empty();
+                tokio::select! {
+                    // Arms are polled in order. Timer arms reset after their body, so none
+                    // can make itself ready again at once and starve the arms below it.
+                    biased;
+                    _ = shutdown.wait() => {
+                        break;
                     }
 
-                    let active_settlements = settlement_executor.active_settlements();
-                    let n = active_settlements.len();
-                    let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
-                    let pct = used.saturating_mul(100).checked_div(max).unwrap_or(0);
-                    let (alloc, fees) = settlement_executor.queue_depth();
-                    let cache_stats = tokio::time::timeout(HEARTBEAT_STATS_TIMEOUT, settlement_executor.cache_stats())
-                        .await
-                        .ok()
-                        .flatten();
-                    let cache_str = if let Some((avail, consumed, reserved, selectable)) = cache_stats {
-                        format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
-                    } else {
-                        String::new()
-                    };
-                    let worker_str = if let Some((aa, am, fa, fm)) = settlement_executor.worker_utilization() {
-                        format!(", workers alloc {}/{} fee {}/{}", aa, am, fa, fm)
-                    } else {
-                        String::new()
-                    };
-                    let pause_str = {
-                        let mut parts = Vec::new();
-                        if crate::forecast::is_sequencer_overloaded() {
-                            parts.push("SEQUENCER OVERLOAD".to_string());
+                    _ = heartbeat_timer.tick() => {
+                        let arm_started = Instant::now();
+                        heartbeat_count = heartbeat_count.wrapping_add(1);
+
+                        // Net-position checkpoint (dirty-gated, ≤1 write/min) —
+                        // covers grid-only agents where the V2 sweep never runs.
+                        if let Some(ref np) = options.net_positions {
+                            np.checkpoint_if_dirty();
                         }
-                        if let Some(secs) = settlement_executor.background_pause_secs() {
-                            parts.push(format!("CANCELS PAUSED {}s", secs));
-                        }
-                        if parts.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {}", parts.join(", "))
-                        }
-                    };
-                    let forecast_str = {
-                        let label = crate::forecast::forecast_label();
-                        if label != "unknown" {
-                            let coeff = crate::forecast::forecast_coefficient()
-                                .unwrap_or_default();
-                            // Age exposes a dead poller: without it a frozen
-                            // coefficient is indistinguishable from a steady one.
-                            let age = match crate::forecast::forecast_age_secs() {
-                                Some(a) => format!(" {}s ago", a),
-                                None => " never".to_string(),
-                            };
-                            format!(", forecast {} ({}){}", label, coeff, age)
-                        } else {
-                            String::new()
-                        }
-                    };
-                    info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees{}{}{}{}",
-                        n, used, max, pct, in_backoff, waiting, alloc, fees, cache_str, worker_str, pause_str, forecast_str);
-                    info!(
-                        "{}",
-                        loop_stats.take_line(stream_backlog.len(), settlement_executor.held_count(), Instant::now())
-                    );
-                    loop_stats.warn_overdue(poll_interval, Instant::now());
-                    if has_markets {
-                        log_grid_heartbeat(&grid_stats, grid_task.is_some(), grid_withdrawn.load(Ordering::SeqCst));
-                    }
-                    settlement_executor.log_cid_waiting_summary();
-                    // Liquidity stats
-                    if let Some(lm) = settlement_executor.liquidity_manager() {
-                        // Reconcile CC reservations against the authoritative
-                        // active set: a missed terminal event would otherwise
-                        // leak a per-proposal reservation forever, decaying
-                        // available CC to 0 over ~2 days. Self-heals each cycle.
-                        let live: std::collections::HashSet<String> =
-                            active_settlements.keys().cloned().collect();
-                        let dropped = lm.retain_commitments(&live).await;
-                        if dropped > 0 {
-                            warn!(
-                                "Liquidity reconcile: released {} orphaned CC reservation(s) (missed terminal event)",
-                                dropped
-                            );
-                        }
-                        let stats = lm.stats().await;
-                        for s in &stats {
-                            let depl_str = if s.hours_to_depletion.is_infinite() {
-                                ">12h".to_string()
-                            } else {
-                                format!("{:.1}h", s.hours_to_depletion)
-                            };
-                            // RFQ V2 holdings histogram (this token as an LP-pays
-                            // leg): total + reserved + USD-value buckets. Empty
-                            // for non-LP backends; unbucketed if no USD price.
-                            let histogram = tokio::time::timeout(
-                                HEARTBEAT_STATS_TIMEOUT,
-                                settlement_executor.holdings_histogram(&s.token),
-                            )
+
+                        let active_settlements = settlement_executor.active_settlements();
+                        let n = active_settlements.len();
+                        let (used, max, in_backoff, waiting) = settlement_executor.thread_utilization();
+                        let pct = used.saturating_mul(100).checked_div(max).unwrap_or(0);
+                        let (alloc, fees) = settlement_executor.queue_depth();
+                        let cache_stats = tokio::time::timeout(HEARTBEAT_STATS_TIMEOUT, settlement_executor.cache_stats())
                             .await
                             .ok()
                             .flatten();
-                            let holdings_str = match histogram {
-                                Some(h) if h.priced => format!(
-                                    " | holdings {} ({} rsvd) <10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
-                                    h.total, h.reserved, h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
-                                ),
-                                Some(h) => format!(
-                                    " | holdings {} ({} rsvd) [no USD price]",
-                                    h.total, h.reserved
-                                ),
-                                None => String::new(),
-                            };
-                            let refreshed_str = match s.refreshed_secs_ago {
-                                Some(secs) if lm.is_stale(&s.token).await.is_some() => format!(", STALE {}s", secs),
-                                Some(secs) => format!(", refreshed {}s ago", secs),
-                                None => ", never refreshed".to_string(),
-                            };
-                            info!(
-                                "LIQUIDITY {}: {} bal / {} committed{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}{}",
-                                s.token,
-                                fmt_sig4(s.balance),
-                                fmt_sig4(s.committed),
-                                if s.fee_reserve > rust_decimal::Decimal::ZERO {
-                                    format!(" + {} reserve", fmt_sig4(s.fee_reserve))
+                        let cache_str = if let Some((avail, consumed, reserved, selectable)) = cache_stats {
+                            format!(", cache {} avail {} consumed {} reserved {} selectable", avail, consumed, reserved, selectable)
+                        } else {
+                            String::new()
+                        };
+                        let worker_str = if let Some((aa, am, fa, fm)) = settlement_executor.worker_utilization() {
+                            format!(", workers alloc {}/{} fee {}/{}", aa, am, fa, fm)
+                        } else {
+                            String::new()
+                        };
+                        let pause_str = {
+                            let mut parts = Vec::new();
+                            if crate::forecast::is_sequencer_overloaded() {
+                                parts.push("SEQUENCER OVERLOAD".to_string());
+                            }
+                            if let Some(secs) = settlement_executor.background_pause_secs() {
+                                parts.push(format!("CANCELS PAUSED {}s", secs));
+                            }
+                            if parts.is_empty() {
+                                String::new()
+                            } else {
+                                format!(", {}", parts.join(", "))
+                            }
+                        };
+                        let forecast_str = {
+                            let label = crate::forecast::forecast_label();
+                            if label != "unknown" {
+                                let coeff = crate::forecast::forecast_coefficient()
+                                    .unwrap_or_default();
+                                // Age exposes a dead poller: without it a frozen
+                                // coefficient is indistinguishable from a steady one.
+                                let age = match crate::forecast::forecast_age_secs() {
+                                    Some(a) => format!(" {}s ago", a),
+                                    None => " never".to_string(),
+                                };
+                                format!(", forecast {} ({}){}", label, coeff, age)
+                            } else {
+                                String::new()
+                            }
+                        };
+                        info!("Heartbeat: {} settlements, threads {}/{} ({}%) {} backoff {} waiting, queue {} alloc {} fees{}{}{}{}",
+                            n, used, max, pct, in_backoff, waiting, alloc, fees, cache_str, worker_str, pause_str, forecast_str);
+                        info!(
+                            "{}",
+                            loop_stats.take_line(stream_backlog.len(), settlement_executor.held_count(), Instant::now())
+                        );
+                        loop_stats.warn_overdue(poll_interval, Instant::now());
+                        if has_markets {
+                            log_grid_heartbeat(&grid_stats, grid_task.is_some(), grid_withdrawn.load(Ordering::SeqCst));
+                        }
+                        settlement_executor.log_cid_waiting_summary();
+                        // Liquidity stats
+                        if let Some(lm) = settlement_executor.liquidity_manager() {
+                            // Reconcile CC reservations against the authoritative
+                            // active set: a missed terminal event would otherwise
+                            // leak a per-proposal reservation forever, decaying
+                            // available CC to 0 over ~2 days. Self-heals each cycle.
+                            let live: std::collections::HashSet<String> =
+                                active_settlements.keys().cloned().collect();
+                            let dropped = lm.retain_commitments(&live).await;
+                            if dropped > 0 {
+                                warn!(
+                                    "Liquidity reconcile: released {} orphaned CC reservation(s) (missed terminal event)",
+                                    dropped
+                                );
+                            }
+                            let stats = lm.stats().await;
+                            for s in &stats {
+                                let depl_str = if s.hours_to_depletion.is_infinite() {
+                                    ">12h".to_string()
                                 } else {
-                                    String::new()
-                                },
-                                fmt_sig4(s.available),
-                                s.num_commitments,
-                                s.net_outflow_per_hour,
-                                s.depletion_coefficient,
-                                depl_str,
-                                holdings_str,
-                                refreshed_str,
-                            );
-                        }
-                        if let Ok(p) = tokio::time::timeout(HEARTBEAT_STATS_TIMEOUT, lm.prepaid_stats()).await {
-                            info!("{}", prepaid_line(&p));
-                        }
-                    }
-                    // Every 5 minutes, also list individual settlement IDs
-                    if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
-                        let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
-                        info!("Active settlements: {}", ids.join(", "));
-                    }
-                    finish_arm(&mut heartbeat_timer, "heartbeat", arm_started);
-                }
-
-                joined = async {
-                    match grid_task.as_mut() {
-                        Some(handle) => handle.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    grid_task = None;
-                    let arm_started = Instant::now();
-                    grid_sweep = Some(on_grid_exit(joined, &shutdown, &config, &tracker, &grid_withdrawn));
-                    warn_if_slow("grid-exit", arm_started);
-                }
-
-                _ = settlement_poll_timer.tick() => {
-                    // Skip poll cycle during shutdown — let the notify branch fire
-                    if shutdown.is_shutting_down() {
-                        continue;
-                    }
-                    let arm_started = Instant::now();
-
-                    // Reconnect settlement stream if broken
-                    if settlement_stream.is_none() {
-                        let resubscribe = orderbook_client.subscribe_settlements(None);
-                        match tokio::time::timeout(canton_op_timeout, resubscribe).await {
-                            Ok(Ok(s)) => {
-                                settlement_stream = Some(s);
-                                info!("Settlement stream reconnected");
-                                settlement_executor.reset_failed_backoffs();
+                                    format!("{:.1}h", s.hours_to_depletion)
+                                };
+                                // RFQ V2 holdings histogram (this token as an LP-pays
+                                // leg): total + reserved + USD-value buckets. Empty
+                                // for non-LP backends; unbucketed if no USD price.
+                                let histogram = tokio::time::timeout(
+                                    HEARTBEAT_STATS_TIMEOUT,
+                                    settlement_executor.holdings_histogram(&s.token),
+                                )
+                                .await
+                                .ok()
+                                .flatten();
+                                let holdings_str = match histogram {
+                                    Some(h) if h.priced => format!(
+                                        " | holdings {} ({} rsvd) <10:{} 10-20:{} 20-50:{} 50-100:{} >100:{}",
+                                        h.total, h.reserved, h.under_10, h.b10_20, h.b20_50, h.b50_100, h.over_100
+                                    ),
+                                    Some(h) => format!(
+                                        " | holdings {} ({} rsvd) [no USD price]",
+                                        h.total, h.reserved
+                                    ),
+                                    None => String::new(),
+                                };
+                                let refreshed_str = match s.refreshed_secs_ago {
+                                    Some(secs) if lm.is_stale(&s.token).await.is_some() => format!(", STALE {}s", secs),
+                                    Some(secs) => format!(", refreshed {}s ago", secs),
+                                    None => ", never refreshed".to_string(),
+                                };
+                                info!(
+                                    "LIQUIDITY {}: {} bal / {} committed{} / {} avail ({} settlements), flow {:.1}/hr, depl={:.1} ({}){}{}",
+                                    s.token,
+                                    fmt_sig4(s.balance),
+                                    fmt_sig4(s.committed),
+                                    if s.fee_reserve > rust_decimal::Decimal::ZERO {
+                                        format!(" + {} reserve", fmt_sig4(s.fee_reserve))
+                                    } else {
+                                        String::new()
+                                    },
+                                    fmt_sig4(s.available),
+                                    s.num_commitments,
+                                    s.net_outflow_per_hour,
+                                    s.depletion_coefficient,
+                                    depl_str,
+                                    holdings_str,
+                                    refreshed_str,
+                                );
                             }
-                            Ok(Err(e)) => warn!("Settlement stream reconnect failed: {:#}", e),
-                            Err(_) => warn!(
-                                "Settlement stream reconnect timed out after {}s",
-                                canton_op_timeout.as_secs()
-                            ),
-                        }
-                    }
-
-                    let polled = tokio::time::timeout(
-                        canton_op_timeout,
-                        settlement_executor.poll_pending_proposals(&mut orderbook_client),
-                    ).await;
-                    // Self-bounded; kept outside the cycle timeout so a slow sync cannot cancel the advance
-                    settlement_executor.sync_on_chain_contracts().await;
-                    let advanced = tokio::time::timeout(
-                        canton_op_timeout,
-                        settlement_executor.advance_all_settlements(),
-                    ).await;
-                    match advanced.and(polled) {
-                        Ok(poll_ok) => {
-                            if poll_ok && poll_failures > 0 {
-                                settlement_executor.reset_failed_backoffs();
+                            if let Ok(p) = tokio::time::timeout(HEARTBEAT_STATS_TIMEOUT, lm.prepaid_stats()).await {
+                                info!("{}", prepaid_line(&p));
                             }
-                            poll_failures = if poll_ok { 0 } else { poll_failures.saturating_add(1) };
                         }
-                        Err(_) => {
-                            poll_failures = poll_failures.saturating_add(1);
-                            warn!("Settlement poll cycle timed out after {}s", canton_op_timeout.as_secs());
+                        // Every 5 minutes, also list individual settlement IDs
+                        if heartbeat_count % 5 == 0 && !active_settlements.is_empty() {
+                            let ids: Vec<&str> = active_settlements.keys().map(|s| s.as_str()).collect();
+                            info!("Active settlements: {}", ids.join(", "));
                         }
+                        finish_arm(&mut heartbeat_timer, "heartbeat", arm_started);
                     }
-                    loop_stats.note_poll(arm_started.elapsed(), Instant::now());
-                    finish_arm(&mut settlement_poll_timer, "poll", arm_started);
+
+                    joined = async {
+                        match grid_task.as_mut() {
+                            Some(handle) => handle.await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        grid_task = None;
+                        let arm_started = Instant::now();
+                        grid_sweep = Some(on_grid_exit(joined, &shutdown, &config, &tracker, &grid_withdrawn));
+                        warn_if_slow("grid-exit", arm_started);
+                    }
+
+                    _ = settlement_poll_timer.tick() => {
+                        // Skip poll cycle during shutdown — let the notify branch fire
+                        if shutdown.is_shutting_down() {
+                            continue;
+                        }
+                        let arm_started = Instant::now();
+
+                        // Reconnect settlement stream if broken
+                        if settlement_stream.is_none() {
+                            let resubscribe = orderbook_client.subscribe_settlements(None);
+                            match tokio::time::timeout(canton_op_timeout, resubscribe).await {
+                                Ok(Ok(s)) => {
+                                    settlement_stream = Some(s);
+                                    info!("Settlement stream reconnected");
+                                    settlement_executor.reset_failed_backoffs();
+                                }
+                                Ok(Err(e)) => warn!("Settlement stream reconnect failed: {:#}", e),
+                                Err(_) => warn!(
+                                    "Settlement stream reconnect timed out after {}s",
+                                    canton_op_timeout.as_secs()
+                                ),
+                            }
+                        }
+
+                        let polled = tokio::time::timeout(
+                            canton_op_timeout,
+                            settlement_executor.poll_pending_proposals(&mut orderbook_client),
+                        ).await;
+                        // Self-bounded; kept outside the cycle timeout so a slow sync cannot cancel the advance
+                        settlement_executor.sync_on_chain_contracts().await;
+                        let advanced = tokio::time::timeout(
+                            canton_op_timeout,
+                            settlement_executor.advance_all_settlements(),
+                        ).await;
+                        match advanced.and(polled) {
+                            Ok(poll_ok) => {
+                                if poll_ok && poll_failures > 0 {
+                                    settlement_executor.reset_failed_backoffs();
+                                }
+                                poll_failures = if poll_ok { 0 } else { poll_failures.saturating_add(1) };
+                            }
+                            Err(_) => {
+                                poll_failures = poll_failures.saturating_add(1);
+                                warn!("Settlement poll cycle timed out after {}s", canton_op_timeout.as_secs());
+                            }
+                        }
+                        loop_stats.note_poll(arm_started.elapsed(), Instant::now());
+                        finish_arm(&mut settlement_poll_timer, "poll", arm_started);
+                    }
+
+                    _ = result_collect_timer.tick() => {
+                        let arm_started = Instant::now();
+                        if tokio::time::timeout(
+                            canton_op_timeout,
+                            settlement_executor.collect_and_readvance(),
+                        ).await.is_err() {
+                            warn!("collect_and_readvance timed out after {}s", canton_op_timeout.as_secs());
+                        }
+                        loop_stats.note_collect(Instant::now());
+                        finish_arm(&mut result_collect_timer, "result-collect", arm_started);
+                    }
+
+                    wake = async {
+                        if has_backlog {
+                            return StreamWake::Backlog;
+                        }
+                        match settlement_stream.as_mut() {
+                            Some(s) => StreamWake::Next(s.next().await),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // Skip processing new settlement events during shutdown
+                        if shutdown.is_shutting_down() {
+                            continue;
+                        }
+                        let arm_started = Instant::now();
+
+                        let closed = take_and_drain(wake, settlement_stream.as_mut(), &mut stream_backlog);
+                        if closed {
+                            warn!("Settlement stream closed, will reconnect on next poll cycle");
+                            settlement_stream = None;
+                        }
+
+                        // Handle queued updates in order, then advance each touched proposal once
+                        if !stream_backlog.is_empty() {
+                            let outcome = settlement_executor
+                                .apply_stream_batch(&mut stream_backlog, canton_op_timeout, STREAM_BATCH_BUDGET)
+                                .await;
+                            loop_stats.note_batch(outcome.handled);
+                            if outcome.affects_grid {
+                                grid_wake.notify_one();
+                            }
+                        }
+                        warn_if_slow("stream", arm_started);
+                    }
                 }
-
-                _ = result_collect_timer.tick() => {
-                    let arm_started = Instant::now();
-                    if tokio::time::timeout(
-                        canton_op_timeout,
-                        settlement_executor.collect_and_readvance(),
-                    ).await.is_err() {
-                        warn!("collect_and_readvance timed out after {}s", canton_op_timeout.as_secs());
-                    }
-                    loop_stats.note_collect(Instant::now());
-                    finish_arm(&mut result_collect_timer, "result-collect", arm_started);
+            }
+        } else {
+            // Orders-only mode
+            loop {
+                if shutdown.is_shutting_down() {
+                    break;
                 }
-
-                wake = async {
-                    if has_backlog {
-                        return StreamWake::Backlog;
-                    }
-                    match settlement_stream.as_mut() {
-                        Some(s) => StreamWake::Next(s.next().await),
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    // Skip processing new settlement events during shutdown
-                    if shutdown.is_shutting_down() {
-                        continue;
-                    }
-                    let arm_started = Instant::now();
-
-                    let closed = take_and_drain(wake, settlement_stream.as_mut(), &mut stream_backlog);
-                    if closed {
-                        warn!("Settlement stream closed, will reconnect on next poll cycle");
-                        settlement_stream = None;
+                tokio::select! {
+                    // Shutdown wins ties; the grid itself runs on its own task.
+                    biased;
+                    _ = shutdown.wait() => {
+                        break;
                     }
 
-                    // Handle queued updates in order, then advance each touched proposal once
-                    if !stream_backlog.is_empty() {
-                        let outcome = settlement_executor
-                            .apply_stream_batch(&mut stream_backlog, canton_op_timeout, STREAM_BATCH_BUDGET)
-                            .await;
-                        loop_stats.note_batch(outcome.handled);
-                        if outcome.affects_grid {
-                            grid_wake.notify_one();
+                    _ = heartbeat_timer.tick() => {
+                        info!("Heartbeat: orders-only mode");
+                        if has_markets {
+                            log_grid_heartbeat(&grid_stats, grid_task.is_some(), grid_withdrawn.load(Ordering::SeqCst));
                         }
                     }
-                    warn_if_slow("stream", arm_started);
+
+                    joined = async {
+                        match grid_task.as_mut() {
+                            Some(handle) => handle.await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        grid_task = None;
+                        let (sweep, unexpected) = on_orders_only_grid_exit(
+                            joined, &shutdown, lp_shutdown.as_ref(), &config, &tracker, &grid_withdrawn,
+                        );
+                        grid_sweep = Some(sweep);
+                        grid_failed = unexpected;
+                        break;
+                    }
                 }
             }
         }
-    } else {
-        // Orders-only mode
-        loop {
-            if shutdown.is_shutting_down() {
-                break;
-            }
-            tokio::select! {
-                // Shutdown wins ties; the grid itself runs on its own task.
-                biased;
-                _ = shutdown.wait() => {
-                    break;
-                }
-
-                _ = heartbeat_timer.tick() => {
-                    info!("Heartbeat: orders-only mode");
-                    if has_markets {
-                        log_grid_heartbeat(&grid_stats, grid_task.is_some(), grid_withdrawn.load(Ordering::SeqCst));
-                    }
-                }
-
-                joined = async {
-                    match grid_task.as_mut() {
-                        Some(handle) => handle.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    grid_task = None;
-                    let (sweep, unexpected) = on_orders_only_grid_exit(
-                        joined, &shutdown, lp_shutdown.as_ref(), &config, &tracker, &grid_withdrawn,
-                    );
-                    grid_sweep = Some(sweep);
-                    grid_failed = unexpected;
-                    break;
-                }
-            }
-        }
+    };
+    if until_window_ends(main_loop, &window, &shutdown).await.is_none() {
+        warn!("Stop window ended during a loop step; it was dropped and the next start resumes it");
     }
 
     // Graceful shutdown — save state and exit immediately
     info!("Shutting down...");
+    window.begin();
     settlement_executor.set_shutting_down();
     settlement_executor.shutdown_backend();
 
-    // In-flight settlement tasks drain while the grid stops and withdraws its orders
+    // In-flight settlement tasks drain while the grid stops and withdraws its orders; both end
+    // with the stop window, the order sweep no sooner than GRID_STOP_FLOOR from its own start
     let (drained, ()) = tokio::join!(
-        settlement_executor.drain_tasks(),
-        finish_grid(grid_task.take(), grid_sweep.take(), &mut orderbook_client, &tracker, GRID_STOP_TIMEOUT),
+        settlement_executor.drain_tasks_until(window.ended(&shutdown)),
+        finish_grid_until(
+            grid_task.take(), grid_sweep.take(), &mut orderbook_client, &tracker, GRID_STOP_TIMEOUT,
+            || window.ended(&shutdown), GRID_STOP_FLOOR,
+        ),
     );
     if drained > 0 {
         info!("Drained {} settlement task(s)", drained);
@@ -1675,7 +1792,7 @@ where
             &tracker,
             start_time_ms,
             &options,
-            SHUTDOWN_LOCK_TIMEOUT,
+            snapshot_lock_limit(&window),
         )
         .await;
         let (completed, rejected) = (saved.completed_proposals.len(), saved.rejected_proposals.len());
@@ -2509,6 +2626,26 @@ mod loop_tests {
         tracker.lock().await.export_state().1.iter().filter(|o| o.is_active).count()
     }
 
+    /// The grid stop without a stop window, as when the agent runs without a stop limit.
+    async fn finish_grid<G, C: PartyOrders + ?Sized>(
+        grid: Option<JoinHandle<G>>,
+        sweep: Option<GridSweep>,
+        client: &mut C,
+        tracker: &Arc<Mutex<OrderTracker>>,
+        limit: Duration,
+    ) {
+        finish_grid_until(grid, sweep, client, tracker, limit, std::future::pending::<()>, Duration::ZERO).await;
+    }
+
+    async fn stop_grid<G, C: PartyOrders + ?Sized>(
+        grid: Option<JoinHandle<G>>,
+        client: &mut C,
+        tracker: &Arc<Mutex<OrderTracker>>,
+        limit: Duration,
+    ) {
+        finish_grid(grid, None, client, tracker, limit).await;
+    }
+
     // Both party sweeps track an order booked by a failed submit before cancelling it
     #[tokio::test]
     async fn party_sweeps_adopt_a_booked_failed_submit_before_cancelling_it() {
@@ -2979,29 +3116,216 @@ mod loop_tests {
 
     // ---- Ctrl-C, shutdown save and startup ----
 
-    fn signals(script: Vec<std::io::Result<()>>) -> impl FnMut() -> std::future::Ready<std::io::Result<()>> {
-        let mut script = script.into_iter();
-        move || std::future::ready(script.next().unwrap_or(Ok(())))
+    fn signals(script: Vec<std::io::Result<()>>) -> impl tokio_stream::Stream<Item = std::io::Result<()>> {
+        futures::stream::iter(script)
     }
 
     fn unavailable() -> std::io::Result<()> {
         Err(std::io::Error::other("no signal driver"))
     }
 
-    // A failing listener is not a Ctrl-C: no shutdown and no forced exit
+    /// What the Ctrl-C watcher did with one script of signals.
+    struct Watched {
+        shutdown: Shutdown,
+        lp: Shutdown,
+        window: StopWindow,
+        armed: bool,
+        exited: bool,
+    }
+
+    async fn watch(script: Vec<std::io::Result<()>>, window: StopWindow) -> Watched {
+        let (shutdown, lp) = (Shutdown::new(), Shutdown::new());
+        let (armed, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (a, e) = (Arc::clone(&armed), Arc::clone(&exited));
+        let arm = move || a.store(true, Ordering::SeqCst);
+        let exit = move || e.store(true, Ordering::SeqCst);
+        watch_ctrl_c(signals(script), shutdown.clone(), Some(lp.clone()), window.clone(), arm, exit).await;
+        let (armed, exited) = (armed.load(Ordering::SeqCst), exited.load(Ordering::SeqCst));
+        Watched { shutdown, lp, window, armed, exited }
+    }
+
+    // A failing listener is not a Ctrl-C: nothing starts, is cut short or exits
     #[tokio::test]
     async fn ctrl_c_listener_errors_are_not_signals() {
-        let exited = Arc::new(AtomicBool::new(false));
-        for script in [vec![unavailable()], vec![Ok(()), unavailable()], vec![Ok(()), Ok(())]] {
-            let first_ok = script.first().is_some_and(|r| r.is_ok());
-            let second_ok = script.len() > 1 && script.get(1).is_some_and(|r| r.is_ok());
-            let (shutdown, lp) = (Shutdown::new(), Shutdown::new());
-            exited.store(false, Ordering::SeqCst);
-            let e = Arc::clone(&exited);
-            watch_ctrl_c(signals(script), shutdown.clone(), Some(lp.clone()), move || e.store(true, Ordering::SeqCst)).await;
-            assert_eq!(shutdown.is_shutting_down(), first_ok);
-            assert_eq!(lp.is_shutting_down(), first_ok);
-            assert_eq!(exited.load(Ordering::SeqCst), second_ok);
+        let w = watch(vec![unavailable()], StopWindow::new(Some(ms(100)))).await;
+        assert!(!w.shutdown.is_shutting_down() && !w.lp.is_shutting_down());
+        assert!(!w.window.is_cut() && !w.armed && !w.exited);
+        tokio::time::sleep(ms(150)).await;
+        assert_eq!(w.window.remaining(), Some(ms(100)), "the window did not begin");
+
+        let w = watch(vec![Ok(()), unavailable()], StopWindow::new(None)).await;
+        assert!(w.shutdown.is_shutting_down() && w.lp.is_shutting_down());
+        assert!(!w.window.is_cut() && !w.armed && !w.exited);
+
+        let w = watch(vec![Ok(()), Ok(()), unavailable()], StopWindow::new(None)).await;
+        assert!(w.window.is_cut() && w.armed && !w.exited);
+    }
+
+    #[tokio::test]
+    async fn the_first_ctrl_c_starts_the_stop_and_its_window() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let w = watch(vec![Ok(())], StopWindow::new(Some(ms(100)))).await;
+        assert!(w.shutdown.is_shutting_down() && w.lp.is_shutting_down());
+        assert!(!w.window.is_cut() && !w.armed && !w.exited);
+        assert_eq!(logs.count("Ctrl-C received, shutting down gracefully..."), 1);
+        tokio::time::sleep(ms(150)).await;
+        assert_eq!(w.window.remaining(), Some(Duration::ZERO), "the window began at the Ctrl-C");
+    }
+
+    // A second Ctrl-C cuts the stop short and only arms the exit; a third exits at once
+    #[tokio::test]
+    async fn later_ctrl_cs_cut_the_stop_short_then_exit() {
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let w = watch(vec![Ok(()), Ok(())], StopWindow::new(None)).await;
+        assert!(w.shutdown.is_shutting_down() && w.lp.is_shutting_down() && w.window.is_cut());
+        assert_eq!(w.window.remaining(), Some(Duration::ZERO));
+        assert!(w.armed && !w.exited, "the exit is armed, not run");
+        let second = "Second Ctrl-C received: cutting the stop short and saving state; a third exits at once";
+        assert_eq!(logs.count(second), 1);
+
+        let w = watch(vec![Ok(()), Ok(()), Ok(())], StopWindow::new(None)).await;
+        assert!(w.armed && w.exited);
+    }
+
+    #[test]
+    fn an_armed_exit_runs_on_its_own_thread_after_the_delay() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        let started = Instant::now();
+        arm_forced_exit(ms(300), move || f.store(true, Ordering::SeqCst));
+        assert!(!fired.load(Ordering::SeqCst), "not before the delay");
+        while !fired.load(Ordering::SeqCst) && started.elapsed() < WAIT {
+            std::thread::sleep(ms(5));
+        }
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(started.elapsed() >= ms(300));
+        assert_eq!(FORCED_EXIT_DELAY, Duration::from_secs(45));
+    }
+
+    // The window drops a step that never ends, and the lock that step holds with it
+    #[tokio::test]
+    async fn the_stop_window_cuts_off_a_loop_that_never_ends() {
+        let (stop, window) = (Shutdown::new(), StopWindow::new(Some(ms(100))));
+        let lock = Mutex::new(());
+        let s = stop.clone();
+        let _stopper = crate::supervise::try_spawn("stopper", async move {
+            tokio::time::sleep(ms(50)).await;
+            s.signal();
+        });
+        let started = Instant::now();
+        let busy = async {
+            let _held = lock.lock().await;
+            std::future::pending::<u8>().await
+        };
+        assert_eq!(until_window_ends(busy, &window, &stop).await, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(lock.try_lock().is_ok(), "the dropped step released its lock");
+
+        let (stop, window) = (Shutdown::new(), StopWindow::new(None));
+        stop.signal();
+        window.cut_short();
+        let cut = tokio::time::timeout(WAIT, until_window_ends(std::future::pending::<u8>(), &window, &stop)).await;
+        assert_eq!(cut.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_loop_that_ends_by_itself_is_not_cut() {
+        let (stop, window) = (Shutdown::new(), StopWindow::new(Some(Duration::from_secs(3600))));
+        stop.signal();
+        let started = Instant::now();
+        let quick = async {
+            tokio::time::sleep(ms(20)).await;
+            7u8
+        };
+        assert_eq!(until_window_ends(quick, &window, &stop).await, Some(7));
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        // Without a limit or a cut the loop takes as long as it needs
+        let (stop, window) = (Shutdown::new(), StopWindow::new(None));
+        stop.signal();
+        let slow = async {
+            tokio::time::sleep(ms(150)).await;
+            8u8
+        };
+        assert_eq!(until_window_ends(slow, &window, &stop).await, Some(8));
+    }
+
+    #[tokio::test]
+    async fn the_state_snapshot_waits_less_once_the_window_ended() {
+        assert_eq!(snapshot_lock_limit(&StopWindow::new(None)), SHUTDOWN_LOCK_TIMEOUT);
+        let open = StopWindow::new(Some(Duration::from_secs(3600)));
+        open.begin();
+        assert_eq!(snapshot_lock_limit(&open), SHUTDOWN_LOCK_TIMEOUT);
+        let cut = StopWindow::new(None);
+        cut.cut_short();
+        assert_eq!(snapshot_lock_limit(&cut), SHUTDOWN_LOCK_LIMIT_AFTER_WINDOW);
+        let passed = StopWindow::new(Some(ms(20)));
+        passed.begin();
+        tokio::time::sleep(ms(50)).await;
+        assert_eq!(snapshot_lock_limit(&passed), SHUTDOWN_LOCK_LIMIT_AFTER_WINDOW);
+        assert_eq!(SHUTDOWN_LOCK_LIMIT_AFTER_WINDOW, Duration::from_secs(2));
+    }
+
+    // A grid stop cut off by the window aborts the grid task or the sweep it waits for; its own
+    // order sweep is then cut off once the floor has passed too
+    #[tokio::test]
+    async fn a_grid_stop_cut_off_by_its_bound_aborts_its_tasks() {
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let logs = crate::test_logs::LogBuf::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let warning = "orders may stay live until the next start";
+        for as_sweep in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = SetOnDrop(Arc::clone(&dropped));
+            let stuck = crate::supervise::try_spawn("stuck", async move {
+                let _flag = flag;
+                std::future::pending::<bool>().await
+            })
+            .unwrap();
+            let (grid, sweep) = if as_sweep { (None, Some(GridSweep::Running(stuck))) } else { (Some(stuck), None) };
+            let tracker = tracker_with_live_orders(&[1]);
+            let (stop, window) = (Shutdown::new(), StopWindow::new(Some(ms(100))));
+            stop.signal();
+            let started = Instant::now();
+            finish_grid_until(grid, sweep, &mut StuckCancel, &tracker, WAIT, || window.ended(&stop), ms(200)).await;
+            assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+            assert!(started.elapsed() >= ms(290), "the sweep gets the floor: {:?}", started.elapsed());
+            assert!(wait_for(WAIT, || dropped.load(Ordering::SeqCst)).await, "the stuck task is aborted");
+            assert_eq!(live_tracked(&tracker).await, 1, "an unfinished sweep leaves the tracker alone");
+        }
+        assert_eq!(logs.count(warning), 2);
+
+        // A stop that finishes first is not cut
+        let tracker = tracker_with_live_orders(&[1]);
+        let mut book = ScriptedBook::new(vec![Some(vec![1])]);
+        let grid = crate::supervise::try_spawn("grid", async { 1u8 });
+        finish_grid_until(grid, None, &mut book, &tracker, WAIT, std::future::pending::<()>, ms(200)).await;
+        assert_eq!(book.cancelled, [1]);
+        assert_eq!(live_tracked(&tracker).await, 0);
+        assert_eq!(logs.count(warning), 2);
+    }
+
+    // A join that outlasts the window is cut there, so the floor goes to cancelling the orders
+    #[tokio::test]
+    async fn a_grid_join_cut_by_the_window_still_withdraws_the_book() {
+        let floor = Duration::from_secs(3);
+        for as_sweep in [false, true] {
+            let (stop, window) = (Shutdown::new(), StopWindow::new(Some(ms(100))));
+            stop.signal();
+            window.begin();
+            let stuck = crate::supervise::try_spawn("stuck", std::future::pending::<bool>()).unwrap();
+            let (grid, sweep) = if as_sweep { (None, Some(GridSweep::Running(stuck))) } else { (Some(stuck), None) };
+            let tracker = tracker_with_live_orders(&[1, 2]);
+            let mut book = ScriptedBook::new(vec![Some(vec![1, 2])]);
+            finish_grid_until(grid, sweep, &mut book, &tracker, WAIT, || window.ended(&stop), floor).await;
+            assert_eq!(book.cancelled, [1, 2], "as_sweep={as_sweep}");
+            assert_eq!(live_tracked(&tracker).await, 0, "as_sweep={as_sweep}");
         }
     }
 
@@ -3011,7 +3335,8 @@ mod loop_tests {
         let logs = crate::test_logs::LogBuf::default();
         let _guard = logs.capture(tracing::Level::INFO);
         let (shutdown, lp) = (Shutdown::new(), Shutdown::new());
-        watch_ctrl_c(signals(vec![Ok(()), unavailable()]), shutdown.clone(), Some(lp.clone()), || {}).await;
+        let window = StopWindow::new(None);
+        watch_ctrl_c(signals(vec![Ok(()), unavailable()]), shutdown.clone(), Some(lp.clone()), window, || {}, || {}).await;
         forward_external_shutdown(lp.clone(), shutdown.clone(), Some(lp.clone())).await;
         assert_eq!(logs.count("External shutdown signal received"), 0);
 
@@ -3079,6 +3404,7 @@ mod loop_tests {
             no_reject: false,
             atomic_v2_snapshot: None,
             net_positions: None,
+            stop_timeout: None,
         }
     }
 

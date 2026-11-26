@@ -85,8 +85,8 @@ impl MarketView<'_> {
     }
 }
 
-/// Quotes worth one USD a unit, matched regardless of case.
-const USD_STABLES: [&str; 6] = ["USD", "USDC", "USDCx", "TUSDT", "tf-usdt", "USD8"];
+/// Quotes worth one USD a unit, in the order a rate route prefers them; matched regardless of case.
+const USD_STABLES: [&str; 6] = ["USDCx", "USDC", "TUSDT", "USD8", "USD", "tf-usdt"];
 
 /// What one unit of a market's quote is worth in USD.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,8 +94,8 @@ pub(crate) enum QuoteUsd {
     Rate(f64),
     /// CC, while its rate is not known yet
     Pending,
-    /// No USD rate for this quote
-    Unpriced,
+    /// Neither a USD stable nor CC; valued through a listed market
+    Other,
 }
 
 /// The quote of a BASE-QUOTE market: a USD stable is worth 1, CC its live rate.
@@ -108,8 +108,63 @@ pub(crate) fn quote_usd(market_id: &str, cc_token_id: Option<&str>, cc_usd: Opti
     match cc_usd.filter(|r| r.is_finite() && *r > 0.0) {
         Some(rate) if is_cc => QuoteUsd::Rate(rate),
         None if is_cc => QuoteUsd::Pending,
-        _ => QuoteUsd::Unpriced,
+        _ => QuoteUsd::Other,
     }
+}
+
+/// A listed market whose price values one unit of a quote in USD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsdRoute {
+    pub market_id: String,
+    /// The quote is that market's quote, so a unit is worth 1/last
+    pub inverse: bool,
+    /// Priced in CC, so the CC/USD rate converts it
+    pub via_cc: bool,
+}
+
+impl UsdRoute {
+    /// USD value of one quote unit at the route market's `last` price.
+    pub(crate) fn usd(&self, last: f64, cc_usd: Option<f64>) -> Option<f64> {
+        let ok = |x: f64| x.is_finite() && x > 0.0;
+        let unit = if self.inverse { 1.0 / last } else { last };
+        let usd = if self.via_cc { unit * cc_usd.filter(|r| ok(*r))? } else { unit };
+        (ok(last) && ok(usd)).then_some(usd)
+    }
+}
+
+/// Every market that could value `quote` in USD, best first: priced in a stable, in CC, then inverted.
+pub(crate) fn route_candidates(quote: &str, cc_token_id: Option<&str>) -> Vec<UsdRoute> {
+    if quote.is_empty() {
+        return Vec::new();
+    }
+    let mut cc = vec!["CC"];
+    cc.extend(cc_token_id.filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case("CC")));
+    let route = |market_id: String, inverse, via_cc| UsdRoute { market_id, inverse, via_cc };
+    let mut out: Vec<UsdRoute> = USD_STABLES.iter().map(|s| route(format!("{quote}-{s}"), false, false)).collect();
+    out.extend(cc.iter().map(|c| route(format!("{quote}-{c}"), false, true)));
+    out.extend(USD_STABLES.iter().map(|s| route(format!("{s}-{quote}"), true, false)));
+    out.push(route(format!("CC-{quote}"), true, true));
+    out
+}
+
+/// The candidates for `quote` that are listed, matched regardless of case, with the listed spelling.
+pub(crate) fn usd_routes(quote: &str, cc_token_id: Option<&str>, listed: &[String]) -> Vec<UsdRoute> {
+    let mut routes: Vec<UsdRoute> = Vec::new();
+    for candidate in route_candidates(quote, cc_token_id) {
+        let Some(id) = listed.iter().find(|m| m.eq_ignore_ascii_case(&candidate.market_id)) else { continue };
+        if !routes.iter().any(|r| r.market_id == *id) {
+            routes.push(UsdRoute { market_id: id.clone(), ..candidate });
+        }
+    }
+    routes
+}
+
+/// A rate price is used for this long after its server time.
+pub(crate) const RATE_MAX_AGE_SECS: i64 = 300;
+
+/// A rate price stamped at `stamp_secs` is fresh at `now_secs`; a stamp ahead of the clock is too.
+pub(crate) fn rate_fresh(stamp_secs: i64, now_secs: i64) -> bool {
+    now_secs.saturating_sub(stamp_secs) <= RATE_MAX_AGE_SECS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,7 +543,7 @@ pub(crate) struct StrategyRuntime {
     pub rest_until: Option<(u64, Instant)>,
     /// When a failed settlement-history lookup is tried again
     pub history_retry_at: Option<Instant>,
-    /// The quote without a USD rate was reported
+    /// The quote without a USD route was reported
     pub quote_refused: bool,
     /// Takes may hit the liquidity provider's best level
     pub take_lp: bool,
@@ -643,8 +698,84 @@ mod tests {
         assert_eq!(rate("TUSDT-CC", None, Some(0.0)), QuoteUsd::Pending);
         assert_eq!(rate("TUSDT-Amulet", Some("Amulet"), Some(0.07)), QuoteUsd::Rate(0.07));
         for id in ["HECTO-cETH", "TUSDT-Amulet", "USDC", "CC-"] {
-            assert_eq!(rate(id, None, Some(0.07)), QuoteUsd::Unpriced, "{id}");
+            assert_eq!(rate(id, None, Some(0.07)), QuoteUsd::Other, "{id}");
         }
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn usd_routes_prefer_stables_then_cc_then_the_inverse() {
+        let mut listed = ids(&["CC-cETH", "cETH-CC", "cETH-Amulet", "HECTO-cETH"]);
+        for s in ["tf-usdt", "USD", "USD8", "TUSDT", "USDC", "USDCx"] {
+            listed.extend([format!("{s}-cETH"), format!("cETH-{s}")]);
+        }
+        let routes = usd_routes("cETH", Some("Amulet"), &listed);
+        let found: Vec<(&str, bool, bool)> = routes.iter().map(|r| (r.market_id.as_str(), r.inverse, r.via_cc)).collect();
+        assert_eq!(
+            found,
+            [
+                ("cETH-USDCx", false, false),
+                ("cETH-USDC", false, false),
+                ("cETH-TUSDT", false, false),
+                ("cETH-USD8", false, false),
+                ("cETH-USD", false, false),
+                ("cETH-tf-usdt", false, false),
+                ("cETH-CC", false, true),
+                ("cETH-Amulet", false, true),
+                ("USDCx-cETH", true, false),
+                ("USDC-cETH", true, false),
+                ("TUSDT-cETH", true, false),
+                ("USD8-cETH", true, false),
+                ("USD-cETH", true, false),
+                ("tf-usdt-cETH", true, false),
+                ("CC-cETH", true, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn usd_routes_come_from_listed_markets_only() {
+        let route = |id: &str, inverse, via_cc| UsdRoute { market_id: id.to_string(), inverse, via_cc };
+        // Matched regardless of case, with the listed spelling kept
+        assert_eq!(usd_routes("ceth", None, &ids(&["CETH-usdcx", "HECTO-cETH"])), [route("CETH-usdcx", false, false)]);
+        assert_eq!(usd_routes("EDELx", Some("Amulet"), &ids(&["EDELx-Amulet"])), [route("EDELx-Amulet", false, true)]);
+        // No route twice, and none for an empty quote or an unlisted pair
+        assert_eq!(usd_routes("EDELx", Some("cc"), &ids(&["EDELx-CC", "edelx-cc"])), [route("EDELx-CC", false, true)]);
+        assert!(usd_routes("", Some("CC"), &ids(&["-USDC", "USDC-", "CC-", "-CC"])).is_empty());
+        assert!(usd_routes("HECTO", None, &ids(&["HECTO-cETH", "cETH-USDC", "EDELx-USDCx"])).is_empty());
+        assert!(usd_routes("cETH", None, &[]).is_empty());
+        // A CC-CBTC quote is valued through CBTC-USDC first
+        let routes = usd_routes("CBTC", None, &ids(&["CC-CBTC", "CC-USDCx", "CBTC-USDC"]));
+        assert_eq!(routes, [route("CBTC-USDC", false, false), route("CC-CBTC", true, true)]);
+    }
+
+    #[test]
+    fn a_route_turns_its_last_price_into_usd() {
+        let route = |inverse, via_cc| UsdRoute { market_id: "X-Y".to_string(), inverse, via_cc };
+        let near = |got: Option<f64>, want: f64| got.is_some_and(|g| (g - want).abs() <= want * 1e-12);
+        assert!(near(route(false, false).usd(1700.0, None), 1700.0));
+        assert!(near(route(true, false).usd(0.0005, None), 2000.0));
+        assert!(near(route(false, true).usd(0.125, Some(0.08)), 0.01));
+        assert!(near(route(true, true).usd(8.0, Some(0.08)), 0.01));
+        assert_eq!(route(false, true).usd(0.125, None), None, "CC/USD not known");
+        assert_eq!(route(true, false).usd(1e-320, None), None, "the inverse overflows");
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            for (inverse, via_cc) in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_eq!(route(inverse, via_cc).usd(bad, Some(0.08)), None, "{bad} {inverse} {via_cc}");
+            }
+            assert_eq!(route(false, true).usd(0.125, Some(bad)), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_rate_price_is_fresh_for_five_minutes() {
+        assert!(rate_fresh(1_000, 1_300));
+        assert!(!rate_fresh(1_000, 1_301));
+        assert!(rate_fresh(2_000, 1_000), "a stamp ahead of the clock");
+        assert!(!rate_fresh(i64::MIN, i64::MAX));
     }
 
     #[test]

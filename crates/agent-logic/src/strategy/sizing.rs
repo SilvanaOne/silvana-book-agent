@@ -66,6 +66,12 @@ pub(crate) fn lot_exp(price: f64) -> i32 {
     clampf((-price.log10()).floor(), -10.0, 12.0) as i32
 }
 
+/// [`lot_exp`] at the price in USD when a quote unit is worth more, so a lot is also worth at most $1.
+pub(crate) fn lot_exp_usd(price: f64, quote_usd: f64) -> i32 {
+    // f64::max ignores NaN, so an unusable rate keeps the quote-unit lot
+    lot_exp(price * quote_usd.max(1.0))
+}
+
 /// `qty` in whole lots of 10^exp, as an exact decimal; None below one lot.
 pub(crate) fn lots(qty: f64, exp: i32, up: bool) -> Option<Decimal> {
     let units = qty / 10f64.powi(exp);
@@ -245,6 +251,24 @@ mod tests {
         assert_eq!(order_qty(40.0, MIN_ORDER_USD, 0.0016, 0.0, 2).map(|d| d.to_string()), Some("25000".into()));
         assert_eq!(tick_price(16_123, 1e-7).as_deref(), Some("0.0016123"));
         assert_eq!(tick_price(0, 1e-7), None);
+    }
+
+    #[test]
+    fn a_lot_is_worth_at_most_one_quote_unit_and_one_usd() {
+        // A stable or CC quote keeps the quote-unit lot, and so does a rate that is not a number
+        assert_eq!((lot_exp_usd(0.0016, 1.0), lot_exp_usd(13.4, 0.0746), lot_exp_usd(0.0016, f64::NAN)), (2, -2, 2));
+        // EDELx-cETH at 0.0000055 with cETH at $1700: 100 EDELx a lot, about $0.94
+        let (p, usd) = (0.0000055, 1700.0);
+        let exp = lot_exp_usd(p, usd);
+        assert_eq!((lot_exp(p), exp), (5, 2));
+        let lot = 10f64.powi(exp) * p;
+        assert!(lot <= 1.0 && lot * usd <= 1.0 && lot * usd > 0.1, "{lot}");
+        let min = MIN_ORDER_USD / usd;
+        let qty = |exp| order_qty(min, min, p, SERVER_FLOOR_USD / usd, exp).map(|d| d.to_string());
+        assert_eq!(qty(exp).as_deref(), Some("1300"));
+        assert_eq!(qty(lot_exp(p)).as_deref(), Some("100000"), "a $935 lot");
+        // HECTO-EDELx at 0.05 with EDELx at $0.01 keeps 10 HECTO a lot
+        assert_eq!(lot_exp_usd(0.05, 0.01), 1);
     }
 
     #[test]

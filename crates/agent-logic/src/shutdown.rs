@@ -7,14 +7,15 @@
 //!      terminates the moment Ctrl-C arrives.
 //!   3. Add a `_ = shutdown.wait() => break` arm to nested `tokio::select!`s.
 //!
-//! Note: we DO NOT cancel in-flight work (Canton tx, gRPC requests). The select
-//! arm only fires when the loop is *idle*; once a non-shutdown branch has been
-//! chosen, its body runs to completion.
+//! Note: we DO NOT cancel in-flight work (Canton tx, gRPC requests) until a
+//! [`StopWindow`] ends. The select arm only fires when the loop is *idle*; once a
+//! non-shutdown branch has been chosen, its body runs to completion.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 #[derive(Clone)]
 pub struct Shutdown {
@@ -83,6 +84,75 @@ impl Shutdown {
         tokio::select! {
             _ = tokio::time::sleep(duration) => self.flag.load(Ordering::Acquire),
             _ = notified.as_mut() => true,
+        }
+    }
+}
+
+/// How long a stop may take once it begins; cutting it short ends it at once.
+#[derive(Clone)]
+pub struct StopWindow {
+    limit: Option<Duration>,
+    began: Arc<OnceLock<Instant>>,
+    cut: Shutdown,
+}
+
+impl StopWindow {
+    /// A window of `limit` from its first [`StopWindow::begin`]; `None` ends only when cut short.
+    pub fn new(limit: Option<Duration>) -> Self {
+        Self { limit, began: Arc::new(OnceLock::new()), cut: Shutdown::new() }
+    }
+
+    /// Start the window now; later calls keep the first start.
+    pub fn begin(&self) {
+        self.began.get_or_init(Instant::now);
+    }
+
+    /// End the window at once.
+    pub fn cut_short(&self) {
+        self.cut.signal();
+    }
+
+    /// Whether the window was cut short.
+    pub fn is_cut(&self) -> bool {
+        self.cut.is_shutting_down()
+    }
+
+    /// Time left: `None` without a limit, zero once cut short or past.
+    pub fn remaining(&self) -> Option<Duration> {
+        if self.is_cut() {
+            return Some(Duration::ZERO);
+        }
+        let limit = self.limit?;
+        Some(match self.began.get() {
+            Some(began) => limit.saturating_sub(Instant::now().saturating_duration_since(*began)),
+            None => limit,
+        })
+    }
+
+    /// Resolves once `stop` fired and the limit has passed since the window began
+    /// (the stop begins it if nothing did); never without a limit.
+    pub async fn passed(&self, stop: &Shutdown) {
+        let Some(limit) = self.limit else {
+            return std::future::pending().await;
+        };
+        stop.wait().await;
+        let began = *self.began.get_or_init(Instant::now);
+        match began.checked_add(limit) {
+            Some(end) => tokio::time::sleep_until(end).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Resolves once the window is cut short.
+    pub async fn cut(&self) {
+        self.cut.wait().await;
+    }
+
+    /// Resolves when the window passed after `stop` or was cut short.
+    pub async fn ended(&self, stop: &Shutdown) {
+        tokio::select! {
+            () = self.passed(stop) => {}
+            () = self.cut() => {}
         }
     }
 }
@@ -200,6 +270,82 @@ mod tests {
                 .unwrap();
             assert!(observed, "sleep() must report shutdown when raced");
         }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[tokio::test]
+    async fn a_stop_window_ends_its_limit_after_the_first_begin() {
+        let (stop, window) = (Shutdown::new(), StopWindow::new(Some(ms(100))));
+        assert_eq!(window.remaining(), Some(ms(100)), "not begun yet");
+        assert!(tokio::time::timeout(ms(200), window.ended(&stop)).await.is_err(), "nothing ends before the stop");
+        stop.signal();
+        let started = std::time::Instant::now();
+        window.begin();
+        tokio::time::sleep(ms(30)).await;
+        window.begin();
+        assert!(window.remaining().is_some_and(|left| left <= ms(75)), "{:?}", window.remaining());
+        tokio::time::timeout(Duration::from_secs(2), window.ended(&stop))
+            .await
+            .expect("the window must end");
+        let took = started.elapsed();
+        assert!(took >= ms(95) && took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(window.remaining(), Some(Duration::ZERO));
+        assert!(!window.is_cut());
+    }
+
+    #[tokio::test]
+    async fn a_window_without_a_limit_ends_only_when_cut_short() {
+        let (stop, window) = (Shutdown::new(), StopWindow::new(None));
+        stop.signal();
+        window.begin();
+        assert_eq!(window.remaining(), None);
+        assert!(tokio::time::timeout(ms(150), window.ended(&stop)).await.is_err());
+        let w = window.clone();
+        let _cutter = crate::supervise::try_spawn("cutter", async move {
+            tokio::time::sleep(ms(50)).await;
+            w.cut_short();
+        });
+        tokio::time::timeout(Duration::from_secs(2), window.ended(&stop))
+            .await
+            .expect("a cut ends the window");
+        tokio::time::timeout(ms(50), window.cut()).await.expect("cut() resolves once cut");
+        assert!(window.is_cut());
+        assert_eq!(window.remaining(), Some(Duration::ZERO));
+        assert!(tokio::time::timeout(ms(50), window.passed(&stop)).await.is_err(), "no limit never passes");
+    }
+
+    #[tokio::test]
+    async fn a_cut_ends_a_long_window_at_once() {
+        let (stop, window) = (Shutdown::new(), StopWindow::new(Some(Duration::from_secs(3600))));
+        stop.signal();
+        window.begin();
+        assert!(window.remaining().is_some_and(|left| left > Duration::from_secs(3500)));
+        assert!(tokio::time::timeout(ms(100), window.cut()).await.is_err());
+        window.cut_short();
+        window.cut_short();
+        tokio::time::timeout(ms(100), window.ended(&stop)).await.expect("a cut window ends at once");
+        assert_eq!(window.remaining(), Some(Duration::ZERO));
+    }
+
+    // A stop that did not begin the window starts it when the stop fires
+    #[tokio::test]
+    async fn passed_counts_from_the_stop_when_nothing_began_the_window() {
+        let (stop, window) = (Shutdown::new(), StopWindow::new(Some(ms(100))));
+        let (w, s) = (window.clone(), stop.clone());
+        let passed = crate::supervise::try_spawn("passed", async move { w.passed(&s).await }).unwrap();
+        tokio::time::sleep(ms(150)).await;
+        assert!(!passed.is_finished(), "nothing passes before the stop");
+        let started = std::time::Instant::now();
+        stop.signal();
+        tokio::time::timeout(Duration::from_secs(2), passed)
+            .await
+            .expect("the window must pass")
+            .unwrap();
+        let took = started.elapsed();
+        assert!(took >= ms(95) && took < Duration::from_secs(1), "{took:?}");
     }
 }
 

@@ -107,8 +107,8 @@ Rules:
 - Makers rest orders inside the liquidity provider's quotes and re-quote when their target moves more than 2 bps.
 - Takers, and the makers that rest a single order (`rebalancer`, `mean_reversion`), send nothing new while a settlement of theirs is open in that market; `max_inflight` limits only `market_maker`, and the other kinds accept it so configurations that set it still load.
 - Position limits and the report's change count from the balances at the strategy's start; these are saved at a stop and kept if the agent restarts within 6 hours with the same kind on that market, otherwise taken again from the first usable balances. Funds moved in or out while the agent was stopped move the kept start by the same amount, with a warning, so only the position carries over.
-- Amounts named `_usd` are in US dollars. They are converted to the market's quote at its USD rate: 1 for a USD stablecoin quote (USDC, USDCx, TUSDT, USD8), the live CC/USD rate for a CC quote. A CC-quoted strategy waits while that rate is unknown or more than 30 minutes old. A strategy on a market quoted in anything else is refused at startup.
-- Orders are worth at least $12 and use round lots; rungs below the server's minimum order value are skipped (the grid skips them too).
+- Amounts named `_usd` are in US dollars. They are converted to the market's quote at its USD rate: 1 for a USD stablecoin quote (USDC, USDCx, TUSDT, USD8), the live CC/USD rate for a CC quote. A CC-quoted strategy waits while that rate is unknown or more than 30 minutes old. Any other quote, for example cETH in EDELx-cETH or EDELx in HECTO-EDELx, is valued through a listed market that prices it: first the quote against a USD stablecoin (cETH-USDCx, cETH-USDC, cETH-TUSDT, ...), then against CC (converted at the CC/USD rate), then the inverse pairs (USDCx-cETH, ..., CC-cETH). The agent reads that market's last price every 30 seconds and uses it while the price is at most 5 minutes old; the rate market is only read, and its orders and grid are never touched. While no rate is known a strategy holds and a maker withdraws its quotes. If no listed market prices the quote, this is logged once and the strategy waits; the market list is checked again every 10 minutes.
+- Orders are worth at least $12 and use round lots worth at most one quote unit and at most $1; rungs below the server's minimum order value are skipped (the grid skips them too). For a quote worth more than $1, the status line prints quote amounts to about a cent and also shows the value in US dollars.
 - Every 5 minutes each enabled market, the grid included, logs one line: balances, value at the reference price, change since the start and against simply holding, takes (filled and empty), fills, and the strategy's own state.
 
 Parameters every strategy except `grid` accepts:
@@ -459,20 +459,24 @@ Flags:
 | `--party <ID>`           | Skip the waiting list; prompts for the private key when none is configured |
 | `--private-key <B58>`    | Base58 Ed25519 private key for `--party` (optional in a terminal — prompted, input hidden) |
 | `--env-file <PATH>`      | Path to .env file (default: `.env`; global flag, works on every command) |
+| `--config-dir <DIR>`     | Agent folder; onboard writes `.env` and `agent.toml` there (create the folder first; global flag, works on every command) |
 | `--poll-interval <SECS>` | Polling interval during onboarding, 1–3600 (default: 10) |
 
 ### Configuration
 
 `.env` and `agent.toml` are both created by `cloud-agent onboard` — you typically don't write them from scratch. The tables below describe each field so you can tune an existing config.
 
-Every command accepts a global `--env-file <PATH>` flag to load a specific env file instead of the default `.env` lookup — useful for running several agents (one folder and env file per identity) that share a single `agent.toml`:
+Every command accepts a global `--config-dir <DIR>` flag that runs it from one agent's own folder. The folder becomes the working directory, so `agent.toml`, `agent-state.json`, `backups/`, `net-positions.json`, `logs/` and every relative path (`-c` and `--env-file` included) resolve inside it, and its `.env` is the env file. One shared binary can run many agents this way, one folder each:
 
 ```bash
-cloud-agent --env-file agent1/.env -c agent.toml info balance
-cloud-agent --env-file agent2/.env -c agent.toml agent
+cloud-agent --config-dir agent1 info balance
+cloud-agent --config-dir agent1 agent
+cloud-agent --config-dir agent2 agent
 ```
 
-An explicit `--env-file` overrides variables already set in the shell. Without the flag, `.env` is searched for in the current directory and its parents, and already-set shell variables win.
+The folder must exist, and the agent logs `Config folder: <path>` at startup. Its `.env` is loaded like an explicit `--env-file`: it overrides variables already set in the shell, a missing `.env` stops the command (except `onboard`, which creates `.env` and `agent.toml` in the folder), and parent folders are not searched. `--env-file <PATH>` names a different env file, resolved inside the folder when relative; the folder of the env file in use stays the agent folder for `control/` and `usdcx/`, so leave `--env-file` out to keep all of an agent's state in one place.
+
+Without `--config-dir`, `--env-file <PATH>` loads a specific env file instead of the default `.env` lookup, and an explicit `--env-file` overrides variables already set in the shell. Without either flag, `.env` is searched for in the current directory and its parents, and already-set shell variables win. Agents started from the same working directory share its `agent-state.json`, `backups/` and `logs/`, even with one `--env-file` each, so give each agent its own folder and start it with `--config-dir`.
 
 **The agent folder.** The directory of the env file in use (the current directory when there is none) is the agent's folder, and the agent keeps its local state there:
 
@@ -718,6 +722,10 @@ Progress is saved to `agent-state.json` in the working directory, and each round
 | `--confirm`         | Prompt for confirmation before signing each transaction; no answer within 120s, or 120s waiting behind another prompt, declines it |
 | `--verbose`         | Enable verbose logging                                       |
 | `--config <PATH>`   | Path to agent.toml (default: `agent.toml`)                   |
+| `--config-dir <DIR>` | Run from this agent folder: `.env`, `agent.toml`, `agent-state.json`, `backups/` and `logs/` live there |
+| `--shutdown-timeout-secs <SECS>` | Longest stop after Ctrl-C, 1–3600 seconds (default: no overall limit) |
+
+**Stopping the agent.** The first Ctrl-C starts a graceful stop: the agent takes no new work, lets the settlement steps in flight finish (up to 5 minutes for settlement tasks; a main-loop step can take up to `canton_op_timeout_secs`, default 600 s), cancels its grid orders and saves `agent-state.json`, which the next start resumes from. With `--shutdown-timeout-secs N` the stop is bounded: after N seconds the steps still running are dropped and picked up again at the next start, cancelling grid orders still gets up to 30 s, and the state is always saved, so a stop takes at most about N + 70 seconds. A second Ctrl-C cuts the stop short, saves the state and exits within 45 seconds; a third exits at once without saving.
 
 ### Full CLI Reference
 

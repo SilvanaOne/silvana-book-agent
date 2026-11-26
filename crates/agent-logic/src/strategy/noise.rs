@@ -83,7 +83,7 @@ impl Decide for NoiseTaker {
 
 #[cfg(test)]
 mod tests {
-    use super::super::maker::tests::{cc_flat_base, cc_view, view, CC_USD};
+    use super::super::maker::tests::{cc_flat_base, cc_view, ceth_flat_base, ceth_view, view, CC_USD, CETH_REF, CETH_USD};
     use super::*;
 
     fn run(seed: u64, steps: usize) -> Vec<Decision> {
@@ -130,6 +130,25 @@ mod tests {
             if let Decision::Take(Some(w)) = nt.decide(&v) {
                 takes += 1;
                 let usd = w.max_quantity * 13.4 * CC_USD;
+                assert!((15.0 - 1e-9..=40.0 + 1e-9).contains(&usd), "{usd}");
+            }
+        }
+        assert!(takes > 10, "{takes}");
+    }
+
+    #[test]
+    fn ceth_quoted_clips_are_usd() {
+        let cfg = NoiseTakerConfig { seed: Some(8), ..Default::default() };
+        let mut nt = NoiseTaker::new(cfg, "EDELx-cETH");
+        let base = ceth_flat_base();
+        let mut v = ceth_view(None, base, base);
+        let t0 = v.now;
+        let mut takes = 0;
+        for i in 0..400u64 {
+            v.now = t0 + Duration::from_secs(5 * i);
+            if let Decision::Take(Some(w)) = nt.decide(&v) {
+                takes += 1;
+                let usd = w.max_quantity * CETH_REF * CETH_USD;
                 assert!((15.0 - 1e-9..=40.0 + 1e-9).contains(&usd), "{usd}");
             }
         }

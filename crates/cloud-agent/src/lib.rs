@@ -620,6 +620,7 @@ pub async fn run_cloud_agent(
     confirm: bool,
     version_info: Option<&str>,
     env_file: Option<PathBuf>,
+    stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     if dry_run {
         anyhow::bail!(AGENT_DRY_RUN_REFUSAL);
@@ -1058,6 +1059,7 @@ pub async fn run_cloud_agent(
             no_reject,
             atomic_v2_snapshot,
             net_positions: net_positions.clone(),
+            stop_timeout,
         },
     )
     .await;
@@ -3607,20 +3609,16 @@ fn print_pins(states: &[(&'static str, control::pins::PinState)]) {
     println!("Platform parties (pinned once, never replaced):\n{}", String::from_utf8_lossy(&out).trim_end());
 }
 
-/// Save agent.toml from server config if it doesn't already exist locally.
+/// Save agent.toml from server config at `toml_path` if it doesn't already exist locally.
 /// Customizes `name = "LP agent"` → `name = "LP <agent_name>"` if agent_name is provided.
 pub fn maybe_write_agent_toml(
-    env_file: &std::path::Path,
+    toml_path: &std::path::Path,
     config_resp: &GetAgentConfigResponse,
     agent_name: Option<&str>,
 ) {
     if config_resp.agent_toml.is_empty() {
         return;
     }
-    let toml_path = env_file
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("agent.toml");
     if toml_path.exists() {
         println!("agent.toml already exists, skipping write");
         return;
@@ -3629,7 +3627,7 @@ pub fn maybe_write_agent_toml(
     if let Some(name) = agent_name {
         content = content.replace("name = \"LP agent\"", &format!("name = \"LP {}\"", name));
     }
-    match std::fs::write(&toml_path, &content) {
+    match std::fs::write(toml_path, &content) {
         Ok(_) => println!("Agent config written to {}", toml_path.display()),
         Err(e) => eprintln!("Warning: could not write agent.toml: {}", e),
     }
@@ -3777,6 +3775,7 @@ pub async fn run_onboard(
     agent_name: String,
     email: Option<String>,
     env_file: PathBuf,
+    agent_toml: PathBuf,
     poll_interval: u64,
 ) -> Result<()> {
     println!("=== Cloud Agent Self-Service Onboarding ===\n");
@@ -3822,7 +3821,7 @@ pub async fn run_onboard(
                 let pins = write_server_config_to_env(&env_file, &rpc, &config_resp)?;
                 println!("Server config written to {}", env_file.display());
                 print_pins(&pins);
-                maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
+                maybe_write_agent_toml(&agent_toml, &config_resp, Some(&agent_name));
             }
             println!("\nPARTY_AGENT={} — checking ledger onboarding...", party_id);
             if link_commitment.is_some() {
@@ -3853,7 +3852,7 @@ pub async fn run_onboard(
     let pins = write_server_config_to_env(&env_file, &rpc, &config_resp)?;
     println!("Server config written to {}", env_file.display());
     print_pins(&pins);
-    maybe_write_agent_toml(&env_file, &config_resp, Some(&agent_name));
+    maybe_write_agent_toml(&agent_toml, &config_resp, Some(&agent_name));
 
     // Step 4: Register on waiting list (idempotent)
     println!("\nRegistering agent on waiting list...");
@@ -7204,7 +7203,7 @@ mod daemon_tests {
         let mut config = BaseConfig::test_minimal().unwrap();
         config.orderbook_grpc_url = ledger.url.clone();
         let run = run_cloud_agent(
-            config, false, false, true, false, false, false, false, false, None, None,
+            config, false, false, true, false, false, false, false, false, None, None, None,
         );
         let err = tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -7232,7 +7231,7 @@ mod daemon_tests {
         let mut config = BaseConfig::test_minimal().unwrap();
         config.orderbook_grpc_url = ledger.url.clone();
         let run = run_cloud_agent(
-            config, false, false, true, false, false, true, false, false, None, None,
+            config, false, false, true, false, false, true, false, false, None, None, None,
         );
         let err = tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -7746,7 +7745,7 @@ mod onboard_key_tests {
         let (_, pub2) = keypair();
         let rpc = OnboardTarget::resolve(None, Some("http://127.0.0.1:1".to_string())).unwrap();
         let env = scratch_env(None);
-        let err = run_onboard(rpc.clone(), Some(party_of(&pub2)), Some(k1.clone()), "AGT-x".into(), "n".into(), None, env.clone(), 1)
+        let err = run_onboard(rpc.clone(), Some(party_of(&pub2)), Some(k1.clone()), "AGT-x".into(), "n".into(), None, env.clone(), env.with_extension("toml"), 1)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("refusing to record PARTY_AGENT"), "{err:#}");
@@ -7754,11 +7753,31 @@ mod onboard_key_tests {
 
         let content = format!("PARTY_AGENT={}\nPARTY_AGENT_PRIVATE_KEY={}\n", party_of(&pub2), *k1);
         let env = scratch_env(Some(&content));
-        let err = run_onboard(rpc, None, None, "AGT-x".into(), "n".into(), None, env.clone(), 1)
+        let err = run_onboard(rpc, None, None, "AGT-x".into(), "n".into(), None, env.clone(), env.with_extension("toml"), 1)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("does not belong to this key"), "{err:#}");
         assert_eq!(read_env_value(&env, "PARTY_AGENT"), Some(party_of(&pub2)), "left as it was");
+    }
+
+    // The agent config goes to the path given, which may lie outside the env file's folder
+    #[test]
+    fn the_agent_config_is_written_at_the_path_given() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cloud-agent-onboard-toml-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let served = |toml: &str| GetAgentConfigResponse { agent_toml: toml.into(), ..Default::default() };
+        let target = dir.join("custom.toml");
+        maybe_write_agent_toml(&target, &served("name = \"LP agent\"\n"), Some("a1"));
+        let written = std::fs::read_to_string(&target);
+        let beside = dir.join("agent.toml").exists();
+        maybe_write_agent_toml(&target, &served("other\n"), None);
+        let kept = std::fs::read_to_string(&target);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(written.unwrap(), "name = \"LP a1\"\n");
+        assert!(!beside, "nothing is written beside it");
+        assert_eq!(kept.unwrap(), "name = \"LP a1\"\n", "an existing file is kept");
     }
 
     #[test]
@@ -7839,7 +7858,9 @@ mod onboard_key_tests {
         let env = scratch_env(Some(&content));
         let before = std::fs::read(&env).unwrap();
         let mainnet = OnboardTarget { rpc: "http://127.0.0.1:1".into(), network: Some("mainnet".into()) };
-        let err = run_onboard(mainnet, None, None, "AGT-x".into(), "n".into(), None, env.clone(), 1).await.unwrap_err();
+        let err = run_onboard(mainnet, None, None, "AGT-x".into(), "n".into(), None, env.clone(), env.with_extension("toml"), 1)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("records CANTON_CHAIN=devnet, not mainnet; give --network devnet"), "{err:#}");
         assert_eq!(std::fs::read(&env).unwrap(), before, ".env is unchanged");
     }
