@@ -54,6 +54,7 @@ pub mod split_worker;
 mod test_util;
 pub mod ticket_pool;
 pub mod topup;
+pub mod traffic_purchase;
 pub mod transfer_all;
 pub mod tx_capture;
 pub mod updates_worker;
@@ -77,6 +78,14 @@ pub struct PrepaidTrafficBalance {
     pub available_cc: rust_decimal::Decimal,
     pub total_credited_cc: rust_decimal::Decimal,
     pub total_debited_cc: rust_decimal::Decimal,
+    /// The order-book fee discount in percent; `None` reads as full price.
+    pub orderbook_fee_discount_pct: Option<rust_decimal::Decimal>,
+}
+
+/// A discount percent as the ledger service sends it: 0 up to (not including) 100, else `None`.
+pub fn parse_fee_discount_pct(raw: &str) -> Option<rust_decimal::Decimal> {
+    let pct = rust_decimal::Decimal::from_str_exact(raw.trim()).ok()?;
+    (pct >= rust_decimal::Decimal::ZERO && pct < rust_decimal::Decimal::ONE_HUNDRED).then_some(pct)
 }
 
 // ============================================================================
@@ -200,14 +209,18 @@ pub enum TransferCommands {
         #[arg(long, value_delimiter = ',')]
         amulet_cids: Option<Vec<String>>,
     },
-    /// Top up the off-chain prepaid traffic balance by transferring CC to PARTY_PREPAID_TRAFFIC
+    /// Top up the off-chain prepaid traffic balance by transferring CC to PARTY_PREPAID_TRAFFIC,
+    /// or with --token, by paying a USD stable to PARTY_TRAFFIC_FEE for the same CC credit
     PrepayTraffic {
-        /// CC amount to credit (decimal string), or `all` for the full unlocked balance
+        /// CC amount to credit (decimal string), or `all` for the full unlocked balance (CC only)
         #[arg(long)]
         amount: String,
         /// Optional human-readable note
         #[arg(long)]
         description: Option<String>,
+        /// Pay in this token instead (e.g. TUSDT, USDCx): prints the purchase and waits up to 60 s for the credit
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -962,13 +975,24 @@ pub async fn run_cloud_agent(
             })?
             .with_fee_demand(Arc::clone(&liquidity_manager))
             .with_pins(prepaid_traffic_pin(&config), named_party(&config.dso_party));
+            let tokens = topup::topup_tokens(&config);
+            let stable = stable_topups(&config, &tokens, &liquidity_manager);
+            let names: Vec<&str> = tokens.iter().map(|t| t.name()).collect();
             info!(
                 min_cc = %min_cc,
                 topup_cc = %topup_cc,
+                tokens = ?names,
                 "Auto-topup enabled"
             );
             // Wallet CC a top-up can move counts as fee capacity
-            liquidity_manager.set_auto_topup(Some(topup_cc)).await;
+            if topup::moves_wallet_cc(&tokens) {
+                liquidity_manager.set_auto_topup(Some(topup_cc)).await;
+            }
+            let mut runner = runner.with_token_topups(tokens, Some(stable));
+            match agent_logic::agent_dir::current() {
+                Some(dir) => runner = runner.with_payment_file(dir.join(topup::PAYMENT_FILE)),
+                None => warn!("No agent folder: a restart forgets a top-up payment in flight"),
+            }
             Some(Arc::new(runner).spawn(lp_shutdown.clone())?)
         }
         _ => {
@@ -1507,6 +1531,7 @@ pub async fn run_fill(
     if !atomic && !fee_tokens.is_empty() {
         warn!("--fee-token only applies to --atomic (RFQ V2) fills — ignored on the v1 path");
     }
+    let (fee_tokens, prune_fee_tokens) = fill_loop::fill_fee_tokens(fee_tokens, &config.rfq_v2_fee_tokens);
 
     // Check for saved fill state
     let state_file = PathBuf::from("agent-state.json");
@@ -1603,6 +1628,7 @@ pub async fn run_fill(
         interval_secs: interval,
         atomic,
         fee_tokens,
+        prune_fee_tokens,
     };
 
     // Keep `backend` alive so its ACS worker keeps refreshing amulets until return.
@@ -2402,6 +2428,28 @@ pub(crate) fn named_party(party: &str) -> Option<String> {
     (!party.is_empty()).then(|| party.to_string())
 }
 
+/// What stable top-ups need: the traffic-fee pin in force, read by each walk, and a purchase
+/// client that connects on first use.
+fn stable_topups(
+    config: &BaseConfig,
+    tokens: &[topup::TopupToken],
+    lm: &Arc<agent_logic::liquidity::LiquidityManager>,
+) -> topup::StableTopups {
+    let configured = config.party_traffic_fee.clone();
+    let pin: topup::PinSource = Arc::new(move || {
+        let installed = control::platform_parties().ok().and_then(|parties| parties.traffic_fee);
+        topup::traffic_fee_pin(installed.as_deref(), configured.as_deref())
+    });
+    if tokens.iter().any(|t| matches!(t, topup::TopupToken::Stable { .. })) && pin().is_none() {
+        warn!("PREPAID_TRAFFIC_TOPUP_TOKENS lists a stable but PARTY_TRAFFIC_FEE is unset: the stables are skipped until it is pinned");
+    }
+    topup::StableTopups {
+        traffic_fee_party: pin,
+        purchases: Arc::new(traffic_purchase::LazyPurchaseClient::new(config.clone())),
+        rates: Arc::clone(lm),
+    }
+}
+
 /// The pinned prepaid-traffic party, when set.
 pub(crate) fn prepaid_traffic_pin(config: &BaseConfig) -> Option<String> {
     config.party_prepaid_traffic.as_deref().and_then(named_party)
@@ -2640,6 +2688,7 @@ pub async fn run_transfer(
                             // Empty = server auto-select; `--amount all` pins the summed inputs.
                             input_holding_cids,
                             max_input_holdings,
+                            direct_only: false,
                         })),
                         request_signature: None,
                         controller_command: None,
@@ -2935,7 +2984,11 @@ pub async fn run_transfer(
         TransferCommands::PrepayTraffic {
             amount,
             description,
+            token,
         } => {
+            if let Some(token) = token.as_deref().map(str::trim).filter(|t| !t.eq_ignore_ascii_case(agent_logic::config::CC_FEE_TOKEN)) {
+                return prepay_traffic_with_token(&config, &mut client, token, &amount, confirm, dry_run).await;
+            }
             let (amount, amulet_cids) = if transfer_all::is_all_amount(&amount) {
                 let (cids, total) =
                     transfer_all::all_amulets(&mut client, None, "pass a fixed --amount").await?;
@@ -3001,6 +3054,103 @@ pub async fn run_transfer(
         }
     }
 
+    Ok(())
+}
+
+/// Longest wait for a stable purchase's payment.
+const PREPAY_PAYMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+/// Longest wait for a stable purchase's credit after its payment.
+const PREPAY_CREDIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `transfer prepay-traffic --token`: buys `amount` CC of prepaid traffic with a USD stable.
+async fn prepay_traffic_with_token(
+    config: &BaseConfig,
+    client: &mut DAppProviderClient,
+    token: &str,
+    amount: &str,
+    confirm: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::traffic_purchase::{log_safe, purchase_state, PurchaseState};
+    use rust_decimal::Decimal;
+    if transfer_all::is_all_amount(amount) {
+        anyhow::bail!("--amount all is refused with --token: pass the CC amount to credit");
+    }
+    let token = agent_logic::config::known_fee_token(token)
+        .ok_or_else(|| anyhow!("--token {}: not a known fee token (CC, TUSDT or a USDC token)", log_safe(token)))?;
+    let credit_cc = Decimal::from_str_exact(amount.trim())
+        .ok()
+        .filter(|a| *a > Decimal::ZERO)
+        .ok_or_else(|| anyhow!("--amount must be a CC amount above 0, got '{}'", log_safe(amount)))?;
+    let (wire_id, registry) = topup::resolve_fee_token(config, &token)
+        .ok_or_else(|| anyhow!("{token} is not in the instrument registry"))?;
+    let pin = config
+        .party_traffic_fee
+        .as_deref()
+        .and_then(named_party)
+        .ok_or_else(|| anyhow!("PARTY_TRAFFIC_FEE is not set: a {token} top-up is paid to that party"))?;
+    let rates = client.get_dso_rates().await?;
+    let rate = Decimal::from_str_exact(rates.cc_usd_rate.trim())
+        .ok()
+        .filter(|r| *r > Decimal::ZERO)
+        .ok_or_else(|| anyhow!("the ledger service sent no usable CC/USD rate"))?;
+    let token_amount = topup::stable_amount(credit_cc, rate)
+        .ok_or_else(|| anyhow!("no {token} amount for {credit_cc} CC at {rate} USD per CC"))?;
+    println!("Prepay traffic: {credit_cc} CC for {token_amount} {token} ({rate} USD per CC), paid to {pin}");
+    if dry_run {
+        println!("--- DRY RUN: no purchase created, nothing signed ---");
+        return Ok(());
+    }
+    if confirm {
+        let lock = agent_logic::confirm::new_confirm_lock();
+        agent_logic::confirm::confirm_transaction(
+            &lock,
+            "Prepay traffic",
+            &format!("{token_amount} {token} for {credit_cc} CC"),
+        )
+        .await?;
+    }
+    let api = traffic_purchase::PurchaseClient::connect(config).await?;
+    let ledger = topup::ClientLedger(client.clone());
+    let buy = topup::StablePurchase {
+        token: &token,
+        wire_id: &wire_id,
+        registry: &registry,
+        traffic_fee_party: &pin,
+        credit_cc,
+        cc_usd_rate: rate,
+    };
+    let deadline = agent_logic::clock::deadline_after(PREPAY_PAYMENT_BUDGET);
+    let bought = topup::buy_traffic(&ledger, &api, &config.party_id, &buy, deadline).await?;
+    println!("Purchase:  {}", log_safe(&bought.purchase_id));
+    println!("Memo:      {}", log_safe(&bought.memo));
+    println!("Update:    {}", log_safe(&bought.update_id));
+    println!("Waiting up to {}s for the credit...", PREPAY_CREDIT_WAIT.as_secs());
+    let last = topup::wait_for_credit(&api, &bought.purchase_id, PREPAY_CREDIT_WAIT).await;
+    control::intent::remove_open_traffic_purchase(&bought.memo);
+    match last {
+        Some(p) if purchase_state(&p.status) == PurchaseState::Credited => {
+            println!("Credited:  {} CC", log_safe(p.credited_cc.as_deref().unwrap_or(&p.credit_cc)));
+        }
+        Some(p) if purchase_state(&p.status) == PurchaseState::Rejected => {
+            anyhow::bail!(
+                "purchase {} was rejected: {}",
+                log_safe(&bought.purchase_id),
+                log_safe(p.reject_reason.as_deref().unwrap_or(""))
+            );
+        }
+        Some(p) => println!("Not credited yet (status {}); the credit follows once the payment is seen", log_safe(&p.status)),
+        None => println!("Purchase status unavailable; the credit follows once the payment is seen"),
+    }
+    match client.get_prepaid_traffic_balance().await {
+        Ok(pt) => {
+            println!("\n=== Prepaid Traffic Balance ===\n");
+            println!("Balance:           {} CC", pt.balance_cc);
+            println!("Credit limit:      {} CC", pt.credit_limit_cc);
+            println!("Available:         {} CC", pt.available_cc);
+        }
+        Err(e) => println!("(unable to fetch post-topup balance: {})", e),
+    }
     Ok(())
 }
 
@@ -3438,6 +3588,7 @@ fn write_server_config_with(
                     | agent_logic::control_store::CONTROL_DIR_ENV
                     | "PARTY_FEE"
                     | "PARTY_PREPAID_TRAFFIC"
+                    | control::pins::TRAFFIC_FEE_KEY
             ) {
                 continue;
             }
@@ -3925,6 +4076,7 @@ fn onboarding_control_config(
     // The pins onboarding wrote; the link's attach installs them for this process.
     config.party_fee = get("PARTY_FEE");
     config.party_prepaid_traffic = get("PARTY_PREPAID_TRAFFIC");
+    config.party_traffic_fee = get("PARTY_TRAFFIC_FEE");
     Ok(config)
 }
 
@@ -4056,11 +4208,12 @@ mod onboarding_invite_tests {
         let party = agent_logic::control_store::testing::party_for(seed, "agent-1").unwrap();
         let ledger = bs58::encode([9u8; 32]).into_string();
         let (fee, traffic) = (format!("fee::1220{}", "a".repeat(64)), format!("traffic::1220{}", "b".repeat(64)));
+        let traffic_fee = format!("traffic-fee::1220{}", "c".repeat(64));
         std::fs::write(
             &env_file,
             format!(
                 "PARTY_AGENT={party}\nNODE_NAME=n1\nLEDGER_SERVICE_PUBLIC_KEY={ledger}\nCANTON_CHAIN=devnet\n\
-                 PARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\n"
+                 PARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\nPARTY_TRAFFIC_FEE={traffic_fee}\n"
             ),
         )
         .unwrap();
@@ -4070,6 +4223,7 @@ mod onboarding_invite_tests {
         assert_eq!(config.orderbook_grpc_url, "http://127.0.0.1:1");
         // The link's attach installs these pins for the rest of the onboarding process.
         assert_eq!((config.party_fee, config.party_prepaid_traffic), (Some(fee), Some(traffic)));
+        assert_eq!(config.party_traffic_fee, Some(traffic_fee));
         std::fs::write(&env_file, format!("PARTY_AGENT={party}\n")).unwrap();
         assert!(onboarding_control_config(&env_file, "http://127.0.0.1:1", &key, &|_| None).is_err());
     }
@@ -7665,7 +7819,7 @@ mod onboard_key_tests {
         let (fee, traffic) = (party("fee", "7"), party("traffic", "8"));
         let env = format!("SYNCHRONIZER_ID=s\nPARTY_FEE={fee}\nPARTY_PREPAID_TRAFFIC={traffic}\n");
         let served = GetAgentConfigResponse { env, ..Default::default() };
-        let both = control::PlatformParties { fee: Some(fee), prepaid_traffic: Some(traffic) };
+        let both = control::PlatformParties { fee: Some(fee), prepaid_traffic: Some(traffic), traffic_fee: None };
         // Other tests install their own pins meanwhile; a run they interleave is repeated.
         let held = (0..20).any(|_| {
             control::install_platform_parties(control::PlatformParties::default());
@@ -7735,6 +7889,36 @@ mod transfer_tests {
 
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
+    }
+
+    // Refused before any purchase exists: a stable buys a stated CC amount, never `all`
+    #[tokio::test]
+    async fn prepay_traffic_with_a_token_needs_an_amount_a_known_token_the_registry_and_the_pin() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut client = DAppProviderClient::from_channel(
+            channel,
+            &config.party_id,
+            &config.role,
+            &config.private_key,
+            60,
+            None,
+            &config.ledger_service_public_key,
+        )
+        .unwrap();
+        let refusal = |config: BaseConfig, token: &'static str, amount: &'static str| {
+            let mut client = client.clone();
+            async move { prepay_traffic_with_token(&config, &mut client, token, amount, false, false).await.unwrap_err().to_string() }
+        };
+        assert!(refusal(config.clone(), "TUSDT", "all").await.contains("--amount all is refused with --token"));
+        assert!(refusal(config.clone(), "DOGE", "10").await.contains("not a known fee token"));
+        assert!(refusal(config.clone(), "TUSDT", "0").await.contains("above 0"));
+        assert!(refusal(config.clone(), "TUSDT", "10").await.contains("not in the instrument registry"));
+        config.instrument_wire_ids.insert("TUSDT".into(), "tusdt-wire".into());
+        config.instrument_registries.insert("TUSDT".into(), "registry::1220aa".into());
+        config.party_traffic_fee = None;
+        assert!(refusal(config.clone(), "TUSDT", "10").await.contains("PARTY_TRAFFIC_FEE is not set"));
+        let _ = &mut client;
     }
 
     fn created(template_id: &str, contract_id: &str) -> CreatedContractInfo {
@@ -7937,5 +8121,22 @@ mod batch_pay_limit_tests {
     fn named_party_ignores_blank_values() {
         assert_eq!(named_party(" dso::1220aa "), Some("dso::1220aa".to_string()));
         assert_eq!(named_party("  "), None);
+    }
+}
+
+#[cfg(test)]
+mod fee_discount_tests {
+    use super::parse_fee_discount_pct;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn a_discount_is_a_percent_below_100_and_anything_else_is_full_price() {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        assert_eq!(parse_fee_discount_pct("90"), Some(d("90")));
+        assert_eq!(parse_fee_discount_pct(" 12.50 "), Some(d("12.50")));
+        assert_eq!(parse_fee_discount_pct("0"), Some(Decimal::ZERO));
+        for full_price in ["", "100", "-1", "abc", "1e1", "99.5%"] {
+            assert_eq!(parse_fee_discount_pct(full_price), None, "{full_price:?}");
+        }
     }
 }

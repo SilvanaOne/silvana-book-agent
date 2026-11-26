@@ -1543,6 +1543,7 @@ mod tests {
                 pinned: PlatformParties {
                     fee: Some(fee.clone()),
                     prepaid_traffic: Some(party("prepaid", 8)),
+                    traffic_fee: None,
                 },
                 fee,
                 cc: cc(),

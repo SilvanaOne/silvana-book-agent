@@ -253,6 +253,7 @@ async fn check_and_merge_instrument(
                     input_holding_cids: cids.clone(),
                     // Ignored: explicit cids take the pass-through path.
                     max_input_holdings: None,
+                    direct_only: false,
                 })),
                 request_signature: None,
                 controller_command: None,

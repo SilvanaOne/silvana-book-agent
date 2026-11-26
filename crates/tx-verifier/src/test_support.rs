@@ -54,6 +54,18 @@ pub(crate) fn optional(inner: Option<Value>) -> Value {
     })))
 }
 
+pub(crate) fn text_map(entries: Vec<(&str, Value)>) -> Value {
+    val(Sum::TextMap(v2::TextMap {
+        entries: entries
+            .into_iter()
+            .map(|(key, value)| v2::text_map::Entry {
+                key: key.into(),
+                value: Some(value),
+            })
+            .collect(),
+    }))
+}
+
 pub(crate) fn record(fields: Vec<(&str, Value)>) -> Value {
     val(Sum::Record(Record {
         record_id: None,

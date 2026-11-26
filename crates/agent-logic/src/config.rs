@@ -254,6 +254,10 @@ pub struct BaseConfig {
     pub min_prepaid_traffic_balance_cc: Option<rust_decimal::Decimal>,
     /// Amount to credit on each top-up, in CC.
     pub prepaid_traffic_topup_cc: Option<rust_decimal::Decimal>,
+    /// `PREPAID_TRAFFIC_TOPUP_TOKENS`: the tokens a top-up is paid in, by priority; never empty.
+    pub prepaid_traffic_topup_tokens: Vec<String>,
+    /// `RFQ_V2_FEE_TOKENS`: the tokens an atomic swap fee is paid in, by priority; empty means CC.
+    pub rfq_v2_fee_tokens: Vec<String>,
 
     /// RFQ V2 (AtomicDVP) secp256k1 quote-signing keypair. Loaded in `assemble`
     /// iff `liquidity_provider.rfq_v2.enabled`, from the
@@ -267,6 +271,8 @@ pub struct BaseConfig {
     pub party_fee: Option<String>,
     /// `PARTY_PREPAID_TRAFFIC`: the prepaid traffic party, pinned locally.
     pub party_prepaid_traffic: Option<String>,
+    /// `PARTY_TRAFFIC_FEE`: the receiver of top-ups paid in a token other than CC, pinned locally.
+    pub party_traffic_fee: Option<String>,
     /// agent.toml `[control]`: what a linked agent does with pending controller work.
     pub control: ControlSettings,
     /// agent.toml `[vetted_packages]`: checked before every signature when `selected`.
@@ -373,10 +379,13 @@ impl BaseConfig {
             depletion_min_hours: 1.0,
             min_prepaid_traffic_balance_cc: None,
             prepaid_traffic_topup_cc: None,
+            prepaid_traffic_topup_tokens: vec![CC_FEE_TOKEN.to_string()],
+            rfq_v2_fee_tokens: Vec::new(),
             atomic_quote_key: None,
             canton_chain: None,
             party_fee: None,
             party_prepaid_traffic: None,
+            party_traffic_fee: None,
             control: ControlSettings::default(),
             vetted_packages: VettedPackages::default(),
             verify: VerifySettings::default(),
@@ -426,13 +435,83 @@ impl BaseConfig {
             .sign_control_jwt_for_head(&self.jwt_request(), store, lock, head)
     }
 
-    /// The locally pinned platform parties (fee, prepaid traffic) that are set.
+    /// The locally pinned platform parties (fee, prepaid traffic, traffic fee) that are set.
     pub fn platform_parties(&self) -> Vec<&str> {
-        [self.party_fee.as_deref(), self.party_prepaid_traffic.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            self.party_fee.as_deref(),
+            self.party_prepaid_traffic.as_deref(),
+            self.party_traffic_fee.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
+}
+
+/// The fee token that needs no stable rate.
+pub const CC_FEE_TOKEN: &str = "CC";
+/// The longest fee-token priority list.
+const MAX_FEE_TOKENS: usize = 8;
+
+/// The spelling a known fee token is used under: CC or a USD stable (TUSDT, or a token
+/// whose symbol starts with USDC, as the server classifies them). None for anything else.
+pub fn known_fee_token(symbol: &str) -> Option<String> {
+    let well_formed = (1..=32).contains(&symbol.len())
+        && symbol
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !well_formed {
+        return None;
+    }
+    for canonical in [CC_FEE_TOKEN, "TUSDT", "USDCx", "USDC"] {
+        if symbol.eq_ignore_ascii_case(canonical) {
+            return Some(canonical.to_string());
+        }
+    }
+    let usdc = symbol.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("USDC"));
+    usdc.then(|| symbol.to_string())
+}
+
+/// A comma-separated priority list of known fee tokens from env `name`; unset or blank is
+/// empty. An empty entry, an unknown token, a repeat or more than 8 entries is refused.
+fn fee_token_list(name: &str, value: Option<&str>) -> Result<Vec<String>> {
+    let Some(text) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut tokens: Vec<String> = Vec::new();
+    for entry in text.split(',').map(str::trim) {
+        if entry.is_empty() {
+            bail!("{name} has an empty entry: {text:?}");
+        }
+        let token = known_fee_token(entry).ok_or_else(|| {
+            anyhow!("{name}: {entry:?} is not a known token (CC, TUSDT or a USDC token)")
+        })?;
+        if tokens.iter().any(|t| t.eq_ignore_ascii_case(&token)) {
+            bail!("{name} lists {token} twice");
+        }
+        tokens.push(token);
+    }
+    if tokens.len() > MAX_FEE_TOKENS {
+        bail!("{name} lists {} tokens; at most {MAX_FEE_TOKENS} are allowed", tokens.len());
+    }
+    Ok(tokens)
+}
+
+/// `PREPAID_TRAFFIC_TOPUP_TOKENS`: the tokens a prepaid top-up is paid in, by priority;
+/// unset or blank means CC only.
+pub fn prepaid_traffic_topup_tokens(value: Option<&str>) -> Result<Vec<String>> {
+    let tokens = fee_token_list("PREPAID_TRAFFIC_TOPUP_TOKENS", value)?;
+    Ok(if tokens.is_empty() {
+        vec![CC_FEE_TOKEN.to_string()]
+    } else {
+        tokens
+    })
+}
+
+/// `RFQ_V2_FEE_TOKENS`: the tokens an atomic swap fee is paid in, by priority; unset or
+/// blank is empty, which means CC.
+pub fn rfq_v2_fee_tokens(value: Option<&str>) -> Result<Vec<String>> {
+    fee_token_list("RFQ_V2_FEE_TOKENS", value)
 }
 
 /// A set, non-blank env var, trimmed.
@@ -600,10 +679,13 @@ impl BaseConfig {
             depletion_min_hours: 1.0,
             min_prepaid_traffic_balance_cc: None,
             prepaid_traffic_topup_cc: None,
+            prepaid_traffic_topup_tokens: vec![CC_FEE_TOKEN.to_string()],
+            rfq_v2_fee_tokens: Vec::new(),
             atomic_quote_key: None,
             canton_chain: None,
             party_fee: None,
             party_prepaid_traffic: None,
+            party_traffic_fee: None,
             control: ControlSettings::default(),
             vetted_packages: VettedPackages::default(),
             verify: VerifySettings::default(),
@@ -1300,10 +1382,15 @@ impl BaseConfig {
             depletion_min_hours,
             min_prepaid_traffic_balance_cc,
             prepaid_traffic_topup_cc,
+            prepaid_traffic_topup_tokens: prepaid_traffic_topup_tokens(
+                std::env::var("PREPAID_TRAFFIC_TOPUP_TOKENS").ok().as_deref(),
+            )?,
+            rfq_v2_fee_tokens: rfq_v2_fee_tokens(std::env::var("RFQ_V2_FEE_TOKENS").ok().as_deref())?,
             atomic_quote_key,
             canton_chain: optional_env(crate::control_store::CHAIN_ENV),
             party_fee: pinned_party_env("PARTY_FEE")?,
             party_prepaid_traffic: pinned_party_env("PARTY_PREPAID_TRAFFIC")?,
+            party_traffic_fee: pinned_party_env("PARTY_TRAFFIC_FEE")?,
             control: sections.control,
             vetted_packages: sections.vetted_packages,
             verify: sections.verify,
@@ -3453,6 +3540,81 @@ name = "LP test"
         assert!(config.platform_parties().is_empty());
         config.party_prepaid_traffic = Some("traffic::1220cd".into());
         assert_eq!(config.platform_parties(), vec!["traffic::1220cd"]);
+    }
+
+    #[test]
+    fn known_fee_tokens_follow_the_server_rule() {
+        for (given, known) in [
+            ("CC", "CC"),
+            ("cc", "CC"),
+            ("TUSDT", "TUSDT"),
+            ("tusdt", "TUSDT"),
+            ("USDCx", "USDCx"),
+            ("usdcx", "USDCx"),
+            ("USDC", "USDC"),
+            ("usdc", "USDC"),
+            ("USDC.e", "USDC.e"),
+        ] {
+            assert_eq!(known_fee_token(given).as_deref(), Some(known), "{given}");
+        }
+        let long = format!("USDC{}", "x".repeat(29));
+        for unknown in ["", "CBTC", "USD", "US DC", "CC ", "USDC/x", "TUSDT2", long.as_str()] {
+            assert_eq!(known_fee_token(unknown), None, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn prepaid_traffic_topup_tokens_are_a_priority_list_defaulting_to_cc() {
+        assert_eq!(prepaid_traffic_topup_tokens(None).unwrap(), vec!["CC"]);
+        assert_eq!(prepaid_traffic_topup_tokens(Some("  ")).unwrap(), vec!["CC"]);
+        assert_eq!(
+            prepaid_traffic_topup_tokens(Some("TUSDT,USDCx,CC")).unwrap(),
+            vec!["TUSDT", "USDCx", "CC"]
+        );
+        assert_eq!(
+            prepaid_traffic_topup_tokens(Some(" tusdt , usdcx ,cc ")).unwrap(),
+            vec!["TUSDT", "USDCx", "CC"]
+        );
+        assert_eq!(prepaid_traffic_topup_tokens(Some("USDC")).unwrap(), vec!["USDC"]);
+        let nine = ["USDC1", "USDC2", "USDC3", "USDC4", "USDC5", "USDC6", "USDC7", "USDC8", "CC"].join(",");
+        for (bad, why) in [
+            ("TUSDT,,CC", "an empty entry"),
+            ("CC,", "an empty entry"),
+            (",CC", "an empty entry"),
+            ("TUSDT,CC,tusdt", "twice"),
+            ("CC,cc", "twice"),
+            ("CBTC", "not a known token"),
+            ("CC;TUSDT", "not a known token"),
+            (nine.as_str(), "at most 8"),
+        ] {
+            let err = prepaid_traffic_topup_tokens(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("PREPAID_TRAFFIC_TOPUP_TOKENS") && err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rfq_v2_fee_tokens_default_to_empty_which_means_cc() {
+        assert!(rfq_v2_fee_tokens(None).unwrap().is_empty());
+        assert!(rfq_v2_fee_tokens(Some(" ")).unwrap().is_empty());
+        assert_eq!(
+            rfq_v2_fee_tokens(Some("TUSDT,USDCx,CC")).unwrap(),
+            vec!["TUSDT", "USDCx", "CC"]
+        );
+        for bad in ["TUSDT,TUSDT", "TUSDT,", "ETH"] {
+            let err = rfq_v2_fee_tokens(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("RFQ_V2_FEE_TOKENS"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_traffic_fee_party_is_a_third_platform_party() {
+        let mut config = BaseConfig::test_minimal().unwrap();
+        assert_eq!(config.party_traffic_fee, None);
+        assert_eq!(config.prepaid_traffic_topup_tokens, vec!["CC"]);
+        assert!(config.rfq_v2_fee_tokens.is_empty());
+        config.party_traffic_fee = Some("traffic-fee::1220ef".into());
+        assert_eq!(config.platform_parties(), vec!["traffic-fee::1220ef"]);
+        assert!(pinned_party("PARTY_TRAFFIC_FEE", Some("traffic fee".into())).is_err());
     }
 
     #[test]

@@ -119,7 +119,8 @@ pub fn signing_settings() -> Arc<SigningSettings> {
     agent_logic::sync::read(&SIGNING).clone().unwrap_or_default()
 }
 
-/// The installed platform parties, else `PARTY_FEE` and `PARTY_PREPAID_TRAFFIC` from the env.
+/// The installed platform parties, else `PARTY_FEE`, `PARTY_PREPAID_TRAFFIC` and
+/// `PARTY_TRAFFIC_FEE` from the env.
 pub fn platform_parties() -> Result<PlatformParties> {
     if let Some(parties) = agent_logic::sync::read(&PLATFORM).clone() {
         return Ok(parties);
@@ -127,6 +128,7 @@ pub fn platform_parties() -> Result<PlatformParties> {
     Ok(PlatformParties {
         fee: agent_logic::config::pinned_party_env("PARTY_FEE")?,
         prepaid_traffic: agent_logic::config::pinned_party_env("PARTY_PREPAID_TRAFFIC")?,
+        traffic_fee: agent_logic::config::pinned_party_env("PARTY_TRAFFIC_FEE")?,
     })
 }
 
@@ -590,7 +592,9 @@ impl ControlContext {
             *agent_logic::sync::write(&self.platform) = next.clone();
             install_platform_parties(next.clone());
         }
-        if let Some(text) = pins::unset_warning_of(&next).filter(|_| linked_now) {
+        if let Some(text) =
+            pins::unset_warning_of(&next, &self.config.prepaid_traffic_topup_tokens).filter(|_| linked_now)
+        {
             warn!("agent control: {text}");
         }
     }

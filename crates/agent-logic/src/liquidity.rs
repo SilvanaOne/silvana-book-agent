@@ -218,6 +218,8 @@ struct PrepaidState {
     topup_cc: Option<Decimal>,
     /// Prepaid held for each settlement's own transactions.
     traffic_cc: Decimal,
+    /// The order-book fee discount (percent) the last prepaid poll reported.
+    orderbook_fee_discount_pct: Option<Decimal>,
 }
 
 /// Why fee capacity does not cover a fee.
@@ -463,6 +465,17 @@ impl LiquidityManager {
     pub async fn set_settlement_traffic(&self, traffic_cc: Decimal) {
         let mut s = self.state.write().await;
         s.prepaid.traffic_cc = traffic_cc.max(Decimal::ZERO);
+    }
+
+    /// Record the order-book fee discount from a prepaid poll; outside 0..100 reads as none.
+    pub async fn set_orderbook_fee_discount_pct(&self, pct: Option<Decimal>) {
+        let mut s = self.state.write().await;
+        s.prepaid.orderbook_fee_discount_pct = pct.filter(|p| *p >= Decimal::ZERO && *p < Decimal::ONE_HUNDRED);
+    }
+
+    /// The last order-book fee discount in percent; `None` means full price.
+    pub async fn orderbook_fee_discount_pct(&self) -> Option<Decimal> {
+        self.state.read().await.prepaid.orderbook_fee_discount_pct
     }
 
     /// A fee was debited: lowers the prepaid figure and the proposal's fee commitment by
@@ -2157,5 +2170,23 @@ mod tests {
         // A zero rate is no rate
         lm.update_cc_usd_rate(Decimal::ZERO).await;
         assert_eq!(lm.cc_usd_rate().await, None);
+    }
+
+    // The prepaid poll's discount is kept until the next poll; out of range is full price
+    #[tokio::test]
+    async fn the_order_book_fee_discount_is_cached_from_the_poll() {
+        let lm = LiquidityManager::new(5.0, 1.1, 4.0, 12.0, 1.0);
+        assert_eq!(lm.orderbook_fee_discount_pct().await, None);
+        lm.set_orderbook_fee_discount_pct(Some(dec("90"))).await;
+        assert_eq!(lm.orderbook_fee_discount_pct().await, Some(dec("90")));
+        lm.set_orderbook_fee_discount_pct(Some(Decimal::ZERO)).await;
+        assert_eq!(lm.orderbook_fee_discount_pct().await, Some(Decimal::ZERO));
+        for out_of_range in [dec("100"), dec("-1"), dec("250")] {
+            lm.set_orderbook_fee_discount_pct(Some(out_of_range)).await;
+            assert_eq!(lm.orderbook_fee_discount_pct().await, None, "{out_of_range}");
+        }
+        lm.set_orderbook_fee_discount_pct(Some(dec("12.5"))).await;
+        lm.set_orderbook_fee_discount_pct(None).await;
+        assert_eq!(lm.orderbook_fee_discount_pct().await, None);
     }
 }

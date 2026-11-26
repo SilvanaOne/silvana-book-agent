@@ -24,6 +24,8 @@ use tx_verifier::{ExpectedDvpTerms, HashCheck, OperationExpectation, Verificatio
 pub struct PlatformParties {
     pub fee: Option<String>,
     pub prepaid_traffic: Option<String>,
+    /// Receives top-ups paid in a token other than CC.
+    pub traffic_fee: Option<String>,
 }
 
 impl PlatformParties {
@@ -31,6 +33,7 @@ impl PlatformParties {
         Self {
             fee: config.party_fee.clone(),
             prepaid_traffic: config.party_prepaid_traffic.clone(),
+            traffic_fee: config.party_traffic_fee.clone(),
         }
     }
 
@@ -44,8 +47,49 @@ impl PlatformParties {
         Ok(agent_control::PlatformParties {
             fee: parse(&self.fee, "PARTY_FEE")?,
             prepaid_traffic: parse(&self.prepaid_traffic, "PARTY_PREPAID_TRAFFIC")?,
+            traffic_fee: parse(&self.traffic_fee, TRAFFIC_FEE_PIN)?,
         })
     }
+}
+
+/// References of the traffic purchases this process is paying: only these may be paid to
+/// the traffic-fee party.
+static OPEN_TRAFFIC_PURCHASES: std::sync::RwLock<BTreeSet<String>> = std::sync::RwLock::new(BTreeSet::new());
+/// Bound on the open purchases one process tracks.
+const MAX_OPEN_TRAFFIC_PURCHASES: usize = 32;
+/// Bound on the length of a purchase reference.
+const MAX_PURCHASE_REFERENCE_CHARS: usize = 256;
+
+/// Adds `reference` to `open`; false when it is blank, padded, too long, carries an unsafe
+/// character, or `open` is full. A reference already open stays open.
+fn open_purchase_in(open: &mut BTreeSet<String>, reference: &str) -> bool {
+    let admissible = !reference.trim().is_empty()
+        && reference.trim() == reference
+        && reference.chars().count() <= MAX_PURCHASE_REFERENCE_CHARS
+        && !reference.chars().any(crate::log_text::is_log_unsafe);
+    if !admissible {
+        return false;
+    }
+    if open.contains(reference) {
+        return true;
+    }
+    open.len() < MAX_OPEN_TRAFFIC_PURCHASES && open.insert(reference.to_string())
+}
+
+/// Records `reference` as an open traffic purchase of this process, before its payment is
+/// signed; false when it is refused (see [`open_purchase_in`]).
+pub fn insert_open_traffic_purchase(reference: &str) -> bool {
+    open_purchase_in(&mut agent_logic::sync::write(&OPEN_TRAFFIC_PURCHASES), reference)
+}
+
+/// Forgets `reference` once its purchase is credited, rejected or given up; true when it was open.
+pub fn remove_open_traffic_purchase(reference: &str) -> bool {
+    agent_logic::sync::write(&OPEN_TRAFFIC_PURCHASES).remove(reference)
+}
+
+/// Whether `reference` is an open traffic purchase of this process.
+pub fn is_open_traffic_purchase(reference: &str) -> bool {
+    agent_logic::sync::read(&OPEN_TRAFFIC_PURCHASES).contains(reference)
 }
 
 /// The typed request the agent itself built.
@@ -71,6 +115,7 @@ pub enum ContentRefusal {
 /// The pins a request may need, by their env names.
 const FEE_PIN: &str = "PARTY_FEE";
 const PREPAID_TRAFFIC_PIN: &str = "PARTY_PREPAID_TRAFFIC";
+const TRAFFIC_FEE_PIN: &str = "PARTY_TRAFFIC_FEE";
 
 /// `text` with control, line separator and bidi characters replaced by spaces.
 fn clean(text: &str) -> String {
@@ -510,6 +555,48 @@ fn multicall_legs(
     Ok(legs)
 }
 
+/// How a CIP-56 transfer to another party stands toward the traffic-fee pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrafficFeeLeg {
+    /// Not a traffic purchase: an ordinary transfer.
+    Ordinary,
+    /// Pays an open purchase of this process to the pinned party: a Holding only.
+    Purchase,
+    /// Pays an open purchase while the pin is unset: a Holding only, then refused for the pin.
+    Unpinned,
+}
+
+/// A leg to the traffic-fee pin pays one of this process's open purchases, whose reference
+/// the transaction carries as a memo; an open purchase is paid to the pin alone.
+fn traffic_fee_leg(
+    platform: &PlatformParties,
+    receiver: &str,
+    reference: Option<&str>,
+    facts: &TxFacts,
+) -> Result<TrafficFeeLeg, ContentRefusal> {
+    let open = reference.filter(|r| is_open_traffic_purchase(r));
+    let named = |reference: &str| {
+        if facts.memos.iter().any(|memo| memo == reference) {
+            Ok(())
+        } else {
+            Err(ContentRefusal::BadRequest(
+                "the transfer to the traffic-fee party does not carry its purchase reference as its memo".to_string(),
+            ))
+        }
+    };
+    match (platform.traffic_fee.as_deref(), open) {
+        (Some(pin), Some(reference)) if pin == receiver => named(reference).map(|()| TrafficFeeLeg::Purchase),
+        (Some(pin), None) if pin == receiver => Err(ContentRefusal::BadRequest(format!(
+            "a transfer to the traffic-fee party ({TRAFFIC_FEE_PIN}) must pay an open traffic purchase of this agent"
+        ))),
+        (Some(_), Some(_)) => Err(ContentRefusal::BadRequest(format!(
+            "an open traffic purchase is paid only to the traffic-fee party ({TRAFFIC_FEE_PIN})"
+        ))),
+        (None, Some(reference)) => named(reference).map(|()| TrafficFeeLeg::Unpinned),
+        (Some(_), None) | (None, None) => Ok(TrafficFeeLeg::Ordinary),
+    }
+}
+
 /// Everything the request explains, by operation; anything else is refused.
 fn expected_legs(
     agent: &str,
@@ -532,13 +619,25 @@ fn expected_legs(
             if receiver_party == sender_party {
                 Vec::new()
             } else {
-                vec![Leg::exact(
+                let leg = Leg::exact(
                     receiver_party,
                     Some(instrument_admin),
                     Some(instrument_id),
                     amount(a, "the transfer amount")?,
                     TRANSFER_KINDS,
-                )]
+                );
+                let reference = match ledger_params {
+                    Some(Params::TransferCip56(p)) => p.reference.as_deref(),
+                    _ => None,
+                };
+                match traffic_fee_leg(platform, receiver_party, reference, facts)? {
+                    TrafficFeeLeg::Ordinary => vec![leg],
+                    TrafficFeeLeg::Purchase => vec![Leg { kinds: HOLDING_KINDS, ..leg }],
+                    TrafficFeeLeg::Unpinned => {
+                        missing = Some(TRAFFIC_FEE_PIN);
+                        vec![Leg { to: Recipient::Unpinned, kinds: HOLDING_KINDS, ..leg }]
+                    }
+                }
             }
         }
         E::PrepayTraffic { amount: a, .. } => {
@@ -1000,7 +1099,7 @@ mod tests {
     }
 
     fn pins() -> PlatformParties {
-        PlatformParties { fee: Some(FEE.into()), prepaid_traffic: Some(TRAFFIC.into()) }
+        PlatformParties { fee: Some(FEE.into()), prepaid_traffic: Some(TRAFFIC.into()), traffic_fee: None }
     }
 
     fn check_with(
@@ -1110,6 +1209,165 @@ mod tests {
         refused_outflow(check(&transfer_cc("1"), facts(vec![cc(BOB, "1"), cc(FEE, "0.3")])));
         let split = OperationExpectation::SplitCc { party: ME.into(), output_amounts: vec![], amulet_cids: vec![], dso_party: None };
         refused_outflow(check(&split, facts(vec![cc(TRAFFIC, "1")])));
+    }
+
+    const TRAFFIC_FEE: &str = "traffic-fee::1220ef";
+    const REG: &str = "reg::1220ab";
+
+    fn token_transfer(to: &str, amount: &str) -> OperationExpectation {
+        OperationExpectation::TransferCip56 {
+            sender_party: ME.into(),
+            receiver_party: to.into(),
+            instrument_id: "TUSDT".into(),
+            instrument_admin: REG.into(),
+            amount: amount.into(),
+            command_id: None,
+            input_holding_cids: vec![],
+        }
+    }
+
+    fn token_request(to: &str, amount: &str, reference: Option<&str>) -> Params {
+        Params::TransferCip56(orderbook_proto::ledger::TransferCip56Params {
+            instrument_id: "TUSDT".into(),
+            instrument_admin: REG.into(),
+            receiver_party: to.into(),
+            amount: amount.into(),
+            reference: reference.map(str::to_string),
+            input_holding_cids: Vec::new(),
+            max_input_holdings: None,
+            direct_only: true,
+        })
+    }
+
+    fn with_traffic_fee() -> PlatformParties {
+        PlatformParties { traffic_fee: Some(TRAFFIC_FEE.into()), ..pins() }
+    }
+
+    fn token(to: &str, amount: &str, kind: FlowKind) -> ValueFlow {
+        flow(to, REG, "TUSDT", amount, kind)
+    }
+
+    fn with_memos(outflows: Vec<ValueFlow>, memos: &[&str]) -> TxFacts {
+        TxFacts { memos: memos.iter().map(|m| m.to_string()).collect(), ..facts(outflows) }
+    }
+
+    fn bad_request(result: Result<(), ContentRefusal>) -> String {
+        match result {
+            Err(ContentRefusal::BadRequest(reason)) => reason,
+            other => panic!("expected a bad request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_traffic_fee_leg_is_a_holding_paying_an_open_purchase_named_in_its_memo() {
+        let reference = "traffic-purchase-c17-holding";
+        assert!(insert_open_traffic_purchase(reference));
+        let e = token_transfer(TRAFFIC_FEE, "13.25");
+        let req = token_request(TRAFFIC_FEE, "13.25", Some(reference));
+        let run = |facts: TxFacts, req: &Params, platform: &PlatformParties| {
+            check_with(&e, OwnRequest::Ledger(Some(req)), facts, platform)
+        };
+        let paid = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding), token(ME, "1", FlowKind::Holding)], &[reference]);
+        assert_eq!(run(paid.clone(), &req, &with_traffic_fee()), Ok(()));
+        // A pending transfer to the traffic-fee party is never a top-up.
+        let pending = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::PendingTransfer)], &[reference]);
+        assert_eq!(refused_outflow(run(pending, &req, &with_traffic_fee())).kind, FlowKind::PendingTransfer);
+        // A second payment or another amount is not the leg.
+        let twice = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding), token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], &[reference]);
+        refused_outflow(run(twice, &req, &with_traffic_fee()));
+        refused_outflow(run(with_memos(vec![token(TRAFFIC_FEE, "13.26", FlowKind::Holding)], &[reference]), &req, &with_traffic_fee()));
+        // The memo must carry the purchase reference.
+        for memos in [&[][..], &["traffic-purchase-other"][..], &["traffic-purchase-c17-holding "][..]] {
+            let reason = bad_request(run(with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], memos), &req, &with_traffic_fee()));
+            assert!(reason.contains("memo"), "{reason}");
+        }
+        // A reference that is not an open purchase of this process, or none, is refused.
+        for foreign in [Some("traffic-purchase-c17-foreign"), None] {
+            let req = token_request(TRAFFIC_FEE, "13.25", foreign);
+            let memos: Vec<&str> = foreign.into_iter().collect();
+            let reason = bad_request(run(with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], &memos), &req, &with_traffic_fee()));
+            assert!(reason.contains("open traffic purchase"), "{reason}");
+        }
+        // An open purchase pays only the pinned party.
+        let elsewhere = token_request(BOB, "13.25", Some(reference));
+        let reason = bad_request(check_with(
+            &token_transfer(BOB, "13.25"),
+            OwnRequest::Ledger(Some(&elsewhere)),
+            with_memos(vec![token(BOB, "13.25", FlowKind::Holding)], &[reference]),
+            &with_traffic_fee(),
+        ));
+        assert!(reason.contains("PARTY_TRAFFIC_FEE"), "{reason}");
+        // Once closed, the same payment is refused.
+        assert!(remove_open_traffic_purchase(reference));
+        bad_request(run(paid, &req, &with_traffic_fee()));
+        // An ordinary transfer to another party keeps both transfer shapes.
+        let ordinary = token_request(BOB, "2", Some("invoice-7"));
+        for kind in [FlowKind::Holding, FlowKind::PendingTransfer] {
+            let r = check_with(&token_transfer(BOB, "2"), OwnRequest::Ledger(Some(&ordinary)), facts(vec![token(BOB, "2", kind)]), &with_traffic_fee());
+            assert_eq!(r, Ok(()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_traffic_purchase_without_the_pin_is_refused_for_that_alone() {
+        let reference = "traffic-purchase-c17-unpinned";
+        assert!(insert_open_traffic_purchase(reference));
+        let e = token_transfer(TRAFFIC_FEE, "13.25");
+        let req = token_request(TRAFFIC_FEE, "13.25", Some(reference));
+        let paid = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)], &[reference]);
+        let unpinned = check_with(&e, OwnRequest::Ledger(Some(&req)), paid, &pins());
+        assert_eq!(unpinned, Err(ContentRefusal::PinMissing { operation: "transfer_cip56", pin: TRAFFIC_FEE_PIN }));
+        assert!(unpinned.unwrap_err().to_string().contains("PARTY_TRAFFIC_FEE is not set"));
+        // Anything else wrong still refuses as such.
+        let pending = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::PendingTransfer)], &[reference]);
+        refused_outflow(check_with(&e, OwnRequest::Ledger(Some(&req)), pending, &pins()));
+        let unnamed = facts(vec![token(TRAFFIC_FEE, "13.25", FlowKind::Holding)]);
+        bad_request(check_with(&e, OwnRequest::Ledger(Some(&req)), unnamed, &pins()));
+        assert!(remove_open_traffic_purchase(reference));
+        // Without an open purchase it is an ordinary transfer, judged as before.
+        let paid = with_memos(vec![token(TRAFFIC_FEE, "13.25", FlowKind::PendingTransfer)], &[reference]);
+        assert_eq!(check_with(&e, OwnRequest::Ledger(Some(&req)), paid, &pins()), Ok(()));
+    }
+
+    #[test]
+    fn open_traffic_purchases_are_bounded_and_forgotten() {
+        let mut open = BTreeSet::new();
+        for bad in ["", "  ", " padded", "line\nbreak", "bidi\u{202e}"] {
+            assert!(!open_purchase_in(&mut open, bad), "{bad:?}");
+        }
+        assert!(!open_purchase_in(&mut open, &"r".repeat(257)));
+        for n in 0..MAX_OPEN_TRAFFIC_PURCHASES {
+            assert!(open_purchase_in(&mut open, &format!("purchase-{n}")));
+        }
+        assert!(open_purchase_in(&mut open, "purchase-0"), "an open one stays open");
+        assert!(!open_purchase_in(&mut open, "purchase-new"), "the set is full");
+        let reference = "traffic-purchase-c17-lifecycle";
+        assert!(!is_open_traffic_purchase(reference));
+        assert!(insert_open_traffic_purchase(reference));
+        assert!(is_open_traffic_purchase(reference));
+        assert!(remove_open_traffic_purchase(reference));
+        assert!(!is_open_traffic_purchase(reference));
+        assert!(!remove_open_traffic_purchase(reference));
+    }
+
+    #[test]
+    fn the_traffic_fee_pin_reaches_the_evaluator() {
+        let full = |hint: &str, digit: &str| format!("{hint}::1220{}", digit.repeat(64));
+        let traffic_fee = full("traffic-fee", "d");
+        let parties = PlatformParties {
+            fee: Some(full("fee", "a")),
+            prepaid_traffic: Some(full("traffic", "b")),
+            traffic_fee: Some(traffic_fee.clone()),
+        };
+        let pinned = parties.pinned().unwrap();
+        assert_eq!(pinned.traffic_fee.as_ref().map(|p| p.as_str()), Some(traffic_fee.as_str()));
+        let unpinned = PlatformParties { traffic_fee: None, ..parties.clone() };
+        assert_eq!(unpinned.pinned().unwrap().traffic_fee, None);
+        let bad = PlatformParties { traffic_fee: Some("traffic fee".into()), ..parties };
+        assert!(bad.pinned().unwrap_err().contains("PARTY_TRAFFIC_FEE"));
+        let mut config = agent_logic::config::BaseConfig::test_minimal().unwrap();
+        config.party_traffic_fee = Some(TRAFFIC_FEE.into());
+        assert_eq!(PlatformParties::from_config(&config).traffic_fee.as_deref(), Some(TRAFFIC_FEE));
     }
 
     fn terms(proposal: &str, buyer: &str, seller: &str) -> DvpTerms {

@@ -60,6 +60,7 @@ service AgentControllerService {
   rpc GetControllerTraffic(ControllerAgentRequest) returns (GetAgentTrafficResponse);
   rpc GetControllerActivity(ControllerPageRequest) returns (GetAgentActivityResponse);
   rpc GetControllerLedger(ControllerPageRequest) returns (GetAgentLedgerResponse);
+  rpc GetControllerTrafficLedger(ControllerTrafficLedgerRequest) returns (GetAgentTrafficLedgerResponse);
   rpc ListNodePackages(ListNodePackagesRequest) returns (ListNodePackagesResponse);
   rpc EndControllerSession(EndControllerSessionRequest) returns (EndControllerSessionResponse);
 }
@@ -656,6 +657,11 @@ message ControllerPageRequest {
   string agent_party = 1;
   uint32 limit = 2;
   uint32 offset = 3;
+}
+
+message ControllerTrafficLedgerRequest {
+  string agent_party = 1;
+  TrafficLedgerQuery query = 2;
 }
 
 message EndControllerSessionRequest {}

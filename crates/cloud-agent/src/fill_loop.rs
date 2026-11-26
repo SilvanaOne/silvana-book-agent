@@ -90,6 +90,160 @@ pub struct FillParams {
     /// RFQ V2 settlement-fee token preference, priority order (instruments
     /// symbols, e.g. ["USDC", "CC"]). Empty = CC. Atomic path only.
     pub fee_tokens: Vec<String>,
+    /// Each round offers only the fee tokens that can still pay the fee after its pay leg.
+    pub prune_fee_tokens: bool,
+}
+
+/// Least a fee token must be worth, in USD, after a round's pay leg until a quote names the fee.
+pub const MIN_FEE_TOKEN_USD: Decimal = Decimal::TWO;
+/// A quoted fee plus its margin, in percent of the fee.
+const FEE_WITH_MARGIN_PCT: u32 = 110;
+
+/// What a fee token must still be worth after the pay leg, in USD: the last quoted fee plus a
+/// 10% margin, else [`MIN_FEE_TOKEN_USD`].
+pub fn fee_need_usd(quoted_fee_usd: Option<Decimal>) -> Decimal {
+    quoted_fee_usd
+        .and_then(|fee| fee.checked_mul(Decimal::from(FEE_WITH_MARGIN_PCT))?.checked_div(Decimal::ONE_HUNDRED))
+        .unwrap_or(MIN_FEE_TOKEN_USD)
+}
+
+/// The fee tokens of a fill: `--fee-token` as given, else `RFQ_V2_FEE_TOKENS`, pruned per round.
+pub fn fill_fee_tokens(given: Vec<String>, configured: &[String]) -> (Vec<String>, bool) {
+    if given.is_empty() {
+        (configured.to_vec(), !configured.is_empty())
+    } else {
+        (given, false)
+    }
+}
+
+/// One fee token's unlocked balance, its USD value per unit and its instrument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeeFunds {
+    pub unlocked: Decimal,
+    pub usd_per_unit: Decimal,
+    /// The instrument id and admin a quoted fee names; `None` when unknown.
+    pub instrument: Option<(String, String)>,
+}
+
+/// The round's fee tokens in order: those worth at least `need_usd` once the pay leg
+/// (`pay_amount` of `pay_token`) is paid; every one of them when none is.
+pub fn round_fee_tokens(
+    configured: &[String],
+    pay_token: &str,
+    pay_amount: Option<Decimal>,
+    need_usd: Decimal,
+    funds: impl Fn(&str) -> Option<FeeFunds>,
+) -> Vec<String> {
+    let worth_after_pay = |token: &str| -> Option<Decimal> {
+        let f = funds(token)?;
+        let left = if token.eq_ignore_ascii_case(pay_token) {
+            f.unlocked.checked_sub(pay_amount?)?
+        } else {
+            f.unlocked
+        };
+        left.checked_mul(f.usd_per_unit)
+    };
+    let offered: Vec<String> = configured
+        .iter()
+        .filter(|token| worth_after_pay(token).is_some_and(|usd| usd >= need_usd))
+        .cloned()
+        .collect();
+    if offered.is_empty() {
+        configured.to_vec()
+    } else {
+        offered
+    }
+}
+
+/// One round's view of its fee tokens: the funds read for it and its pay leg.
+#[derive(Clone, Debug)]
+pub struct FeeView {
+    pub configured: Vec<String>,
+    pub funds: std::collections::HashMap<String, FeeFunds>,
+    pub pay_token: String,
+    pub pay_amount: Option<Decimal>,
+}
+
+impl FeeView {
+    /// The tokens to offer when the fee is expected to be `quoted_fee_usd`.
+    pub fn offered(&self, quoted_fee_usd: Option<Decimal>) -> Vec<String> {
+        round_fee_tokens(&self.configured, &self.pay_token, self.pay_amount, fee_need_usd(quoted_fee_usd), |t| {
+            self.funds.get(t).cloned()
+        })
+    }
+
+    /// A quoted fee in USD and, when its token cannot pay it after the pay leg while another token
+    /// can, the tokens to quote again with; `None` when the funds cannot place or read the fee.
+    pub fn check_quote(&self, fee: &AtomicFeeSpec) -> Option<(Decimal, Option<Vec<String>>)> {
+        let amount = Decimal::from_str_exact(fee.amount.trim()).ok().filter(|a| *a > Decimal::ZERO)?;
+        let names = |f: &FeeFunds| {
+            f.instrument.as_ref().is_some_and(|(id, admin)| *id == fee.instrument_id && *admin == fee.instrument_admin)
+        };
+        let (token, funds) = self.funds.iter().find(|(_, f)| names(f))?;
+        let usd = amount.checked_mul(funds.usd_per_unit)?;
+        let next = self.offered(Some(usd));
+        let pass = !next.iter().any(|t| t.eq_ignore_ascii_case(token));
+        Some((usd, pass.then_some(next)))
+    }
+}
+
+/// A round's fee tokens: those offered, the view that checks the quote, and the last quoted fee.
+#[derive(Clone, Debug, Default)]
+pub struct RoundFees {
+    pub offered: Vec<String>,
+    pub view: Option<FeeView>,
+    pub quoted_fee_usd: Option<Decimal>,
+}
+
+/// Each fee token's funds, read once for a round; `None` when the balances are unavailable.
+async fn fee_token_funds(
+    config: &BaseConfig,
+    ledger: &mut DAppProviderClient,
+    tokens: &[String],
+) -> Option<std::collections::HashMap<String, FeeFunds>> {
+    let balances = match ledger.get_balances().await {
+        Ok(balances) => balances,
+        Err(e) => {
+            warn!("Fee tokens offered unpruned: balances unavailable: {e:#}");
+            return None;
+        }
+    };
+    let is_cc = |t: &str| t.eq_ignore_ascii_case(agent_logic::config::CC_FEE_TOKEN);
+    let cc_rate = if tokens.iter().any(|t| is_cc(t)) {
+        match ledger.get_dso_rates().await {
+            Ok(rates) => Decimal::from_str_exact(rates.cc_usd_rate.trim()).ok().filter(|r| *r > Decimal::ZERO),
+            Err(e) => {
+                warn!("CC fee token unpriced this round: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cc_instrument = balances
+        .iter()
+        .find(|b| b.is_canton_coin)
+        .map(|b| (b.instrument_id.clone(), b.instrument_admin.clone()));
+    let mut funds = std::collections::HashMap::new();
+    for token in tokens {
+        let entry = if is_cc(token) {
+            cc_rate.map(|usd_per_unit| FeeFunds {
+                unlocked: crate::topup::unlocked_cc(&balances),
+                usd_per_unit,
+                instrument: cc_instrument.clone(),
+            })
+        } else {
+            crate::topup::resolve_fee_token(config, token).map(|(wire, registry)| FeeFunds {
+                unlocked: crate::topup::unlocked_of(&balances, &wire, &registry),
+                usd_per_unit: Decimal::ONE,
+                instrument: Some((wire, registry)),
+            })
+        };
+        if let Some(entry) = entry {
+            funds.insert(token.clone(), entry);
+        }
+    }
+    Some(funds)
 }
 
 /// Amounts and the price limit must be finite and above 0.
@@ -675,6 +829,8 @@ pub async fn run_fill_loop(
     let mut monitors: JoinSet<()> = JoinSet::new();
     let mut abort_reason: Option<String> = None;
 
+    // The fee the last RFQ V2 quote of this fill named, in USD.
+    let mut quoted_fee_usd: Option<Decimal> = None;
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             warn!(
@@ -738,7 +894,30 @@ pub async fn run_fill_loop(
 
         // ---- RFQ V2 atomic round (one-transaction settle) ----------------
         if let Some(swapper) = atomic {
-            match atomic_round(
+            let view = if params.prune_fee_tokens {
+                let (pay_token, pay_amount) = match params.direction {
+                    FillDirection::Buy => (&quote_instrument, request_amount * price_limit),
+                    FillDirection::Sell => (&base_instrument, request_amount),
+                };
+                let pay_amount = Decimal::from_f64_retain(pay_amount).map(|a| a.round_dp(10));
+                fee_token_funds(&config, &mut ledger, &params.fee_tokens).await.map(|funds| FeeView {
+                    configured: params.fee_tokens.clone(),
+                    funds,
+                    pay_token: pay_token.clone(),
+                    pay_amount,
+                })
+            } else {
+                None
+            };
+            let offered = match &view {
+                Some(view) => view.offered(quoted_fee_usd),
+                None => params.fee_tokens.clone(),
+            };
+            if params.prune_fee_tokens {
+                info!("[round {}] Fee tokens offered: {:?}", round, offered);
+            }
+            let mut fees = RoundFees { offered, view, quoted_fee_usd };
+            let result = atomic_round(
                 &mut client,
                 swapper,
                 &params,
@@ -749,9 +928,11 @@ pub async fn run_fill_loop(
                 sink,
                 (filled_total, remaining),
                 atomic_max_inputs,
+                &mut fees,
             )
-            .await
-            {
+            .await;
+            quoted_fee_usd = fees.quoted_fee_usd;
+            match result {
                 AtomicRoundResult::Filled(fill) => {
                     filled_total += fill.filled_base;
                     remaining -= fill.filled_base;
@@ -1617,7 +1798,7 @@ fn split_market(market_id: &str) -> (String, String) {
 // RFQ V2 atomic round
 // ============================================================================
 
-use orderbook_proto::rfqv2::{AtomicQuoteEnvelope, AtomicQuoteInfo};
+use orderbook_proto::rfqv2::{AtomicFeeSpec, AtomicQuoteEnvelope, AtomicQuoteInfo};
 
 use crate::atomic_swap::{AtomicFill, AtomicSwapper, SwapOutcome};
 
@@ -1646,7 +1827,9 @@ async fn atomic_round(
     sink: FillStateSink<'_>,
     progress: (f64, f64),
     max_input_holdings: usize,
+    fees: &mut RoundFees,
 ) -> AtomicRoundResult {
+    let fee_tokens = fees.offered.clone();
     let rfq_response = match client
         .request_quotes_atomic(
             &params.market_id,
@@ -1655,7 +1838,7 @@ async fn atomic_round(
             None,
             vec![],
             Some(15),
-            params.fee_tokens.clone(),
+            fee_tokens.to_vec(),
         )
         .await
     {
@@ -1718,7 +1901,7 @@ async fn atomic_round(
                 None,
                 vec![],
                 Some(15),
-                params.fee_tokens.clone(),
+                fee_tokens.to_vec(),
             )
             .await
         {
@@ -1741,6 +1924,20 @@ async fn atomic_round(
             }
         }
     };
+
+    // A fee token that cannot pay the quoted fee after the pay leg would fail the settle
+    if let (Some(view), Some(fee)) = (fees.view.as_ref(), best.settlement_fee.as_ref())
+        && let Some((usd, requote)) = view.check_quote(fee)
+    {
+        fees.quoted_fee_usd = Some(usd);
+        if let Some(next) = requote {
+            warn!(
+                "[round {}] Fee {} {} is more than its token holds after the pay leg; quoting again with {:?}",
+                round, fee.amount, fee.instrument_id, next
+            );
+            return AtomicRoundResult::Retry;
+        }
+    }
 
     // Fee visibility before accept (design §14 D21): accepting implies consent;
     // the settle path asserts the signed lpFees equal exactly this.
@@ -1875,7 +2072,94 @@ mod tests {
             interval_secs: 60,
             atomic: false,
             fee_tokens: Vec::new(),
+            prune_fee_tokens: false,
         }
+    }
+
+    #[test]
+    fn a_fill_without_fee_tokens_uses_the_configured_list_pruned_per_round() {
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let configured = list(&["TUSDT", "USDCx", "CC"]);
+        assert_eq!(fill_fee_tokens(Vec::new(), &configured), (configured.clone(), true));
+        assert_eq!(fill_fee_tokens(list(&["USDC"]), &configured), (list(&["USDC"]), false), "--fee-token wins as given");
+        assert_eq!(fill_fee_tokens(Vec::new(), &[]), (Vec::new(), false), "nothing configured: CC");
+    }
+
+    fn fee_funds(unlocked: &str, usd_per_unit: &str, id: &str) -> FeeFunds {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        FeeFunds { unlocked: d(unlocked), usd_per_unit: d(usd_per_unit), instrument: Some((id.to_string(), format!("{id}-admin::1220"))) }
+    }
+
+    fn fee_view(pay_token: &str, pay_amount: Option<&str>, usdcx: &str, tusdt: &str, cc: &str) -> FeeView {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        FeeView {
+            configured: ["USDCx", "TUSDT", "CC"].iter().map(|s| s.to_string()).collect(),
+            funds: std::collections::HashMap::from([
+                ("USDCx".to_string(), fee_funds(usdcx, "1", "USDCx")),
+                ("TUSDT".to_string(), fee_funds(tusdt, "1", "tusdt-wire")),
+                ("CC".to_string(), fee_funds(cc, "0.1", "Amulet")),
+            ]),
+            pay_token: pay_token.to_string(),
+            pay_amount: pay_amount.map(d),
+        }
+    }
+
+    // Before any quote a fee token must keep $2 after the pay leg, which counts against its own token
+    #[test]
+    fn before_a_quote_fee_tokens_keep_2_usd_after_the_pay_leg() {
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Paying 100 USDCx out of 101 leaves $1: USDCx is dropped; 19 CC is $1.90
+        assert_eq!(fee_view("USDCx", Some("100"), "101", "5", "19").offered(None), list(&["TUSDT"]));
+        assert_eq!(fee_view("USDCx", Some("100"), "102", "5", "20").offered(None), list(&["USDCx", "TUSDT", "CC"]));
+        // The pay token matches whatever its spelling; none qualifying offers them all
+        assert_eq!(fee_view("usdcx", Some("100"), "101", "0", "0").offered(None), list(&["USDCx", "TUSDT", "CC"]));
+        // An unknown pay amount drops its own token, never the others
+        assert_eq!(fee_view("TUSDT", None, "3", "500", "0").offered(None), list(&["USDCx"]));
+        // A token without funds is left out
+        let mut view = fee_view("CC", Some("1"), "0", "0", "100");
+        view.configured = list(&["USDC", "CC"]);
+        assert_eq!(view.offered(None), list(&["CC"]));
+    }
+
+    // Once a quote names its fee, a token must cover that fee plus the margin after the pay leg
+    #[test]
+    fn the_quoted_fee_decides_which_fee_tokens_are_offered() {
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        assert_eq!(fee_need_usd(None), MIN_FEE_TOKEN_USD);
+        assert_eq!(fee_need_usd(Some(d("3.6"))), d("3.96"));
+        // Buying with TUSDT leaves $2.50 of it: enough for the $2 floor, not for a $3.60 fee
+        let view = fee_view("TUSDT", Some("10"), "5", "12.5", "100");
+        assert_eq!(view.offered(None), list(&["USDCx", "TUSDT", "CC"]));
+        assert_eq!(view.offered(Some(d("3.6"))), list(&["USDCx", "CC"]));
+        // A small fee keeps a token the $2 floor would drop
+        let view = fee_view("USDCx", Some("100"), "101", "0", "0");
+        assert_eq!(view.offered(None), list(&["USDCx", "TUSDT", "CC"]), "none keeps $2: all are offered");
+        assert_eq!(view.offered(Some(d("0.3"))), list(&["USDCx"]));
+    }
+
+    // A quote whose fee token cannot pay the fee after the pay leg is passed on while another token can
+    #[test]
+    fn a_quote_is_passed_on_when_its_fee_token_cannot_pay_the_fee() {
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        let fee = |id: &str, amount: &str| AtomicFeeSpec {
+            receiver: "fee::1220".into(),
+            instrument_admin: format!("{id}-admin::1220"),
+            instrument_id: id.into(),
+            amount: amount.into(),
+        };
+        let view = fee_view("TUSDT", Some("10"), "5", "12.5", "100");
+        assert_eq!(view.check_quote(&fee("tusdt-wire", "3.6")), Some((d("3.6"), Some(list(&["USDCx", "CC"])))));
+        assert_eq!(view.check_quote(&fee("USDCx", "3.6")), Some((d("3.6"), None)), "USDCx holds 5");
+        assert_eq!(view.check_quote(&fee("Amulet", "36")), Some((d("3.6"), None)), "100 CC is $10");
+        // No other token can pay it: the quote is taken, the settle decides
+        let poor = fee_view("TUSDT", Some("10"), "0", "12.5", "0");
+        assert_eq!(poor.check_quote(&fee("tusdt-wire", "3.6")), Some((d("3.6"), None)));
+        // A fee the funds cannot place, or cannot read, teaches nothing
+        assert_eq!(view.check_quote(&fee("other", "3.6")), None);
+        assert_eq!(view.check_quote(&fee("USDCx", "1e1")), None);
+        assert_eq!(view.check_quote(&AtomicFeeSpec { instrument_admin: "other::1220".into(), ..fee("USDCx", "3.6") }), None);
     }
 
     // NaN, infinite and non-positive values used to start a loop that could never fill correctly

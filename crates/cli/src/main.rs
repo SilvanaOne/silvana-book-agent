@@ -174,8 +174,8 @@ enum Commands {
         /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
         #[arg(long)]
         atomic: bool,
-        /// Settlement-fee token preference for --atomic, priority order
-        /// (repeatable, e.g. --fee-token USDC --fee-token CC). Default: CC.
+        /// Settlement-fee token preference for --atomic, priority order (repeatable). Default:
+        /// RFQ_V2_FEE_TOKENS less tokens worth under $2 after the pay leg; CC when unset.
         #[arg(long = "fee-token")]
         fee_token: Vec<String>,
     },
@@ -202,8 +202,8 @@ enum Commands {
         /// Settle via RFQ V2 / AtomicDVP (one atomic transaction per round)
         #[arg(long)]
         atomic: bool,
-        /// Settlement-fee token preference for --atomic, priority order
-        /// (repeatable, e.g. --fee-token USDC --fee-token CC). Default: CC.
+        /// Settlement-fee token preference for --atomic, priority order (repeatable). Default:
+        /// RFQ_V2_FEE_TOKENS less tokens worth under $2 after the pay leg; CC when unset.
         #[arg(long = "fee-token")]
         fee_token: Vec<String>,
     },

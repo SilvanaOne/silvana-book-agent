@@ -284,6 +284,7 @@ impl OrderbookClient {
             // counterparty filter (retail orders default it to true).
             only_liquidity_providers: Some(false),
             liquidity_provider_name: None,
+            fee_tokens: Vec::new(),
         });
 
         let response = within(self.deadline, self.orderbook_client.submit_order(request))
@@ -517,6 +518,7 @@ impl OrderbookClient {
         let request = Request::new(AcceptQuoteRequest {
             rfq_id: rfq_id.to_string(),
             quote_id: quote_id.to_string(),
+            fee_tokens: Vec::new(),
         });
 
         let response = within(self.deadline, self.orderbook_client.accept_quote(request))

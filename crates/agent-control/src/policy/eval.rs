@@ -109,6 +109,41 @@ pub struct Intent {
     pub coverage: Coverage,
     /// The settle terms, for an atomic settle; a directed swap needs them.
     pub settle: Option<SettleTerms>,
+    /// The memos the transaction carries, as read.
+    pub memos: Vec<String>,
+    /// How the outflows reach their recipients; `None` when it was not read.
+    pub delivery: Option<Delivery>,
+}
+
+/// How a transfer's outflows reach their recipients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Delivery {
+    /// Every outflow is a holding of its recipient.
+    Direct,
+    /// An outflow waits for its recipient to accept it (a two-step offer).
+    Pending,
+}
+
+impl Delivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Pending => "pending",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Direct, Self::Pending].into_iter().find(|d| d.as_str() == s)
+    }
+}
+
+/// The memo prefix of a traffic purchase payment; the purchase id follows it.
+pub const TRAFFIC_PURCHASE_MEMO_PREFIX: &str = "agent-traffic:";
+
+/// A memo that names a traffic purchase: the prefix, then a non-blank id.
+pub fn is_traffic_purchase_memo(memo: &str) -> bool {
+    memo.strip_prefix(TRAFFIC_PURCHASE_MEMO_PREFIX)
+        .is_some_and(|id| !id.is_empty() && !id.chars().any(char::is_whitespace))
 }
 
 impl Intent {
@@ -123,6 +158,8 @@ impl Intent {
             sub: Vec::new(),
             coverage: Coverage::Fields,
             settle: None,
+            memos: Vec::new(),
+            delivery: None,
         }
     }
 }
@@ -132,12 +169,15 @@ impl Intent {
 pub struct PlatformParties {
     pub fee: Option<PartyId>,
     pub prepaid_traffic: Option<PartyId>,
+    /// Recipient of traffic purchases: a lone undirected CIP-56 transfer to it is maintenance.
+    pub traffic_fee: Option<PartyId>,
 }
 
 impl PlatformParties {
     pub const NONE: Self = Self {
         fee: None,
         prepaid_traffic: None,
+        traffic_fee: None,
     };
 
     pub fn contains(&self, party: &PartyId) -> bool {
@@ -422,8 +462,45 @@ fn all_fee_flows(part: &Intent, ctx: &EvalContext<'_>) -> bool {
     any
 }
 
-/// The class after the self-transfer, platform-party and unexplained-flow rules; a
-/// command's operation decides a directed part.
+/// A direct CIP-56 transfer whose only outflow goes to the pinned traffic-fee party and
+/// whose memos all name a traffic purchase.
+fn is_traffic_top_up(part: &Intent, ctx: &EvalContext<'_>) -> bool {
+    let Some(traffic_fee) = &ctx.platform.traffic_fee else {
+        return false;
+    };
+    let mut outflows = part
+        .outgoing
+        .iter()
+        .filter(|flow| !is_self(flow, ctx.agent_party));
+    part.kind == OperationKind::TransferCip56
+        && part.delivery == Some(Delivery::Direct)
+        && !part.memos.is_empty()
+        && part.memos.iter().all(|memo| is_traffic_purchase_memo(memo))
+        && matches!(
+            (outflows.next(), outflows.next()),
+            (Some(Flow { to: Some(Recipient::Party(party)), .. }), None) if party == traffic_fee
+        )
+}
+
+/// A CC traffic cap cannot count a maintenance outflow in another token, so it refuses it.
+fn check_token_traffic(
+    rules: &Rules,
+    ctx: &EvalContext<'_>,
+    part: &Intent,
+    class: OperationClass,
+) -> Result<OperationClass, Refusal> {
+    let token = |flow: &Flow| !is_self(flow, ctx.agent_party) && flow.instrument != *ctx.cc;
+    if class == OperationClass::Maintenance
+        && rules.maintenance.traffic_cc_per_day.is_some()
+        && part.outgoing.iter().any(token)
+    {
+        return Err(refuse(ReasonCode::TrafficDailyCap, class));
+    }
+    Ok(class)
+}
+
+/// The class after the self-transfer, platform-party, traffic top-up and unexplained-flow
+/// rules; a command's operation decides a directed part.
 fn part_class(
     part: &Intent,
     coverage: Coverage,
@@ -455,6 +532,8 @@ fn part_class(
                 OperationClass::Maintenance
             } else if all_fee_flows(part, ctx) {
                 OperationClass::FeeConsents
+            } else if is_traffic_top_up(part, ctx) {
+                OperationClass::Maintenance
             } else {
                 base
             }
@@ -650,8 +729,9 @@ fn check_part(
             }
         }
         OperationClass::Maintenance => {
+            check_token_traffic(rules, ctx, part, class)?;
             for flow in &part.outgoing {
-                if !is_self(flow, ctx.agent_party) {
+                if !is_self(flow, ctx.agent_party) && flow.instrument == *ctx.cc {
                     tally.traffic = add(tally.traffic, flow.amount, class)?;
                 }
             }
@@ -1104,6 +1184,7 @@ pub fn precheck_intent(
             .try_for_each(|sub| {
                 gates(rules, ctx, sub, Coverage::Fields, None)
                     .and_then(|class| directed_only(rules, class, false))
+                    .and_then(|class| check_token_traffic(rules, ctx, sub, class))
                     .map(|_| ())
             })
             .map(|()| static_class),
@@ -1114,7 +1195,8 @@ pub fn precheck_intent(
             Some(refusal) => Err(refusal),
             None => gates(rules, ctx, intent, Coverage::Fields, command)
                 .and_then(|class| swap_markets(rules, class, command))
-                .and_then(|class| directed_only(rules, class, command.is_some())),
+                .and_then(|class| directed_only(rules, class, command.is_some()))
+                .and_then(|class| check_token_traffic(rules, ctx, intent, class)),
         },
     };
     decided(result)
@@ -1219,6 +1301,7 @@ mod tests {
         bob: PartyId,
         fee: PartyId,
         prepaid: PartyId,
+        traffic_fee: PartyId,
         pinned: PlatformParties,
         none: PlatformParties,
         usage: UsageTotals,
@@ -1228,6 +1311,7 @@ mod tests {
         fn new() -> Self {
             let fee = party("fee", 7);
             let prepaid = party("prepaid", 8);
+            let traffic_fee = party("traffic-fee", 9);
             Self {
                 agent: testkit::agent_party(),
                 cc: instrument(&party("DSO", 1), "Amulet"),
@@ -1237,9 +1321,11 @@ mod tests {
                 pinned: PlatformParties {
                     fee: Some(fee.clone()),
                     prepaid_traffic: Some(prepaid.clone()),
+                    traffic_fee: Some(traffic_fee.clone()),
                 },
                 fee,
                 prepaid,
+                traffic_fee,
                 none: PlatformParties::NONE,
                 usage: UsageTotals::new(),
             }
@@ -1342,6 +1428,15 @@ mod tests {
         Intent {
             outgoing: flows,
             ..Intent::new(kind)
+        }
+    }
+
+    /// `intent` as a direct transfer that pays a traffic purchase.
+    fn purchase(intent: Intent) -> Intent {
+        Intent {
+            memos: vec!["agent-traffic:p-1".into()],
+            delivery: Some(Delivery::Direct),
+            ..intent
         }
     }
 
@@ -2418,6 +2513,257 @@ mod tests {
         assert_eq!(verdict(&rules, &unpinned, &elsewhere), R::Allowed);
         let hidden = with_flows(K::SplitCc, vec![f.flow(&f.cc, "2", &f.alice)]);
         assert_eq!(verdict(&rules, &unpinned, &hidden), R::DirectedOnly);
+    }
+
+    #[test]
+    fn a_top_up_to_the_pinned_traffic_fee_party_is_maintenance() {
+        let mut f = Fixture::new();
+        f.usage
+            .insert(UsageBucket::Traffic, &f.cc.clone(), amount("6"));
+        let ctx = f.ctx();
+        let rules = DEFAULT_LINKED_RULES;
+        let top_up = |instrument: &InstrumentRef, value: &str| {
+            purchase(with_flows(
+                K::TransferCip56,
+                vec![
+                    f.flow(instrument, value, &f.traffic_fee),
+                    f.flow(instrument, "2", &f.agent),
+                ],
+            ))
+        };
+        let token = top_up(&f.usdc, "13");
+        let decision = evaluate(&rules, &ctx, &token, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Maintenance)
+        );
+        assert!(decision.usage.is_empty(), "{:?}", decision.usage);
+        let mut paused = rules.clone();
+        paused.paused = true;
+        assert_eq!(verdict(&paused, &ctx, &token), R::Allowed);
+        let mut off = rules.clone();
+        off.maintenance.enabled = false;
+        assert_eq!(verdict(&off, &ctx, &token), R::ClassDisabled);
+        // Unpinned, or not read from verified content, it stays a transfer.
+        let decision = evaluate(&rules, &f.unpinned(), &token, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::DirectedOnly, OperationClass::Transfers)
+        );
+        let unverified = Intent {
+            coverage: Coverage::Unverified,
+            ..token.clone()
+        };
+        assert_eq!(
+            verdict(&rules, &ctx, &unverified),
+            R::ContentUnverifiable
+        );
+        // A CC top-up counts as traffic.
+        let cc = top_up(&f.cc, "4");
+        let decision = evaluate(&rules, &ctx, &cc, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Maintenance)
+        );
+        assert_eq!(
+            decision.usage,
+            vec![UsageDelta {
+                bucket: UsageBucket::Traffic,
+                instrument: f.cc.clone(),
+                amount: amount("4"),
+            }]
+        );
+        // Under a CC traffic cap a token top-up is refused; a CC one is summed.
+        let mut capped = rules.clone();
+        capped.maintenance.traffic_cc_per_day = Some(amount("10"));
+        let decision = evaluate(&capped, &ctx, &token, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::TrafficDailyCap, OperationClass::Maintenance)
+        );
+        assert_eq!(verdict(&capped, &ctx, &cc), R::Allowed);
+        assert_eq!(
+            verdict(&capped, &ctx, &top_up(&f.cc, "4.0000000001")),
+            R::TrafficDailyCap
+        );
+        assert_eq!(
+            verdict(&capped, &f.unpinned(), &token),
+            R::DirectedOnly
+        );
+    }
+
+    #[test]
+    fn only_a_single_undirected_cip56_flow_is_a_traffic_top_up() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let rules = DEFAULT_LINKED_RULES;
+        let transfers = [
+            purchase(with_flows(
+                K::TransferCip56,
+                vec![
+                    f.flow(&f.usdc, "13", &f.traffic_fee),
+                    f.flow(&f.usdc, "1", &f.alice),
+                ],
+            )),
+            purchase(with_flows(
+                K::TransferCip56,
+                vec![
+                    f.flow(&f.usdc, "13", &f.traffic_fee),
+                    f.flow(&f.usdc, "1", &f.traffic_fee),
+                ],
+            )),
+            purchase(with_flows(
+                K::TransferCip56,
+                vec![
+                    f.flow(&f.usdc, "13", &f.traffic_fee),
+                    Flow {
+                        instrument: f.usdc.clone(),
+                        amount: amount("1"),
+                        to: None,
+                    },
+                ],
+            )),
+            purchase(with_flows(K::TransferCc, vec![f.flow(&f.cc, "4", &f.traffic_fee)])),
+            multicall(vec![purchase(with_flows(
+                K::McTransfer,
+                vec![f.flow(&f.cc, "4", &f.traffic_fee)],
+            ))]),
+        ];
+        for intent in &transfers {
+            let decision = evaluate(&rules, &ctx, intent, None);
+            assert_eq!(
+                (decision.reason, decision.class),
+                (R::DirectedOnly, OperationClass::Transfers),
+                "{intent:?}"
+            );
+        }
+        // A command directs it as the transfer it names.
+        let command = f.command(CommandOp::TransferToken {
+            receiver: f.traffic_fee.clone(),
+            instrument: f.usdc.clone(),
+            amount: amount("13"),
+            reference: None,
+        });
+        let token = with_flows(
+            K::TransferCip56,
+            vec![f.flow(&f.usdc, "13", &f.traffic_fee)],
+        );
+        let decision = evaluate(&rules, &ctx, &token, Some(&command));
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Transfers)
+        );
+        let decision = precheck_intent(&rules, &ctx, &token, Some(&command));
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Transfers)
+        );
+        // The traffic-fee party is not a platform fee party.
+        assert!(!f.pinned.contains(&f.traffic_fee));
+        let mut capped = rules.clone();
+        capped.fees.cc_per_consent = Some(amount("1"));
+        let cc = purchase(with_flows(
+            K::TransferCip56,
+            vec![f.flow(&f.cc, "4", &f.traffic_fee)],
+        ));
+        assert_eq!(verdict(&capped, &ctx, &cc), R::Allowed);
+    }
+
+    // Only a direct transfer that pays a purchase is a top-up: the shared rule passes pauses
+    #[test]
+    fn a_traffic_top_up_is_a_direct_transfer_with_the_purchase_memo() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let rules = DEFAULT_LINKED_RULES;
+        let mut paused = rules.clone();
+        paused.paused = true;
+        paused.transfers.directed_only = false;
+        let paid = purchase(with_flows(
+            K::TransferCip56,
+            vec![f.flow(&f.usdc, "13", &f.traffic_fee)],
+        ));
+        let decision = evaluate(&rules, &ctx, &paid, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Maintenance)
+        );
+        assert_eq!(verdict(&paused, &ctx, &paid), R::Allowed);
+        type Edit = (&'static str, fn(&mut Intent));
+        let edits: [Edit; 6] = [
+            ("no memo", |i| i.memos.clear()),
+            ("a foreign memo", |i| i.memos = vec!["refund".into()]),
+            ("the prefix alone", |i| i.memos = vec!["agent-traffic:".into()]),
+            ("a second memo", |i| i.memos.push("other".into())),
+            ("a two-step offer", |i| i.delivery = Some(Delivery::Pending)),
+            ("no delivery read", |i| i.delivery = None),
+        ];
+        for (what, edit) in edits {
+            let mut intent = paid.clone();
+            edit(&mut intent);
+            let decision = evaluate(&rules, &ctx, &intent, None);
+            assert_eq!(
+                (decision.reason, decision.class),
+                (R::DirectedOnly, OperationClass::Transfers),
+                "{what}"
+            );
+            assert_eq!(
+                precheck_intent(&rules, &ctx, &intent, None).reason,
+                R::DirectedOnly,
+                "{what}"
+            );
+            assert_eq!(verdict(&paused, &ctx, &intent), R::Paused, "{what}");
+        }
+        assert!(is_traffic_purchase_memo("agent-traffic:p-1"));
+        for memo in ["", "agent-traffic:", "agent-traffic: p", "agent-traffic:p 1", "AGENT-TRAFFIC:p"] {
+            assert!(!is_traffic_purchase_memo(memo), "{memo:?}");
+        }
+    }
+
+    #[test]
+    fn prechecks_judge_a_traffic_top_up_by_its_named_flow() {
+        let f = Fixture::new();
+        let ctx = f.ctx();
+        let rules = DEFAULT_LINKED_RULES;
+        let token = purchase(with_flows(
+            K::TransferCip56,
+            vec![f.flow(&f.usdc, "13", &f.traffic_fee)],
+        ));
+        let cc = purchase(with_flows(
+            K::TransferCip56,
+            vec![f.flow(&f.cc, "40", &f.traffic_fee)],
+        ));
+        let decision = precheck_intent(&rules, &ctx, &token, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::Allowed, OperationClass::Maintenance)
+        );
+        assert_eq!(
+            precheck_intent(&rules, &f.unpinned(), &token, None).reason,
+            R::DirectedOnly
+        );
+        let mut capped = rules.clone();
+        capped.maintenance.traffic_cc_per_day = Some(amount("10"));
+        let decision = precheck_intent(&capped, &ctx, &token, None);
+        assert_eq!(
+            (decision.reason, decision.class),
+            (R::TrafficDailyCap, OperationClass::Maintenance)
+        );
+        // Prechecks sum no caps: a CC top-up over the cap passes here.
+        assert_eq!(
+            precheck_intent(&capped, &ctx, &cc, None).reason,
+            R::Allowed
+        );
+        let mixed = purchase(with_flows(
+            K::TransferCip56,
+            vec![
+                f.flow(&f.usdc, "13", &f.traffic_fee),
+                f.flow(&f.usdc, "1", &f.alice),
+            ],
+        ));
+        assert_eq!(
+            precheck_intent(&rules, &ctx, &mixed, None).reason,
+            R::DirectedOnly
+        );
     }
 
     #[test]

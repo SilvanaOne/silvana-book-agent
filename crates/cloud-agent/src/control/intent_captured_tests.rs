@@ -83,6 +83,7 @@ fn platform() -> PlatformParties {
     PlatformParties {
         fee: Some(text(&pins, "party_fee")),
         prepaid_traffic: Some(text(&pins, "party_prepaid_traffic")),
+        traffic_fee: None,
     }
 }
 

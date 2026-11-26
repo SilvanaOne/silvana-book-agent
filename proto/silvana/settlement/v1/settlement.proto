@@ -279,6 +279,11 @@ message SettlementProposalMessage {
   string dvp_processing_fee_seller = 14;
   string allocation_processing_fee_buyer = 15;
   string allocation_processing_fee_seller = 16;
+  // Fee token per side (empty means CC) and the fee discount percent applied (unset means none).
+  string fee_token_buyer = 17;
+  string fee_token_seller = 18;
+  optional string fee_discount_pct_buyer = 19;
+  optional string fee_discount_pct_seller = 20;
 }
 
 // Preconfirmation request

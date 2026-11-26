@@ -28,6 +28,8 @@ pub const SETTLE_CHOICE: &str = "AtomicDVP_Settle";
 /// The venue template, as `module:entity`.
 pub const VENUE_TEMPLATE: &str = "AtomicDVP:AtomicDVP";
 const DVP_MODULE: &str = "Utility.Settlement.App.V1.Model.Dvp";
+/// The token-standard metadata key of a transfer's reason.
+pub const REASON_META_KEY: &str = "splice.lfdecentralizedtrust.org/reason";
 
 /// The facts of one prepared transaction, as seen by one party.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,6 +62,9 @@ pub struct TxFacts {
     pub atomic_settle: Option<SettleFacts>,
     /// Created or exercised templates outside the model, as `module:entity`, sorted.
     pub unmodelled: Vec<String>,
+    /// The non-empty memos of root transfers, in root order: a `TransferFactory_Transfer`
+    /// reason, or a `TransferPreapproval_Send` / `_SendV2` description.
+    pub memos: Vec<String>,
 }
 
 /// One root exercise.
@@ -299,6 +304,7 @@ pub fn extract_facts(
                         choice: e.choice_id.clone(),
                         contract_id: e.contract_id.clone(),
                     });
+                    facts.memos.extend(memo(e).map(str::to_string));
                 }
                 if model.is_none() {
                     unmodelled.insert(name);
@@ -1038,6 +1044,37 @@ fn instrument(r: &Record) -> Result<Instrument, FactsError> {
     })
 }
 
+/// A transfer's reason or a preapproval send's description; another shape has no memo.
+fn memo(e: &Exercise) -> Option<&str> {
+    let chosen = e.chosen_value.as_ref().and_then(as_record)?;
+    let memo = match e.choice_id.as_str() {
+        "TransferFactory_Transfer" => {
+            let transfer = get_record_field(chosen, "transfer").and_then(as_record)?;
+            let meta = get_record_field(transfer, "meta").and_then(as_record)?;
+            let Some(Sum::TextMap(values)) = get_record_field(meta, "values")?.sum.as_ref() else {
+                return None;
+            };
+            values
+                .entries
+                .iter()
+                .find(|entry| entry.key == REASON_META_KEY)?
+                .value
+                .as_ref()
+                .and_then(get_text)?
+        }
+        "TransferPreapproval_Send" | "TransferPreapproval_SendV2" => {
+            let Some(Sum::Optional(description)) =
+                get_record_field(chosen, "description")?.sum.as_ref()
+            else {
+                return None;
+            };
+            description.value.as_deref().and_then(get_text)?
+        }
+        _ => return None,
+    };
+    (!memo.is_empty()).then_some(memo)
+}
+
 // ============================================================================
 // Field helpers
 // ============================================================================
@@ -1447,6 +1484,96 @@ mod tests {
             choices,
             ["TransferFactory_Transfer", "AmuletRules_Transfer"]
         );
+    }
+
+    /// A TransferFactory_Transfer root whose `transfer.meta.values` are `values`.
+    fn factory_root(values: Value) -> Exercise {
+        let mut ex = root(RULES, "TransferFactory_Transfer", &[]);
+        ex.chosen_value = Some(record(vec![
+            ("expectedAdmin", party(DSO)),
+            (
+                "transfer",
+                record(vec![
+                    ("sender", party(P)),
+                    ("receiver", party(TRAFFIC)),
+                    ("meta", record(vec![("values", values)])),
+                ]),
+            ),
+            ("extraArgs", record(vec![])),
+        ]));
+        ex
+    }
+
+    fn reason(memo: &str) -> Value {
+        text_map(vec![("other", text("x")), (REASON_META_KEY, text(memo))])
+    }
+
+    /// A preapproval send `choice` by P with `description`.
+    fn send_root(choice: &str, description: Option<&str>) -> Exercise {
+        let mut ex = root(("Splice.AmuletRules", "TransferPreapproval"), choice, &[]);
+        ex.chosen_value = Some(record(vec![
+            ("inputs", list(vec![])),
+            ("amount", numeric("1.0")),
+            ("sender", party(P)),
+            ("description", optional(description.map(text))),
+        ]));
+        ex
+    }
+
+    fn memos_of(roots: Vec<Exercise>) -> Vec<String> {
+        let ids: Vec<String> = (0..roots.len()).map(|i| format!("r{i}")).collect();
+        let nodes = ids
+            .iter()
+            .zip(roots)
+            .map(|(id, ex)| exercise_node(id, ex))
+            .collect();
+        let roots: Vec<&str> = ids.iter().map(String::as_str).collect();
+        facts(&prepared(&roots, nodes, vec![], &[P])).memos
+    }
+
+    #[test]
+    fn root_transfers_name_their_memos_in_root_order() {
+        assert_eq!(memos_of(vec![factory_root(reason("buy-01"))]), ["buy-01"]);
+        assert_eq!(
+            memos_of(vec![
+                send_root("TransferPreapproval_Send", Some("one")),
+                factory_root(reason("two")),
+                send_root("TransferPreapproval_SendV2", Some("three")),
+            ]),
+            ["one", "two", "three"]
+        );
+        // Empty, absent and odd memos are left out.
+        let odd = [
+            factory_root(reason("")),
+            factory_root(text_map(vec![("other", text("x"))])),
+            factory_root(record(vec![(REASON_META_KEY, text("x"))])),
+            factory_root(text_map(vec![(REASON_META_KEY, numeric("1.0"))])),
+            send_root("TransferPreapproval_SendV2", None),
+            send_root("TransferPreapproval_SendV2", Some("")),
+            send_root("TransferPreapproval_Renew", Some("x")),
+            root(RULES, "TransferFactory_Transfer", &[]),
+        ];
+        for ex in odd {
+            assert_eq!(memos_of(vec![ex.clone()]), Vec::<String>::new(), "{ex:?}");
+        }
+        let mut description = send_root("TransferPreapproval_SendV2", None);
+        description.chosen_value = Some(record(vec![("description", text("bare"))]));
+        assert!(memos_of(vec![description]).is_empty());
+    }
+
+    #[test]
+    fn a_nested_send_is_not_a_root_memo() {
+        let mut outer = factory_root(reason("outer"));
+        outer.children = vec!["n1".into()];
+        let inner = send_root("TransferPreapproval_SendV2", Some("inner"));
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", outer), exercise_node("n1", inner)],
+            vec![],
+            &[P],
+        );
+        assert_eq!(facts(&p).memos, ["outer"]);
+        assert!(facts(&transfer_tx(vec![amulet("c1", Q, "1.0")])).memos.is_empty());
     }
 
     #[test]

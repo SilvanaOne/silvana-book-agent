@@ -1279,6 +1279,7 @@ fn request_for(
                 reference: reference.as_ref().map(|r| r.as_str().to_string()),
                 input_holding_cids: Vec::new(),
                 max_input_holdings: None,
+                direct_only: false,
             });
             let req = PrepareTransactionRequest {
                 operation: TransactionOperation::TransferCip56 as i32,
