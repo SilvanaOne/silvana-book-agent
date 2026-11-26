@@ -4804,7 +4804,7 @@ mod bounded_io_tests {
                 let submit = c.submit_atomic_with_retries(req.clone(), &tickets, false, false, force, 1);
                 let err = tokio::time::timeout(Duration::from_secs(30), submit).await.expect("bounded").unwrap_err();
                 let text = format!("{err:#}");
-                let expected = if force { FORCE_REFUSED_WHEN_LINKED } else { "is not a leg of this issue_tickets request" };
+                let expected = if force { FORCE_REFUSED_WHEN_LINKED } else { "are not the one exercise of this issue_tickets request" };
                 assert!(text.contains(expected), "{text}");
             }
             server.abort();

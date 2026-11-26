@@ -27,6 +27,8 @@ const AMULET_ID: &str = "Amulet";
 pub const SETTLE_CHOICE: &str = "AtomicDVP_Settle";
 /// The venue template, as `module:entity`.
 pub const VENUE_TEMPLATE: &str = "AtomicDVP:AtomicDVP";
+/// The provider's service template, as `module:entity`; only its exercises are modelled.
+pub const SERVICE_TEMPLATE: &str = "AtomicDVP:AtomicDVPService";
 const DVP_MODULE: &str = "Utility.Settlement.App.V1.Model.Dvp";
 /// The token-standard metadata key of a transfer's reason.
 pub const REASON_META_KEY: &str = "splice.lfdecentralizedtrust.org/reason";
@@ -60,6 +62,8 @@ pub struct TxFacts {
     pub allocations: Vec<AllocationFact>,
     /// The terms of the atomic settle the transaction runs, if any.
     pub atomic_settle: Option<SettleFacts>,
+    /// Every venue the transaction creates outside rolled-back nodes, in node order.
+    pub venues: Vec<CreatedVenue>,
     /// Created or exercised templates outside the model, as `module:entity`, sorted.
     pub unmodelled: Vec<String>,
     /// The non-empty memos of root transfers, in root order: a `TransferFactory_Transfer`
@@ -199,6 +203,15 @@ pub struct VenueTerms {
     pub quote: Instrument,
 }
 
+/// A venue the transaction creates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedVenue {
+    pub contract_id: String,
+    pub terms: VenueTerms,
+    /// The quote key as the venue states it.
+    pub quote_public_key: String,
+}
+
 /// A CIP-56 instrument id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instrument {
@@ -287,7 +300,8 @@ pub fn extract_facts(
                     created_live.insert(c.contract_id.as_str());
                 }
                 let (id, name) = template(c.template_id.as_ref())?;
-                match model_of(id) {
+                // The provider alone creates the service, so a create of it is never modelled.
+                match model_of(id).filter(|_| name != SERVICE_TEMPLATE) {
                     None => {
                         unmodelled.insert(name);
                     }
@@ -425,6 +439,14 @@ pub fn extract_facts(
             Model::WithdrawAttestation if !transient => burn(arg, party)?,
             Model::DvpProposal | Model::Dvp => {
                 push_dvp(&mut facts.dvp, &mut dvp_seen, dvp_terms(arg, model)?);
+                None
+            }
+            Model::Venue => {
+                facts.venues.push(CreatedVenue {
+                    contract_id: c.contract_id.clone(),
+                    terms: venue_of(arg)?,
+                    quote_public_key: text_field(arg, "quotePublicKey")?.to_string(),
+                });
                 None
             }
             _ => None,
@@ -655,6 +677,7 @@ const MODELS: &[(&str, &str, Model)] = &[
         Model::Neutral,
     ),
     ("AtomicDVP", "SettlementTicket", Model::Neutral),
+    ("AtomicDVP", "AtomicDVPService", Model::Neutral),
     (
         "Splice.ExternalPartyAmuletRules",
         "ExternalPartyAmuletRules",
@@ -1027,14 +1050,17 @@ fn venue_terms(metadata: &Metadata, cid: &str) -> Result<Option<VenueTerms>, Fac
     if model_of(id) != Some(Model::Venue) {
         return Err(malformed(format!("the settled venue is a {name}")));
     }
-    let arg = argument(venue)?;
-    Ok(Some(VenueTerms {
+    venue_of(argument(venue)?).map(Some)
+}
+
+fn venue_of(arg: &Record) -> Result<VenueTerms, FactsError> {
+    Ok(VenueTerms {
         lp: party_field(arg, "lp")?.to_string(),
         provider: party_field(arg, "provider")?.to_string(),
         pair_name: text_field(arg, "pairName")?.to_string(),
         base: instrument(record_field(arg, "baseInstrumentId")?)?,
         quote: instrument(record_field(arg, "quoteInstrumentId")?)?,
-    }))
+    })
 }
 
 fn instrument(r: &Record) -> Result<Instrument, FactsError> {
@@ -2353,6 +2379,217 @@ mod tests {
                 "Splice.ExternalPartyConfigState:ExternalPartyConfigStateV2",
             ]
         );
+    }
+
+    const SERVICE_T: (&str, &str) = ("AtomicDVP", "AtomicDVPService");
+    const TICKET_T: (&str, &str) = ("AtomicDVP", "SettlementTicket");
+    const FACTORY_T: (&str, &str) = (
+        "Utility.Registry.App.V0.Service.AllocationFactory",
+        "AllocationFactory",
+    );
+
+    /// A nonconsuming exercise by P of `choice` on the service contract `svc`.
+    fn service_root(choice: &str, children: &[&str]) -> Exercise {
+        let mut ex = root(SERVICE_T, choice, children);
+        ex.contract_id = "svc".into();
+        ex
+    }
+
+    /// A split of P's 100 TOK into two outputs of 10 and the change, one self-transfer per
+    /// output, the second output owned by `second`.
+    fn split_tx(second: &str) -> PreparedTransaction {
+        let transfer = |children: &[&str]| root(FACTORY_T, "TransferFactory_Transfer", children);
+        let p = prepared(
+            &["0"],
+            vec![
+                exercise_node("0", service_root("AtomicDVPService_SplitHoldings", &["t1", "t2"])),
+                exercise_node("t1", transfer(&["a1", "o1", "c1"])),
+                exercise_node("a1", spend("in1", HOLDING_T)),
+                create_node("o1", reg_holding("out1", P, "10.0")),
+                create_node("c1", reg_holding("ch1", P, "90.0")),
+                exercise_node("t2", transfer(&["a2", "o2", "c2"])),
+                exercise_node("a2", spend("ch1", HOLDING_T)),
+                create_node("o2", reg_holding("out2", second, "10.0")),
+                create_node("c2", reg_holding("ch2", P, "80.0")),
+            ],
+            vec![],
+            &[P],
+        );
+        with_input_contract(p, reg_holding("in1", P, "100.0"))
+    }
+
+    #[test]
+    fn a_split_on_the_service_moves_nothing_to_others() {
+        let f = facts(&split_tx(P));
+        assert!(f.unmodelled.is_empty() && f.outflows.is_empty(), "{f:?}");
+        assert_eq!(
+            f.inflows,
+            vec![
+                held("out1", REG, "TOK", "10"),
+                held("out2", REG, "TOK", "10"),
+                held("ch2", REG, "TOK", "80")
+            ]
+        );
+        assert_eq!(f.consumed, vec![held("in1", REG, "TOK", "100")]);
+        assert_eq!(
+            f.roots,
+            vec![ExerciseFact {
+                template: SERVICE_TEMPLATE.into(),
+                choice: "AtomicDVPService_SplitHoldings".into(),
+                contract_id: "svc".into(),
+            }]
+        );
+        // a holding for another party under the service root is a holding flow
+        let f = facts(&split_tx(Q));
+        assert!(f.unmodelled.is_empty(), "{f:?}");
+        assert_eq!(f.outflows, vec![flow(Q, REG, "TOK", "10", FlowKind::Holding)]);
+    }
+
+    #[test]
+    fn the_service_is_modelled_for_its_exercises_only() {
+        let service = |t: (&str, &str), cid: &str| {
+            with_cid(
+                create(ident(t.0, t.1), record(vec![("provider", party(P))]), &[P]),
+                cid,
+            )
+        };
+        let p = prepared(
+            &["0", "1", "2"],
+            vec![
+                create_node("0", service(SERVICE_T, "s1")),
+                create_node("1", service(("AtomicDVP", "AtomicDVPServiceV2"), "s2")),
+                create_node("2", service(("AtomicDVPx", "AtomicDVPService"), "s3")),
+            ],
+            vec![],
+            &[P],
+        );
+        assert_eq!(
+            facts(&p).unmodelled,
+            [
+                "AtomicDVP:AtomicDVPService",
+                "AtomicDVP:AtomicDVPServiceV2",
+                "AtomicDVPx:AtomicDVPService"
+            ]
+        );
+        // exercises of the same entity in another module stay outside the model
+        let mut other = service_root("AtomicDVPService_SplitHoldings", &[]);
+        other.template_id = Some(ident("AtomicDVPx", "AtomicDVPService"));
+        let f = facts(&prepared(&["0"], vec![exercise_node("0", other)], vec![], &[P]));
+        assert_eq!(f.unmodelled, ["AtomicDVPx:AtomicDVPService"]);
+    }
+
+    #[test]
+    fn ticket_and_venue_upkeep_on_the_service_is_clean() {
+        let ticket = |cid: &str| {
+            with_cid(
+                create(
+                    ident(TICKET_T.0, TICKET_T.1),
+                    record(vec![("lp", party(P)), ("ticketId", text(cid))]),
+                    &[P],
+                ),
+                cid,
+            )
+        };
+        let issue = prepared(
+            &["0"],
+            vec![
+                exercise_node("0", service_root("AtomicDVPService_IssueTickets", &["1", "2"])),
+                create_node("1", ticket("tk1")),
+                create_node("2", ticket("tk2")),
+            ],
+            vec![],
+            &[P],
+        );
+        let cancel = prepared(
+            &["0"],
+            vec![
+                exercise_node("0", service_root("AtomicDVPService_CancelTickets", &["1", "2"])),
+                fetch_node("1", fetch(ident(TICKET_T.0, TICKET_T.1), "tk1", &[P])),
+                exercise_node("2", spend("tk1", TICKET_T)),
+            ],
+            vec![],
+            &[P],
+        );
+        let create_venue = prepared(
+            &["0"],
+            vec![
+                exercise_node("0", service_root("AtomicDVPService_CreateVenue", &["1"])),
+                create_node("1", venue_contract("v1", "30aa")),
+            ],
+            vec![],
+            &[P],
+        );
+        for (p, choice, venues) in [
+            (issue, "AtomicDVPService_IssueTickets", vec![]),
+            (with_input_contract(cancel, ticket("tk1")), "AtomicDVPService_CancelTickets", vec![]),
+            (create_venue, "AtomicDVPService_CreateVenue", vec![created_venue("v1", "30aa")]),
+        ] {
+            let f = facts(&p);
+            assert!(f.unmodelled.is_empty(), "{choice}: {f:?}");
+            assert!(f.outflows.is_empty() && f.inflows.is_empty(), "{choice}: {f:?}");
+            assert!(f.unlisted_inputs.is_empty(), "{choice}: {f:?}");
+            assert_eq!(f.roots.len(), 1, "{choice}");
+            assert_eq!(f.roots[0].choice, choice);
+            assert_eq!(f.venues, venues, "{choice}");
+        }
+    }
+
+    /// The venue `cid` of P with provider Q for TOK/CC, under the quote key `key`.
+    fn venue_contract(cid: &str, key: &str) -> Create {
+        let arg = record(vec![
+            ("provider", party(Q)),
+            ("lp", party(P)),
+            ("pairName", text("TOK/CC")),
+            ("baseInstrumentId", instrument_id(REG, "TOK")),
+            ("quoteInstrumentId", instrument_id(DSO, "Amulet")),
+            ("quotePublicKey", text(key)),
+        ]);
+        with_cid(create(ident("AtomicDVP", "AtomicDVP"), arg, &[P, Q]), cid)
+    }
+
+    fn created_venue(cid: &str, key: &str) -> CreatedVenue {
+        CreatedVenue {
+            contract_id: cid.into(),
+            terms: VenueTerms {
+                lp: P.into(),
+                provider: Q.into(),
+                pair_name: "TOK/CC".into(),
+                base: Instrument { admin: REG.into(), id: "TOK".into() },
+                quote: Instrument { admin: DSO.into(), id: "Amulet".into() },
+            },
+            quote_public_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn a_venue_key_update_lists_the_venue_it_creates() {
+        let mut update = root(("AtomicDVP", "AtomicDVP"), "AtomicDVP_UpdateKey", &["1"]);
+        update.contract_id = "v1".into();
+        update.consuming = true;
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", update), create_node("1", venue_contract("v2", "30bb"))],
+            vec![],
+            &[P],
+        );
+        let p = with_input_contract(p, venue_contract("v1", "30aa"));
+        let f = facts(&p);
+        assert!(f.unmodelled.is_empty() && f.outflows.is_empty(), "{f:?}");
+        assert_eq!(f.venues, vec![created_venue("v2", "30bb")]);
+        // a transaction that creates no venue lists none, a settle on an input venue included
+        assert!(facts(&with_input_contract(prepared(&["0"], vec![exercise_node("0", settle("v1"))], vec![], &[P]), venue_contract("v1", "30aa"))).venues.is_empty());
+        // a created venue without its quote key is malformed
+        let mut keyless = venue_contract("v3", "30cc");
+        if let Some(Sum::Record(r)) = keyless.argument.as_mut().and_then(|a| a.sum.as_mut()) {
+            r.fields.retain(|f| f.label != "quotePublicKey");
+        }
+        let p = prepared(
+            &["0"],
+            vec![exercise_node("0", service_root("AtomicDVPService_CreateVenue", &["1"])), create_node("1", keyless)],
+            vec![],
+            &[P],
+        );
+        assert!(malformed_reason(&p).contains("quotePublicKey"), "{}", malformed_reason(&p));
     }
 
     #[test]
